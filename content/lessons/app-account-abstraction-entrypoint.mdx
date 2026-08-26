@@ -1,0 +1,368 @@
+---
+id: app-account-abstraction-entrypoint
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [eip-4337, erc-4337-docs, erc-4337-entrypoint-explainer, erc-4337-bundlers, erc-7562, erc-7769, eth-infinitism-releases, eip-712]
+stack: {}
+---
+
+Open the trace of any ERC-4337 transaction and the top frame is an EOA — the bundler's — calling one
+function on one contract. Every account in the bundle, every paymaster, every target contract sits
+underneath that single frame.
+
+The contract is the EntryPoint. It has no protocol privileges. It is
+[an ordinary contract account](/c/contract-account): code, storage, a balance, reachable by
+[an ordinary message call](/c/evm-message-call). Nothing in a client's state transition function knows
+its name. All of its authority comes from the fact that every 4337 account and every paymaster
+contains a hard-coded reference to it and refuses to talk to anyone else.
+
+That is a strange amount of power to hand a contract, and this lesson is about why the design needs
+it, what it does with it, and the two consequences that bite in production: deposits are not stakes,
+and the address you choose is not something you can change your mind about.
+
+## The problem it exists to solve
+
+The spec states it in one sentence, and every structural oddity in ERC-4337 is downstream of it:
+
+The main challenge with a purely smart-contract-account-based account abstraction system is DoS
+safety — how can a block builder including an operation make sure that it will actually pay fees,
+without having to first execute the entire operation?<Cite src="eip-4337" />
+
+Hold the two halves apart. The builder needs a **guarantee of payment**. The builder must obtain it
+**without running the work**. For an ordinary transaction the protocol solves this for you: the
+sender's balance and nonce are checked before execution, by the client, using rules no contract can
+change. For a smart account, the check is arbitrary code — and arbitrary code can behave one way
+during simulation and another way at inclusion.
+
+The EntryPoint's answer is a strict separation of phases, enforced by one contract so that a bundler
+only has to reason about one contract's behaviour rather than about every account implementation in
+existence.
+
+## Two loops, not one
+
+The bundler calls exactly one function:
+
+```solidity
+function handleOps(
+    PackedUserOperation[] calldata ops,
+    address payable beneficiary
+) external;
+```
+
+<Cite src="eip-4337" />
+
+Inside, the EntryPoint runs the bundle twice.
+
+**The verification loop** goes over every operation: create the sender account if it does not exist
+yet, call `validateUserOp` on it, and check that the deposit covering the operation is
+sufficient.<Cite src="eip-4337" />
+
+**The execution loop** then goes over every operation again: execute the `callData`, apply the 10%
+penalty on unused gas above the 40,000 threshold, refund the excess to the sender, and pay the
+bundler.<Cite src="eip-4337" />
+
+The ordering is the design. If validation and execution were interleaved per operation, operation
+three's execution could invalidate operation five's validation, and the bundler would discover it
+mid-transaction with the gas already spent. Validating the whole bundle first means the bundler's
+simulation covers the whole bundle.
+
+<Aside kind="note">
+This is also why the ERC-7562 rules exist at all. Separating the phases is only useful if the
+validation phase is *reproducible*, which is why validation may not read the timestamp, the block
+number, the base fee or another entity's storage.<Cite src="erc-7562" /> The separation and the
+restrictions are one mechanism described in two documents.
+</Aside>
+
+## Where each frame goes
+
+The documentation reduces the EntryPoint's job to three moves: it calls `validateUserOp()` on the
+sender account, calls `validatePaymasterUserOp()` on the paymaster if one is present, and executes the
+`callData` if validation succeeds.<Cite src="erc-4337-docs" />
+
+Every arrow below is an ordinary `CALL` — a new machine with its own gas, its own `msg.sender` and its
+own revert boundary. Nothing here is magic; it is the call model you already have, arranged in a
+specific order.
+
+<Figure
+  caption="The bundle is walked twice: every operation in it is validated before any operation executes."
+  alt="EntryPoint.handleOps fans out into a verification loop that optionally deploys the sender through a factory, calls validateUserOp on the sender and validatePaymasterUserOp on the paymaster, and then an execution loop where the sender executes the callData and the paymaster's postOp runs."
+>
+  <Flow
+    dir="down"
+    lanes={['one transaction', 'verification loop, per op', 'execution loop, per op']}
+    nodes={[
+      { id: 'ho', label: 'EntryPoint.handleOps', note: 'called by the bundler EOA', col: 0 },
+      { id: 'f', label: 'factory', note: 'if initCode — deploys sender', col: 1, dashed: true },
+      { id: 'v', label: 'sender.validateUserOp', note: 'userOp, userOpHash, missingAccountFunds', col: 1, tone: 'accent' },
+      { id: 'pv', label: 'validatePaymasterUserOp', note: 'if a paymaster is named', col: 1, dashed: true },
+      { id: 'ex', label: 'sender runs callData', note: '→ target contracts', col: 2, tone: 'accent' },
+      { id: 'po', label: 'paymaster.postOp', note: 'if it returned context', col: 2, dashed: true },
+    ]}
+    edges={[
+      { from: 'ho', to: 'f', dashed: true },
+      { from: 'ho', to: 'v' },
+      { from: 'ho', to: 'pv', dashed: true },
+      { from: 'v', to: 'ex' },
+      { from: 'pv', to: 'po', dashed: true },
+    ]}
+  />
+</Figure>
+
+The single most useful thing to extract from that diagram: **inside your account's `validateUserOp`,
+`msg.sender` is the EntryPoint.** Not the user. Not the bundler. That is why every 4337 account
+implementation begins its validation with a check that the caller is the EntryPoint it was written
+for, and why "which EntryPoint" is baked into the account at deploy time.
+
+### Worked example: deriving the check every account needs
+
+A team writes a minimal smart account. `validateUserOp` verifies the owner's signature over
+`userOpHash`. A second function, `execute(address to, uint256 value, bytes data)`, performs the call
+the EntryPoint asked for. Neither function has an access modifier, because — the reasoning went — the
+EntryPoint is the only thing that ever calls them. Derive what goes wrong.
+
+**Subgoal 1 — name what the two functions each guarantee.** `validateUserOp` guarantees *this
+operation was authorised by the owner*. `execute` guarantees nothing at all; it is the mechanical arm
+that moves value once something else has decided the move is allowed.
+
+**Subgoal 2 — separate the caller from the authoriser.** In the intended flow those are two different
+parties: the bundler triggers, the EntryPoint calls, the owner's signature authorises. The account
+receives the call from the EntryPoint and infers authorisation from the fact that validation ran
+first — in the verification loop, in the same transaction.<Cite src="eip-4337" />
+
+**Subgoal 3 — ask who else can produce that call.** Anyone. `execute` is a public function on a
+deployed contract; the documentation's picture of bundlers monitoring a mempool and submitting bundles
+describes the *intended* traffic, not the only reachable path.<Cite src="erc-4337-bundlers" /> An
+attacker calls `execute` directly, skipping validation entirely, and the account drains. The signature
+check was never bypassed — it was simply never reached.
+
+**Subgoal 4 — state the invariant the account must hold.** *Every state-changing entry point on the
+account is callable only by the EntryPoint it trusts, or by the account itself.* The EntryPoint's
+guarantee is that validation precedes execution **within its own call**; that guarantee says nothing
+about calls that never went through it.
+
+**Subgoal 5 — generalise.** The account is not secured by the EntryPoint. It is secured by refusing
+every caller except the EntryPoint, which is a property the account has to assert for itself. The
+documentation describes the EntryPoint as the single point of contact between bundlers, wallets and
+paymasters<Cite src="erc-4337-entrypoint-explainer" /> — "single point of contact" is an architectural
+description, not an enforced constraint.
+
+## The answer validation returns
+
+`validateUserOp` does not return a boolean.
+
+```solidity
+function validateUserOp(
+    PackedUserOperation calldata userOp,
+    bytes32 userOpHash,
+    uint256 missingAccountFunds
+) external returns (uint256 validationData);
+```
+
+<Cite src="eip-4337" />
+
+The returned word packs three things: an aggregator address in twenty bytes — `0` for a valid
+signature, `1` to mark failure, otherwise the address of an aggregator contract — then a `validUntil`
+in six bytes and a `validAfter` in six bytes. Twenty plus six plus six is the whole
+word.<Cite src="eip-4337" />
+
+Three details in that are worth pulling out.
+
+**A time window is data, not a check.** The account states when the operation is good for; the
+EntryPoint enforces it. The account never reads a clock, so the validation stays reproducible for the
+bundler's simulation.
+
+**An aggregator can be named.** Aggregator contracts let multiple UserOperations share a single
+validation, and the spec requires that an aggregator's `validateSignatures()` be callable only from
+the EntryPoint.<Cite src="eip-4337" /> That constraint is the same pattern as the account's own
+EntryPoint check, one level up.
+
+**`missingAccountFunds` is an instruction to pay.** The EntryPoint tells the account how much it must
+transfer to cover the operation. The account pays it from its EntryPoint deposit or tops the deposit
+up; if it cannot, validation fails.
+
+## Deposits and stakes are two different pots
+
+This is the distinction most people collapse, and collapsing it produces a support ticket that reads
+"we have money at the EntryPoint but operations are being rejected".
+
+**A deposit is gas money.** It is a balance the EntryPoint holds on behalf of an account or a
+paymaster, and it is what actually reimburses the bundler.<Cite src="eip-4337" /> The documentation
+puts it plainly: wallets and paymasters must fund gas fees through deposits held by the
+EntryPoint.<Cite src="erc-4337-entrypoint-explainer" /> The interface is small:
+
+```solidity
+function balanceOf(address account) public view returns (uint256);
+function depositTo(address account) public payable;
+function withdrawTo(address payable withdrawAddress, uint256 amount) external;
+receive() external payable;
+```
+
+<Cite src="eip-4337" />
+
+**A stake is standing.** It is a separate bond with a withdrawal delay:
+
+```solidity
+function addStake(uint32 _unstakeDelaySec) external payable;
+function unlockStake() external;
+function withdrawStake(address payable withdrawAddress) external;
+```
+
+<Cite src="eip-4337" />
+
+Staked entities enjoy relaxed storage access rules during validation.<Cite src="eip-4337" /> The
+mempool-side numbers come from ERC-7562: `MIN_UNSTAKE_DELAY` is 86,400 seconds, described as a
+sufficient withdrawal delay to prevent most Sybil attacks, and `MIN_STAKE_VALUE` is adjustable per
+chain with a recommendation of roughly $1,000 equivalent in native
+tokens.<Cite src="erc-7562" /> The documentation's framing of why a paymaster stakes is
+one word long: to prevent griefing.<Cite src="erc-4337-entrypoint-explainer" />
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Deposit', note: 'gas money' },
+    { title: 'Stake', note: 'standing', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What is it?',
+      cells: [
+        'A balance the EntryPoint holds on behalf of an account or a paymaster',
+        'A separate bond, with a withdrawal delay you choose at the time',
+      ],
+    },
+    {
+      label: 'What does it buy?',
+      cells: [
+        'Payment: it is what reimburses the bundler',
+        'Relaxed storage-access rules during validation',
+      ],
+    },
+    {
+      label: 'What does the mempool do with it?',
+      cells: ['Nothing', 'Higher quotas, above a per-chain stake value the spec only recommends'],
+    },
+    {
+      label: 'How quickly can you take it back?',
+      cells: ['Immediately', 'Not before the unstake delay — at least 86,400 seconds'],
+    },
+  ]}
+  caption="The money that pays for gas is not the money that buys standing, which is why a fully funded paymaster can still be refused."
+  alt="Deposits and stakes at the EntryPoint compared: what each is, what each buys, what the mempool does with it, and how quickly it can be withdrawn."
+/>
+
+Deposit buys inclusion of a specific operation. Stake buys the right to be a well-behaved participant
+with relaxed rules and higher mempool quotas. Withdrawing a deposit is immediate; withdrawing a stake
+is not. A paymaster with a large deposit and no stake will find its operations rejected the moment its
+validation logic needs to read anything outside itself.
+
+<Misconception
+  belief="Depositing ETH at the EntryPoint is what makes a paymaster usable."
+  reality="A deposit pays gas. Relaxed validation-storage rules and mempool quota come from a separate stake with a withdrawal delay of at least one day. Many paymaster designs are unusable without both."
+  why="Both are ETH sent to the same contract, and both are described as 'funding' the paymaster. The difference is not visible in a balance."
+  src="erc-7562"
+/>
+
+## Reputation: the part with no on-chain trace
+
+Bundlers do not just apply per-operation rules; they keep score. The spec's own statement of policy:
+to prevent abuse, an entity that causes invalidation of a large number of UserOperations in the
+mempool is throttled down, or completely banned for a period of time.<Cite src="eip-4337" /> ERC-7562
+gives that machinery rule numbers and quotas — `THROTTLED_ENTITY_MEMPOOL_COUNT` is 4, and rules like
+EREP-015 exist to keep a paymaster's score from being damaged by a failure that was the factory's or
+the account's fault.<Cite src="erc-7562" />
+
+Reputation is per-bundler, off-chain, and invisible in any block explorer. When a paymaster starts
+being ignored, there is nothing on chain to look at. That is worth knowing before the incident, not
+during it.
+
+## Three addresses, and a choice you make once
+
+The documentation describes the design intent — a singleton, hard-coded by major bundlers, one point
+of contact between bundlers, wallets and paymasters.<Cite src="erc-4337-entrypoint-explainer" /> The
+release history shows what that means in practice: one canonical address **per version**, all of them
+deployed and none of them retired.<Cite src="eth-infinitism-releases" />
+
+```text
+v0.7.0   0x0000000071727De22E5E9d8BAf0edAc6f37da032
+v0.8.0   0x4337084d9e255ff0702461cf8895ce9e3b5ff108
+v0.9.0   0x433709009B8330FDa32311DF1C2AFA402eD8D009
+```
+
+<Cite src="eth-infinitism-releases" />
+
+<Aside kind="warn">
+**Which of these predominates on mainnet in August 2026 is not something this course will assert.**
+v0.7 is the version described as production in the material available here; v0.8 and v0.9 exist and
+are deployed. Adoption is a per-chain and per-wallet fact that the research for this module could not
+establish from a primary source, and a confident sentence here would be a guess wearing a citation.
+Check the chain you are deploying to, and check which EntryPoint your chosen bundler and account
+implementation are written against — they must agree. The repository's own guidance for v0.9 is to
+verify the deployment address and code hash against the official security audit report before
+updating.<Cite src="eth-infinitism-releases" />
+</Aside>
+
+This matters more than a version pin usually does, because of something established in the previous
+lesson: the `userOpHash` is an EIP-712 typed message hash, and the signature MUST depend on `chainid`
+and on the EntryPoint address, specifically to prevent replay across EntryPoint
+versions.<Cite src="eip-4337" /><Cite src="eip-712" />
+
+So a signature produced for one EntryPoint is not merely inconvenient to reuse against another. It
+does not verify. Moving an account from one EntryPoint to another is not a configuration change; it is
+a migration of the account implementation, the bundler relationship and every signing path at once.
+
+<Misconception
+  belief="The EntryPoint is part of Ethereum — a system contract, like a precompile."
+  reality="It is a contract with no protocol status. Its authority is entirely conventional: accounts and paymasters choose to trust one address, and bundlers choose to call it. Several versions are live at different addresses simultaneously."
+  why="It is called a singleton, it sits at a vanity address, and every 4337 diagram draws it in the centre. Centrality in a diagram reads as protocol status."
+  src="eip-4337"
+/>
+
+<Check type="explain" concept="entrypoint">
+A bundle of five UserOperations is submitted. Operation three's execution reverts — the target
+contract rejects the call. The bundle transaction itself is mined with status 1, and the bundler is
+paid for all five operations, including operation three.
+
+Explain how that outcome is consistent with the two-loop design, and say what your product's UI has to
+do differently because of it.
+
+<Answer>
+**Why the bundle succeeded.** Validation and execution are separate loops. Operation three passed
+validation — its signature was acceptable and its funding was in place — so the payment guarantee the
+bundler needed was established before any execution ran. The execution loop then ran the `callData`,
+which reverted inside its own call frame. A reverted inner frame does not revert the caller unless the
+caller chooses to propagate it, and the EntryPoint does not: it proceeds to refund excess gas and pay
+the bundler.<Cite src="eip-4337" />
+
+**Where the spec says the reverted case is normal.** The paymaster hook's mode enum contains
+`opReverted`, and its comment in the specification reads: "UserOperation reverted. paymaster still has
+to pay for gas."<Cite src="eip-4337" /> A reverted operation is a fully priced, fully settled outcome,
+not an aborted one.
+
+**What the UI must do differently.** Transaction-level status is the wrong signal. `status: 1` on the
+bundle transaction tells you the bundler's work succeeded — it says nothing about whether the user's
+action happened. A product that renders success from the transaction receipt will confidently tell a
+user their swap went through when it reverted. The operation-level result is the one to read, via the
+bundler's UserOperation receipt method rather than `eth_getTransactionReceipt`.<Cite src="erc-7769" />
+
+**The wider habit.** Everywhere in this pipeline, "the transaction succeeded" and "the user's intent
+happened" are separate propositions. That gap already existed for batched calls and for anything
+routed through a relayer; ERC-4337 makes it the default case rather than the exception.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** is the optional participant in that call graph — the paymaster. Everything you now
+know about the two loops is what makes its risk legible: it commits to pay during the verification
+loop, on information available in the verification loop, and is charged for whatever happens in the
+execution loop.
+
+**The two-roads lesson** returns to the EntryPoint from an unexpected direction. ERC-4337 has an
+explicit path for an EOA that has been upgraded in place, and part of that path is a rule about which
+address may call an account's initialiser — a rule that names an EntryPoint function.
+
+**The session-key module** builds directly on the `validationData` return value: a time-bounded
+permission is expressed as `validAfter`/`validUntil` precisely because validation cannot read the
+clock itself.

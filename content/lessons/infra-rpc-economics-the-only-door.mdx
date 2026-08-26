@@ -1,0 +1,299 @@
+---
+id: infra-rpc-economics-the-only-door
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [execution-apis-spec, ethereum-org-json-rpc, ethereum-org-nodes-clients, eth-run-a-node, geth-pubsub, viem-clients, viem-fallback-transport, flashbots-protect-docs, alchemy-throughput]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The status page was green. The contracts were fine — they are always fine, in the sense that a
+contract has no uptime to lose. What had happened was that a single environment variable, shared by
+the web app, the backend, the keeper and the CI fork suite, pointed at an endpoint that started
+returning HTTP 429 for eleven minutes.
+
+The web app showed zeros where balances go, because a failed read resolved to `undefined` and the
+formatter turned that into `0.00`. The backend's cron job logged the error and exited, so a batch that
+runs hourly silently skipped an hour. The keeper stopped submitting, which is the one component whose
+job it was to keep submitting. And CI went red on a branch that had touched nothing but a README.
+
+Four failures, four teams, one cause. Nobody had written down what any of those components should do
+when a chain read fails, because in every codebase involved the endpoint lived in the same file as the
+log level and the port number.
+
+That is the subject of this module, and this lesson is the framing: the endpoint is not configuration.
+It is the single dependency that every part of an on-chain product shares, and treating it as a string
+is how a provider's bad quarter-hour becomes your incident.
+
+## There is exactly one door
+
+You already know the interface. What is worth making precise is how narrow it is.
+
+The Ethereum execution JSON-RPC specification describes itself as "a specification of the standard
+interface for Ethereum clients", and the method set it standardises is small: 57 methods in the `eth_`
+namespace, 6 in `debug_`, 3 in `txpool_`, 1 in `net_`, plus the `engine_` namespace that is not for
+you — that one is the private channel between an execution client and its consensus
+client.<Cite src="execution-apis-spec" /> Ethereum.org states the consequence from the application
+side: every client implements the specification, "so there is a uniform set of methods that
+applications can rely on regardless of the specific node or client
+implementation".<Cite src="ethereum-org-json-rpc" />
+
+<Figure
+  caption="Sixty-seven standardised methods, and 57 of them are one namespace."
+  alt="The execution JSON-RPC specification standardises 57 methods in the eth namespace, 6 in debug, 3 in txpool and 1 in net."
+>
+  <Bars
+    unit="methods"
+    axisLabel="in the execution JSON-RPC specification"
+    caption="ethereum/execution-apis, read 26 August 2026"
+    items={[
+      { label: 'eth_', value: 57, tone: 'accent' },
+      { label: 'debug_', value: 6 },
+      { label: 'txpool_', value: 3 },
+      { label: 'net_', value: 1 },
+    ]}
+  />
+</Figure>
+
+That uniformity is the good news and it is also the boundary. Everything your product knows about the
+chain arrives through those methods, and everything it does to the chain leaves through one of them.
+There is no second channel. A contract cannot push to you; [logs are a one-way
+broadcast](/c/logs-are-write-only) that someone has to come and read. State cannot be subscribed to;
+[`eth_call` is the primitive](/c/eth-call-is-the-primitive) and it is a request. A transaction cannot
+be self-delivered; it is `eth_sendRawTransaction` or it does not exist.
+
+Now list the components of a real product and mark which ones go through that door:
+
+| Component | What it needs the endpoint for |
+|---|---|
+| Wallet | balances, nonce, gas estimation, broadcast |
+| Frontend | every displayed value, every simulation before a write |
+| Backend / cron | reconciliation reads, historical scans |
+| Indexer | the log backfill and the live tail |
+| Keeper or bot | the condition check *and* the transaction that acts on it |
+| Monitoring | the head height it compares against, and the alerting reads |
+| CI | every [fork test](/c/fork-testing-foundry) in the suite |
+| Deploy scripts | simulation, broadcast, receipt polling, verification |
+
+Eight rows, one dependency. Your payment processor is a dependency of checkout; your email provider is
+a dependency of notifications. The RPC endpoint is a dependency of *the product*, including the parts
+that are supposed to tell you the product is broken.
+
+<Figure
+  caption="Every arrow starts on your side and ends on a machine somebody else operates — including the arrows from the things that watch."
+  alt="User-facing code, automation and the safety net of monitoring, CI and deploy scripts all reach the chain through one endpoint URL, which is a metered, rate-limited service running on a node operated by someone else."
+>
+  <Flow
+    lanes={['your product', 'one endpoint', 'not yours']}
+    nodes={[
+      { id: 'ui', label: 'user-facing', note: 'wallet, frontend', col: 0 },
+      { id: 'auto', label: 'automation', note: 'cron, indexer, keeper', col: 0 },
+      { id: 'net', label: 'the safety net', note: 'monitoring, CI, deploys', col: 0, tone: 'warn' },
+      { id: 'door', label: 'one endpoint URL', note: 'metered, rate-limited', col: 1, tone: 'accent' },
+      { id: 'node', label: "someone else's node", note: 'their uptime, their view', col: 2 },
+    ]}
+  />
+</Figure>
+
+<Aside kind="note">
+Notice the last two rows especially. Teams routinely give the frontend a paid plan and leave CI and
+the deploy scripts on whatever key was in the shell history. Then a release blocks on a rate-limited
+fork suite, or a `forge script` broadcast fails halfway through a multi-step deployment — much worse
+than a red build, because [the broadcast log is the source of truth](/c/broadcast-as-source-of-truth).
+</Aside>
+
+## Why this is the most frequent user-visible failure
+
+Contracts do not have uptime. Once deployed, a contract's behaviour is fixed and its availability is
+the chain's availability. A contract bug is severe and rare. An endpoint failure is mild and constant,
+and over a year of operating something the mild-and-constant category dominates the count of "users
+saw something wrong". That is not a claim about any particular provider. It follows from arithmetic:
+thousands of requests per session across a dozen components, each one a network call to a shared,
+metered, rate-limited third party.
+
+The diagnostic habit from the distributed-systems track transfers directly — when something looks
+wrong on-chain, ask first whether the head is advancing, because most reports of "the chain is down"
+resolve at your own endpoint. What this module adds is the layer under that question: *why* your
+endpoint stopped answering, which is one of a small number of things, all of which have names and all
+of which are predictable before you ship.
+
+<Misconception
+  belief="The RPC endpoint is infrastructure plumbing — a URL in an env file, like a database connection string."
+  reality="A database connection string points at a system you operate, with your own uptime, your own capacity planning and no per-query billing. An RPC endpoint points at a metered third-party service shared by every component of your product, with two independent limits, per-method pricing and a failure mode you do not control."
+  why="It is configured like a connection string, it looks like a connection string, and every tutorial introduces it as one. The difference only surfaces under load or under a bill."
+/>
+
+## The behaviour nobody defined
+
+Here is the question worth asking about your own codebase before the next incident: **what is the
+defined behaviour when a chain read fails?**
+
+For most products the honest answer is that there isn't one, and the reason is structural rather than
+careless. A chain read is a request against a service you do not run, so its failures are ordinary
+network failures — a timeout, a 429, a 500, a malformed body — and each one surfaces at whichever
+call site happened to make it. There is no single place where "the chain is unreachable" is a state
+the application is in.
+
+The consequences show up as four different-looking bugs that are one bug:
+
+**A failed read renders as a value.** `undefined` becomes `0.00`, an empty array becomes "no
+positions", a rejected promise inside a component boundary becomes a blank card. The user is not shown
+an error; they are shown a *wrong answer*, confidently.
+
+**A failed read is retried immediately.** The most natural thing to write, and under a throughput
+limit it is exactly wrong — it converts an eleven-second burst into an eleven-minute throttle. Two
+lessons from now that becomes a specific rule with a specific formula behind it.
+
+**A failed write is indistinguishable from a slow one.** `eth_sendRawTransaction` returned an error,
+or it returned a hash and the receipt poll failed. Those are very different situations and most code
+handles them identically, which is how a product ends up either double-submitting or losing a
+transaction it actually sent.
+
+**A partial failure is invisible.** Six reads for one screen; five succeed. Nothing errors. The screen
+is internally inconsistent and nothing anywhere says so. That one has its own lesson later in this
+module, because it also happens when every read *succeeds*.
+
+The fix is not a library. It is deciding, per surface, which of three behaviours you want — show
+stale data with an explicit timestamp, show an error state, or block the interaction — and then
+having somewhere for that decision to live. viem's client abstraction gives you the hook: a client is
+a transport plus a chain plus its actions, and the transport is a swappable object rather than a
+string, which is why [a fallback list can be dropped in later](/c/provider-failover-pattern) without
+touching call sites.<Cite src="viem-clients" /><Cite src="viem-fallback-transport" />
+
+## What the provider sees
+
+The second half of "the endpoint is architecture" has nothing to do with uptime.
+
+Look at the method signatures you already know by heart. `eth_getBalance` takes an address and a
+block. `eth_call` takes a `to`, a `data` blob and a block. `eth_getLogs` takes an address and topics.
+`eth_getStorageAt` takes an address and a slot.<Cite src="execution-apis-spec" /> The parameters *are*
+the surveillance surface: there is no version of these methods that does not name what you are
+interested in.
+
+So a provider observes, per API key and per source IP:
+
+- **Which addresses a person holds.** A wallet fetching balances for the accounts it manages hands
+  over the whole set, repeatedly, on a timer.
+- **Which contracts a product reads.** Your integration list, before you announce it.
+- **What a user is about to do.** A simulation before a write is a statement of intent, sent seconds
+  before the intent becomes public.
+- **Where the requests come from.** The network identity, which is what links the on-chain addresses
+  to a person rather than to an anonymous set.
+
+Ethereum.org makes the point from the other direction, as an argument for running your own node: with
+your own node "you can use dapps more securely and privately because you won't have to leak your
+addresses and balances to intermediaries", and it describes pointing a wallet at a community endpoint
+via custom RPC as gaining "more privacy than with some random trusted third
+party".<Cite src="ethereum-org-nodes-clients" /> The run-a-node guide repeats it specifically for
+wallets: connecting MetaMask to your own RPC endpoint "has strong privacy and security
+benefits".<Cite src="eth-run-a-node" />
+
+Read those sentences as a threat model rather than as advocacy. They are telling you that the default
+configuration of essentially every wallet and dapp leaks the address set to a third party, that this
+is understood, and that the only mitigation the documentation offers is running the node yourself.
+
+### The write side is a separate leak with a separate mitigation
+
+Reads leak what you are interested in. Writes leak something more actionable: a signed transaction
+that has not yet been included.
+
+Whoever receives your `eth_sendRawTransaction` sees the transaction before the network does, and knows
+its exact contents. Ordinary public-mempool broadcast makes that observation available to everybody
+anyway, which is the setting for the MEV material in the DeFi track. But it is worth separating the
+two: the mempool is a public leak by design, whereas the provider is a *privileged* observer with a
+head start measured from the moment your signature exists.
+
+This is why private-transaction endpoints are a product category. Flashbots Protect describes itself
+as sending transactions "to a private Flashbots mempool where they will be hidden from frontrunning
+and sandwich bots", accessed by sending `eth_sendRawTransaction` requests to its own
+endpoint.<Cite src="flashbots-protect-docs" /> Note the shape of that: it is not a fix for the
+privacy problem, it is a *different trusted observer* chosen for different properties. You still send
+a signed transaction to somebody. What changes is who, and what they are structurally incentivised to
+do with it.
+
+<Misconception
+  belief="Using a well-known provider is a privacy-neutral choice, because everything on-chain is public anyway."
+  reality="On-chain data is public but unlinked. The provider holds the linkage: this network identity queried these addresses at these times, and signed this transaction before anyone else saw it. That association exists nowhere on chain and cannot be derived from chain data."
+  why="'It's all public' is true of the ledger and false of the access pattern, and the access pattern is the part that deanonymises."
+  src="ethereum-org-nodes-clients"
+/>
+
+<Check type="explain" concept="rpc-is-the-only-door">
+A wallet team ships a browser extension. It polls `eth_getBalance` for each of the user's accounts
+every twelve seconds against one provider, and calls `eth_call` on a token contract for each of the
+user's tracked tokens on the same schedule. The team's position is that this is fine, because the
+extension never sends the user's private key anywhere and all the data it fetches is public.
+
+State what the provider can infer that is not derivable from public chain data, and name one change
+that reduces it without abandoning the provider.
+
+<Answer>
+**What the provider learns that the chain does not publish.**
+
+**1 — The account set belongs to one person.** On chain, five addresses are five unrelated entries.
+Arriving in the same request batch, from the same API key, from the same IP, on the same twelve-second
+timer, they are one wallet's accounts. That clustering is the single most valuable thing a chain
+analyst normally has to *guess* at, and this design hands it over directly.
+
+**2 — Liveness and timezone.** The polling starts when the extension is open. Over a week that is an
+activity profile: hours awake, days off, and — because the polling stops — when the user closed the
+laptop.
+
+**3 — The IP-to-address linkage.** The chain has addresses. The provider has addresses plus a network
+identity, which is the piece that connects a pseudonym to a subscriber.
+
+**4 — Interest before action.** The token list is what the user is watching, including tokens they
+hold none of. Simulations before a write are stronger still: they state intent seconds before the
+transaction is public.
+
+**One change that helps.** Several, at different costs:
+
+- **Batch and slow down.** Replace per-token `eth_call` polling with one aggregated read per refresh
+  and a longer interval. This does not remove the linkage — the batch is, if anything, a cleaner
+  statement that these addresses belong together — but it reduces the timing profile and, not
+  incidentally, the bill. It is the honest minimum.
+- **Split across providers by account.** Different keys and different endpoints per account breaks the
+  clustering for any single observer. It costs you a second contract and gives up cross-account
+  consistency, which the later lesson on pinning a block number makes concrete.
+- **Let the user supply an endpoint.** The mitigation the documentation itself
+  recommends,<Cite src="eth-run-a-node" /> and the only one that removes the third party rather than
+  changing which third party it is. Almost free to implement, used by a small minority of users, and
+  worth shipping anyway because the users who want it are the ones who will notice you did not.
+
+**The part worth carrying.** None of these are contract-level problems, so none of them show up in an
+audit, a threat model of the protocol, or a formal specification. The leak is a property of the
+*deployment*, and the only place it can be found is an inventory of what your product asks and whom
+it asks.
+</Answer>
+</Check>
+
+## The subscription is not an escape hatch either
+
+One anticipation, because it is the first idea people reach for when they see how many requests
+polling costs.
+
+`eth_subscribe` looks like it changes the shape of the dependency: instead of asking repeatedly, you
+are told. It does not. Notice first that it is not in the standard method set at all — the execution
+API specification's `eth_` namespace does not include it,<Cite src="execution-apis-spec" /> and it
+exists because Geth added publish/subscribe over JSON-RPC notifications in v1.4 "to wait for events
+instead of polling for them", over connections Geth offers as WebSocket and
+IPC.<Cite src="geth-pubsub" /> A push channel that is not in the spec is still the same door,
+differently shaped, with a lifecycle attached — and the lifecycle is where it will bite you. Two
+lessons from now it gets its own section.
+
+## What this unlocks
+
+**Next**, the bill. You are not billed per request, and the number on the pricing page is not the
+number of calls you get. That lesson turns your call inventory into a forecast you can make before
+shipping rather than a surprise you read afterwards.
+
+**Then**, the two limits — throughput and volume — that fail in completely different ways, and the
+retry policy that decides whether a burst is a blip or an outage. Alchemy publishes both the error
+shape and the backoff algorithm it wants you to use, which makes this one of the few places where the
+vendor documentation is also the correct engineering answer.<Cite src="alchemy-throughput" />
+
+**And the inventory you just built is the module's working artifact.** Every remaining lesson operates
+on it: which rows make expensive calls, which must survive a provider being down, which would break if
+you changed provider, and which justify running the node yourself. The reflection prompt at the end of
+this module asks for exactly that, one screen at a time.

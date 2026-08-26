@@ -1,0 +1,386 @@
+---
+id: app-viem-one-endpoint-is-a-spof
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [viem-fallback-transport-doc, viem-http-transport-doc, viem-websocket-transport-doc, viem-public-client-doc, viem-multicall, multicall3-repo, viem-clients, viem-read-contract-doc, viem-errors-glossary]
+stack: { viem: "2.x" }
+---
+
+The whole application is one string:
+
+```ts
+const client = createPublicClient({ chain: mainnet, transport: http(process.env.RPC_URL) })
+```
+
+Everything your product knows about the chain arrives through that URL. When the provider behind it
+has an incident, your app is down, your tests pass, your error rate graph is a wall of transport
+errors, and there is nothing in your code to fix. You already know from
+[the RPC cost model](/c/rpc-cost-model) that this endpoint is a metered dependency. This lesson is
+about the other two things it is: a single point of failure, and a round-trip budget you are probably
+overspending by an order of magnitude.
+
+Both have one-line fixes. Neither one-line fix does quite what its name suggests, which is the actual
+content of the lesson.
+
+## fallback is failover, and failover is not load balancing
+
+```ts
+const client = createPublicClient({
+  chain: mainnet,
+  transport: fallback([http(PRIMARY), http(SECONDARY)]),
+})
+```
+
+viem's definition is exact: the `fallback` transport consumes multiple transports, and if a transport
+request fails, it falls back to the next one in the list.<Cite src="viem-fallback-transport-doc" />
+That is the whole default behaviour. Requests go to the first transport. When one *errors*, that
+request is retried against the next. Traffic is not distributed; the second endpoint is cold standby.
+
+Two consequences people are surprised by.
+
+**Your primary carries 100% of the load.** If you added a second provider hoping to halve your
+request bill, you did not. The bill is unchanged until the first provider fails.
+
+**Only errors trigger failover.** A provider that returns a *wrong but well-formed* answer — stale
+state, a pruned node claiming a log range is empty, a fleet member several blocks behind — is a
+success as far as `fallback` can tell. This is the same hazard as
+[a load-balanced fleet answering at different heights](/c/rpc-consistency-hazard), and it does not
+go away when you add redundancy. It arguably gets slightly worse, because now two independent
+fleets can disagree with each other as well as with themselves.
+
+<Figure
+  caption="Adding a second endpoint removes one failure mode and none of the others."
+  alt="A request enters the fallback transport and always reaches the first endpoint. If that endpoint errors, the request is retried against the second. If it answers at all, the answer is returned to your code whether or not it is stale, and the second endpoint is never consulted."
+>
+  <Flow
+    lanes={['a request', 'first in the list', 'what came back', 'your code']}
+    nodes={[
+      { id: 'req', label: 'any action', note: 'unchanged by fallback', col: 0, tone: 'accent' },
+      { id: 't1', label: 'http(PRIMARY)', note: 'carries all of it', col: 1 },
+      { id: 'err', label: 'an error', note: 'the only trigger', col: 2, tone: 'warn' },
+      { id: 'ans', label: 'a well-formed answer', note: 'fresh or minutes behind', col: 2, tone: 'danger' },
+      { id: 't2', label: 'http(SECONDARY)', note: 'cold until then', col: 3, dashed: true },
+      { id: 'you', label: 'one value', note: 'no record of the path', col: 3 },
+    ]}
+    edges={[
+      { from: 'req', to: 't1' },
+      { from: 't1', to: 'err' },
+      { from: 't1', to: 'ans' },
+      { from: 'err', to: 't2', label: 'retry', tone: 'warn' },
+      { from: 'ans', to: 'you' },
+      { from: 't2', to: 'you' },
+    ]}
+  />
+</Figure>
+
+### Ranking, and what it actually measures
+
+Ranking exists, and it is off by default: `rank` is `boolean | RankOptions` with a default of
+`false`.<Cite src="viem-fallback-transport-doc" /> Turn it on and viem periodically pings each
+transport and reorders them by a weighted moving score.<Cite src="viem-fallback-transport-doc" />
+
+The parameters are worth knowing because they tell you what the score means:
+
+<Matrix
+  corner="Option"
+  cols={['Default', 'What it controls']}
+  rows={[
+    { label: 'rank', cells: [{ v: 'false', tone: 'warn' }, 'Whether ranking runs at all'] },
+    { label: 'rank.sampleCount', cells: ['10', 'How many recent pings the score is computed over'] },
+    { label: 'rank.timeout', cells: ['1_000 ms', 'How long a ping may take before it counts against stability'] },
+    { label: 'rank.weights.stability', cells: ['0.7', 'Weight on "did it respond"'] },
+    { label: 'rank.weights.latency', cells: ['0.3', 'Weight on "how fast did it respond"'] },
+    { label: 'rank.ping', cells: [{ v: 'net_listening', tone: 'warn' }, 'The request used as the probe'] },
+    { label: 'rank.interval', cells: ['client.pollingInterval', 'How often probes run'] },
+  ]}
+  caption="Ranking is off unless you ask for it, and when it runs the score is seven tenths reachability and three tenths speed."
+  alt="The fallback transport's rank options and their documented defaults: rank is false, sampleCount 10, timeout 1000 ms, stability weight 0.7, latency weight 0.3, ping net_listening, interval the client's pollingInterval."
+/>
+
+<Cite src="viem-fallback-transport-doc" />
+
+Two honest notes about that table. First, the page's prose describes the ranker as pinging "every 10
+seconds", while the parameter reference gives the `interval` default as the client's
+`pollingInterval` — the documentation is not self-consistent on this number, so treat the cadence as
+"configurable, and worth setting explicitly" rather than as a
+constant.<Cite src="viem-fallback-transport-doc" /> Second, the default probe is `net_listening`, a
+liveness check.<Cite src="viem-fallback-transport-doc" /> A provider can answer `net_listening`
+instantly while being minutes behind on state. If what you care about is freshness rather than
+reachability, supply a `ping` that asks something real — the option exists for exactly that
+reason.<Cite src="viem-fallback-transport-doc" />
+
+<Misconception
+  belief="fallback([a, b]) spreads requests across two providers."
+  reality="It sends everything to the first and moves to the second on error. Distribution only happens if you enable ranking, and even then it is reordering by score, not round-robin."
+  why="The array looks like a pool, and every load balancer you have configured before took a list of upstreams."
+  src="viem-fallback-transport-doc"
+/>
+
+### The latency arithmetic nobody does in advance
+
+`fallback` has its own `retryCount`, default `3`, with a note attached: the fallback will first try
+all the transports before retrying.<Cite src="viem-fallback-transport-doc" /> Each `http()` transport
+underneath also has a `retryCount` of `3` and a `retryDelay` of `150` ms with exponential
+backoff.<Cite src="viem-http-transport-doc" />
+
+Now consider a total outage of both providers with default settings everywhere. Attempts multiply
+across the layers, and the backoff is exponential, so a single `getBlockNumber` can occupy your
+request path for a long time before it finally throws — during which the promise is simply pending
+and your UI has no signal to show. The point is not a precise number, which depends on where the
+timeouts land; the point is that **redundancy converts a fast failure into a slow one**, and slow
+failures are harder to render than fast ones. If a screen must degrade rather than hang, set
+`retryCount` down deliberately at both layers.
+
+### Routing by method, which is the underused option
+
+Both `http()` and `webSocket()` take `methods: { include?: string[], exclude?: string[] }` to include
+or exclude methods from being sent through that
+transport.<Cite src="viem-http-transport-doc" /><Cite src="viem-websocket-transport-doc" /> Combined
+with `fallback`, that turns a list of endpoints into a routing table:
+
+```ts
+transport: fallback([
+  http(PRIVATE_RELAY, { methods: { include: ['eth_sendRawTransaction'] } }),
+  http(ARCHIVE_NODE,  { methods: { include: ['eth_getLogs', 'eth_call'] } }),
+  http(GENERAL_RPC),
+])
+```
+
+Sends go to one endpoint, historical queries to another, everything else to a third — and if the
+first two fail, the general endpoint still answers, because `fallback` keeps walking the
+list.<Cite src="viem-fallback-transport-doc" /> This is a policy decision about
+[who sees your transactions before they are mined](/c/mempool-is-a-public-broadcast) expressed as
+transport configuration, with no action code involved.
+
+## Three different things are called "batching"
+
+Now the round trips. viem has three separate mechanisms here and they are frequently confused,
+including in tutorials. Here they are with their real defaults.
+
+**1. JSON-RPC batching (transport level).** `http()` supports Batch JSON-RPC: multiple JSON-RPC
+requests in a single HTTP request, collected over a window that defaults to a zero delay — the end of
+the current JavaScript message queue.<Cite src="viem-http-transport-doc" /> The `batch` option is
+`boolean | BatchOptions` with a **default of `false`**, `batch.batchSize` defaults to `1_000`
+requests, and `batch.wait` defaults to `0` ms.<Cite src="viem-http-transport-doc" /> It saves HTTP
+round trips. The node still executes N separate requests.
+
+**2. `eth_call` aggregation (client level).** A Public Client can aggregate `eth_call` requests into a
+single Multicall3 `aggregate3` call, so every action that uses an `eth_call` — `readContract` among
+them — gets batched.<Cite src="viem-public-client-doc" /> The flag is `batch.multicall`, also
+**default `false`**, with `batch.multicall.batchSize` defaulting to `1_024` *bytes* of calldata per
+chunk and `wait` to `0` ms.<Cite src="viem-public-client-doc" /> This saves round trips *and* collapses
+N requests into one.
+
+**3. Explicit `multicall`.** You write the batch yourself as an array of contract calls, and viem
+sends one Multicall3 request.<Cite src="viem-multicall" />
+
+<Aside kind="warn">
+If you have read that viem "batches eligible requests by default", check it against the two default
+values above before you rely on it. Both `http({ batch })` and `batch.multicall` are documented as
+`false` by default in viem 2.x.<Cite src="viem-http-transport-doc" /><Cite src="viem-public-client-doc" />
+Batching is opt-in. An app that has never set either flag is issuing one HTTP request per read.
+</Aside>
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'JSON-RPC batching', note: 'http({ batch })' },
+    { title: 'eth_call aggregation', note: 'batch.multicall on the client', tone: 'accent' },
+    { title: 'Explicit multicall', note: 'you write the array' },
+  ]}
+  rows={[
+    {
+      label: 'Where is it turned on?',
+      cells: [
+        'On the transport',
+        'On the Public Client, applying to every action that uses an eth_call',
+        'At the call site, once',
+      ],
+    },
+    {
+      label: 'What is the default?',
+      cells: [
+        'false',
+        'false',
+        'Nothing happens unless you call it',
+      ],
+    },
+    {
+      label: 'What arrives at the node?',
+      cells: [
+        'One HTTP request holding N JSON-RPC requests',
+        'One eth_call to Multicall3',
+        'One eth_call to Multicall3',
+      ],
+    },
+    {
+      label: 'What still runs N times?',
+      cells: [
+        'The N requests, executed separately',
+        'The N inner calls, inside aggregate3',
+        'The N inner calls, inside aggregate3',
+      ],
+    },
+    {
+      label: 'Can a reader of the file see the batch?',
+      cells: [
+        'No — it is a transport option somewhere else',
+        'No — unrelated components coalesce without anyone deciding',
+        'Yes, which is the argument for it',
+      ],
+    },
+  ]}
+  caption="Only the last two collapse N questions into one question; the first collapses N envelopes."
+  alt="viem's three batching mechanisms compared: transport-level JSON-RPC batching packs several requests into one HTTP call, client-level multicall aggregation and explicit multicall both send a single eth_call to Multicall3, and both aggregation forms are off or absent unless you opt in."
+/>
+
+Note that the two batchSize defaults are counted in different units — 1,000 *requests* for JSON-RPC
+batching, 1,024 *bytes* of calldata for multicall
+chunking.<Cite src="viem-http-transport-doc" /><Cite src="viem-public-client-doc" /> Both exist
+because providers impose their own limits, and viem's docs flag that some providers cap the calldata
+allowed in a single `eth_call`.<Cite src="viem-public-client-doc" /><Cite src="viem-multicall" />
+
+## What Multicall3 actually is
+
+Multicall3 is a deployed contract, not a protocol feature. It is at
+`0xcA11bde05977b3631167028862bE2a173976CA11` on over 250 chains, and viem's `multicall` resolves that
+address from `client.chain.contracts.multicall3.address` unless you override it with
+`multicallAddress`.<Cite src="multicall3-repo" /><Cite src="viem-multicall" /> The method viem uses is
+`aggregate3`, which takes an array of structs and returns an array of
+structs:<Cite src="multicall3-repo" />
+
+```solidity
+struct Call3 { address target; bool allowFailure; bytes callData; }
+struct Result { bool success; bytes returnData; }
+
+function aggregate3(Call3[] calldata calls) public payable returns (Result[] memory returnData);
+```
+
+Read that as the [call semantics](/c/call-returns-a-boolean) you already know: one `eth_call` reaches
+Multicall3, which makes N inner calls and returns each one's success flag and raw bytes. viem encodes
+your entries into `callData`, decodes each `returnData` against the ABI you supplied, and hands back
+an array.<Cite src="viem-multicall" />
+
+`allowFailure` defaults to `true`, and each entry comes back tagged with its own outcome — the
+documented return shape is a per-call `{ result, status: 'success' }` or `{ error, status: 'failure' }`,
+and setting `allowFailure: false` instead returns a plain array of decoded values and throws if any
+call reverts.<Cite src="viem-multicall" /> That choice is a product decision, not a style one: a
+dashboard showing twelve positions should degrade to eleven rather than to a blank screen, while a
+computation that needs all twelve inputs to be meaningful should fail loudly.
+
+### The saving is round trips — plus one thing that is not round trips
+
+The obvious win is latency and request count. Twenty `readContract` calls are twenty round trips over
+your network path; one `multicall` is one. The chain does the same work either way — the same twenty
+reads execute, in the same EVM, at the same cost in gas terms — so nothing about on-chain compute
+improves.<Cite src="viem-multicall" />
+
+The less obvious win is correctness, and it is the better argument. Multicall3's own documentation
+states it plainly: batching guarantees that all values returned are from the same
+block.<Cite src="multicall3-repo" /> Twenty sequential reads at the `latest` tag can straddle a block
+boundary, or be served by fleet members at different heights, and produce a snapshot that never
+existed — a balance from block *n* and a price from block *n+1*.<Cite src="multicall3-repo" /> If you
+have ever computed a health factor that briefly showed an impossible value, this is a strong candidate
+for why. Multicall3 even exposes `getBlockNumber` and `getCurrentBlockTimestamp` as callable targets
+so you can include the block the batch executed in alongside the data
+itself.<Cite src="multicall3-repo" />
+
+<Aside kind="stop">
+Multicall3's repository carries a caution that belongs in your threat model rather than in a footnote:
+the deployer private key was mined with Profanity and has been compromised. The maintainers state that
+all existing deployments are safe and that no new manual deployments will be made by that deployer,
+but they also record one instance of a custom contract being deployed to the Multicall3 address on
+Ancient8 — the one deployment known to be incorrect.<Cite src="multicall3-repo" />
+
+You met Profanity as a vanity-address key-grinding weakness. Here is what it costs at the application
+layer: the address `0xcA11...CA11` is not self-authenticating, and "the same address on every chain"
+is a convention maintained by a deployer, not a guarantee enforced by anything. On a chain you have
+not vetted, confirm what is at that address before routing reads through it, and remember that
+`multicallAddress` lets you point somewhere you have checked.<Cite src="viem-multicall" />
+</Aside>
+
+## Worked example: turning a screen's worth of reads into one request
+
+A portfolio row needs, for each of eight tokens: `symbol`, `decimals`, and `balanceOf(user)`.
+
+**Subgoal 1 — count what the naive version costs.** Twenty-four `readContract` calls. With no
+batching flags set, that is twenty-four HTTP requests and twenty-four round
+trips.<Cite src="viem-http-transport-doc" /><Cite src="viem-read-contract-doc" /> On a local node this
+is invisible; against a hosted provider a continent away it is the dominant term in your render time,
+and it is twenty-four billable units of whatever your provider counts.
+
+**Subgoal 2 — decide which mechanism fits.** These are all `eth_call`s against known contracts, which
+is exactly what Multicall3 aggregation targets.<Cite src="viem-public-client-doc" /> Either enable
+`batch: { multicall: true }` on the client and leave the twenty-four call sites alone, or write one
+explicit `multicall`.<Cite src="viem-public-client-doc" /><Cite src="viem-multicall" />
+
+**Subgoal 3 — choose between them on a real criterion.** The client flag is invisible and applies
+everywhere, which is its strength and its weakness: reads issued from unrelated components coalesce
+without anyone deciding they should. The explicit call is local and legible — someone reading the file
+can see the batch. Prefer the explicit form where the grouping is semantic, as it is here: these
+twenty-four values are one snapshot of one screen.
+
+**Subgoal 4 — set the failure policy deliberately.** `allowFailure: true` (the default) means a token
+with a non-standard `symbol` — and you have met
+[the weird-ERC-20 taxonomy](/c/weird-erc20-taxonomy) — degrades that one entry to
+`status: 'failure'` instead of blanking the portfolio.<Cite src="viem-multicall" /> That is the right
+call for a display surface.
+
+**Subgoal 5 — check what did not change.** Twenty-four EVM calls still execute. The provider still
+does the same work. What you removed is twenty-three network round trips and the possibility of a
+mixed-block snapshot.<Cite src="viem-multicall" /><Cite src="multicall3-repo" /> Naming the saving
+correctly matters, because someone will eventually ask whether multicall makes the *chain* cheaper,
+and the answer is no.
+
+<Check type="predict" concept="viem-multicall-batching">
+An engineer replaces a loop of `readContract` calls with a single `multicall` and reports three
+observations. For each, say whether it is expected, and why.
+
+1. Wall-clock time for the refresh drops from 2.1 s to 190 ms against a hosted provider, but is
+   essentially unchanged against a local development node.
+2. One entry that used to throw a decode error now silently shows a dash in the UI, and no error
+   reaches the logging pipeline.
+3. After deploying to a newer L2, the whole batch fails with a single error and every entry is gone —
+   although the same reads work individually.
+
+<Answer>
+**1. Expected, and it is the clearest possible demonstration of what was saved.** The saving is
+network round trips, not chain compute.<Cite src="viem-multicall" /> Against a local node the round
+trip is nearly free, so collapsing twenty of them saves nearly nothing. Against a provider on another
+continent, the round trip *is* the latency. If someone benchmarks multicall on localhost and concludes
+it does not help, this is the error.
+
+**2. Expected, and it is a regression they need to handle.** `allowFailure` defaults to `true`, so a
+failing entry is returned as `{ error, status: 'failure' }` inside the results array rather than being
+thrown.<Cite src="viem-multicall" /> The loop's per-call throw used to reach whatever catch block was
+around it. The batch's per-entry failure only reaches code that inspects `status`. Batching moved
+error handling from the language's control flow into your data, and nothing warns you about that.
+
+**3. Two candidates, and they are distinguishable.** Either Multicall3 is not deployed at the address
+viem resolved for that chain — the address is a per-chain deployment record, not a protocol constant,
+and viem reads it from the chain object<Cite src="viem-multicall" /><Cite src="multicall3-repo" /> —
+in which case the call reaches an address with no code and viem raises a chain-does-not-support-contract
+style error.<Cite src="viem-errors-glossary" /> Or the batch exceeded the provider's calldata limit
+for a single `eth_call`, which viem's own docs warn about and which `batchSize` exists to
+manage.<Cite src="viem-multicall" /><Cite src="viem-public-client-doc" /> Test them apart by reading
+the code size at the resolved multicall address first: that is one request and it settles the
+question. If there *is* code there on a chain you have not vetted, the Ancient8 note is the reason to
+check what that code is rather than assuming.<Cite src="multicall3-repo" />
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** is about the guarantees TypeScript gives you over an ABI — and about the fact that
+`multicall` infers per-entry return types from per-entry ABIs, which is only possible because of the
+same `as const` mechanism.
+
+**The simulate lesson** puts a read on the critical path of every write. Once a simulation stands
+between the user's click and the wallet prompt, the latency of your read path stops being a background
+concern and becomes the thing the user is waiting on.
+
+**The infrastructure track**, if you take it, goes past redundancy into what you actually owe your
+provider relationship: [request cost models](/c/rpc-cost-model), the difference between an archive and
+a pruned node, and when running your own becomes cheaper than not.

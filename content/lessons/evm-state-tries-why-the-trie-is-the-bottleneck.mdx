@@ -1,0 +1,226 @@
+---
+id: evm-state-tries-why-the-trie-is-the-bottleneck
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [eip-2929, eip-2930, eip-3529, eip-7864, eip-7928, measured-gas-constants, geth-hardware, geth-dbpruning, stateless-binary-tree]
+stack: {}
+---
+
+Two loops, same shape. One sums an array in memory; one sums the same values out of storage. The
+storage version costs orders of magnitude more gas, and the explanation everyone reaches for is
+"persistence is expensive".
+
+That explanation is not wrong so much as unhelpful. It suggests the price is a fee for durability, as
+though the protocol were charging rent. What the price is actually denominated in is **time to process
+a block**, and what makes storage access slow is a specific, structural consequence of everything in
+the previous five lessons: hashed keys, a nested trie, and a map that only ever gets bigger.
+
+This lesson is that argument, and what a product engineer does about it.
+
+## Gas is a time estimate, and state access broke the estimate
+
+EIP-2929 states the model outright: the main function of an opcode's gas cost is to estimate the time
+needed to process that opcode, so that a gas limit corresponds to a limit on the time to process a
+block. It then says that storage-accessing opcodes — SLOAD, the CALL family, BALANCE and the EXT
+family — had historically been underpriced.<Cite src="eip-2929" />
+
+The evidence it gives is not theoretical. In the 2016 Shanghai denial-of-service attacks, once the
+worst client bugs were patched, one of the more durably successful strategies was simply to send
+transactions that access or call a large number of accounts. The EIP quotes measurements showing that
+EXTCODESIZE forces the client to search for the contract on disk, and that such malicious transactions
+took around 20 to 80 seconds to execute where an average transaction took a few
+milliseconds.<Cite src="eip-2929" />
+
+Four orders of magnitude, from an opcode that reads one integer.
+
+The repricing that followed is the cold/warm split you meet in every gas table. Measured on this
+project's toolchain: an SLOAD costs 2,100 the first time a slot is touched in a transaction and 100
+thereafter; BALANCE and EXTCODESIZE cost 2,600 cold and 100
+warm.<Cite src="measured-gas-constants" /><Cite src="eip-2929" />
+
+**Read the ratio, not the numbers.** A twenty-one-fold difference between the first and second read of
+the same slot is not a pricing preference. It is the protocol telling you that the expensive part
+already happened, on a disk, and everything after it is a cache hit.
+
+## Why the access is random
+
+Now connect it to lesson 3.
+
+Trie paths are `keccak256` of the key. That was the right decision — it denies an attacker control over
+trie shape — and its unavoidable side effect is that **logically adjacent keys are physically
+unrelated**. Two slots your contract writes in the same line of code land in unrelated parts of the
+structure. An array's elements, which a database would store contiguously, do not benefit from any
+locality at all.
+
+So state access is a random-access pattern over a large on-disk structure. There is no prefetch that
+helps, no scan that amortises, no ordering to exploit. That is the physical fact the cold price is
+denominated in, and it is why the same fact drives the fix everyone is reaching for: if you knew
+*ahead of time* which slots a block would touch, you could issue those reads in parallel instead of
+discovering them one at a time as execution proceeds.
+
+<Figure
+  caption="Every step here is forced by the one before it, which is why the price is a property of the structure rather than of storage."
+  alt="Hashing the key makes trie shape unchooseable, which destroys locality between logically adjacent keys, which turns each first touch into a random seek on disk, which is the work the cold access price of 2,100 gas against a warm 100 is estimating."
+>
+  <Flow
+    nodes={[
+      { id: 'h', label: 'path = keccak(key)', note: 'shape is unchooseable', col: 0, tone: 'accent' },
+      { id: 'n', label: 'no locality', note: 'adjacent keys unrelated', col: 1 },
+      { id: 'd', label: 'random seek', note: 'on every first touch', col: 2, tone: 'warn' },
+      { id: 'p', label: '2,100 then 100', note: 'cold, then warm', col: 3, tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+## And the structure only grows
+
+The second half of the problem is that nothing shrinks the state on its own.
+
+Entries leave only when something writes a default value — clearing a slot, or emptying an account. The
+protocol pays for that with a refund, and EIP-3529 deliberately reduced the payment: the clearing
+refund became `SSTORE_RESET_GAS + ACCESS_LIST_STORAGE_KEY_COST`, 4,800 gas, and the total refundable
+after a transaction was capped at `gas_used // 5` rather than half.<Cite src="eip-3529" /> The EIP's
+own reasoning is that a large refund lets a block be inflated far past its nominal gas limit, which is
+its own denial-of-service surface.<Cite src="eip-3529" /> The incentive to shrink state exists; it is
+deliberately not strong enough to be gamed.
+
+The result is monotone growth, and the operational numbers are public. Geth's hardware page, last
+edited September 2023, puts a snap-synced full node above 650 GB, growing by roughly 14 GB per week,
+with a full archive node above 12 TB.<Cite src="geth-hardware" /> Attach the date and the client to
+those figures whenever you repeat them: they are one implementation's measurements at one moment, and
+different clients store genuinely different things.
+
+<Aside kind="warn">
+Which is the deeper point. The trie is a commitment, not a storage engine — Geth's own pruning
+documentation describes a **state snapshot** layer that the pruner iterates to decide which trie nodes
+are still reachable, and distinguishes a hash-based state scheme from a path-based
+one.<Cite src="geth-dbpruning" /> Clients moved away from storing the literal trie years ago precisely
+because random-access lookups over it are too slow to serve. Any disk-size or sync-time figure you
+quote is therefore a statement about one client's layout, never about "Ethereum's state".
+</Aside>
+
+## Three responses, and only one of them is a redesign
+
+The pressure has produced work in three distinct places. Keeping them separate is what stops roadmap
+reading from turning into vibes.
+
+**Storage layout, already shipped.** Flat tables and snapshot layers with the trie derived rather than
+stored. Invisible over JSON-RPC, and the reason archive sizes and sync strategies differ so much
+between implementations.<Cite src="geth-dbpruning" />
+
+**Pricing and pre-declaration, partly shipped.** EIP-2929's cold/warm split makes the first touch pay
+for the seek.<Cite src="eip-2929" /> EIP-2930 lets a transaction pre-declare addresses and slots to warm
+them up front.<Cite src="eip-2930" /> EIP-7928 would go further and record, at the *block* level, every
+account and storage location accessed during execution along with post-execution values — explicitly in
+order to enable parallel disk reads, parallel validation and parallel state-root computation. Its own
+motivation notes that execution cannot be parallelised without knowing the access set in advance, and
+that EIP-2930's transaction-level lists are optional and unenforced.<Cite src="eip-7928" /> It is in
+peer review, created in 2025.<Cite src="eip-7928" />
+
+**A replacement commitment, proposed.** EIP-7864 specifies a unified binary tree that merges accounts,
+storage and code into one structure, drops RLP, and would freeze the existing trie while new writes
+accumulate in the new one.<Cite src="eip-7864" /> If you read
+[the binary state tree](/c/binary-state-tree) lesson in Track 01 you have the design; what belongs here
+is its status. It is a Draft. Its hash function is explicitly undecided.<Cite src="eip-7864" /> This
+project found it attached to no named fork, and the direction of travel is evidenced by a draft
+specification arguing against the alternative rather than by any dated cancellation
+announcement.<Cite src="stateless-binary-tree" />
+
+<Misconception
+  belief="Verkle trees are Ethereum's next state format."
+  reality="The active specification work is EIP-7864's unified binary tree, which argues explicitly against the Verkle approach. Verkle is not what the current proposal is building toward."
+  why="Verkle was promoted heavily from roughly 2021 to 2024 and that material still dominates search results. It was accurate about the design being pursued at the time; the criterion it optimised for — witness size — was later reframed as proving cost."
+  src="eip-7864"
+/>
+
+<Misconception
+  belief="A replacement is scheduled and will land with the next fork."
+  reality="EIP-7864 is a Draft with an undecided hash function and no named fork assignment, and EIP-7928 is in peer review. Neither has a mainnet date you should plan around."
+  why="Roadmap diagrams flatten 'proposed', 'in review' and 'scheduled' into one row of boxes, and conference talks describe designs in the present tense. Treat any date you see as a forecast unless it comes with a client-release note."
+  src="eip-7864"
+/>
+
+## What to do with this today
+
+The structure will not change under you this year. Five things follow from it that are actionable now.
+
+**Budget in slots, not instructions.** Arithmetic is nearly free; a cold slot is not. A design review
+that counts storage reads and writes will find more savings than one that counts operations.
+
+**Warm what you know you will touch.** An access list moves the cold charge to the front of the
+transaction where you can pay it once, deliberately, rather than discovering it inside a
+loop.<Cite src="eip-2930" />
+
+**Never plan to enumerate.** There is no way to list an account's non-zero slots over the standard
+API, and there will not be one, because the structure has no order to enumerate along. The index is
+yours to build.
+
+**Treat unbounded per-user state as a cost you are imposing on others.** A contract that adds a
+permanent entry per user is adding a row every node on the network carries forever, subsidised by a gas
+schedule that prices the write once. That is not a reason never to do it; it is a reason to know you
+are doing it, and to give the entry a way to be cleared.
+
+**Be careful about verifying historical state on-chain.** EIP-7864 names this among its breaking
+changes: a change of tree structure means in-EVM proofs of historical state stop
+working.<Cite src="eip-7864" /> If you are building a contract that verifies storage proofs, that is a
+dependency on a format, and the format has a live proposal to replace it.
+
+<Check type="explain" concept="state-growth-problem">
+A colleague looks at the measured numbers — SLOAD 2,100 cold, 100 warm — and proposes an optimisation:
+"Our contract reads the same three config slots on every call. Let's pack them into one slot. Then it's
+one cold read instead of three, so we save 4,200 gas per call."
+
+Is the reasoning sound? What is it right about, what is it wrong about, and what does the answer tell
+you about what gas is actually pricing?
+
+<Answer>
+**The conclusion is roughly right and the reasoning is wrong in a way that will mislead the next
+optimisation.**
+
+*Right about:* three separate slots mean three separate paths through the storage trie, hence three
+separate cold accesses at 2,100 each. Packing three small values into one 32-byte slot means one path,
+one cold access.<Cite src="measured-gas-constants" /> The saving is real, and it is real because of
+locality that the packing created *inside a single slot* — the only locality the trie offers, since
+[hashed paths destroy every other kind](/c/secure-trie-hashed-keys).
+
+*Wrong about:* the arithmetic assumes each read was cold. Cold is a per-transaction property, not a
+per-call one.<Cite src="eip-2929" /> If the contract is called twice in the same transaction, the second
+call's reads are warm at 100 each and the packing saves almost nothing on that call. If a caller
+supplies an access list, the slots may be warm before execution even starts.<Cite src="eip-2930" /> The
+honest claim is "up to 4,200 on a cold path", not "4,200 per call".
+
+*Also missing:* packing has a cost on the write side. Updating one packed field is a read-modify-write
+of the whole slot, so a struct that is written field-by-field can end up more expensive than the
+unpacked version even while reads got cheaper. And packing helps in storage only —
+[on the stack and in memory everything occupies a full word regardless](/c/packing-helps-storage-only).
+
+**What it tells you about gas.** The cold price is not a fee for the *value* being read; the same value
+costs 100 the second time. It is a fee for the work of locating it — a random seek into a large on-disk
+structure — which is why EIP-2929 frames opcode pricing as an estimate of processing
+time.<Cite src="eip-2929" /> Once you hold that, the whole schedule reads differently. Warm access is
+cheap because the client already has the node. Clearing is refunded because the structure gets
+smaller.<Cite src="eip-3529" /> Storage is expensive because every node on the network will carry the
+result indefinitely. **Gas prices work and footprint, not durability.**
+</Answer>
+</Check>
+
+## Where this pays off
+
+This is the last lesson in the module, so the payoff is mostly outward.
+
+The cold/warm model reappears everywhere gas is optimised, and it is the reason
+[access lists](/c/access-list) exist as a transaction feature rather than a client one. The
+"compute is cheap, storage is not" hierarchy is the single most reliable heuristic for
+[where a contract's gas actually goes](/c/compute-is-cheap-storage-is-not).
+
+The growth problem is upstream of a whole cluster of topics you will meet later:
+[statelessness](/c/statelessness), [witness size](/c/witness-size-is-the-blocker),
+[state expiry](/c/state-expiry), and the sync-mode choices node operators argue about. All of them are
+the same sentence in different words — the state is large, growing, randomly accessed, and every node
+carries it.
+
+And the habit worth taking with you is smaller than any of that. When you meet a gas number, ask what
+physical work it is estimating. The number will change at the next repricing; the work it stands for
+usually will not.

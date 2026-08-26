@@ -1,0 +1,345 @@
+---
+id: altvm-parallel-execution-it-did-not-revert
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [solana-cookbook-retry, agave-greedy-scheduler, solana-docs-fee-structure, solana-docs-transaction-structure, solana-cookbook-confirmation, solana-swqos-guide, helius-local-fee-markets, solana-docs-fees, eip-7928]
+stack: {}
+---
+
+A user writes in: "the swap failed, and it took my money."
+
+You have the signature. You look it up. `getSignatureStatuses` returns null. The explorer says the
+signature does not exist. No fee was charged. No account changed. There is no error, because there is
+no transaction — the bytes the user signed were never recorded by anyone.
+
+Both halves of the user's sentence are wrong, and you cannot tell them so, because from inside a
+wallet a transaction that never landed and a transaction that reverted look identical: a spinner, then
+nothing.
+
+This is the failure mode EVM developers consistently misread, and it is the last thing this module
+has to teach, because everything before it — declared access, one leader's buffer, requested compute,
+a global priority queue that leaks — converges here.
+
+## Four exits, and only one of them writes anything down
+
+Trace a transaction from `sendTransaction` and count the ways it can end.
+
+**Exit 1 — dropped before it ever reaches a validator.** `sendTransaction` relays and returns a
+signature; a successful response says nothing about whether the transaction will be processed or
+finalized.<Cite src="solana-cookbook-retry" /> The relaying node re-forwards every two seconds, and
+drops *newly submitted* transactions once its outstanding rebroadcast queue exceeds 10,000.<Cite src="solana-cookbook-retry" />
+There is also a lag failure with no EVM analogue: fetch a blockhash from one node in an RPC pool,
+submit through a node that is behind, and the second node does not recognise the blockhash and drops
+the transaction.<Cite src="solana-cookbook-retry" />
+
+**Exit 2 — dropped at or near the leader.** Packet loss, or a leader overwhelmed by volume. Surplus
+transactions can be passed on via `tpu_forwards`, but there is a limit on how much may be forwarded
+and each forward is a **single hop** — a transaction received on the forwarding port is not forwarded
+again.<Cite src="solana-cookbook-retry" />
+
+**Exit 3 — buffered and never scheduled.** It reached the banking stage and sat there: outranked in
+the priority queue, or unschedulable against in-flight locks and pushed back at the end of every
+pass.<Cite src="agave-greedy-scheduler" /> This is the exit the previous lesson was about, and from
+outside it is indistinguishable from exits 1 and 2.
+
+**Exit 4 — executed.** Only here does anything get written down: success, or a program error, and
+either way the fee is charged.<Cite src="solana-docs-fee-structure" />
+
+<Figure
+  caption="Only the last exit leaves anything to look up. The other three are indistinguishable from a transaction you never sent."
+  alt="A vertical flow of a Solana transaction's four exits. sendTransaction returns a signature and promises nothing. At the relay, exit one is a drop once the RPC's rebroadcast queue exceeds 10,000. At the leader, exit two is a drop where tpu_forwards allows only a single hop. In the banking buffer, exit three is being outranked and never scheduled. Only exit four, execution, charges a fee and writes a record."
+>
+  <Flow
+    dir="down"
+    lanes={['client', 'relay', 'leader', 'buffer', 'block']}
+    nodes={[
+      { id: 'send', label: 'sendTransaction', note: 'a signature, and no promise', col: 0 },
+      { id: 'rpc', label: 'RPC relay', col: 1 },
+      { id: 'e1', label: 'exit 1 — dropped', note: 'queue over 10,000', col: 1, tone: 'danger', dashed: true },
+      { id: 'tpu', label: 'leader TPU', col: 2 },
+      { id: 'e2', label: 'exit 2 — dropped', note: 'forwarding is one hop', col: 2, tone: 'danger', dashed: true },
+      { id: 'buf', label: 'banking buffer', col: 3 },
+      { id: 'e3', label: 'exit 3 — set aside', note: 'outranked, requeued', col: 3, tone: 'danger', dashed: true },
+      { id: 'e4', label: 'exit 4 — executed', note: 'fee charged, record written', col: 4, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'send', to: 'rpc' },
+      { from: 'rpc', to: 'e1', tone: 'danger', dashed: true },
+      { from: 'rpc', to: 'tpu' },
+      { from: 'tpu', to: 'e2', tone: 'danger', dashed: true },
+      { from: 'tpu', to: 'buf' },
+      { from: 'buf', to: 'e3', tone: 'danger', dashed: true },
+      { from: 'buf', to: 'e4', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+There is a fifth, subtler ending. A transaction can be *processed* on a minority fork and then vanish
+when the cluster switches away from it — executed, then unexecuted, with no record on the chain that
+survives.<Cite src="solana-cookbook-retry" />
+
+<Misconception
+  belief="A transaction that fails under congestion reverted, so there will be a receipt explaining why."
+  reality="Most congestion failures were never included. They were dropped by an RPC, dropped at the leader, or sat in the buffer until their blockhash aged out. There is no signature status, no log, no error and no fee — the query returns nothing at all."
+  why="On Ethereum a validly-nonced transaction in the mempool almost always eventually lands somewhere and produces a receipt, so 'failed' and 'has an explanation' became one concept. Here they are separate, and the common case is the one with no explanation."
+  src="solana-cookbook-retry"
+/>
+
+## The clock that turns silence into failure
+
+Exits 1 through 3 are not, by themselves, terminal. The transaction is still valid; it could still
+land. What makes them terminal is expiry.
+
+Each transaction carries a recent blockhash serving as both timestamp and deduplication
+key.<Cite src="solana-docs-transaction-structure" /> As blocks finalize, their hashes enter a
+`BlockhashQueue` holding the 300 most recent, and a validator will process a transaction only if its
+blockhash is among the most recent 151 stored hashes — the max processing age is 150 and the age is
+zero-indexed, which is where the extra one comes from.<Cite src="solana-cookbook-confirmation" /> At
+slot times configured near 400 ms and fluctuating up to 600 ms, that is roughly **60 to 90 seconds** of
+usable life.<Cite src="solana-cookbook-confirmation" />
+
+The documentation's own worked example is worth carrying because it shows the boundary is exact rather
+than approximate: a transaction 151 blockhashes old is still processable; the validator finishes the
+next block, adds its hash to the queue, re-checks the same transaction, finds it 152 old, and rejects
+it.<Cite src="solana-cookbook-confirmation" />
+
+**So "no confirmation within the blockhash lifetime" is a first-class outcome**, with its own detection
+and its own handling, distinct from a program error. Your client's state machine needs four states,
+not two:
+
+<Matrix
+  corner="State"
+  cols={['How you detect it', 'What to do']}
+  rows={[
+    { label: 'Confirmed, succeeded', cells: ['signature status with no error', { v: 'proceed', tone: 'good' }] },
+    { label: 'Confirmed, failed', cells: ['signature status with an error', { v: 'show the program error', tone: 'warn' }] },
+    { label: 'In flight', cells: [<>current block height below <code>lastValidBlockHeight</code></>, 'keep resubmitting'] },
+    { label: 'Expired', cells: [<>block height reached <code>lastValidBlockHeight</code>, still no status</>, { v: 'it never happened', tone: 'danger' }] },
+  ]}
+  caption="A client that models two states will report the fourth one as a failure it cannot explain."
+  alt="Four client-side states for a submitted Solana transaction. Confirmed and succeeded is detected by a signature status with no error, and you proceed. Confirmed and failed is detected by a signature status carrying an error, and you show the program error. In flight is detected by the current block height being below lastValidBlockHeight, and you keep resubmitting. Expired is detected by block height reaching lastValidBlockHeight with still no status, and it means the transaction never happened."
+/>
+
+The mechanics of the third and fourth rows are documented directly: stash the `lastValidBlockHeight`
+returned alongside the blockhash by `getLatestBlockhash`, poll the cluster's block height, and
+resubmit at your chosen interval until they meet.<Cite src="solana-cookbook-retry" />
+
+<Aside kind="stop">
+The fourth row is the one that carries a guarantee you should tell your users about. Because expiry is
+deterministic and deduplication is by blockhash, a transaction that expires **will never be processed**
+— users can retry knowing the previous attempt cannot execute later.<Cite src="solana-cookbook-confirmation" />
+That is strictly better than the EVM's stuck-nonce situation, where a pending transaction may land
+hours later and where every higher-nonce transaction behind it is blocked until it
+does.<Cite src="solana-cookbook-confirmation" /> Solana traded a longer window for a clean terminal
+state. Build the terminal state into your UI and the failure mode becomes explainable instead of
+mysterious.
+</Aside>
+
+## Spending the window well
+
+Since the window is short and fixed, the whole game is not wasting it.
+
+**Do not burn it on commitment.** `getLatestBlockhash` defaults to `finalized`, and the finalized block
+typically trails the most recent confirmed block by at least 32 slots — the documentation puts the cost
+at roughly **13 seconds** of your expiration window, more under unstable
+conditions.<Cite src="solana-cookbook-confirmation" /> The recommendation is `confirmed` for almost all
+requests: only a few slots behind `processed`, with a very low chance of belonging to a dropped
+fork.<Cite src="solana-cookbook-confirmation" /> Choosing `processed` maximises your window and exposes
+you to the roughly **5% of blocks that never get finalized**, whose blockhashes are never recent enough
+for any block on the surviving chain.<Cite src="solana-cookbook-confirmation" />
+
+**Take over the retry loop.** `maxRetries` overrides the node's generic algorithm, and the documented
+pattern under congestion is to set it to 0 and rebroadcast yourself at a chosen
+interval.<Cite src="solana-cookbook-retry" /> Some teams use exponential backoff; others resubmit at a
+constant interval until a timeout.<Cite src="solana-cookbook-retry" /> Either way you are resubmitting
+*identical signed bytes*, which is safe because the blockhash deduplicates.
+
+**Keep preflight on unless you have a reason.** `sendTransaction` performs three checks before
+submitting: signatures valid, blockhash within the last 150 blocks, and a simulation against the bank
+slot selected by `preflightCommitment`.<Cite src="solana-cookbook-retry" /> Those checks are what turn
+the RPC-pool lag failure into a visible error rather than a silent
+drop.<Cite src="solana-cookbook-retry" />
+
+**Separate your submission path from your query path.** Nodes serving data-intensive requests can fall
+behind and are poorly suited to forwarding transactions; dedicated nodes handling only
+`sendTransaction` are the documented recommendation for time-sensitive
+work.<Cite src="solana-cookbook-retry" />
+
+<Misconception
+  belief="If my transaction has not landed, I should re-sign it with a higher fee, the way I would bump gas."
+  reality="There is no replace-by-fee and no nonce ordering. A re-signed transaction is a second, independently valid transaction with a different signature, and if both reach a leader before the shared blockhash expires, both can execute."
+  why="Every EVM tool treats fee bumping as replacement because the nonce makes it replacement. Here the deduplication key is the blockhash, not a per-sender counter, so a new signature is a new transaction rather than a substitute for the old one."
+  src="solana-cookbook-retry"
+/>
+
+The retry guide's rule is exactly this: before re-signing anything, make sure the initial
+transaction's blockhash has expired.<Cite src="solana-cookbook-retry" />
+
+<Aside kind="warn">
+There is an escape hatch from expiry, and it is dangerous. A durable nonce transaction is exempt from
+the blockhash rule and remains valid indefinitely rather than being rejected with
+`BlockhashNotFound`.<Cite src="solana-docs-transaction-structure" /> That is genuinely useful for
+offline signing and multi-party approval flows — and the property that makes it useful, *never
+expiring*, is the property that makes a pre-signed transaction a permanent liability. This track's
+security module covers [durable nonces as an attack surface](/c/durable-nonce-as-attack-surface) with a
+nine-figure case study attached. Reach for them when the flow genuinely requires signing far ahead of
+submission, and never as a way to avoid writing a retry loop.
+</Aside>
+
+## The lever that is neither fee nor code
+
+Everything above assumes your transaction reaches the leader. Whether it does is partly bought, and
+not with priority fees.
+
+Leader ingress capacity is rationed by stake. With stake-weighted quality of service enabled, a
+validator holding 1% of stake has the right to transmit up to 1% of packets to the leader, and the
+documentation records the current allocation as a stake-weighted priority over **80% of a leader's TPU
+capacity**.<Cite src="solana-swqos-guide" /> The stated purpose is Sybil resistance: without it,
+low-stake or no-stake peers can drown out traffic from higher-stake ones.<Cite src="solana-swqos-guide" />
+
+RPC nodes are unstaked and non-voting by definition, so they have no natural claim on that
+capacity.<Cite src="solana-swqos-guide" /> The mechanism lets a validator grant one a *virtual* stake:
+the validator runs with `--staked-nodes-overrides` pointing at a file mapping identity public keys to
+lamport amounts, the RPC runs with `--rpc-send-transaction-tpu-peer` pointing at the validator's QUIC
+TPU port, and the 80% is split proportionally using those amounts alongside real cluster
+stake.<Cite src="solana-swqos-guide" /> Both sides must be configured or nothing happens, and the
+documentation is emphatic that this is a *trusted peering arrangement*, not something to enable with
+an untrusted RPC — and that stake should be applied to block-producing validators, never delegated to
+RPC servers.<Cite src="solana-swqos-guide" />
+
+Read the consequence plainly. **Landing rate on Solana is partly an infrastructure procurement
+decision.** The beneficiaries the documentation names are commercial RPC operators who can negotiate
+with staked validators, and exchanges that run both and can peer them
+internally.<Cite src="solana-swqos-guide" /> If your provider has such arrangements, your transactions
+have a materially better path to the leader's buffer under load than a transaction sent through a
+public endpoint. If it does not, no fee fixes it, because the fee is only read after the packet
+arrives.
+
+There is no clean EVM analogue. The nearest thing — private orderflow through a builder — solves
+front-running and inclusion politics, in a system where the mempool is public and reaching it is
+trivial. This solves a bandwidth-rationing problem that exists because there is no mempool at all.
+
+<Misconception
+  belief="Landing rate is a function of the priority fee, so a transaction that is not landing is under-priced."
+  reality="The priority fee is read by the scheduler, which only ever sees transactions that already reached the leader's buffer. Ingress rationing, RPC queue drops and single-hop forwarding all happen before any fee is examined."
+  why="On Ethereum, reaching the mempool is essentially free and fee is the only lever, so 'not landing' and 'under-priced' became synonyms. Here they are two different failures with two different fixes, and only one of them costs lamports."
+  src="solana-swqos-guide"
+/>
+
+## What to instrument
+
+The module ends with a metric, because none of the above is visible in the places EVM monitoring
+looks.
+
+**Landing rate is the headline number**: signatures submitted, divided by signatures confirmed within
+their blockhash lifetime. Not "transactions succeeded" — a transaction that executed and returned a
+program error *landed*, and it is a different problem with a different owner. Split the two.
+
+**Break landing rate down three ways**, because each maps to a different fix:
+
+- **By submission path.** Run a control stream through a second, independently-peered provider. A gap
+  between paths under load points at ingress, not at fees.<Cite src="solana-swqos-guide" />
+- **By transaction cost.** Bucket by `costUnits`. A gradient — cheap transactions landing, expensive
+  ones not — points at priority, since priority divides reward by cost.<Cite src="solana-docs-fee-structure" />
+- **By time-in-window.** Record how much of the blockhash lifetime was left at confirmation. A
+  distribution creeping toward expiry is an early warning that arrives before your landing rate moves.
+
+**And treat priority fee estimates as vendor output, not protocol truth.** Every major RPC ships its
+own fee API and they disagree; a widely-cited analysis flags both the divergence and the resulting
+tendency to overpay defensively.<Cite src="helius-local-fee-markets" /> Recompute whatever you are
+advised to pay against the published formula before believing it.<Cite src="solana-docs-fees" />
+
+<Check type="spot-bug" concept="contention-failure-modes">
+A payments team ships this submission logic:
+
+```text
+1. getLatestBlockhash()                    // default commitment
+2. build and sign transaction
+3. sendTransaction(tx, { skipPreflight: true })
+4. sleep 30s
+5. getSignatureStatuses(sig)
+6. if null -> re-sign with a 3x higher CU price and go to 3
+7. after 3 attempts -> show "transaction failed"
+```
+
+It works in testing and produces duplicate payments in production. Find every defect.
+
+<Answer>
+**Six defects, and the duplicate payments come from one of them.**
+
+**1 — the duplicate payments: step 6 re-signs without checking expiry.** The original transaction is
+still valid for the remainder of its blockhash lifetime. Re-signing produces a second, independently
+valid transaction with a different signature and no relationship to the first, so both can
+execute.<Cite src="solana-cookbook-retry" /> This is not fee bumping; there is no replace-by-fee. The
+rule is to confirm the original blockhash has expired before re-signing
+anything.<Cite src="solana-cookbook-retry" />
+
+**2 — step 1 wastes the window.** The default commitment is `finalized`, which trails confirmed by at
+least 32 slots and costs roughly 13 seconds of a 60-to-90-second
+budget.<Cite src="solana-cookbook-confirmation" /> `confirmed` is the documented recommendation for
+almost all requests.<Cite src="solana-cookbook-confirmation" />
+
+**3 — step 3 disables the checks that would have exposed the real failure.** Preflight verifies
+signatures, checks the blockhash is within the last 150 blocks, and simulates against the selected
+commitment.<Cite src="solana-cookbook-retry" /> Skipping it turns an RPC-pool lag drop into silence.
+
+**4 — step 4 submits once and waits.** Under congestion the documented pattern is the opposite:
+`maxRetries: 0` plus your own tight resubmission loop of the *same signed bytes* for the whole
+window.<Cite src="solana-cookbook-retry" /> Thirty seconds of a sixty-second budget spent doing
+nothing is half the window discarded.
+
+**5 — step 5 has no terminal condition.** Polling for a status is not how expiry is detected. Stash
+`lastValidBlockHeight` from `getLatestBlockhash` and poll block height against
+it.<Cite src="solana-cookbook-retry" /> Until they meet, "null" means *in flight*, not *failed*.
+
+**6 — step 7 lies to the user, and step 6's fee escalation is aimed at the wrong problem.** "Failed"
+is wrong: nothing executed, nothing was charged, and no record exists — which is materially different
+from a payment that was attempted and rejected. And tripling the CU price triples the priority fee for
+a transaction whose problem may be ingress or capacity rather than
+ranking.<Cite src="solana-swqos-guide" />
+
+**The corrected shape.**
+
+```text
+1. { blockhash, lastValidBlockHeight } = getLatestBlockhash('confirmed')
+2. build and sign ONCE
+3. loop until blockHeight >= lastValidBlockHeight:
+       sendRawTransaction(same bytes, { maxRetries: 0 })
+       sleep ~500ms
+       if getSignatureStatuses(sig) is non-null: exit with its result
+4. on exit-by-height: report EXPIRED — not failed. Nothing happened,
+   nothing was charged, and this transaction can never execute later.
+5. only now may you build a new transaction, with a fresh blockhash.
+```
+
+**The idempotency point behind all of it.** The one-signature-one-outcome property is what makes step 3
+safe to run in a tight loop, and step 6 of the original destroyed it by minting new signatures. If your
+payment flow needs stronger guarantees than "this signature executes at most once", the guarantee has
+to come from your program's own state — a marker account, a claim flag — not from the submission
+layer.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**You now have the whole chain.** Declared access makes conflict decidable before execution; the
+scheduler turns that into locks and serialization instead of retries; one leader holds the only buffer
+that matters; compute units are billed on request rather than consumption; a per-writable-account
+ceiling bounds contention while a shared queue, shared workers and shared ingress leak it; and the
+result of losing any of those contests is silence rather than a receipt.
+
+**The reflection prompt is the exercise that binds them.** Find the one account every user of your
+application must write, divide the current per-account compute ceiling by your transaction's cost, and
+you have your ceiling in users per block. Then ask what you would change in the data model to get that
+account off the write path — and what you would lose, in client complexity, rent and verification
+burden, by doing it. That trade is the whole module in one question.
+
+**And carry the reframing back to the EVM.** You did not learn a second virtual machine here. You
+learned that "state access is discovered during execution" was a *choice* — one that buys convenient
+programs, forces serial execution, makes gas refundable, permits a global base fee, and produces a
+public mempool where a receipt is nearly guaranteed. Solana chose the other branch at that one node,
+and every difference in this module followed. EIP-7928 is Ethereum reaching back across for the other
+branch's property without giving up its own.<Cite src="eip-7928" /> Whichever machine you end up
+shipping on, you can now see the fork.

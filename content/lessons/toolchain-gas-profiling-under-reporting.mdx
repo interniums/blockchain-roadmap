@@ -1,0 +1,289 @@
+---
+id: toolchain-gas-profiling-under-reporting
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [foundry-forge-testing, foundry-issue-5494, forge-gas-metering, forge-test-reference, eip-2929, eip-2028, eip-2930, eip-7825, measured-gas-profiling-1-7-1, measured-forge-1-7-1]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+One test, three identical statements, three wildly different prices.
+
+```solidity
+function test_threeCalls() public {
+    uint256 a = gasleft();  l.credit(alice, 1);
+    uint256 b = gasleft();  l.credit(alice, 1);
+    uint256 c = gasleft();  l.credit(alice, 1);
+    uint256 d = gasleft();
+    // a-b, b-c, c-d
+}
+```
+
+```
+call 1  20339
+call 2   4227
+call 3   4227
+```
+
+Measured on forge 1.7.1 with solc 0.8.36, optimizer off.<Cite src="measured-gas-profiling-1-7-1" /><Cite src="measured-forge-1-7-1" /> The first call costs nearly
+five times the second. Nothing about the contract differs between them. What differs is everything
+that happened before.
+
+You already know the mechanism from [cold and warm access](/c/cold-vs-warm-access): a transaction
+maintains a set of touched addresses and slots, the first touch of each is priced at the cold rate,
+every later touch at the warm rate.<Cite src="eip-2929" /> Call 1 pays cold on the Ledger account and on both storage
+slots. Calls 2 and 3 find everything warm — and find both slots already modified in this
+transaction, so their writes are at the cheapest tier of all.
+
+Now the uncomfortable question. **Which of those three numbers is what a user pays?**
+
+None of them. And the reason is the subject of this lesson.
+
+## Turn on isolation and watch 21,368 appear
+
+`--isolate` makes every top-level external call from a test execute as a separate transaction in a
+separate EVM context.<Cite src="forge-test-reference" /> Same test, same commit:
+
+```
+              default    --isolate
+call 1         20339       41707
+call 2          4227       35195
+call 3          4227       35195
+```
+
+Take the difference on call 1: **41,707 − 20,339 = 21,368**.<Cite src="measured-gas-profiling-1-7-1" />
+
+**Subgoal — decompose that number, because if it reconciles exactly then you understand the model.**
+
+The calldata for `credit(address,uint256)` with `to = 0x…0A11CE` and `amount = 1` is 68 bytes: a
+four-byte selector `0xef6506db`, then a 32-byte word for the address, then a 32-byte word for the
+amount.<Cite src="measured-gas-profiling-1-7-1" /> Count the bytes by value:
+
+<Matrix
+  numeric
+  corner="Region"
+  cols={['Non-zero bytes', 'Zero bytes']}
+  rows={[
+    { label: 'selector ef 65 06 db', cells: ['4', { v: '0', tone: 'muted' }] },
+    { label: 'address word (…0a 11 ce)', cells: ['3', { v: '29', tone: 'muted' }] },
+    { label: 'amount word (…01)', cells: ['1', { v: '31', tone: 'muted' }] },
+    { label: 'total', cells: [{ v: '8', tone: 'accent' }, { v: '60', tone: 'accent' }] },
+  ]}
+  caption="Sixty of the sixty-eight bytes are ABI padding, which is why the difference isolation introduces reconciles to 21,368 rather than to something much larger."
+  alt="Calldata for a credit call, counted by value: the four-byte selector is four non-zero bytes, the address word is three non-zero and twenty-nine zero bytes, the amount word is one non-zero and thirty-one zero bytes, totalling eight non-zero and sixty zero bytes."
+/>
+
+Calldata is charged 16 gas per non-zero byte and 4 per zero byte, and the base charge for a
+transaction is 21,000.<Cite src="eip-2028" /> So:
+
+```
+21,000  base
+   128  8 non-zero bytes × 16
+   240  60 zero bytes × 4
+-------
+21,368
+```
+
+Exact, to the gas. That is the [intrinsic charge](/c/intrinsic-gas) — the cost of getting the call
+onto a chain at all, levied before the first opcode runs, and completely absent from the default
+measurement.
+
+The same arithmetic on a different function confirms it is not a coincidence. A no-argument `bump()`
+— selector `0x68110b2f`, four non-zero bytes and nothing else — showed a difference of **21,064**,
+which is 21,000 + 4 × 16.<Cite src="measured-gas-profiling-1-7-1" />
+
+<Aside kind="note">
+Calls 2 and 3 rise by more than the intrinsic charge (from 4,227 to 35,195) because isolation also
+resets the access list. Each is now a first touch again. That is the correct model for three
+separate user transactions and the wrong model for one transaction that makes three calls — which is
+exactly the trade-off the flag represents.
+</Aside>
+
+## The default on this version, and why the docs read both ways
+
+Foundry's documentation refers to isolation both as an opt-in `--isolate` and as an opt-out
+`--no-isolate` / `isolate = false`, which has left the default genuinely unclear in published
+material.<Cite src="foundry-forge-testing" /> Three facts, measured on forge 1.7.1:<Cite src="measured-gas-profiling-1-7-1" />
+
+- `forge config` resolves `isolate = false`. Isolation is off by default on this version.
+- `forge test --help` on 1.7.1 lists `--isolate` and does **not** list a `--no-isolate` counterpart.
+- `forge test --gas-report` produces byte-identical output to `forge test --isolate`. **Asking for a
+  gas report turns isolation on** for that run, even though the configured default says otherwise.
+
+The stable conclusion is not any of those three, all of which are version-specific. It is: **run
+`forge config` and record the flags, because a gas figure is only comparable to another figure taken
+under the same [isolation setting](/c/call-isolation-default) and the same Foundry version.** Every
+blog post benchmark you will ever read omits both.
+
+<Misconception
+  belief="Isolation makes tests more realistic, so it should always be on."
+  reality="It also changes the meaning of any test that legitimately models several calls inside one transaction — a batched call, a flash-loan callback, a multicall — where warmth persisting across calls is the thing being tested."
+  why="'More realistic' is heard as strictly better, rather than as a different and equally specific model."
+  src="foundry-forge-testing" />
+
+That trade is worth stating concretely, because both models are right for something:
+
+- **A user sending three separate transactions** pays the intrinsic charge three times and pays cold
+  rates three times. Isolation models this.
+- **A batched call through a delegated account, or a router doing three hops** pays the intrinsic
+  charge once and pays cold rates once. The default models this.
+
+Choose by what your users actually do. If both, run both, and label the two numbers.
+
+## Three numbers for one call, and what each contains
+
+Isolation also explains a discrepancy you will hit the moment you cross-check two instruments. For a
+single no-argument call, measured under `--gas-report` on forge 1.7.1:<Cite src="measured-gas-profiling-1-7-1" />
+
+| Figure | Value | Contains |
+|---|---|---|
+| gas-report row | 26,382 | intrinsic charge + the callee frame |
+| `gasleft()` bracket in the test | 26,908 | the above + the test contract's own call setup |
+| plain `forge test`, same call | 1,044 | the callee frame only, on a warm second call |
+
+Three instruments, one statement, one run.<Cite src="measured-gas-profiling-1-7-1" />
+
+The gas-report row decomposes cleanly: 21,064 of intrinsic charge plus 5,318 of execution inside
+`bump`. The `gasleft()` bracket adds 526 for the caller's argument layout and `CALL` opcode<Cite src="measured-gas-profiling-1-7-1" /> —
+work your test contract does that no user's transaction ever will. And the plain figure is the same
+operation with the access list already populated.
+
+Three legitimate measurements of one statement, spanning a factor of twenty-five. None of them is
+wrong; they answer different questions. The failure is quoting one without saying which.
+
+## What a fresh transaction starts warm with
+
+Isolation does not reset everything to cold, and the exception is specified rather than incidental.
+When a transaction begins, `accessed_storage_keys` is initialised **empty**, but
+`accessed_addresses` is initialised to include the sender, the destination `tx.to` (or the address
+being created), and the set of all precompiles.<Cite src="eip-2929" />
+
+Three consequences you will use:
+
+- **The contract you are calling is warm on entry.** Its account access is 100, not 2,600, because
+  it is `tx.to`.<Cite src="eip-2929" /><Cite src="measured-forge-1-7-1" /> A second contract it calls is not.
+- **Every storage slot it touches is cold.** The account being warm buys you nothing on the slots.
+  That asymmetry is why a first call to an untouched contract still costs thousands more than the
+  second: it is the slots, not the account.
+- **Precompiles are always warm.** A `sha256` or `ecrecover` never carries a cold account surcharge
+  in any transaction — which matters when you are timing a hash comparison, as the previous lesson's
+  worked bug showed.
+
+There is a fourth lever the protocol hands the *sender*: an EIP-2930 access list, which pre-declares
+addresses and storage keys and moves them into the warm set before execution, in exchange for a
+per-entry charge at intrinsic-gas time.<Cite src="eip-2930" /> A transaction that pays for an access list up front
+changes exactly the numbers this lesson is about. Foundry's test EVM will not construct one for you,
+so a production caller that uses access lists is paying a different price from anything your suite
+has ever printed.
+
+## The bias that isolation does not fix
+
+Turning isolation on removes one source of under-reporting. Three remain, and all three run the same
+direction.
+
+**Setup leaves state warm, and nothing can cool it.** `setUp` runs before every test and touches
+whatever it touches. Under the default there is no cheatcode to force a slot back to cold — this is
+the substance of the long-standing report that `forge test` shows less gas used than the same
+transaction on mainnet.<Cite src="foundry-issue-5494" /> Isolation resets the access list per top-level call, which is a large
+repair, but the state *shape* is still your fixture's.
+
+**Your storage is not mainnet's storage.** The single largest lever on the cost of a write is
+whether the slot is currently zero, and your test's addresses are fresh while production's are not.
+A `credit` to a brand-new holder measured 68,312 in the report and to an existing one 34,112 — the
+same function, a 2× spread, decided entirely by state you invented.<Cite src="measured-gas-profiling-1-7-1" /> If your fixture is one
+holder and production has fifty thousand, your distribution is not theirs.
+
+**The test EVM's limits are not a chain's limits.** On forge 1.7.1 the resolved `gas_limit` default
+is **1,073,741,824** — 2^30.<Cite src="measured-gas-profiling-1-7-1" /> EIP-7825 caps a single L1 transaction at **16,777,216** gas,
+2^24.<Cite src="eip-7825" /> The test default is sixty-four times the protocol cap, and enforcement of the protocol
+cap is opt-in: `forge test --enable-tx-gas-limit` is documented as enabling the transaction
+gas-limit checks imposed by Osaka.<Cite src="measured-gas-profiling-1-7-1" /><Cite src="forge-test-reference" /> A migration or mass-deployment script can therefore
+pass green in your suite and be rejected outright by the network.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'plain forge test', note: 'isolate = false', tone: 'muted' },
+    { title: '--gas-report or --isolate', note: 'each call is a transaction', tone: 'accent' },
+    { title: "what a user pays", note: 'a real transaction on chain', tone: 'warn' },
+  ]}
+  rows={[
+    { label: 'Is the 21,000 base charge inside the number?', cells: ['No', 'Yes', 'Yes'] },
+    { label: 'Are the calldata bytes charged?', cells: ['No', 'Yes', 'Yes'] },
+    { label: 'Does each top-level call start with an empty access list?', cells: ['No — warmth carries across calls', 'Yes, it resets per call', 'Yes'] },
+    { label: 'What did the first credit call read?', cells: ['20,339', '41,707', 'neither of those'] },
+    { label: 'Whose state decides the write tier?', cells: ['your fixture', 'your fixture', "production's storage"] },
+    { label: 'Is the 16,777,216-gas transaction cap enforced?', cells: ['No — gas_limit resolves to 2^30', 'Only with --enable-tx-gas-limit', 'Yes'] },
+  ]}
+  caption="Isolation adds the transaction back. It does not add mainnet's state back, so the rows below the fourth are unchanged by the flag."
+  alt="Three measurements compared: plain forge test, a run under --gas-report or --isolate, and what a user actually pays. Only the isolated run and the real transaction include the 21,000 base charge and the calldata bytes and reset the access list per call; the first credit call reads 20,339 plain against 41,707 isolated; the state shape and the enforced transaction gas cap differ from mainnet in both test modes."
+/>
+
+<Aside kind="warn">
+The bias is **one-directional**. Every effect listed here makes the measured number lower than the
+real one; none makes it higher. So a Foundry gas figure is usable as a lower bound and as a
+comparison between two versions of your own code, and is not usable as an answer to "what will this
+cost my users". Treat the gap as unknown-but-positive rather than as small.
+</Aside>
+
+## What to do about it
+
+**For comparisons — most of your work — do nothing.** If you are asking whether variant B is cheaper
+than variant A, run both under identical settings and read the difference. Every bias above is
+common-mode and cancels.
+
+**For an absolute figure, add the transaction back.** The intrinsic charge is 21,000 plus 16 per
+non-zero calldata byte and 4 per zero byte, and you can compute it from the encoded calldata without
+any tooling at all.<Cite src="eip-2028" /> `--isolate` does it for you. For anything more careful,
+`emo-eth/forge-gas-metering` exists specifically to meter the parts `--gas-report` omits — the
+intrinsic and calldata costs of a real transaction.<Cite src="forge-gas-metering" />
+
+**For a number you will publish, fork.** Fork a recent block, use real addresses with real balances,
+run with isolation on, and say which block. That is the only measurement whose state shape resembles
+production's, and it is worth doing exactly once per release rather than on every commit.
+
+<Check type="predict" concept="test-warmth-bias">
+A team optimises an ERC-20 `transfer`. Their gas report says the median dropped from 34,100 to
+29,300 — a 4,800-gas saving, 14%. They write it into the release notes as "transfers are 14%
+cheaper".
+
+Two weeks after shipping, support reports that users see roughly the same fee as before. The
+contract is correct and the optimisation is real. Explain the gap, and say what the release note
+should have claimed.
+
+<Answer>
+**The denominator was wrong.** The report measured the call, not the transaction. Under the default
+setting on forge 1.7.1, plain `forge test` figures exclude the intrinsic charge entirely; an ERC-20
+`transfer(address,uint256)` carries 68 calldata bytes, so the transaction the user signs costs
+roughly 21,000 + a few hundred more than anything the report showed. Add about 21,300 to both sides
+and 34,100 → 29,300 becomes roughly 55,400 → 50,600: a saving of the same 4,800 gas, but **8.7%**,
+not 14%.
+
+**And the numerator is probably optimistic too.** A 4,800-gas saving on a `transfer` is very close
+to the size of one storage-write tier change, which is the kind of saving that appears when a slot
+the fixture had already warmed no longer has to be touched. On a recipient with a zero balance — a
+first-time holder, which is a large share of real transfers — the expensive path may be unchanged.
+The report's own min-to-max spread would have shown this: check whether the improvement moved the
+max as well as the median, or only the median.
+
+**What the release note should say.** "Transfers to an existing holder cost about 4,800 gas less; on
+a 55,000-gas transfer that is roughly 9%. Transfers that create a new balance are unchanged."
+Concrete, checkable, and it survives someone measuring it themselves.
+
+**The general habit.** Before quoting a percentage, ask what it is a percentage *of*. Gas savings
+divided by a call-scoped denominator always look larger than the fee change a user experiences,
+because the 21,000-gas floor is in their number and not in yours.
+
+</Answer>
+</Check>
+
+## Where this goes
+
+**Next**, the module stops measuring instruments and starts measuring economics: which parts of a
+transaction actually carry the cost. Storage first, because nothing else is close; then refunds and
+the cap that bounds them; then calldata, which is where the model changed under your feet and where
+an L2 inverts the ranking entirely.
+
+**Then, finally**, the folklore — measured with the probe from the last lesson, under the isolation
+setting from this one, so the numbers mean something.

@@ -1,0 +1,245 @@
+---
+id: ledgers-blocks-consensus-inside-the-evm
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-4788, execution-specs-osaka-fork, execution-specs-osaka-blocks, eip-7773]
+stack: {}
+---
+
+A staking pool wants to slash a node operator who got slashed on the beacon chain. A restaking
+protocol wants to check that the validators backing a service are still active. A bridge wants to
+know the head is finalised before releasing funds.
+
+Every one of those is a question about **consensus-layer state**, asked by code running in the
+**execution layer**. Before March 2024 there was no honest way to answer it. The EVM had no view of
+the beacon chain at all, so the answer was always the same shape: a committee, a multisig, an oracle
+— some set of humans or servers attesting off-chain to a fact that was, in principle, cryptographically
+established already.
+
+One 32-byte header field changed the shape of that answer, and this lesson is about the field, the
+strange little contract it feeds, and what it does and does not remove from your trust assumptions.
+
+## The field
+
+`parentBeaconBlockRoot` carries the hash tree root of the parent beacon block into the execution
+header.<Cite src="execution-specs-osaka-blocks" /> EIP-4788 added it in Cancun, and the reasoning it
+gives for doing so is worth quoting in substance: beacon block roots are **cryptographic accumulators
+that allow proofs of arbitrary consensus state**, so exposing them inside the EVM gives
+trust-minimised access to the consensus layer.<Cite src="eip-4788" />
+
+Validity is not the execution layer's problem. The consensus client supplies the value and execution
+clients must ensure the header matches what they were given — the same arrangement as
+withdrawals.<Cite src="eip-4788" /> At genesis, where there is no parent beacon block, the field is
+32 zero bytes.<Cite src="eip-4788" />
+
+Note the choice of *block* root rather than *state* root, because the rationale is a nice piece of
+engineering. A beacon block root is a constant amount of work to carry forward regardless of what
+happened, whereas anchoring on state roots would require linear work per new payload across skipped
+slots. The cost is that proofs need a couple of extra nodes to hop from the block root into the
+state, which the EIP treats as negligible and notes can be amortised by caching.<Cite src="eip-4788" />
+
+## The ring buffer, and why it has a strange shape
+
+A header field is visible to the client but not, by itself, to a contract. So EIP-4788 pairs the
+field with a small system contract that stores a rolling history of roots, at
+`0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02`.<Cite src="eip-4788" />
+
+**How it gets written.** At the start of processing every block, before any transaction runs, the
+client calls that address as `SYSTEM_ADDRESS` with the 32-byte `parent_beacon_block_root` as
+calldata.<Cite src="execution-specs-osaka-fork" /> The call has a gas limit of 30,000,000, transfers
+no value, does not count against the block's gas limit, must execute to completion, and fails
+silently if no code exists at the address.<Cite src="eip-4788" /> The contract has no function
+selector: it decides between its two operations purely by looking at `caller`. If the caller is the
+system address, it writes; otherwise it reads.<Cite src="eip-4788" />
+
+**How it is stored.** `HISTORY_BUFFER_LENGTH` is 8191, and there are *two* buffers. Writing stores
+the block's timestamp at index `timestamp % 8191`, and the beacon root at index
+`timestamp % 8191 + 8191`.<Cite src="eip-4788" />
+
+<Figure
+  caption="The second buffer is what makes a stale entry detectable: a root alone cannot tell you which slot it belongs to."
+  alt="The beacon-roots contract's storage is two parallel runs of 8191 slots. The first holds block timestamps at index timestamp modulo 8191; the second holds the matching beacon block roots at the same index offset by 8191."
+>
+  <ByteLayout
+    unit="words"
+    caption="storage of 0x000F3df6…Beac02"
+    fields={[
+      { label: 'timestamps', size: 8191, note: 'index = t % 8191' },
+      { label: 'beacon roots', size: 8191, tone: 'accent', note: 'same index + 8191' },
+    ]}
+  />
+</Figure>
+
+**How it reads.** A caller passes the timestamp it is asking about, encoded as 32 big-endian bytes.
+The contract reverts if the input is not exactly 32 bytes, reverts if it is zero, computes the same
+index, and — this is the important part — **reverts unless the timestamp stored at that index equals
+the one asked for.** Only then does it return the root.<Cite src="eip-4788" />
+
+### Why two buffers, and why 8191
+
+Both details are answers to failure modes you can now recognise.
+
+**Two buffers exist because slots get missed.** With a single buffer holding only roots, an old entry
+whose timestamp happened to be congruent modulo the buffer length would be returned as if it were
+current — a caller asking about a slot that produced no block would receive a stale root and have no
+way to tell.<Cite src="eip-4788" /> Storing the pair and verifying the timestamp on read nullifies
+that. The previous lesson's point — that slots pass without producing blocks — is not an abstraction
+here; it is the reason this contract has the storage layout it has.
+
+**8191 is prime.** That guarantees no entry is overwritten until the buffer has saturated completely,
+and after that each entry is replaced exactly once per revolution. It also means the design survives
+a change to the slot duration: whatever the slot length becomes, the contract still uses at most 8191
+storage slots.<Cite src="eip-4788" />
+
+**Coverage is bounded, and that is a deadline.** At current mainnet parameters, 8191 roots is about a
+day.<Cite src="eip-4788" /> The EIP's own framing of why that is enough is telling: it gives users
+plenty of time to construct a transaction verifying against a specific root and get it included. In
+other words, this is not an archive. A proof against a root older than the window cannot be verified
+on-chain at all, because the contract will revert rather than return it.
+
+<Misconception
+  belief="EIP-4788 lets a contract read consensus-layer state."
+  reality="It lets a contract read a 32-byte commitment to a recent beacon block. Everything else — a validator's balance, its slashed flag, the finalised checkpoint — has to be supplied to the contract as calldata together with a Merkle proof that the contract verifies against that commitment."
+  why="'Beacon block root in the EVM' reads like access. It is anchoring, not access: the protocol supplies the anchor and you supply the data."
+  src="eip-4788"
+/>
+
+## What a verification actually looks like
+
+The pattern is the same one you have now met three times in this module — an anchor plus a proof —
+with the anchor coming from consensus rather than from a header field you already hold.
+
+**Subgoal: obtain the anchor on-chain.** The contract calls the beacon-roots address with the
+timestamp of an execution block whose parent beacon block is the slot it cares about, and receives
+that slot's beacon block root. Note the off-by-one: the value stored under a block's timestamp is
+that block's `parentBeaconBlockRoot`, so the root you get back belongs to the slot *before* the block
+you named.<Cite src="eip-4788" />
+
+**Subgoal: accept the claim and its proof as calldata.** The caller supplies the value being asserted
+— say a validator's effective balance, or its slashed flag — plus the SSZ Merkle branch connecting it
+to the beacon block root. The contract never fetches anything; it is handed everything.
+
+**Subgoal: hash upward and compare.** The contract recomputes the path with
+[SSZ merkleization](/c/ssz-merkleization) from Track 01 — beacon block root, down through the beacon
+state root, into the validator registry, to the field — and compares the computed root against the
+one the ring buffer returned. Equality means the claim is true of that beacon block. Anything else
+reverts.
+
+**Subgoal: decide what the claim licenses.** A proof against a beacon block root establishes a fact
+about *that block*. Whether that block is on the canonical chain, and whether it is finalised, are
+separate questions — exactly as they were for the receipt proofs two lessons ago. A root read from
+the ring buffer is at most about a day old and may be about a chain segment that was reorged; if your
+action is irreversible, the finalised checkpoint is what you should be proving against, not the head.
+
+<Figure
+  caption="Every input to the check arrives as calldata except one — the 32-byte anchor, which is the only value the contract does not take on trust."
+  alt="A verification has two inputs. The caller supplies the asserted value and its SSZ Merkle branch as calldata, which the contract hashes upward through generalized indices. The contract separately calls the beacon-roots address for the anchor, which reverts if the timestamp is outside the window. The computed root and the anchor are then compared, and anything other than equality reverts."
+>
+  <Flow
+    lanes={['inputs', 'work', 'the check']}
+    nodes={[
+      { id: 'claim', label: 'claim + SSZ branch', note: 'supplied as calldata', col: 0, tone: 'warn' },
+      { id: 'ring', label: 'beacon-roots call', note: 'reverts outside the window', col: 0, tone: 'accent' },
+      { id: 'hash', label: 'hash upward', note: 'generalized indices', col: 1 },
+      { id: 'cmp', label: 'compare', note: 'equal, or revert', col: 2, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'claim', to: 'hash' },
+      { from: 'hash', to: 'cmp' },
+      { from: 'ring', to: 'cmp', label: 'the anchor', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="warn">
+The trust you removed is an oracle committee. The trust you added is **a hard-coded understanding of
+the beacon state's SSZ layout.** A Merkle proof into an SSZ container is a path expressed in
+generalized indices, and those indices are a function of the container's field list. Change the
+container — add a field, reorder one, restructure the block body — and every contract holding a
+hard-coded path verifies against the wrong position or stops verifying at all. Proposals that
+restructure the beacon block are on the Glamsterdam candidate list, which is itself a Draft with no
+mainnet activation.<Cite src="eip-7773" /> This is the same fork-shaped liability as a hard-coded
+execution header layout, one level up, and it is the reason production users of EIP-4788 keep the
+proof paths upgradeable rather than immutable.
+</Aside>
+
+## What this unlocked
+
+The EIP names the use cases it was written for: improving the trust assumptions of staking pools,
+restaking constructions, smart-contract bridges and MEV mitigations.<Cite src="eip-4788" /> Every one
+of those is a case where a contract previously had to be told something about consensus by a party
+that could lie.
+
+The general shape is worth naming, because it recurs. **A commitment carried in a place everyone
+already verifies converts an attestation problem into a proof problem.** Nobody had to build a new
+network, a new signature scheme or a new committee. Thirty-two bytes were added to a structure that
+every node already validates, and an entire category of oracle disappeared from designs that were
+willing to pay the gas for a proof.
+
+The gas cost is not nothing, which is why the category did not disappear from *all* designs. Cheaper
+is not free, and a system that needs a consensus fact in every transaction will still reach for a
+cached, attested value. The choice is now an explicit trade rather than an absence of options.
+
+<Check type="explain" concept="parent-beacon-block-root">
+A protocol you are reviewing verifies validator status through EIP-4788. Its contract stores the most
+recently verified beacon root in a state variable so that later transactions can verify additional
+proofs against it without paying for the ring-buffer call again. A comment says: "roots are immutable
+once written, so caching is safe."
+
+Assess the comment. Then describe two distinct failure modes this design has that a
+verify-against-a-fresh-root design does not, and say which one is worse.
+
+<Answer>
+**The comment is true and irrelevant.** A beacon block root is indeed a fixed 32 bytes once that
+block exists — hashing is deterministic and the root never changes. What the comment quietly assumes
+is that a root's *meaning* is stable, and it is not. The root identifies a beacon block; it does not
+certify that the block is canonical, and it certainly does not certify that facts proven against it
+remain true later.
+
+**Failure mode one: the cached root goes stale.** Every proof verified against it is a statement
+about the state of the beacon chain at that moment. A validator that was active at the cached root
+may have been slashed, exited, or had its balance change since. The contract will keep accepting
+proofs of the old status and reporting them as current, indefinitely, with no signal that anything
+has moved. This is not an exotic edge case — validator status changing is the normal life cycle of
+the thing being tracked.
+
+**Failure mode two: the cached root outlives its window and the design becomes unrepairable in
+place.** The ring buffer holds about a day of roots, and reverts rather than returns for anything
+outside it. A contract that has cached a root from beyond the window cannot re-derive or re-validate
+it: there is no on-chain way to ask "is this root still one the chain acknowledges". So the cache
+becomes an unverifiable value that the contract nonetheless treats as authoritative, and refreshing
+it requires whatever privileged path the protocol built — which is the oracle you were trying to
+delete, wearing a different hat.
+
+**Which is worse.** The first, by a distance. Stale-but-plausible data flows straight into decisions:
+funds released to a slashed operator, a service reporting security it no longer has, a bridge acting
+on a validator set that has changed. The second is at least loud — it fails a check, or the contract
+notices its cache is unrefreshable — and loudness is the property you want from a broken assumption.
+
+**What to do instead.** Verify against a root fetched in the same transaction, and require it to be
+recent by construction: pass the block timestamp you are anchoring to, let the ring buffer revert if
+it is outside the window, and treat that revert as the freshness check rather than adding one of your
+own. If a batch of proofs must share an anchor, share it *within one transaction*, never across
+blocks. And for irreversible actions, prove against the finalised checkpoint rather than a recent
+head, because a root being present in the ring buffer says nothing about the chain segment
+surviving.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Liquid staking and restaking protocols** are the largest users of this field. Their whole security
+argument rests on being able to check validator status without asking an operator to self-report.
+
+**Light-client bridges** use the same anchor from the other direction: a contract on another chain
+holds Ethereum beacon roots and verifies proofs against them, which is what makes a bridge a
+verification problem rather than a committee problem.
+
+**The finality module** supplies the missing half of every design here — how to tell head from
+justified from finalised, and how deep is deep enough for the action you are about to take.
+
+**The last lesson in this module** returns to the header for its two remaining live subsystems, and
+shows that the fields metering the block are running two entirely separate auctions that people
+routinely bill as one.

@@ -1,0 +1,399 @@
+---
+id: altvm-solana-security-owner-and-signer
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [sealevel-attacks, fuzz-on-the-beach, cantina-securing-solana, helius-solana-hacks, helius-solana-security-guide, solana-docs-accounts, solana-docs-account-modification-rules, solana-docs-cpi-execution, solana-docs-pda, anchor-account-constraints, anchor-lang-docsrs, neodyme-workshop]
+stack: {}
+---
+
+In July 2022 an attacker created an account, wrote numbers into it, and handed it to Crema Finance's
+concentrated liquidity market maker as a tick account. The program read the numbers. Combined with
+flash loans drawn from Solend, the fabricated fee data let the attacker claim fees that had never been
+earned and drain multiple liquidity pools — approximately $8.8 million, recorded as 69,422.9 SOL and
+6,497,738 USDC, bridged to Ethereum and swapped for 6,064 ETH.<Cite src="helius-solana-hacks" />
+
+The root cause takes one line to state: the fake tick account bypassed owner
+verification.<Cite src="helius-solana-hacks" /> Not a subtle ordering flaw, not an arithmetic edge
+case. The program trusted bytes without asking who wrote them.
+
+This lesson is the first two of the three questions. They are the cheapest checks in the taxonomy —
+one comparison each — and they are the two the framework answers for you, which is why the class is
+largely historical for programs that use Anchor and entirely live for programs that do not.
+
+## Question one: who owns it
+
+Every Solana account carries the same five fields: lamports, data, owner, executable, and
+`rent_epoch`.<Cite src="solana-docs-accounts" /> The `owner` field holds a program id, and the runtime
+enforces one rule around it: only the account's owner program can modify its data or debit its
+lamports, while any program can credit lamports to any writable
+account.<Cite src="solana-docs-accounts" />
+
+**Subgoal: read that rule as an attacker.** It says nothing about who may *hand you* an account. It
+constrains writes, not arguments. So the attacker's move is not to write your account — the runtime
+blocks that and raises `ModifiedProgramId` if a non-owner tries<Cite src="solana-docs-account-modification-rules" />
+— but to create an account of their own, controlled entirely by them, containing exactly the bytes
+that make your logic reach the conclusion they want, and pass it in.
+
+**Subgoal: notice what the deserialization step does not tell you.** Borsh decoding of a byte slice
+into a struct is a layout operation. Give it the right number of bytes in the right shape and it
+succeeds. It has no notion of provenance. A struct decoded from an attacker's account and a struct
+decoded from your own account are indistinguishable once decoded — same type, same fields, no
+residual marker of where the bytes came from.
+
+So the check has to happen before you read, and it is one comparison:
+
+```rust
+// The whole of question one.
+if ctx.accounts.tick.owner != ctx.program_id {
+    return Err(ProgramError::IllegalOwner);
+}
+```
+
+The audit-firm checklist lists this as "account owner or program id check" among its high-severity
+pitfalls, and it names the specific sin: comparing the wrong thing, or not comparing at
+all.<Cite src="cantina-securing-solana" /> The canonical taxonomy files it as class 2, `owner-checks`,
+with a deliberately broken program, a fixed one, and a version written in the framework
+idiom.<Cite src="sealevel-attacks" /> The academic treatment formalises missing-owner-check as one of
+its two named vulnerability types and studies it empirically across real
+programs.<Cite src="fuzz-on-the-beach" />
+
+### What Anchor does about it
+
+The reason this class is mostly historical rather than mostly present is a constructor.
+`Account<'info, T>` performs three steps in order when it is built: assert that the account's owner
+field equals the executing program's id, assert that the first eight bytes match `T`'s discriminator,
+and only then deserialize the remainder.<Cite src="anchor-lang-docsrs" /> Two classic classes — this
+one and the type confusion of the next lesson — are closed by that
+[constructor alone](/c/account-wrapper-does-three-checks).
+
+If you need a *different* owner than your own program, the framework has a constraint for it:
+`owner = expr` checks the account owner matches `expr`.<Cite src="anchor-account-constraints" /> That
+is the one you reach for when the account belongs to the token program, or to any other program whose
+records you read.
+
+<Misconception
+  belief="If an account appears in a typed accounts struct, the framework has validated it."
+  reality="Only some wrappers validate. Signer asserts the account signed. Program asserts both the key and the executable flag. SystemAccount asserts system-program ownership. UncheckedAccount and AccountInfo assert nothing at all, and the framework's only response is to force you to write a CHECK comment explaining why."
+  why="The accounts struct looks like a schema, and schemas normally enforce their own types. Here the struct is a list of assertions, and one of the available assertions is 'none'."
+  src="helius-solana-security-guide"
+/>
+
+That misconception is worth turning into a habit. Reviewing an Anchor program starts by grepping for
+`UncheckedAccount` and `AccountInfo`, reading the `/// CHECK:` comment attached to each, and asking
+whether the justification is true *now* — not whether it was true when written. Those comments are
+the framework's honest record of where it stopped answering questions on your behalf.
+
+### Where the owner check silently is not enough
+
+One case deserves separate attention because it looks handled. Suppose the account is owned by your
+program, so question one passes — but nothing in the runtime says an account owned by your program
+was created *by* your program with your program's meaning. Owner reassignment is permitted: the
+current owner can reassign, provided the account is writable and its data is
+zero-initialised.<Cite src="solana-docs-account-modification-rules" /> Combine that with an
+initialization instruction that anyone may call and you have an account with your program's owner
+field and an attacker's intentions inside it. Owner is necessary; it was never sufficient.
+
+### How the forged account is actually built
+
+The exploit is worth walking concretely, because the abstract version ("an attacker fabricates an
+account") makes it sound like it requires something exotic. It requires four ordinary steps.
+
+<Figure
+  caption="The runtime's rules hold at every step. None of them is about which account sits in slot three."
+  alt="Four steps to build a forged account: create an account assigned to a program you control, write bytes matching the target's struct and discriminator, choose values that make the target's logic conclude what you want, then submit it in the position the target expects."
+>
+  <Flow
+    nodes={[
+      { id: 'create', label: 'create an account', note: 'assigned to a program you control', col: 0 },
+      { id: 'write', label: 'write the payload', note: "field order, widths, endianness — plus the eight-byte discriminator if the target expects one", col: 1, tone: 'accent' },
+      { id: 'choose', label: 'choose the numbers', note: 'no invariant constrains them: the target never wrote these bytes', col: 2, tone: 'warn' },
+      { id: 'submit', label: 'submit', note: 'signatures valid, no unauthorised writes, ownership respected', col: 3, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+**Subgoal: obtain an account whose bytes you control.** Deploy a program of your own, or use the
+system program, and create an account assigned to it. This is the same instruction sequence every
+legitimate program uses. Nothing about it is adversarial yet.
+
+**Subgoal: write the payload.** Lay out bytes matching the target program's struct — field order,
+field widths, endianness. If the target uses the framework, prepend eight bytes matching the
+discriminator it will expect; that prefix is derived from a hash of the type's name and is public,
+because the program is public.<Cite src="anchor-lang-docsrs" /> If the target hand-rolls its
+deserialization, there is no prefix to match.
+
+**Subgoal: choose numbers that make the logic conclude what you want.** Crema's payload was
+transaction fee data, and the point of controlling it was to claim fees that had never
+accrued.<Cite src="helius-solana-hacks" /> The interesting property of this step is that it is not
+constrained by any invariant the target program maintains, because the target program never wrote
+these bytes and has no invariant over them.
+
+**Subgoal: submit.** Build a transaction naming your fabricated account in the position the program
+expects, alongside whatever real accounts the instruction also needs, and sign it as fee payer. Every
+runtime rule holds: signatures valid, no unauthorised writes, ownership respected. The runtime has no
+opinion about whether the account in slot three is the right one, because that has never been the
+runtime's job.<Cite src="solana-docs-accounts" />
+
+Notice what is not on that list. No key compromise, no race, no timing, no flash-loan requirement —
+Crema's flash loans supplied capital scale, not the vulnerability.<Cite src="helius-solana-hacks" />
+The attack is one missing comparison, and everything else about it is documentation-following.
+
+## Question two: did it sign
+
+Here is the sharper difference from the EVM, and it is worth stating starkly: **on Solana there is no
+implicit sender.**
+
+In Solidity, `msg.sender` exists whether or not you use it. The machine derived it from a verified
+signature before your function ran, and every access-control check you have ever written is an
+assertion *about* a value the platform already computed. The failure mode is forgetting to compare
+it. The value itself is never absent.
+
+On Solana, the equivalent value does not exist unless you construct it. What you get instead is a
+flag per account. Each signer in the transaction produced a valid Ed25519 signature over the message,
+and the runtime records that as `is_signer` on the corresponding account. A program that wants to know
+"did the authority consent" asks that flag. A program that does not ask has no fallback — there is no
+ambient sender to have forgotten to check.
+
+```rust
+// The whole of question two.
+if !ctx.accounts.authority.is_signer {
+    return Err(ProgramError::MissingRequiredSignature);
+}
+```
+
+**Subgoal: state what the attack looks like when this is missing.** An instruction takes an
+`authority` account and acts on the strength of it. Nothing checks `is_signer`. An attacker builds a
+transaction naming the *victim's* key as the authority — which costs nothing, since naming a key is
+just putting 32 bytes in a list — and the program performs the privileged action on the victim's
+behalf. Class 0 in the canonical taxonomy is exactly this, `signer-authorization`, and its position at
+the top of the list is not an accident of alphabetisation.<Cite src="sealevel-attacks" /> The
+audit-firm checklist splits the same ground into "account signer check" and "missing check for the
+permission of caller", both rated high severity.<Cite src="cantina-securing-solana" /> The fuzzing
+study takes missing-signer-check as its other named vulnerability
+type.<Cite src="fuzz-on-the-beach" />
+
+In the framework, the assertion is carried in the type: `Signer<'info>` asserts that the account
+signed the transaction.<Cite src="helius-solana-security-guide" /> One word in a struct field,
+answering the question that Solidity answers with a global.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Question one', note: 'who owns it', tone: 'accent' },
+    { title: 'Question two', note: 'did it sign', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What does it establish?',
+      cells: [
+        'These bytes were written under this program’s semantics',
+        'A valid Ed25519 signature over this message exists for this key',
+      ],
+    },
+    {
+      label: 'What is the comparison?',
+      cells: [
+        <><code>account.owner</code> against the executing program id</>,
+        <><code>is_signer</code> on the account</>,
+      ],
+    },
+    {
+      label: 'What carries it in the framework?',
+      cells: [
+        <><code>Account&lt;'info, T&gt;</code>, or <code>owner = expr</code> for another program’s records<Cite src="anchor-account-constraints" /></>,
+        <><code>Signer&lt;'info&gt;</code><Cite src="helius-solana-security-guide" /></>,
+      ],
+    },
+    {
+      label: 'What does its absence look like?',
+      cells: [
+        { v: <>A fabricated account read as the program’s own record — Crema Finance, July 2022<Cite src="helius-solana-hacks" /></>, tone: 'danger' },
+        { v: 'The victim’s key named as the authority by somebody who does not hold it', tone: 'danger' },
+      ],
+    },
+    {
+      label: 'Does it prove the caller may act on this object?',
+      cells: [
+        { v: 'No — ownership is a property of one account and says nothing about a second', tone: 'danger' },
+        { v: 'No — anyone can sign their own transaction', tone: 'danger' },
+      ],
+    },
+  ]}
+  caption="Neither check knows there is another account in the instruction."
+  alt="The owner check and the signer check compared: what each establishes, the comparison behind it, the Anchor construct that carries it, what its absence looks like, and the fact that neither proves the caller is entitled to the object."
+/>
+
+<Misconception
+  belief="A Signer field in the accounts struct means the right person authorised this action."
+  reality="It means *a* key signed. Which key, and whether that key has any relationship to the object being acted on, is a separate question that Signer does not touch. Anyone can sign their own transaction."
+  why="On the EVM, checking msg.sender against a stored owner is a single expression, so 'did someone sign' and 'did the right someone sign' collapse into one habit. Here they are two constraints on two different lines."
+  src="sealevel-attacks"
+/>
+
+That is question three arriving early, and it is the most common way the first two questions produce
+false confidence. `Signer<'info>` plus `Account<'info, Vault>` is a signed transaction and a real
+vault — with nothing at all connecting the two. The binding is `has_one = authority`, which checks
+that the `authority` field stored inside the account's data equals the key of the `authority` account
+in the same instruction.<Cite src="anchor-account-constraints" /> Next lesson takes that apart
+properly; for now, notice that questions one and two are individually necessary and jointly
+insufficient by construction.
+
+### Signers that are not keys
+
+Two cases complicate the flag, and both come up in real programs.
+
+**A PDA can be a signer without a key.** Program derived addresses are deterministically derived from
+a program id and seeds and are guaranteed not to lie on the Ed25519 curve, so no private key exists
+for them — only the program whose id was used in the derivation can sign for one, and it does so
+through `invoke_signed` during a cross-program
+invocation.<Cite src="solana-docs-pda" /> So `is_signer` being true does not imply a human held a key;
+it may mean a program vouched, which is precisely how program-owned vaults authorise transfers.
+
+**Signer privilege propagates downward, and only downward.** In a cross-program invocation an account
+can be a signer in the callee only if it was already a signer in the caller, or if it is a PDA derived
+from the caller's own seeds; otherwise the runtime refuses.<Cite src="solana-docs-cpi-execution" />
+Writable privilege behaves the same way — a caller that passed an account read-only cannot have it
+marked writable by the callee, and the attempt raises
+`PrivilegeEscalation`.<Cite src="solana-docs-cpi-execution" /> Authority strictly narrows as you
+descend a call stack. That is a genuinely good property and worth contrasting with
+[delegatecall](/c/delegatecall-is-the-proxy-primitive), where the callee runs with the caller's full
+authority over the caller's own storage and the direction of the guarantee is reversed.
+
+### The EVM has no equivalent of question one, and that is the point
+
+It is worth asking why an owner check has no Solidity counterpart, because the answer explains the
+whole shape of this module.
+
+In Solidity, when you write `IERC20(token).balanceOf(user)`, the bytes you get back were produced by
+code at `token`. You may be calling the wrong contract — that is real, and it is the arbitrary-target
+class of the next lesson — but you cannot be handed *raw storage* belonging to an arbitrary address
+and asked to interpret it as your own type. The EVM has no primitive for "here is a blob, decode it".
+Storage is reached through the contract that owns it, and reaching it means running that contract's
+code.
+
+Solana inverts that. Accounts are opaque byte arrays addressed by key, and reading one is a memory
+operation, not a call. The owner field is the *only* thing recording which program's semantics those
+bytes were written under, and consulting it is optional. So the EVM's protection here is structural
+and free, and Solana's is a comparison somebody has to remember. That is not a defect in the design —
+it is the price of the account model's other properties, chief among them
+[declared account access](/c/declared-account-access) and the parallelism it buys. But it means the
+security habit does not port, because there is nothing to port it from.
+
+<Aside kind="warn">
+There is a third flag people forget entirely: **writability**. An account passed read-only cannot be
+modified, and the runtime will roll the transaction back if you try. That is a correctness property,
+not a security hole. The security-relevant version is the inverse — a program that *requires* an
+account to be writable and never says so, then behaves differently depending on how the client
+constructed the transaction. The audit-firm checklist lists "account writable check" as its own
+entry.<Cite src="cantina-securing-solana" />
+</Aside>
+
+<Check type="spot-bug" concept="missing-signer-check">
+A lending program. Both accounts are properly typed, the program compiles, and the tests pass. Two of
+the three questions are answered. Find what is missing and state the exact transaction an attacker
+builds.
+
+```rust
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(mut)]
+    pub position: Account<'info, Position>,
+    /// CHECK: the position stores who may act on it
+    pub authority: AccountInfo<'info>,
+    #[account(mut)]
+    pub destination: Account<'info, TokenAccount>,
+}
+
+pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+    require_keys_eq!(
+        ctx.accounts.position.authority,
+        ctx.accounts.authority.key(),
+        ErrorCode::WrongAuthority
+    );
+    ctx.accounts.position.balance -= amount;
+    // ... transfer `amount` to destination ...
+    Ok(())
+}
+```
+
+<Answer>
+**The missing check is `is_signer`, and the `require_keys_eq!` is what disguises it.**
+
+Walk the three questions. Question one is answered: `Account<'info, Position>` asserts the position is
+owned by this program and carries the right discriminator before deserializing
+it.<Cite src="anchor-lang-docsrs" /> Question three is answered, and answered well — the stored
+`authority` field is compared against the passed `authority` account, which is exactly the relational
+check most programs omit. Question two is not answered at all. `AccountInfo` asserts
+nothing.<Cite src="helius-solana-security-guide" />
+
+**The attack.** The attacker reads any victim's `Position` account off-chain — it is public state —
+and finds the pubkey in its `authority` field. They then build a transaction with:
+
+- `position` = the victim's position account,
+- `authority` = the victim's pubkey, as a plain non-signing account,
+- `destination` = a token account the attacker owns,
+
+and sign it with their own fee-payer key, which is unrelated to anything the instruction checks. The
+`require_keys_eq!` passes, because the victim's key really is the victim's key. The withdrawal
+executes against the victim's balance into the attacker's destination.
+
+**Why review missed it.** The relational check is present and correct, and its presence reads as
+diligence. Someone comparing an authority field feels like someone who is thinking about authority. On
+the EVM this bug cannot be written in this shape, because you would have compared against `msg.sender`
+and the sender is authenticated by construction — the platform does not let you name a sender you
+cannot produce a signature for. Here, naming a key and holding a key are entirely different acts, and
+only `is_signer` distinguishes them.
+
+**The fix is one word.**
+
+```rust
+pub authority: Signer<'info>,
+```
+
+`Signer<'info>` asserts the account signed the transaction.<Cite src="helius-solana-security-guide" />
+Better still, replace both the wrapper and the manual comparison with the constraint that expresses
+the whole intent, since `has_one = authority` checks that the `authority` field on the account matches
+the key of the `authority` field in the accounts struct:<Cite src="anchor-account-constraints" />
+
+```rust
+#[account(mut, has_one = authority)]
+pub position: Account<'info, Position>,
+pub authority: Signer<'info>,
+```
+
+**One more finding while you are here.** `ctx.accounts.position.balance -= amount` is unchecked
+subtraction. In a release build that wraps silently rather than panicking, which turns an overdraft
+into an enormous balance. Lesson 7 of this module is about nothing else.
+
+**And the `/// CHECK:` comment is the tell.** It says the position stores who may act on it — which is
+true, and is an answer to question three offered as though it were an answer to question two. The
+comment is where the author recorded their reasoning, and it is where the reasoning went wrong. Read
+those comments as findings-in-waiting.
+</Answer>
+</Check>
+
+## What this unlocks
+
+Two questions down, and they cost one comparison each.
+
+**A concrete review pass you can run today.** For every account in an instruction: is it wrapped in
+something that asserts ownership, and is every account treated as an authority wrapped in `Signer`?
+Two greps and a read. On an Anchor program the exceptions are self-announcing, because the framework
+forced their authors to write a comment next to them.
+
+**A calibration for the rest of the module.** These two classes are the ones the framework closed, and
+the Crema Finance incident is now four years old.<Cite src="helius-solana-hacks" /> If your program
+stays inside the framework's typed wrappers, you will not write these bugs. If your program leaves for
+a lower layer — no owner check, no signer check, no discriminator check, none of it, unless you write
+it — every one of them is live again and yours to write correctly in every
+instruction.<Cite src="cantina-securing-solana" />
+
+**And an appetite for the harder question.** Both of the checks in this lesson look at one account and
+decide something about it in isolation. That is why they are cheap, and it is why they are not enough.
+The next lesson is about the check that cannot be made by looking at any single account — where the
+owner is right, the type is right, the signature is real, and the account still belongs to someone
+else. If you want to feel it before reading it, the hands-on workshop's personal-vault levels put
+exactly this in front of you twice, once as an obvious bug and once as a supposedly secure version
+that still falls.<Cite src="neodyme-workshop" />

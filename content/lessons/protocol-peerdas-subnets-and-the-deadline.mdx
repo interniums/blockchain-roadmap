@@ -1,0 +1,456 @@
+---
+id: protocol-peerdas-subnets-and-the-deadline
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [consensus-specs-fulu-p2p, consensus-specs-fulu-das-core, consensus-specs-v161-mainnet-config, consensus-specs-fulu-validator, engine-api-osaka, eip-7594, fradamt-das-fork-choice, consensus-specs-fulu-preset]
+stack: {}
+---
+
+`ATTESTATION_DUE_BPS` is 3,333 basis points of `SLOT_DURATION_MS`, and `SLOT_DURATION_MS` is
+12,000.<Cite src="consensus-specs-v161-mainnet-config" /> Four seconds. That is the entire budget.
+
+Inside it, a validator must receive a beacon block, obtain eight columns' worth of data it may not
+have been sent, verify every cell proof in them, and decide whether the block's data is available —
+because that decision gates whether it attests. Sampling is not a download that finishes when it
+finishes. It is a real-time deadline with a network on the other side of it, and everything about the
+subnet layout, the peering strategy and the escape hatches exists because of that sentence.
+
+This lesson is the timing budget, the 128 subnets the traffic runs on, the per-sidecar work that has
+to fit, and the one mechanism that lets a consensus client skip the network entirely.
+
+## A hundred and twenty-eight subnets, one per column
+
+`DATA_COLUMN_SIDECAR_SUBNET_COUNT` is 128, and the mapping is the simplest possible
+one:<Cite src="consensus-specs-fulu-p2p" /><Cite src="consensus-specs-v161-mainnet-config" />
+
+```python
+def compute_subnet_for_data_column_sidecar(column_index: ColumnIndex) -> SubnetID:
+    return SubnetID(column_index % DATA_COLUMN_SIDECAR_SUBNET_COUNT)
+```
+
+Column *i* goes to subnet *i*. The `blob_sidecar_{subnet_id}` topic from Deneb is deprecated
+outright; `data_column_sidecar_{subnet_id}` replaces
+it.<Cite src="consensus-specs-fulu-p2p" /> A node joins the gossipsub subnets for the custody groups
+it custodies and no others — which is what keeps its inbound proportional to its custody rather than
+to the block.<Cite src="consensus-specs-fulu-das-core" />
+
+At the minimum that is four subnets out of 128. It is worth pausing on how aggressive that is: a
+default full node is subscribed to about 3% of the topics carrying the data it is voting on being
+available.
+
+The obvious worry — 128 subnets is a lot of meshes to keep healthy — is addressed directly in the
+spec's FAQ, and the answer relocates the problem:
+
+> No, the number of subnets doesn't really matter. What matters to the network stability is the
+> number of nodes and the churn rate in the network. If the number of the nodes is too low, it's
+> likely to have a network partition when some nodes are down. For the churn rate, if the churn rate
+> is high, we even need to have a higher number of nodes, since nodes are likely to be turned off
+> more often.<Cite src="consensus-specs-fulu-das-core" />
+
+Subnet count is not the stability variable. Population and churn are. Treat that as the thing to
+monitor.
+
+### What arrives, and the work it costs
+
+A `DataColumnSidecar` landing on a subnet is not free to accept. Before forwarding it, a node runs a
+validation list that includes: the sidecar is valid per `verify_data_column_sidecar`; it is on the
+correct subnet; it is not from a future slot; its slot is beyond the latest finalized slot; the
+proposer signature on the block header is valid; the parent has been seen and passes validation; the
+sidecar's slot exceeds the parent's; the finalized checkpoint is an ancestor; the `kzg_commitments`
+inclusion proof verifies; the column data verifies via
+`verify_data_column_sidecar_kzg_proofs`; it is the first sidecar for that
+`(slot, proposer_index, index)` tuple; and the proposer is the expected one for the
+slot.<Cite src="consensus-specs-fulu-p2p" />
+
+That is thirteen conditions, three of which are cryptographic — the proposer signature, the inclusion
+proof and the KZG proofs — and one of which, the KZG proof check, scales with the number of blobs in
+the block, because a column carries one cell and one proof per
+blob.<Cite src="consensus-specs-fulu-das-core" />
+
+The spec offers one optimisation explicitly, and it is a good tell for where the cost sits: in the
+inclusion-proof check, all sidecars of the same block verify against the same set of
+`kzg_commitments`, so a client may cache the result keyed on the tuple of commitments, inclusion
+proof and signed block header.<Cite src="consensus-specs-fulu-p2p" /> Eight columns of one block
+means one inclusion-proof verification, not eight.
+
+<Misconception
+  belief="A node subscribes to the subnets for the columns it samples."
+  reality="It subscribes to the subnets for the columns it custodies — four at the minimum. Sampled-but-not-custodied columns are pulled over request/response, though the p2p spec does allow a client to subscribe on account of additional sampling if it prefers."
+  why="Custody and sampling both come out as '8 columns' for a validator node, so the two mechanisms collapse into one in most summaries."
+  src="consensus-specs-fulu-das-core"
+/>
+
+### The proposer's side of the burst
+
+Look at the same four seconds from the other end. A proposer does not publish one object; it publishes
+128.
+
+`get_data_column_sidecars` builds one sidecar per column index, each carrying the block's full
+commitment list, the inclusion proof, the signed header, and one cell plus one proof per
+blob.<Cite src="consensus-specs-fulu-validator" /> The publishing rule is then: compute
+`subnet_id = compute_subnet_for_data_column_sidecar(column_index)` for each, and after publishing all
+columns to their respective subnets, peers may request the sidecar through sync
+requests.<Cite src="consensus-specs-fulu-validator" />
+
+Price it. At 21 blobs a column carries 21 cells at `BYTES_PER_CELL` = 2,048 —
+43,008 bytes — plus 21 commitments and 21 proofs at 48 bytes each and a small fixed
+header.<Cite src="consensus-specs-fulu-preset" /><Cite src="consensus-specs-fulu-das-core" /> Call it
+about 44 KiB per sidecar. Times 128 sidecars: roughly **5.6 MiB that one machine has to push out**,
+early enough in the slot that it can propagate across 128 separate meshes and reach attesters before
+their deadline.
+
+Notice the asymmetry this creates. A sampling node's inbound is ~352 KiB and its 1/8 divisor applies.
+The proposer's outbound is the whole extended matrix and no divisor applies to it at all — the same
+shape as the supernode problem, arriving once per slot at a different machine. This is why the
+proposer publishing late is treated as a normal, expected event with dedicated mitigations rather
+than as misbehaviour, and it is the load the distributed-publishing helpers exist to spread.
+
+<Misconception
+  belief="The proposer sends you the columns you custody."
+  reality="The proposer publishes each column into its subnet's gossip mesh; the sidecar reaches you across some number of hops from peers, not from the proposer. That is why 'the block arrived on time' and 'my columns arrived on time' are separate measurements."
+  why="Point-to-point is the default mental model for delivery, and the proposer is the visible origin."
+  src="consensus-specs-fulu-validator"
+/>
+
+## Pulling what gossip did not deliver
+
+If a node fails to get columns on the column subnets, it can use the request/response protocol to
+query the missing columns from peers.<Cite src="consensus-specs-fulu-das-core" /> Two protocols
+matter, and their shapes tell you what they are for.
+
+**`DataColumnSidecarsByRange`** takes a `start_slot`, a `count`, and a *list of column indices* —
+"give me columns 31, 47 and 56 for these slots".<Cite src="consensus-specs-fulu-p2p" /> The request
+is column-targeted by construction, which is exactly what the deterministic custody derivation makes
+answerable: you already know which peers must have those columns.
+
+**`MAX_REQUEST_DATA_COLUMN_SIDECARS`** is `MAX_REQUEST_BLOCKS_DENEB * NUMBER_OF_COLUMNS` = 128 × 128
+= 16,384.<Cite src="consensus-specs-fulu-p2p" /><Cite src="consensus-specs-v161-mainnet-config" />
+Sized for backfill, not for a single slot's sampling.
+
+Three rules on the serving side shape what you can rely on.
+
+**Serving is an obligation with a window.** `data_column_serve_range` is
+`[max(current_epoch − MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS, FULU_FORK_EPOCH), current_epoch]`,
+and clients must keep a record of sidecars seen in that range and support serving
+it.<Cite src="consensus-specs-fulu-p2p" /> Peers unable to reply within the range should return
+`3: ResourceUnavailable`, and may be descored or disconnected at any
+time.<Cite src="consensus-specs-fulu-p2p" />
+
+**Answers are per block, not per column.** Clients must include *all* data column sidecars of each
+block from which they include any, sent in `(slot, column_index)`
+order.<Cite src="consensus-specs-fulu-p2p" /> You cannot ask for a scattering and get a scattering.
+
+**A node advertises how far back it can go.** `Status` v2 gains
+`earliest_available_slot`,<Cite src="consensus-specs-fulu-p2p" /> and a node that can serve blocks
+but not all sidecars across the retention period should advertise the earliest slot from which it can
+serve all sidecars.<Cite src="consensus-specs-fulu-p2p" /> A node syncing from a recent weak
+subjectivity checkpoint must backfill to `data_column_serve_range` to be fully compliant — and until
+it does, peers may disconnect or temporarily ban it.<Cite src="consensus-specs-fulu-p2p" />
+
+## The clock
+
+Now assemble the budget. Everything below is one slot on mainnet.
+
+**t = 0.** Slot begins. The proposer builds, then publishes the beacon block and, separately, all 128
+column sidecars to their subnets.<Cite src="consensus-specs-fulu-validator" />
+
+**t ≈ 0 to 4 s.** An attesting validator's window. `ATTESTATION_DUE_BPS` = 3,333 bps of a 12,000 ms
+slot puts the deadline just under four seconds
+in.<Cite src="consensus-specs-v161-mainnet-config" /> Inside it the node must: receive and validate
+the block; receive its custodied columns on the subnets it subscribes to; **request** the
+sampled-but-not-custodied columns from peers and receive answers; verify each sidecar; and evaluate
+its availability check.
+
+**The all-or-nothing rule turns every one of those into a critical path.** Sampling is successful only
+if the node retrieves all selected columns.<Cite src="consensus-specs-fulu-das-core" /> One slow peer,
+for one column, and the check fails for the slot.
+
+That is the whole reason this is an engineering problem rather than a mathematics problem. The
+security argument assumes samples get answered; the network decides whether they do. Francesco
+D'Amato's fork-choice notes on PeerDAS put the interaction between sampling and fork choice at the
+centre for the same reason — the timing constraint is what shapes the
+design.<Cite src="fradamt-das-fork-choice" />
+
+<Aside kind="warn">
+The four-second figure is the shipped one. The same config file also defines
+`ATTESTATION_DUE_BPS_GLOAS` = 2,500 bps — 25% of the slot, three seconds — against a
+`GLOAS_FORK_EPOCH` of `18446744073709551615`, the far-future
+sentinel.<Cite src="consensus-specs-v161-mainnet-config" /> That is a constant defined for an
+unshipped fork with no activation epoch set. Read it as evidence that a tighter attestation deadline
+is *proposed*, not as a schedule: no date should be attached to it, and the value could change before
+anything activates.
+</Aside>
+
+### Where the four seconds actually go
+
+The budget is not four seconds of sampling. Order the events and the sampling window shrinks:
+
+- The block has to be built and propagated before anything else starts. Whatever fraction of the slot
+  that takes is subtracted first.
+- Custodied columns arrive on gossip, which is a mesh propagation with its own hop count — not a
+  point-to-point transfer from the proposer.
+- Only then can a node tell which of its sampled columns are *missing*, because a request it did not
+  need to make is the cheapest one.
+- Requests to peers are round trips, and the peer must have the column, be online, and not be
+  saturated.
+
+<Figure
+  caption="A third of the slot, shared by four steps that can only happen in order."
+  alt="A twelve-second slot with ticks at zero, four and twelve seconds. A single span covers the first four seconds and carries the whole of block propagation, arrival of custodied columns on gossip, requests to peers for the sampled columns that did not arrive, and per-sidecar verification. A dashed mark just before four seconds is the attestation deadline, ATTESTATION_DUE_BPS of 3,333 basis points of a 12,000 millisecond slot."
+>
+  <Timeline
+    from={0}
+    to={12}
+    unit="seconds"
+    ticks={[0, 4, 12]}
+    marks={[{ at: 4, label: 'attestation due · 3,333 bps', tone: 'danger' }]}
+    spans={[{ label: 'the whole sampling budget', start: 0, end: 4, tone: 'warn', note: 'block, then custodied columns, then requests for the rest, then verification' }]}
+  />
+</Figure>
+
+The spec declines to specify the moment at which a node gives up on gossip and starts requesting: an
+inline note in das-core names it as an open timing consideration — at what point does a node consider
+samples missing.<Cite src="consensus-specs-fulu-das-core" /> Same gap as the reconstruction delay,
+same consequence: client policy, and a real source of behavioural divergence.
+
+## The escape hatch: ask your own execution client
+
+Here is the piece of the design that most improves the odds, and it works because of something you
+already know about the mempool.
+
+Blob-carrying transactions propagate to execution clients through the transaction pool *before* the
+block that includes them is proposed. So a consensus client holding a beacon block but missing its
+data does not have to wait on the consensus network at all — the bytes may already be sitting in the
+execution client it is paired with, one local RPC away over the
+[Engine API](/c/engine-api).
+
+The p2p spec makes it a recommendation rather than an option:
+
+> Honest nodes SHOULD query `engine_getBlobsV2` as soon as they receive a valid `beacon_block` or
+> `data_column_sidecar` from gossip. If ALL blobs matching `kzg_commitments` are retrieved, they
+> should convert the response to data columns, and import the
+> result.<Cite src="consensus-specs-fulu-p2p" />
+
+And it names the purpose: implementers are encouraged to leverage this method to increase the
+likelihood of incorporating and attesting to the last block when its proposer is not able to publish
+data columns on time.<Cite src="consensus-specs-fulu-p2p" />
+
+### Two shapes, and why there are two
+
+The Osaka fork introduced both:
+
+- **`engine_getBlobsV2`** — all-or-nothing. If any requested blob is missing, or is an older-version
+  blob carrying a blob proof rather than cell proofs, the response **must** be `null` — not a partial
+  array.<Cite src="engine-api-osaka" /> It also returns `null` if the client is syncing or otherwise
+  unable to serve pool data.
+- **`engine_getBlobsV3`** — partial. Same request, but the client must return an array of the same
+  length and order with `null` only at the positions of the missing
+  blobs.<Cite src="engine-api-osaka" />
+
+The reason both exist is the blob count. At a 21-blob cap, an all-or-nothing query fails if a single
+one of the twenty-one is absent, discarding twenty perfectly good blobs the node could have used to
+fill columns. V3 lets the consensus client take what is there and go to the network for the rest.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'engine_getBlobsV2', note: 'all-or-nothing', tone: 'warn' },
+    { title: 'engine_getBlobsV3', note: 'partial', tone: 'good' },
+  ]}
+  rows={[
+    {
+      label: 'What comes back when one blob is missing?',
+      cells: [
+        { v: <>null for the whole response — not a partial array<Cite src="engine-api-osaka" /></>, tone: 'warn' },
+        { v: <>An array of the same length and order, with null only at the missing positions<Cite src="engine-api-osaka" /></>, tone: 'good' },
+      ],
+    },
+    {
+      label: 'What does that cost you?',
+      cells: [
+        'Every blob in the response, including the ones that were present',
+        'Nothing — the blobs that are there still fill their columns',
+      ],
+    },
+    {
+      label: 'What does a miss look like in metrics?',
+      cells: [
+        <>A single null for the call<Cite src="engine-api-osaka" /></>,
+        <>Positional nulls inside a full-length array<Cite src="engine-api-osaka" /></>,
+      ],
+    },
+  ]}
+  caption="One absent blob is the difference between a response you can use and no response at all."
+  alt="engine_getBlobsV2 and engine_getBlobsV3 held against the same questions. V2 must return null for the entire response if any requested blob is missing, discarding every blob that was present; V3 returns an array of the same length and order with null only at the missing positions, so a miss is visible as positional nulls rather than as a single null call."
+/>
+
+`engine_getBlobsV1` returns an unsupported-fork error after Osaka, and `engine_getPayloadV4` errors
+for timestamps at or after Osaka activation.<Cite src="engine-api-osaka" /> The old shapes are gone,
+not deprecated — the pre-Fulu bundle carried one proof per blob, and the new one carries
+`CELLS_PER_EXT_BLOB` cell proofs per blob, so there is no compatible reading of the old
+response.<Cite src="engine-api-osaka" /><Cite src="consensus-specs-fulu-preset" />
+
+### It also lets somebody else finish the proposer's job
+
+The same local-blobs path powers a repair route that does not involve the proposer at all.
+
+`get_data_column_sidecars_from_column_sidecar(sidecar, cells_and_kzg_proofs)` takes **any one** column
+sidecar for a block plus the cells and proofs for the blobs it commits to, and returns the full
+sequence of all 128 sidecars — described in the spec as being for distributed blob publishing,
+reconstructing all sidecars from any sidecar received on the wire, assuming all cells and proofs
+could be retrieved from the local execution layer client.<Cite src="consensus-specs-fulu-validator" />
+
+Chain the two facts together and a useful behaviour falls out. A node that sees one column on gossip
+and holds the blobs in its own execution client can rebuild every other column and publish the ones
+whose subnets it follows. No Reed-Solomon recovery, no 64-column threshold, no waiting: it is
+re-deriving from the originals rather than repairing an erasure. That is why the p2p spec's
+recommendation to query `engine_getBlobsV2` fires on receiving a valid `beacon_block` **or** a
+`data_column_sidecar` — either one is enough context to
+start.<Cite src="consensus-specs-fulu-p2p" />
+
+The consequence for a proposer running late is that it does not need to get all 128 columns out. It
+needs to get the block and enough of a foothold out that nodes with the blobs in their pools can
+finish the distribution for it.
+
+### The rules for what you do with the answer
+
+Blobs from your own execution client did not arrive over gossip, and the spec is careful about
+re-entering them:
+
+**Skip verification of the blobs themselves.** When clients use the local execution layer to retrieve
+blobs, they should skip verification of those blobs.<Cite src="consensus-specs-fulu-p2p" /> The
+execution client already validated them on entry to its pool.
+
+**Then behave exactly as if they had arrived by gossip.** When importing them as data columns, clients
+must publish the corresponding `data_column_sidecar` on its topic **if and only if** they are
+subscribed to it — whether that subscription comes from custody or from additional sampling — and
+must update gossip rule data structures including the anti-equivocation
+cache.<Cite src="consensus-specs-fulu-p2p" />
+
+The "if and only if" is doing real work. A node that published columns for subnets it does not follow
+would inject sidecars into meshes it is not a member of, and a node that published nothing would
+waste the repair opportunity. The rule threads between both.
+
+<Misconception
+  belief="engine_getBlobs is how a consensus client normally gets blob data; gossip is the fallback."
+  reality="It is a latency escape hatch layered on top of gossip. It only works while the blobs are still in the local execution client's pool — the spec is explicit that clients may prune old blobs and will answer null or with nulls at those positions — and it cannot serve a node syncing history."
+  why="It is the fastest path when it works, and the fastest path is easy to mistake for the primary one."
+  src="engine-api-osaka"
+/>
+
+## What to instrument
+
+The timebound is only debuggable if you measure the right intervals, and the spec's structure tells
+you which ones exist.
+
+**Block arrival, separately from column arrival.** They travel on different topics through different
+meshes.<Cite src="consensus-specs-fulu-p2p" /> A node can have the block at 800 ms and still be
+missing columns at 3,800 ms, and the two numbers have completely different causes.
+
+**Per-column arrival, not aggregate.** The all-or-nothing rule means the metric that predicts a missed
+attestation is the *last* column's arrival time, not the mean.<Cite src="consensus-specs-fulu-das-core" />
+An average that looks healthy hides a tail that is failing you.
+
+**Gossip-versus-request split.** For a minimum-custody node, four of eight sampled groups are not
+subscribed, so they arrive by request.<Cite src="consensus-specs-fulu-das-core" /> Tracking what
+fraction of sampled columns arrived by subscription versus by request tells you directly whether
+raising `custody_group_count` would convert round trips into pushes.
+
+**`engine_getBlobs` hit rate and latency.** The spec recommends querying it on every valid block or
+column sidecar,<Cite src="consensus-specs-fulu-p2p" /> so it fires constantly. Its hit rate is a
+measure of your execution client's blob pool coverage, and its miss modes are distinguishable: `null`
+for all-or-nothing under V2 versus positional nulls under
+V3.<Cite src="engine-api-osaka" /> A collapse to zero hits after an upgrade is the signature of a
+version mismatch rather than a network problem.
+
+**Peer coverage of your own sample set.** Because custody is derivable, you can compute at any moment
+how many of your current peers are obliged to hold each column you
+sample.<Cite src="consensus-specs-fulu-das-core" /> A column covered by one peer is a single point of
+failure with a four-second deadline attached, and it is visible before it costs you anything.
+
+None of these are exotic. They are the intervals the specification's own structure creates, and the
+reason to enumerate them is that a node reporting "data unavailable" tells you nothing about which of
+five different things went wrong.
+
+<Check type="predict" concept="das-timebound">
+A staking operator reports that since a recent client upgrade their validators are missing head votes
+on roughly 3% of slots. Their monitoring shows: block arrival times unchanged, CPU well under
+capacity, no disk pressure. The nodes run the minimum custody setting with no validators-driven
+increase applied, and peer count is at the client's default floor. The operator asks whether they
+should raise their custody group count to fix it.
+
+Predict the mechanism behind the misses, say whether raising custody helps, and give the ordered list
+of things to change.
+
+<Answer>
+**The likely mechanism is sampling failing to complete before the attestation deadline, not anything
+about compute.**
+
+A minimum-custody node samples 8 groups and custodies 4, so four of its eight columns are *not*
+delivered by subscription — they must be requested from peers over request/response after the node
+notices they have not arrived.<Cite src="consensus-specs-fulu-das-core" /> Sampling is successful only
+if it retrieves **all** selected columns,<Cite src="consensus-specs-fulu-das-core" /> and the whole
+sequence must finish inside `ATTESTATION_DUE_BPS` = 3,333 bps of a 12,000 ms slot, just under four
+seconds.<Cite src="consensus-specs-v161-mainnet-config" /> Idle CPU is consistent with this: the node
+is waiting on the network, not computing.
+
+**Does raising `custody_group_count` help? Yes, but not for the reason the operator thinks, and it is
+not the first thing to try.**
+
+Raising the count raises `sampling_size` one-for-one, since it is
+`max(SAMPLES_PER_SLOT, custody_group_count)`.<Cite src="consensus-specs-fulu-das-core" /> Above 8, the
+sampled set *equals* the custodied set — so everything the node needs arrives by gossip subscription
+rather than by request, and the round trips disappear. That is a genuine fix for this failure mode.
+It is also permanent: the ratchet says a node should not later reduce its advertised
+count,<Cite src="consensus-specs-fulu-validator" /> and the storage cost is linear in the number of
+groups across the whole 4,096-epoch retention
+window.<Cite src="consensus-specs-fulu-p2p" /> Do not reach for it first.
+
+**Ordered list.**
+
+*1. Raise the peer count.* The failure is a missing answer, and EIP-7594 names peer redundancy as the
+designed mitigation: a node generally has many peers, peer count can be cheaply increased, and if a
+single peer fails another can serve the same sampling task.<Cite src="eip-7594" /> This is the
+cheapest lever and it targets the actual cause.
+
+*2. Check that column-targeted peering is working.* The point of deriving custody from node ids is
+that a node can find peers who **must** hold a given column before dialling
+them.<Cite src="consensus-specs-fulu-das-core" /> A node whose peer set happens not to cover its four
+sampled-not-custodied columns will fail systematically rather than randomly — which fits a stable 3%
+rather than a jittery one.
+
+*3. Confirm `engine_getBlobsV2`/`V3` is actually wired and answering.* Honest nodes should query it as
+soon as a valid block or column sidecar arrives, and it exists precisely to raise the odds of
+attesting when a proposer publishes data late.<Cite src="consensus-specs-fulu-p2p" /> If the upgrade
+changed the Engine API version in use, a client falling back to a method that now returns an
+unsupported-fork error<Cite src="engine-api-osaka" /> would remove this path silently — and "since a
+recent client upgrade" is exactly the shape of that bug.
+
+*4. Only then raise custody*, sized against the storage table, and accept that it is one-way.
+
+**What not to conclude.** Three per cent of slots is not evidence of withholding. The all-or-nothing
+success rule makes a slow peer and a hostile proposer produce the identical local
+outcome,<Cite src="consensus-specs-fulu-das-core" /> so a node's failed check is never by itself
+evidence about the proposer.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You have the real-time picture: 128 subnets, a subscription proportional to custody, a
+request/response path for the rest, thirteen validation conditions per sidecar, and a four-second
+deadline that all of it has to fit
+inside.<Cite src="consensus-specs-fulu-p2p" /><Cite src="consensus-specs-v161-mainnet-config" /> You
+also have the escape hatch, and the honest statement of what it is: a latency mechanism bounded by
+someone else's mempool retention.<Cite src="engine-api-osaka" />
+
+**Next, and last: what the check is permitted to conclude.** Everything in this module has been
+building toward one function in the fork-choice spec, and its content is narrower than the phrase
+"data availability" suggests. The final lesson reads `is_data_available` as it is actually written,
+says what fork choice does with a block that fails it, and closes on the eighteen-day boundary where
+the guarantee stops.
+
+**Carry the deadline.** When you meet a protocol claim that assumes a message was received, ask what
+the budget was and who answers when the first peer does not.

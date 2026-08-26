@@ -1,0 +1,306 @@
+---
+id: app-viem-sync-send
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [viem-write-contract-sync, viem-send-transaction-sync, eip-7966, viem-send-transaction-sync-source, viem-send-raw-transaction-sync-source, viem-jsonrpc-account-doc, viem-wait-for-transaction-receipt, viem-errors-glossary, viem-simulate-contract, viem-issue-4263, npm-viem-dist-tags]
+stack: { viem: "2.x" }
+---
+
+Two ways to write the same flow. The second is one line shorter and the shape every backend engineer
+expects.
+
+```ts
+const hash = await walletClient.writeContract(request)
+const receipt = await publicClient.waitForTransactionReceipt({ hash })
+
+// or
+const receipt = await walletClient.writeContractSync(request)
+```
+
+`writeContractSync` executes a write function and waits for the transaction to be included in a block,
+returning the transaction receipt.<Cite src="viem-write-contract-sync" /> One await instead of two, no
+hash to hold, no polling loop — the version of the API that should always have existed.
+
+viem's documentation puts a warning box on it: this action is only recommended on chains with low block
+times and fast finality, most chains apart from
+mainnet.<Cite src="viem-write-contract-sync" /><Cite src="viem-send-transaction-sync" /> That is the
+entry point, not the most surprising thing here. The most surprising thing is that on the account kind
+most of your users have, the synchronous path is not synchronous at all.
+
+## What the RPC method actually promises
+
+Underneath sits EIP-7966, which specifies `eth_sendRawTransactionSync`: submit a signed raw transaction
+and wait synchronously for the receipt or a configurable timeout before
+returning.<Cite src="eip-7966" /> Two parameters — the signed transaction data, required, and a maximum
+wait in milliseconds, optional and typed as an integer — and on success the node returns the receipt
+object as `eth_getTransactionReceipt` defines it.<Cite src="eip-7966" />
+
+The motivation names its audience precisely: the asynchronous approach is called inefficient for
+high-frequency chains and L2s with fast block times, and combining submission and retrieval into one
+call is claimed to cut total latency by approximately 50%.<Cite src="eip-7966" /> The rationale is
+blunter still — on slower chains the synchronous wait may cause longer RPC durations or timeouts,
+making the method less practical.<Cite src="eip-7966" /> The EIP argues against its own use on L1 in
+its own text.
+
+Note the status: EIP-7966 is a Draft, created 11 June 2025.<Cite src="eip-7966" /> This is a moving
+target in a way that [transaction types](/c/tx-type-2-1559) are not.
+
+## Which of your two account kinds gets the fast path
+
+Here is the detail that changes how you use this action. viem's documentation lists the JSON-RPC
+methods for `sendTransactionSync` in two rows: for JSON-RPC accounts, `eth_sendTransaction`; for local
+accounts, `eth_sendRawTransactionSync`.<Cite src="viem-send-transaction-sync" />
+
+Only the second row is EIP-7966.
+
+The source confirms what the first row means. On the JSON-RPC branch viem sends `eth_sendTransaction`
+(or `wallet_sendTransaction` where the wallet supports that namespace), takes the hash back, and calls
+`waitForTransactionReceipt` with `checkReplacement: false`, a polling interval and a
+timeout.<Cite src="viem-send-transaction-sync-source" /> That is broadcast-then-poll — the loop the sync
+action was supposed to remove — performed inside the action instead of in your code. On the
+local-account branch it prepares and signs the transaction, then makes a single
+`eth_sendRawTransactionSync` request and formats the receipt that comes
+back.<Cite src="viem-send-transaction-sync-source" /><Cite src="viem-send-raw-transaction-sync-source" />
+
+So the win is real for a [local account](/c/viem-account-kinds) — a bot, a relayer, a keeper, a test —
+and absent for a browser wallet, where [the key lives somewhere you cannot reach](/c/viem-wallet-client)
+and the wallet decides how the transaction is submitted.<Cite src="viem-jsonrpc-account-doc" /> The call
+site is identical either way: the same asymmetry as the second lesson of this module, in a place where
+nothing in the signature hints at it.
+
+<Misconception
+  belief="writeContractSync and sendTransactionSync use EIP-7966, so the app gets one round trip instead of two."
+  reality="Only for local accounts. With a JSON-RPC account viem sends eth_sendTransaction and then polls for the receipt internally, with replacement detection switched off."
+  why="The action name describes the shape of the promise your code awaits, not the number of RPC calls underneath — and the docs record the split in a two-line JSON-RPC Methods list at the bottom of the page."
+  src="viem-send-transaction-sync"
+/>
+
+<Figure
+  caption="Nothing at the call site distinguishes these two branches, and only one of them is EIP-7966."
+  alt="A single sendTransactionSync call splits on account kind. A local account is signed locally and sent as one eth_sendRawTransactionSync request. A JSON-RPC account is sent as eth_sendTransaction and then polled with waitForTransactionReceipt inside the action. Both return a receipt."
+>
+  <Flow
+    lanes={['one call site', 'account kind', 'on the wire', 'what you await']}
+    nodes={[
+      { id: 'call', label: 'writeContractSync', note: 'one await', col: 0, tone: 'accent' },
+      { id: 'loc', label: 'local account', note: 'the key is in your process', col: 1 },
+      { id: 'rpc', label: 'JSON-RPC account', note: 'the key is in the wallet', col: 1 },
+      { id: 'raw', label: 'eth_sendRawTransactionSync', note: 'EIP-7966, one request', col: 2, tone: 'good' },
+      { id: 'poll', label: 'eth_sendTransaction', note: 'then poll for the receipt', col: 2, tone: 'warn' },
+      { id: 'rec', label: 'a receipt', col: 3 },
+    ]}
+    edges={[
+      { from: 'call', to: 'loc' },
+      { from: 'call', to: 'rpc' },
+      { from: 'loc', to: 'raw' },
+      { from: 'rpc', to: 'poll' },
+      { from: 'raw', to: 'rec' },
+      { from: 'poll', to: 'rec' },
+    ]}
+  />
+</Figure>
+
+## The timeouts, and why one of them is not a failure
+
+Two timeout budgets are in play, and they belong to different parties.
+
+**Yours.** viem's `timeout` parameter is documented with a default of `chain.blockTime * 3`; the source
+computes `Math.max((chain?.blockTime ?? 0) * 3, 5_000)` milliseconds, so there is a five-second floor
+the docs page does not mention.<Cite src="viem-send-transaction-sync" /><Cite src="viem-send-transaction-sync-source" />
+Either way it is short. `waitForTransactionReceipt` defaults to a timeout of 180,000 ms, `retryCount` 6
+and `confirmations` 1.<Cite src="viem-wait-for-transaction-receipt" /> Switching to the sync action
+shortens your patience by more than an order of magnitude, silently.
+
+**The node's.** The EIP says the timeout must be a positive integer not greater than the
+node-configured maximum, recommends a node default of two seconds, and specifies that an invalid value
+means the node uses its own.<Cite src="eip-7966" /> Its reference implementation clamps the caller's
+value to the node maximum.<Cite src="eip-7966" /> Your generous timeout is a request, not a setting.
+
+Neither has any relationship to inclusion. When the node's clock runs out it returns error code 4 with
+a message saying the transaction was added to the mempool but was not processed within the interval —
+and the `data` field carries the transaction hash.<Cite src="eip-7966" /> Read that carefully. The transaction is *in the mempool*. It is live. It
+may be mined a second later. The hash is handed back precisely so you can go on tracking it.
+
+Design for this. A timeout arriving as a thrown error trains developers to write `catch` blocks meaning
+"it failed", when the honest meaning is "not yet", and a UI showing "transaction failed" on a code 4 is
+lying about a transaction the user is about to pay for. Your catch block has to recover the hash and
+fall back to receipt polling — so you did not delete the polling path, you made it conditional.
+
+<Aside kind="warn">
+The JSON-RPC-account branch passes `checkReplacement: false` to
+`waitForTransactionReceipt`.<Cite src="viem-send-transaction-sync-source" /> Replacement detection is
+therefore off on exactly the account kind where replacement happens: a user who opens their wallet and
+hits speed-up or cancel produces
+[a different transaction at the same nonce, with a different hash](/c/tx-replacement-changes-the-hash).
+The asynchronous path has an `onReplaced` callback with reasons `replaced`, `repriced` and `cancelled`
+for this.<Cite src="viem-wait-for-transaction-receipt" /> The sync path does not use it, so a sped-up
+transaction reads as a timeout on a hash that will never appear.
+</Aside>
+
+## Nonce gaps stop being queued and start being refused
+
+One more behaviour changes, and it is the kind that only shows up under concurrency.
+
+`eth_sendRawTransaction` accepts a transaction whose nonce is ahead of the account's next one and holds
+it until the gap fills. EIP-7966 mandates the opposite: the handler must check readiness *before*
+adding the transaction to the mempool, must not add a nonce-gapped one at all, and must return error
+code 6 carrying the expected nonce as a hex string — with no transaction hash, because the transaction
+was never accepted.<Cite src="eip-7966" />
+
+The intent is good — the expected nonce arrives in the error, so you resubmit without a separate
+`eth_getTransactionCount`.<Cite src="eip-7966" /> The consequence is that firing two sync sends
+concurrently from one account is not "both queue up", it is "the second is rejected". Anything relying
+on [nonce ordering](/c/nonce-ordering) to pipeline work needs a serialising queue in front of it, and
+[a nonce gap](/c/nonce-gap) is now a synchronous error rather than a stalled mempool entry.
+
+## `throwOnReceiptRevert` rewires your control flow
+
+The sync actions take a `throwOnReceiptRevert` flag, documented as whether to throw an error if the
+transaction was detected as reverted.<Cite src="viem-write-contract-sync" /> The docs page gives it no
+default; the source does, and it is
+`true`.<Cite src="viem-send-transaction-sync-source" /><Cite src="viem-send-raw-transaction-sync-source" />
+
+That default is a real change of shape. In the asynchronous flow a mined-and-reverted transaction
+resolves normally and you inspect [the receipt's status](/c/tx-receipt-status-zero). Here it lands in
+your `catch` as `TransactionReceiptRevertedError`, beside the transport failures, the timeouts and the
+nonce refusals.<Cite src="viem-send-transaction-sync-source" /><Cite src="viem-errors-glossary" /> The
+triage function from the previous lesson now separates four outcomes arriving through one channel: a
+revert that was mined and charged, a timeout that is still pending, a nonce refusal that never entered
+the mempool, and a transport error. Only the classes tell them apart.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'writeContract, then waitForTransactionReceipt', note: 'two awaits' },
+    { title: 'writeContractSync', note: 'one await', tone: 'warn' },
+  ]}
+  rows={[
+    {
+      label: 'How long does it wait?',
+      cells: [
+        'timeout defaults to 180,000 ms, with retryCount 6',
+        'timeout defaults to the chain block time times three, floored at 5,000 ms',
+      ],
+    },
+    {
+      label: 'What happens when a mined transaction reverted?',
+      cells: [
+        'It resolves, and you read the receipt status',
+        'It throws TransactionReceiptRevertedError; throwOnReceiptRevert defaults to true',
+      ],
+    },
+    {
+      label: 'Does it notice a speed-up or a cancel?',
+      cells: [
+        'Yes — onReplaced, with reasons replaced, repriced and cancelled',
+        'Not on the JSON-RPC branch, which passes checkReplacement false',
+      ],
+    },
+    {
+      label: 'Can you wait for more than one confirmation?',
+      cells: [
+        'Yes — confirmations, which defaults to 1',
+        'No — the sync actions do not take that parameter at all',
+      ],
+    },
+  ]}
+  caption="Nothing in the two-line diff at the top of this lesson mentions any of these."
+  alt="The asynchronous broadcast-then-wait pair compared with viem's synchronous send: the sync action has a far shorter default timeout, throws on a reverted receipt, does not detect replacement on the JSON-RPC branch, and accepts no confirmations parameter."
+/>
+
+None of this replaces simulation. `simulateContract` still throws before the user signs, and the sync
+actions recommend pairing with it in the same "highly recommended" wording as the asynchronous
+ones.<Cite src="viem-write-contract-sync" /><Cite src="viem-simulate-contract" />
+
+## A receipt is inclusion, and inclusion is not finality
+
+The warning in viem's docs names low block times *and* fast finality, and the second half is the one
+that costs money.<Cite src="viem-write-contract-sync" /> A receipt means the transaction is in a block.
+It does not mean that block is permanent — [confirmations are not finality](/c/tx-confirmations-vs-finality),
+and [a reorg](/c/reorg) can unmake it. `waitForTransactionReceipt` at least exposes `confirmations`; the
+sync actions do not take that parameter at
+all.<Cite src="viem-wait-for-transaction-receipt" /><Cite src="viem-send-transaction-sync" />
+
+On an L2 the receipt is typically [a sequencer soft confirmation](/c/soft-confirmation): fast, useful,
+and a weaker claim than it looks, since [the confirmation tiers](/c/tx-l2-confirmation-tiers) are a
+product decision your code has to make explicitly. Collapsing the flow into one await makes it easy to
+build a success screen out of a single unconfirmed block, because no line of code forces you to think
+about it any more.
+
+<Misconception
+  belief="writeContractSync is a strictly better writeContract, so it should be the default."
+  reality="It needs a provider that implements EIP-7966 for the local-account path, it is documented as unsuitable for chains with slow finality, it defaults to a far shorter timeout, and it throws on a reverted receipt."
+  why="Synchronous APIs feel simpler than callbacks and polling, and every one of the differences is a default rather than a required argument, so none of them appears at the call site."
+  src="viem-write-contract-sync"
+/>
+
+## How new this is
+
+Treat the whole surface as young. EIP-7966 is still a Draft.<Cite src="eip-7966" /> Which public
+providers implement `eth_sendRawTransactionSync` on which networks was not established by the research
+behind this curriculum, so support is provider-dependent and must be verified for your endpoint rather
+than assumed — `MethodNotFoundRpcError` is the expected shape of the
+answer.<Cite src="viem-errors-glossary" />
+
+The client side has moved recently too. An issue filed on 23 January 2026 against viem 2.43.5 reported
+the `timeout` parameter being hex-encoded where the EIP specifies an integer, breaking providers that
+took the spec literally; it closed on 23 February
+2026.<Cite src="viem-issue-4263" /><Cite src="eip-7966" /> In the 2.55.19 source the timeout is passed
+as a raw number, so that bug is behind
+you.<Cite src="viem-send-raw-transaction-sync-source" /><Cite src="npm-viem-dist-tags" /> The general
+lesson stands: a spec-conformance defect shipped and lived for a month. Pin your version and read the
+changelog on this action specifically.
+
+<Check type="predict" concept="viem-sync-send">
+A team moves a dapp from `writeContract` plus `waitForTransactionReceipt` to `writeContractSync`. It is
+an L2 with roughly two-second blocks. Within a week they see three reports. For each, say whether the
+switch caused it and what the fix is.
+
+1. Browser users see no latency improvement at all. The team's backend keeper service, on the same
+   code path, got noticeably faster.
+2. Users who hit "speed up" in their wallet see the interface sit at "confirming" and then show an
+   error, even though a block explorer shows their transaction succeeded.
+3. A reverting transaction now shows a generic "something went wrong" instead of the decoded custom
+   error message the old flow displayed.
+
+<Answer>
+**1. Caused by the switch, and working as documented.** Browser users have JSON-RPC accounts, so viem
+sends `eth_sendTransaction` and polls for the receipt internally; only the keeper's local account takes
+the `eth_sendRawTransactionSync` path.<Cite src="viem-send-transaction-sync" /><Cite src="viem-send-transaction-sync-source" />
+There is no client-side fix, because there is no round trip to remove — the wallet owns submission.
+Keep the sync action for the keeper and treat the browser path as unchanged.
+
+**2. Caused by the switch.** The JSON-RPC branch passes `checkReplacement: false`, so a sped-up
+transaction — [a new hash at the same nonce](/c/tx-replacement-changes-the-hash) — is invisible to the
+wait, which times out on a hash that will never get a
+receipt.<Cite src="viem-send-transaction-sync-source" /> The old flow catches this with `onReplaced` and
+its `repriced` reason.<Cite src="viem-wait-for-transaction-receipt" /> Keep
+`waitForTransactionReceipt` on the browser path, where the user has a speed-up button, and reserve the
+sync action for accounts nobody can reach into.
+
+**3. Caused by the switch, and the easiest to fix.** `throwOnReceiptRevert` defaults to `true`, so a
+mined-and-reverted transaction now arrives as a thrown `TransactionReceiptRevertedError` rather than a
+receipt with a failure status.<Cite src="viem-send-transaction-sync-source" /><Cite src="viem-errors-glossary" />
+It fell through to the generic branch of a handler written when reverts came back as return values. Add
+the class to the triage function from the previous lesson.
+
+**The through-line:** each of these is a default that changed when the action name changed. None is
+visible at the call site, and the two lines opening this lesson still look interchangeable.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**This closes the module.** You can now say, for any line of a viem integration, whether it touches the
+network, whether it holds a key, what it does when the node is wrong, and how many round trips it
+really makes. That is the reflection prompt, and it is worth writing out against code you own.
+
+**The transaction-UX module** builds the state machine the sync actions hide: broadcast, pending,
+replaced, dropped, included, reorged, and
+[which of those a product should treat as done](/c/tx-confirmation-policy-is-a-product-decision).
+
+**The wallet-capabilities module** answers what this lesson leaves open — how to find out what a wallet
+or provider supports before you depend on it, rather than discovering it from a
+`MethodNotFoundRpcError` in production.

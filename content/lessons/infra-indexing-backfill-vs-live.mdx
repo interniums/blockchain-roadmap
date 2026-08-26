@@ -1,0 +1,289 @@
+---
+id: infra-indexing-backfill-vs-live
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [ponder-indexing-overview, ponder-docs, sentio-obib, envio-hypersync-overview, alchemy-eth-getlogs, ponder-observability, bilinear-indexing-events]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+Two screenshots of one indexer's dashboard, four hours apart.
+
+The first shows 41,000 events per second, forty parallel workers, CPU pinned, a progress bar at 62%.
+The second shows three events per second, one worker, CPU at idle, no progress bar at all, and a
+single number that matters: *seconds behind head*.
+
+Nothing was reconfigured between them. The indexer crossed from one regime into the other, and the two
+have almost nothing in common — different bottlenecks, failure modes, correctness properties and
+metrics. Ponder's documentation names them as two distinct
+internal modes that fetch data in different ways, while noting that your handler logic is identical
+across both.<Cite src="ponder-indexing-overview" /> The handler being identical is exactly what makes
+the difference easy to miss.
+
+## The two regimes, side by side
+
+<Compare
+  axis=""
+  columns={[
+    { title: 'Backfill', tone: 'accent' },
+    { title: 'Live tail', tone: 'warn' },
+  ]}
+  rows={[
+    { label: 'Input', cells: ['A fixed range of blocks that already exist', 'Blocks that do not exist yet'] },
+    { label: 'Bounded?', cells: [
+      { v: 'Yes — you know the last block', tone: 'good' },
+      { v: 'No — it never ends', tone: 'warn' },
+    ] },
+    { label: 'Deterministic?', cells: [
+      { v: 'Yes, if the fold is', tone: 'good' },
+      { v: 'No: the tail can be rewritten', tone: 'danger' },
+    ] },
+    { label: 'Parallelisable?', cells: [
+      { v: 'Yes, by block range', tone: 'good' },
+      { v: 'No: ordering is the point', tone: 'warn' },
+    ] },
+    { label: 'Bottleneck', cells: ['Data retrieval throughput, then write throughput', 'Arrival latency'] },
+    { label: 'The metric', cells: ['Wall-clock time to completion', 'Distribution of seconds behind head'] },
+    { label: 'Failure mode', cells: [
+      'Slow, or a range that errors loudly',
+      { v: 'Silent: a stall, a gap, or a stale row', tone: 'danger' },
+    ] },
+    { label: 'What a benchmark measures', cells: [
+      { v: 'This one', tone: 'accent' },
+      { v: 'Almost never this one', tone: 'warn' },
+    ] },
+  ]}
+  caption="The two regimes share a handler and nothing else — including the metric that tells you whether either is working."
+  alt="Backfill and live tail held against eight properties: input, boundedness, determinism, parallelisability, bottleneck, metric, failure mode, and what a benchmark measures."
+/>
+
+Everything below is an unpacking of that table.
+
+### Backfill is a throughput problem with a known answer
+
+The blocks are already there. Nothing about them will change. You know the first block, you know the
+last block, and the only question is how fast you can get through them.
+
+Because the range is fixed and the fold is deterministic, backfill parallelises: hand block ranges to
+independent workers, let each one fetch and decode, and reconcile at the end. Restartability comes from
+the same property: a framework that crashes mid-backfill can roll back its unfinalized changes and
+resume from the finalized block, because replaying the range is guaranteed to reproduce the same
+rows.<Cite src="ponder-indexing-overview" /> The constraints are the
+ones you already priced in the RPC module — [the range and response-size caps on log
+queries](/c/getlogs-is-the-cost-driver), which providers publish per plan and per chain along with a
+hard ceiling on response size,<Cite src="alchemy-eth-getlogs" /> and
+[the two independent rate-limit axes](/c/rate-limit-two-axes). Parallel backfill workers press on the
+concurrency axis, not the volume axis, which is why adding workers turns a slow backfill into a
+429-storm rather than a fast one.
+
+This is also the regime that the entire alternative-data-source argument is about. Envio's HyperSync
+exists because bulk historical retrieval over a request-response protocol designed for point queries
+is the wrong shape; its documentation describes scans that take hours or days over RPC completing in
+seconds on the workloads it benchmarks.<Cite src="envio-hypersync-overview" /> Whatever you make of
+the multipliers — the next module takes them apart — the *category* of the claim is a backfill claim.
+It says nothing about the second screenshot.
+
+How much of backfill is retrieval rather than transformation? The open benchmark ran three workloads
+against Envio's raw extraction engine as well as against full indexers: 3.19 seconds for 100,001
+blocks, 128.64 seconds for roughly 1.7 million transactions, 33.84 seconds for 50,191
+traces.<Cite src="sentio-obib" /> Those are not indexer times — raw data still has to be decoded,
+transformed, stored and served<Cite src="sentio-obib" /> — but the gap to the full-indexer times on
+the same workloads shows how the total splits.
+
+### Live tail is a latency problem with a rewritable input
+
+Now the range is unbounded and the blocks arrive one at a time, roughly on the chain's cadence. You
+cannot go faster than the chain produces blocks, so throughput has stopped being interesting. Three
+other things start being interesting instead.
+
+**Ordering.** A fold is order-dependent, and you cannot process block N+1 before block N and reconcile
+later, because the intermediate states are what your product reads. The parallelism that made backfill
+fast is unavailable by construction.
+
+**Rewritability.** The blocks you are consuming are at the tip, and the tip is exactly the part of the
+chain that gets replaced. Every row written in this regime is provisional. The next lesson is about
+what that costs.
+
+**Silence.** A backfill that fails usually fails loudly — a range errors, a worker crashes, the
+progress bar stops. That benchmark ran with a 72-hour timeout per test and still recorded one platform
+reaching 2.5% of a transactions workload after two hours before being stopped<Cite src="sentio-obib" /> —
+a failure that is unmistakable precisely because the job was supposed to end. A live tail fails by continuing to look healthy. The process is up. The
+`/health` endpoint returns 200. Ponder ships a separate status endpoint and metrics precisely because
+process liveness is not indexing liveness,<Cite src="ponder-observability" /> and its dev logs mark the
+transition into backfill explicitly rather than leaving you to infer
+it.<Cite src="ponder-docs" />
+
+<Misconception
+  belief="Live tail is just backfill over a very small range, so an indexer that backfills fast will tail fast."
+  reality="They are different problems. Backfill is bounded, deterministic and parallel, and its metric is total time. Live tail is unbounded, order-serialised and reading a rewritable input, and its metric is the distribution of lag. A platform can be excellent at one and mediocre at the other, and the published numbers only cover the first."
+  why="Both are 'the indexer reading blocks', and the handler code is byte-identical between them, so nothing in the developer's experience marks the boundary."
+  src="ponder-indexing-overview"
+/>
+
+### The handoff is a moving target
+
+There is a third thing worth naming, which is neither regime but the seam between them.
+
+Backfill is defined against an endpoint — "catch up to block N". But by the time you reach N the chain
+is at N plus several thousand, because it kept producing while you worked. Catching up is therefore a
+sequence of shrinking passes that converges. An indexer processing ten thousand blocks per minute
+closes the gap quickly; one at eight hundred closes it slowly; one processing fewer blocks per minute
+than the chain produces **never closes it at all**, while its progress bar approaches a target that is
+running away from it.
+
+<Figure
+  caption="The gap closes only if each pass is shorter than the last; nothing in the loop guarantees that."
+  alt="Backfill runs to a target block, the chain has already moved past it, and the indexer takes another shorter pass. It enters live tail only when its sustained processing rate beats block production."
+>
+  <Flow
+    nodes={[
+      { id: 'pass', label: 'backfill pass', note: 'a fixed range', col: 0, tone: 'accent' },
+      { id: 'reach', label: 'reach block N', col: 1 },
+      { id: 'moved', label: 'chain is at N+k', note: 'it kept producing', col: 2, tone: 'warn' },
+      { id: 'tail', label: 'live tail', note: 'seconds behind head', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'pass', to: 'reach' },
+      { from: 'reach', to: 'moved' },
+      { from: 'moved', to: 'tail', label: 'rate beats block production', tone: 'good' },
+      { from: 'moved', to: 'pass', label: 'another, shorter pass', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+That case is not hypothetical for expensive folds on high-throughput chains, and it makes "how long is
+the backfill" the wrong question. The right one is "what is my sustained blocks-per-minute, and is it
+comfortably above the chain's block production rate" — which decides whether the two regimes are
+connected by a bridge or by a gap that never closes.
+
+<Misconception
+  belief="When the backfill progress bar reaches 100%, the indexer is caught up and the hard part is over."
+  reality="Reaching the target block means reaching a target that has moved. What you actually need is a sustained processing rate above the chain's block production rate, which is a different quantity and the one that determines whether the indexer ever enters live tail at all."
+  why="Progress bars are drawn against a fixed denominator because that is the only way to draw one, and the denominator of this job is not fixed."
+  src="ponder-indexing-overview"
+/>
+
+## Why every benchmark measures the first one
+
+This is not vendor dishonesty. It is a property of what can be measured.
+
+Look at how the one open indexer benchmark with published configurations defines its work. Every case
+is a fixed historical block range with an expected record count attached: events over blocks 0 to
+22,200,000 expecting 294,278 records; events with contract reads over blocks 22,400,000 to 22,500,000
+expecting 7,634; blocks 0 to 100,000 expecting 100,001; transactions over a 10,000-block range
+expecting 1,696,641; traces over a 90,000-block range expecting 50,191; factory templates over a
+10,000-block range expecting 35,039.<Cite src="sentio-obib" />
+
+Each of those has a start, an end, and a right answer. You can run it, time it, and verify
+completeness. Live tail has none of those things. It has no end, so "how long did it take" is not
+defined; the correct answer changes while you measure it; and any number you produce is a property of
+the chain's block time and your network path as much as of the platform.
+
+So the honest reading of any indexer performance claim is: **this is a statement about catching up.**
+It may correlate with keeping up. It is not a measurement of it.
+
+### What to measure for the regime nobody benchmarks
+
+If you want a number for live tail, you have to define it yourself. Three that are worth wiring in:
+
+**Lag, as a distribution.** Not "seconds behind head" as a single gauge, but its p50, p95 and p99 over
+a window. A tail that is usually current and periodically twelve minutes behind is a different product
+from one steadily forty seconds behind, and a mean hides the difference
+completely.<Cite src="ponder-observability" />
+
+**Contiguity.** Assert that the set of ingested block numbers has no holes in the ingested range. This
+is a query you schedule, not a dashboard you look at — a healthy pipeline returns zero rows, and an
+injected gap returns the gap. A
+subscription that dropped and reconnected past a gap looks identical to a healthy one from every other
+angle — a practitioner write-up on exactly this pipeline shape makes the point that "the process is
+running" is the default health check and the wrong one.<Cite src="bilinear-indexing-events" /> The same
+write-up covers the related tradeoff of deliberately indexing some distance behind the
+head.<Cite src="bilinear-indexing-events" />
+
+**Handler duration at the tail.** In backfill, a handler that takes 40ms is a throughput cost you
+amortise. In live tail, a handler that takes longer than the block time is a lag generator that
+compounds — it can never catch up, only fall further behind, and it will look fine for hours before
+the lag becomes visible.
+
+## Worked example: deciding whether backfill speed is on your critical path
+
+The previous lesson established the real reason backfill duration matters: a change to the fold's
+logic requires replaying the fold, so backfill time is the deploy latency of every data-model change.
+Here is how to turn that into a number before you choose anything.
+
+**Subgoal — establish the size of the replay, not the size of the chain.** Count blocks from your
+contract's deployment block to head, not from genesis — the tutorial that set `startBlock: 0` made the
+chain's full history relevant for no reason. For scale, the benchmark's events case spans blocks 0 to
+22,200,000 for 294,278 records; yours is almost certainly a narrower range at a higher event
+density.<Cite src="sentio-obib" />
+
+**Subgoal — establish the frequency of replay, a property of your team and not your chain.** Count the
+last quarter's tickets that would have changed a handler, a derived field or an entity's shape. Active
+development produces several a month; maintenance produces one or two a year. That number multiplies
+everything else.
+
+**Subgoal — convert to release latency and check it against how you ship.** Multiply estimated backfill
+duration by replay frequency. Four hours, six times a quarter, is an annoyance you absorb. Four *days*,
+six times a quarter, is not a performance issue — it is a constraint that will reshape your
+architecture, because engineers start avoiding the change rather than paying for it.
+
+**Subgoal — name what the workaround costs, because the workaround is what actually happens.** When
+replay is too expensive, teams compute the field in application code, run a second pipeline, or patch
+rows by hand — each of which splits one fold into two sources of truth that will disagree. The cost of
+slow backfill is rarely a slow release; it is the divergence you get from avoiding one.
+
+**Subgoal — only now, look at platform numbers.** With replay frequency in hand, six minutes versus
+thirty-five on a benchmark is usually noise; twenty minutes versus two hours might not be. And a
+platform that *cannot run your workload at all* is not slow at it — a distinction the next module
+makes with data.<Cite src="sentio-obib" />
+
+<Check type="predict" concept="backfill-vs-live">
+A team's indexer backfilled 5 million blocks in ninety minutes and has been tailing the head for three
+weeks with no alerts. They add a handler that, for each `Swap` event, fetches the pool's current
+reserves with a contract read and writes a derived price.
+
+They re-run the backfill: it now takes eleven hours, which they accept as a one-off. It completes, the
+indexer switches to live tail, and the dashboard is green.
+
+Predict what happens next, and name the metric that would have shown it.
+
+<Answer>
+**The dashboard being green is the prediction to distrust.** Two things are likely happening, and
+neither of them raises an error.
+
+**The lag grows, slowly, forever.** The handler now does a network round trip per `Swap`. In backfill
+that round trip is amortised across parallel workers and shows up as an eleven-hour total — annoying,
+finite, done. In live tail there is one ordered consumer, and if the per-event cost times the events
+per block exceeds the block time, the indexer can no longer keep pace. It does not fail; it falls
+behind at a constant rate. Twenty seconds of lag on day one is four hours of lag on day thirty, and
+nothing in the process's health signals changes. The metric is **lag as a distribution over time** —
+and specifically its *trend*, because a single gauge read on a good day tells you nothing about a
+number that is monotonically increasing.
+
+**The derived price may also be wrong.** "Fetches the pool's current reserves" is the determinism
+violation from the first lesson of this module. If the read is not pinned to the event's block, during
+backfill it resolves against the head at the moment of indexing, so the eleven-hour run wrote prices
+sampled at wall-clock-now rather than at each swap. In live tail the two happen to nearly coincide,
+which is why the bug will look like "historical data is weird and recent data is fine" — the most
+misleading symptom shape there is.
+
+**What they should have done differently.** Declared the call rather than making it inside the
+handler, so the runtime can prefetch and batch it per block instead of issuing it per event — the
+mechanism from the previous lesson. That addresses the throughput cost. It does not address the
+pinning bug, which is a separate decision the handler has to make explicitly.
+
+**And the general lesson.** A change that multiplies backfill time by seven did not simply make the
+indexer "slower". It changed which regime the indexer is capable of surviving. Backfill absorbed the
+cost by parallelising; live tail cannot, because it has nothing to parallelise over.
+</Answer>
+</Check>
+
+## Where this goes
+
+You now have the two regimes separated, which is the prerequisite for reading any performance claim in
+this field without being misled by it.
+
+The next lesson stays in the second regime and takes its defining property seriously. Live tail
+consumes blocks that can be replaced — and the failure that causes is the one thing in indexing that
+corrupts data without raising anything at all.

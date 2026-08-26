@@ -1,0 +1,510 @@
+---
+id: solidity-language-core-reading-a-diamond
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [solidity-docs-contracts, solidity-docs-storage-layout, solidity-changelog, solidity-0836-release, python-mro-howto, c3-linearization-paper, oz-erc20-pausable-source, oz-erc20-votes-source, oz-erc20-permit-source]
+stack: { solidity: "0.8.36" }
+---
+
+This is roughly what a token looks like when you ask OpenZeppelin's wizard for pausing and
+governance:
+
+```solidity
+contract MyToken is ERC20, ERC20Pausable, ERC20Votes {
+    function _update(address from, address to, uint256 value)
+        internal
+        override(ERC20, ERC20Pausable, ERC20Votes)
+    {
+        super._update(from, to, value);
+    }
+}
+```
+
+One line in the body. Three names in the `override` list. Now answer a question that decides whether
+this contract is correct: **when a transfer happens, in what order do those three `_update`
+implementations run?**
+
+Most readers answer `ERC20` first — it is listed first, and it is the one that actually moves the
+balances. The real order is `ERC20Votes`, then `ERC20Pausable`, then `ERC20`. The balances move
+*last*, and the pause check runs *after* the voting-power bookkeeping has been entered but *before*
+it completes.
+
+Getting that backwards is not a matter of style. It decides whether the pause check protects the
+transfer, and it decides which contract sees which intermediate state. This lesson is the algorithm
+that produces the answer, run by hand, twice.
+
+## Inheritance is flattening, not composition
+
+Two sentences from the docs set the frame, and both matter more than they look.
+
+> When a contract inherits from other contracts, only a single contract is created on the
+> blockchain, and the code from all the base contracts is compiled into the created contract. This
+> means that all internal calls to functions of base contracts also just use internal function calls
+> (`super.f(..)` will use `JUMP` and not a message call).<Cite src="solidity-docs-contracts" />
+
+So there is no runtime dispatch table and no vtable lookup at execution time. Everything you are
+about to compute happens at compile time, and what ships is one flat contract in which every
+resolved call is already a jump target. Inheritance in Solidity is a source-level operation whose
+entire output is a single bytecode blob.
+
+> Polymorphism means that a function call (internal and external) always executes the function of
+> the same name (and parameter types) in the most derived contract in the inheritance hierarchy.
+> This has to be explicitly enabled on each function in the hierarchy using the `virtual` and
+> `override` keywords.<Cite src="solidity-docs-contracts" />
+
+"Most derived" is doing all the work in that sentence, and it is exactly the thing C3 linearisation
+computes.
+
+## The base list is an ordering, and it runs the other way
+
+Here is the rule that readers get backwards, in the documentation's own words:
+
+> Solidity is similar to Python in that it uses C3 Linearization to force a specific order in the
+> directed acyclic graph (DAG) of base classes. [...] Especially, the order in which the base classes
+> are given in the `is` directive is important: You have to list the direct base contracts in the
+> order from "most base-like" to "most derived". Note that this order is the reverse of the one used
+> in Python.<Cite src="solidity-docs-contracts" />
+
+And the operational restatement, which is the one to memorise:
+
+> when a function is called that is defined multiple times in different contracts, the given bases
+> are searched from **right to left** (left to right in Python) in a depth-first manner, stopping at
+> the first match. If a base contract has already been searched, it is
+> skipped.<Cite src="solidity-docs-contracts" />
+
+So in `contract C is A, B`, the *rightmost* base is the most derived, and lookup starts there. Every
+language most engineers arrive from treats the base list either as an unordered set or as
+most-important-first. Solidity treats it as least-important-first. That single inversion is the
+source of nearly every wrong answer about a Solidity diamond.
+
+<Misconception
+  belief="You list base contracts in `is A, B` in whatever order reads nicely; the order is a style choice."
+  reality="The order is semantic. Bases run from most base-like to most derived, left to right — the reverse of Python — and lookup searches them right to left. A wrong order either changes which implementation wins or produces the error 'Linearization of inheritance graph impossible'."
+  why="Most languages with multiple inheritance or interface lists treat the list as unordered, or order it most-specific-first. The Solidity convention is the opposite of the one Python established, and Python is the language its own documentation compares it to — so even readers who know C3 tend to apply it with the list the wrong way round."
+  src="solidity-docs-contracts"
+/>
+
+## C3, run by hand
+
+C3 came out of the Dylan community as a fix for non-monotonic linearisation, and gives "the desirable
+property of monotonicity" while disallowing some inheritance
+graphs.<Cite src="c3-linearization-paper" /><Cite src="solidity-docs-contracts" /> The rule is short
+enough to apply on paper. In Python's notation, where `L` is the linearisation of a class:
+
+```text
+  L[C(B1 ... BN)] = C + merge( L[B1] ... L[BN], [B1 ... BN] )
+```
+
+"the linearization of C is the sum of C plus the merge of the linearizations of the parents and the
+list of the parents."<Cite src="python-mro-howto" />
+
+And `merge` is a loop with one rule:
+
+```text
+  take the head of the first list; if that head does not appear in the TAIL of any
+  other list, append it to the result and remove it from every list.
+  Otherwise try the head of the next list. Repeat until all lists are empty,
+  or until no good head exists — in which case no linearisation exists.
+```
+
+That is the documented prescription, with "tail" meaning everything after the first
+element.<Cite src="python-mro-howto" />
+
+**The one adaptation for Solidity: reverse the base list before you start.** Solidity writes bases
+most-base-like first; the formula above expects them most-derived first. So `contract C is A, B`
+enters the formula as if it were `class C(B, A)`.<Cite src="solidity-docs-contracts" />
+
+### Worked example: the classic diamond
+
+```solidity
+contract X { function foo() public virtual { /* X */ } }
+contract A is X { function foo() public virtual override { /* A */ } }
+contract B is X { function foo() public virtual override { /* B */ } }
+contract C is A, B { function foo() public override(A, B) { super.foo(); } }
+```
+
+<Figure
+  caption="Two paths reach X, which is the only reason an algorithm is needed — a single chain would resolve itself."
+  alt="An inheritance graph with C at the top deriving from A and B, both of which derive from the same contract X. A is listed first in C's base clause and B last, making B the more derived of the two."
+>
+  <Tree
+    root={{
+      label: 'C',
+      note: 'is A, B',
+      tone: 'accent',
+      children: [
+        { label: 'A', note: 'listed first', children: [{ label: 'X', tone: 'muted' }] },
+        {
+          label: 'B',
+          note: 'listed last, so more derived',
+          children: [{ label: 'X', note: 'one contract, two paths', tone: 'muted', dashed: true }],
+        },
+      ],
+    }}
+  />
+</Figure>
+
+**Subgoal 1 — translate each base list into formula order.** Reverse every `is` clause. `A is X`
+becomes `A(X)`; `B is X` becomes `B(X)`; `C is A, B` becomes `C(B, A)`. This step is where the wrong
+answers are prevented, so do it explicitly and in writing.
+
+**Subgoal 2 — linearise the leaves, which is trivial.**
+
+```text
+  L[X] = [X]
+```
+
+**Subgoal 3 — linearise the middle layer.**
+
+```text
+  L[A] = A + merge( L[X], [X] ) = A + merge( [X], [X] ) = [A, X]
+  L[B] = B + merge( L[X], [X] ) = [B, X]
+```
+
+**Subgoal 4 — run the merge for C, one head at a time.** This is the only step with any content.
+
+```text
+  L[C] = C + merge( L[B], L[A], [B, A] )
+       = C + merge( [B, X], [A, X], [B, A] )
+
+  head B  — appears in the tail of [A, X]? no. of [B, A]? tail is [A], no.  TAKE B
+           remaining: merge( [X], [A, X], [A] )
+  head X  — appears in the tail of [A, X]? tail is [X].  YES → skip this list
+  head A  — (from [A, X]) in the tail of [X]? no. of [A]? tail is empty, no.  TAKE A
+           remaining: merge( [X], [X], [] )
+  head X  — no tails contain it.  TAKE X
+
+  L[C] = [C, B, A, X]
+```
+
+<Figure
+  caption="super is a position in this list, not a reference to a parent — which is why moving a name in the is clause moves the call."
+  alt="The resolved chain for C: C's foo calls B's, which calls A's, which calls X's, the end of the chain."
+>
+  <Flow
+    nodes={[
+      { id: 'c', label: 'C.foo()', note: 'the entry point', col: 0, tone: 'accent' },
+      { id: 'b', label: 'B.foo()', col: 1 },
+      { id: 'a', label: 'A.foo()', col: 2 },
+      { id: 'x', label: 'X.foo()', note: 'end of the chain', col: 3 },
+    ]}
+    edges={[
+      { from: 'c', to: 'b', label: 'super' },
+      { from: 'b', to: 'a', label: 'super' },
+      { from: 'a', to: 'x', label: 'super' },
+    ]}
+  />
+</Figure>
+
+**Subgoal 5 — read the answer off the list.** The linearisation is most-derived first, so:
+
+- `C.foo()` runs C's implementation.
+- `super.foo()` inside C runs **B's**, not A's.
+- `super.foo()` inside B runs A's.
+- `super.foo()` inside A runs X's.
+
+**Subgoal 6 — cross-check against the documented shortcut, because you should never trust one
+derivation.** The docs say bases are searched right to left, depth first, skipping anything already
+searched.<Cite src="solidity-docs-contracts" /> For `C is A, B` that is: B first (and B's own base X,
+except X gets deferred because A still needs to come before it), then A, then X. Same answer, arrived
+at without the merge. Use the shortcut for reading code and the merge for anything you intend to
+argue about.
+
+**Subgoal 7 — flip the list and watch the answer move.** Change the declaration to
+`contract C is B, A`. Formula order becomes `C(A, B)`:
+
+```text
+  L[C] = C + merge( [A, X], [B, X], [A, B] ) = [C, A, B, X]
+```
+
+Same four contracts, same graph, same `super.foo()` in the body — and now `super.foo()` from C runs
+A's implementation. **The base list is the program.**
+
+**Subgoal 8 — find the order that does not exist.** The documentation's own failing case:
+
+```solidity
+contract X {}
+contract A is X {}
+contract C is A, X {}   // Linearization of inheritance graph impossible
+```
+
+Formula order is `C(X, A)`:
+
+```text
+  merge( [X], [A, X], [X, A] )
+  head X — in the tail of [A, X]? tail is [X].  YES → skip
+  head A — in the tail of [X, A]? tail is [A].  YES → skip
+  head X — already rejected.  No good head exists.
+```
+
+The docs give the same conclusion in words: `C` requests `X` to override `A` by listing them in that
+order, while `A` itself requests to override `X`, "which is a contradiction that cannot be
+resolved."<Cite src="solidity-docs-contracts" /> Writing `contract C is X, A` linearises fine — and
+that is the version you almost always meant, because it lists the most base-like contract first.
+
+<Aside kind="note">
+When you need one specific implementation rather than "the next one along", the language has a
+second form. You can call up the hierarchy "by explicitly specifying the contract using
+`ContractName.functionName()`", or use `super.functionName()` "if you want to call the function one
+level higher up in the flattened inheritance hierarchy."<Cite src="solidity-docs-contracts" />
+`A.foo()` is a fixed target chosen at compile time. `super.foo()` is a position in the linearisation,
+and it moves when the base list moves.
+</Aside>
+
+## Back to the token
+
+Now the opening example, with the same procedure. In OpenZeppelin 5.7.0, `ERC20Pausable` is declared
+`is ERC20, Pausable` and overrides `_update` with a `whenNotPaused` modifier before calling
+`super._update`; `ERC20Votes` is declared `is ERC20, Votes` and overrides `_update` by calling
+`super._update` first and then transferring voting
+units.<Cite src="oz-erc20-pausable-source" /><Cite src="oz-erc20-votes-source" />
+
+Formula order for `MyToken is ERC20, ERC20Pausable, ERC20Votes` is `MyToken(ERC20Votes,
+ERC20Pausable, ERC20)`, and running the merge over that graph gives:
+
+```text
+  L[MyToken] = [MyToken, ERC20Votes, Votes, ERC20Pausable, Pausable, ERC20]
+```
+
+So the `super._update` chain, and the actual order of effects during a transfer:
+
+<Figure
+  caption="Only the innermost frame moves a balance; everything above it is a wrapper entered before that frame and finished after it."
+  alt="The super chain for a transfer: MyToken's _update calls ERC20Votes's, which calls ERC20Pausable's, where the whenNotPaused check runs, which calls ERC20's, where balances move. Control then returns into ERC20Votes for the supply cap check and the voting-unit transfer."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'mt', label: 'MyToken._update', note: 'one line: super', col: 0, tone: 'accent' },
+      { id: 'votes', label: 'ERC20Votes._update', note: 'Votes defines no _update', col: 1 },
+      { id: 'paused', label: 'ERC20Pausable._update', note: 'whenNotPaused checks here', col: 2, tone: 'warn' },
+      { id: 'erc20', label: 'ERC20._update', note: 'balances move here', col: 3, tone: 'accent' },
+      { id: 'back', label: 'back in ERC20Votes', note: 'supply cap, then voting units', col: 4, tone: 'muted' },
+    ]}
+    edges={[
+      { from: 'mt', to: 'votes', label: 'super' },
+      { from: 'votes', to: 'paused', label: 'super' },
+      { from: 'paused', to: 'erc20', label: 'super' },
+      { from: 'erc20', to: 'back', label: 'returns', tone: 'muted', dashed: true },
+    ]}
+  />
+</Figure>
+
+Three things fall out that the source text does not show:
+
+**The pause check runs before the balance change, but after entering `ERC20Votes`.** It is a
+precondition of the modifier, which is a precondition of `ERC20Pausable`'s body — the splice model
+from the previous lesson, one layer inside the linearisation.
+
+**`ERC20` runs last even though it is listed first.** That is the whole inversion, in production code
+people copy without reading.
+
+**Reordering the base list would silently reorder the effects.** If `ERC20Votes` came before
+`ERC20Pausable` in the `is` clause, the pause check would run outside the voting-unit accounting
+instead of inside it. The compiler would accept both.
+
+## virtual, override, and when you must name names
+
+The keyword rules are short, and each one exists to stop a specific ambiguity.<Cite src="solidity-docs-contracts" />
+
+- **A function is overridable only if marked `virtual`**, and the overriding function must be marked
+  `override`.
+- **Overriding may tighten and never loosen.** Visibility may change only from `external` to
+  `public`; mutability may go non-payable → `view` → `pure`, and `payable` cannot change at all.
+- **If a function is inherited from more than one base without a unique most-derived
+  implementation, you must override it explicitly and name every base**: `override(Base1, Base2)`.
+  That is the `override(ERC20, ERC20Pausable, ERC20Votes)` in the opening snippet — not decoration,
+  but the compiler forcing you to acknowledge the ambiguity. The same shape shows up wherever two
+  unrelated bases declare one name: OpenZeppelin's `ERC20Permit` inherits `nonces` from both
+  `IERC20Permit` and `Nonces`, and so declares it
+  `override(IERC20Permit, Nonces)`.<Cite src="oz-erc20-permit-source" />
+- **The exemption:** you do not have to override if the function comes from a common base that is
+  part of all override paths and no path re-mentions it. `contract D is B, C` where both `B` and `C`
+  derive from `A` and neither redefines `A.f` needs no override at all.
+- **`private` functions cannot be `virtual`.** They are invisible to derived contracts, so there is
+  nothing to override.
+- **Functions without an implementation must be `virtual` outside interfaces. In interfaces, all
+  functions are automatically virtual.**
+- **Since Solidity 0.8.8 the `override` keyword is not required when overriding an interface
+  function**, except when the function is defined in multiple bases.
+- **Public state variables can override external functions** when the types match the generated
+  getter — but they themselves cannot be overridden.
+
+<Aside kind="warn">
+A correctness note about the compiler itself, because it lands exactly here. Solidity **0.8.36**
+(9 July 2026) fixed an unintentional reversal of the `linearizedBaseContracts` annotation in
+`PostTypeContractLevelChecker`, triggered when emitting a warning about a storage layout base slot
+being too close to the end of storage. The changelog states the reversal "would affect analysis and
+code generation dependent on the inheritance
+order."<Cite src="solidity-changelog" /><Cite src="solidity-0836-release" />
+
+The changelog records the fix, not the introduction, so the exact window is not established from a
+primary source — treat any specific "affected from version X" claim you meet with suspicion. What
+*is* established is the earliest it could have existed: the feature whose warning triggers it,
+relocating contract storage to an arbitrary base slot, landed in 0.8.29 on 12 March
+2025.<Cite src="solidity-changelog" /> If you use custom storage layout on anything older than
+0.8.36, that is a reason to move.
+</Aside>
+
+## Constructors ignore the order you wrote
+
+The inheritance clause lets you pass base constructor arguments, and the syntax makes it look like a
+call sequence. It is not one.
+
+> The constructors will always be executed in the linearized order, regardless of the order in which
+> their arguments are provided in the inheriting contract's
+> constructor.<Cite src="solidity-docs-contracts" />
+
+The documentation's three-way example makes this unmissable:<Cite src="solidity-docs-contracts" />
+
+```solidity
+// executes Base1, Base2, Derived1
+contract Derived1 is Base1, Base2 { constructor() Base1() Base2() {} }
+
+// executes Base2, Base1, Derived2
+contract Derived2 is Base2, Base1 { constructor() Base2() Base1() {} }
+
+// STILL executes Base2, Base1, Derived3
+contract Derived3 is Base2, Base1 { constructor() Base1() Base2() {} }
+```
+
+`Derived3` is the whole lesson. The argument list says `Base1()` before `Base2()`, and `Base1`'s
+constructor runs second. Base constructors run in linearised order — which, since the linearisation
+is most-derived first and construction proceeds base-ward first, means the *leftmost* base in the
+`is` clause runs first.
+
+If one base's constructor depends on state another base's constructor sets, the `is` clause decides
+whether that dependency is satisfied, and the argument list has no say.
+
+<Misconception
+  belief="Base constructors run in the order you supply their arguments in the derived constructor."
+  reality="They always run in linearised order, determined by the `is` clause. The argument list only says which values go where."
+  why="`constructor() Base1(x) Base2(y) {}` is syntactically identical to a modifier invocation list, and modifier invocation lists DO execute in the order presented. Two adjacent features in the same grammatical position, with opposite ordering semantics."
+  src="solidity-docs-contracts"
+/>
+
+Two mechanical details that come with it: arguments may be given either in the inheritance list or
+modifier-style in the derived constructor, and "specifying arguments in both places is an error"; and
+a contract that does not supply arguments for all of its bases "must be declared
+abstract".<Cite src="solidity-docs-contracts" />
+
+## The consequence nobody expects: storage layout
+
+One more thing the linearisation decides, and it is the one with the longest blast radius.
+
+> For contracts that use inheritance, the ordering of state variables is determined by the
+> C3-linearized order of contracts starting with the most base-ward contract. If allowed by the above
+> rules, state variables from different contracts do share the same storage
+> slot.<Cite src="solidity-docs-storage-layout" />
+
+So the `is` clause does not only decide which function body wins. It decides which slot every
+inherited state variable occupies. Reordering two base contracts in a declaration — a change that
+looks like a lint fix — permutes the storage layout of the deployed contract.
+
+For a fresh deployment that is invisible. Behind a proxy, where a new implementation must agree with
+the existing storage, it is a state-corruption bug introduced by editing a single line of an
+inheritance clause. That is why the upgrade tooling in the next module cares about base ordering at
+all, and why "we just reordered the imports" is not a safe changelog entry for an upgradeable
+contract.
+
+<Check type="predict" concept="sol-c3-linearisation">
+Four contracts. Each `log()` appends its own letter to a string and, where it can, calls
+`super.log()` first.
+
+```solidity
+contract Base    { function log() public virtual { _append("Base"); } }
+contract Audited is Base { function log() public virtual override { super.log(); _append("Audited"); } }
+contract Paused  is Base { function log() public virtual override { super.log(); _append("Paused"); } }
+
+contract Vault is Audited, Paused {
+    function log() public override(Audited, Paused) { super.log(); _append("Vault"); }
+}
+```
+
+1. Compute the linearisation of `Vault` and give the exact output string.
+2. The team wants `Paused` to be the outermost of the two bases — entered first, finishing last. A
+   reviewer proposes rewriting the declaration as `contract Vault is Paused, Audited` so the pause
+   guard "comes first". Does that achieve it? Give the resulting output either way.
+3. Someone proposes `contract Vault is Audited, Base`. What happens?
+
+<Answer>
+**1 — Reverse the base list, then merge.** `Vault is Audited, Paused` enters the formula as
+`Vault(Paused, Audited)`.<Cite src="solidity-docs-contracts" />
+
+```text
+  L[Base]    = [Base]
+  L[Audited] = [Audited, Base]
+  L[Paused]  = [Paused, Base]
+
+  L[Vault] = Vault + merge( [Paused, Base], [Audited, Base], [Paused, Audited] )
+    head Paused  — in no other list's tail.  TAKE
+    head Base    — in the tail of [Audited, Base].  skip
+    head Audited — in no tail.  TAKE
+    head Base    — nothing left blocking it.  TAKE
+
+  L[Vault] = [Vault, Paused, Audited, Base]
+```
+
+Execution starts at `Vault.log()`, which calls `super.log()` **before** appending. So the calls
+descend `Vault → Paused → Audited → Base`, and the appends unwind in the reverse order:
+
+**`"BaseAuditedPausedVault"`.**
+
+Note that `Base` appears exactly once even though both `Audited` and `Paused` derive from it. That is
+the "if a base contract has already been searched, it is skipped" clause, and it is why the diamond
+does not double-append.<Cite src="solidity-docs-contracts" />
+
+**2 — They already have it, and the "obvious fix" would break it.** In `L[Vault] = [Vault, Paused,
+Audited, Base]`, `Paused` sits immediately after `Vault`, so `Paused` is the first base entered and
+the last to finish — it wraps everything. The declaration that produces that is the one they wrote:
+`is Audited, Paused`, with `Paused` **rightmost**, because the rightmost base is the most
+derived.<Cite src="solidity-docs-contracts" />
+
+The intuitive move is to promote the important guard to the front of the list. Do that — write
+`contract Vault is Paused, Audited` — and the formula order becomes `Vault(Audited, Paused)`,
+linearising to `[Vault, Audited, Paused, Base]`. Now the calls descend `Vault → Audited → Paused →
+Base`, the output becomes **`"BasePausedAuditedVault"`**, and `Paused` has moved to be the innermost
+of the two, wrapping the least work rather than the most.
+
+That is the whole trap in one edit: "first in the list" and "first to run" are opposites here, and
+the change compiles either way.
+
+**3 — It fails to compile: "Linearization of inheritance graph impossible."** `Vault is Audited,
+Base` asserts that `Base` is more derived than `Audited`, while `Audited is Base` asserts the
+reverse.<Cite src="solidity-docs-contracts" /> Running the merge:
+
+```text
+  merge( [Base], [Audited, Base], [Base, Audited] )
+  head Base    — in the tail of [Audited, Base].  skip
+  head Audited — in the tail of [Base, Audited].  skip
+  no good head → no linearisation
+```
+
+The fix is `contract Vault is Base, Audited`, which is redundant but legal, or dropping the
+redundant base entirely: `contract Vault is Audited`.
+
+**The habit worth keeping:** whenever a contract lists more than one base, write the reversed list in
+the margin before reasoning about anything. Every mistake in this exercise is available only to
+someone who skipped that step.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Interfaces and abstract contracts** is the next lesson, and it is a narrowing of this one: an
+interface is the shape of an inheritance parent with everything that could carry state or behaviour
+removed.
+
+**OpenZeppelin's whole design** depends on the reader being fluent here. The `override(A, B, C)`
+lists and the `super._update` chains in its extensions are not boilerplate to copy — they are the
+mechanism, and a wrong base order produces a contract that compiles and misbehaves.
+
+**Proxies and upgradeability** inherit the storage-layout consequence directly. An upgrade that
+reorders base contracts changes slot assignments, and slots are the only thing the proxy and the
+implementation agree about.
+
+**Reading unfamiliar protocol code** gets faster. When a function you care about is defined in four
+places, you no longer read all four hoping to spot the winner — you reverse the base list, merge, and
+read the one that matters.

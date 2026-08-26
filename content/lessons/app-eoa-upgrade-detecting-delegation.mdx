@@ -1,0 +1,386 @@
+---
+id: app-eoa-upgrade-detecting-delegation
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [eip-7702, eip-3541, viem-get-code, viem-get-delegation, viem-clients, wagmi-use-bytecode, eip-5792, eip5792-atomic-capability, viem-get-capabilities, wagmi-use-capabilities, metamask-7702-upgrade, oz-eoa-delegation, nethermind-7702-attack-surfaces, arxiv-7702-phishing, measured-gas-constants, eip-2929]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+Three places in one product ask the same question, and none of them wants the same answer.
+
+The withdrawal screen fetches the destination's code and, if there is any, warns that the address
+looks like a contract and might not handle the token it is about to receive. The rewards campaign
+filters its eligibility snapshot to addresses with no code, because the campaign is for people. The
+checkout branches on the same test to decide whether to offer a one-confirmation batch or three
+sequential prompts.
+
+On Tuesday a user taps something inside their wallet that has nothing to do with your app, and their
+account acquires twenty-three bytes of code. Same address, same key, same person. All three branches
+flip: two to the wrong answer, the third to the right answer for the wrong reason. Nothing throws.
+
+You know the mechanism — the designator, the `0xef0100` prefix, the
+[asymmetry between the outside and inside views](/c/extcode-vs-code-asymmetry). This lesson is the
+product half: how an application actually discovers the shape of the account in front of it, what
+that discovery entitles you to conclude, and what it does not.
+
+## One call, three shapes
+
+Detection is a single read. viem's `getCode` retrieves the bytecode at an address and returns `Hex`,
+or `undefined` when no bytecode is found there.<Cite src="viem-get-code" /> It is a public-client
+action, so it needs no wallet and no user present.<Cite src="viem-clients" />
+
+The returned value has exactly three shapes that matter:
+
+```ts
+import { type Address, type Hex } from 'viem'
+
+const DESIGNATOR = '0xef0100'
+
+type Shape =
+  | { kind: 'no-code' }
+  | { kind: 'delegated'; delegate: Address }
+  | { kind: 'contract-code' }
+
+function shapeOf(code: Hex | undefined): Shape {
+  if (!code || code === '0x') return { kind: 'no-code' }
+  if (code.length === 48 && code.startsWith(DESIGNATOR)) {
+    return { kind: 'delegated', delegate: `0x${code.slice(8)}` as Address }
+  }
+  return { kind: 'contract-code' }
+}
+```
+
+Forty-eight characters is `0x` plus twenty-three bytes, and the twenty bytes after the three-byte
+prefix are the delegate.<Cite src="eip-7702" /> The prefix cannot be counterfeited by deployed code,
+because EIP-3541 banned `0xef` from the start of new contract code years before anyone needed the
+byte for this.<Cite src="eip-3541" /><Cite src="eip-7702" /> That is the whole reason the check is a
+prefix test rather than a heuristic — see [the designator itself](/c/delegation-designator) for why
+the encoding was chosen.
+
+<Figure
+  caption="The classifier is three character ranges: one that is skipped, one that must match exactly, and one that is the answer."
+  alt="The forty-eight characters getCode returns for a delegated account: the 0x prefix, the six characters of the ef0100 tag, and the forty characters holding the delegate's address."
+>
+  <Anatomy
+    value="0xef01001234567890abcdef1234567890abcdef12345678"
+    parts={[
+      { from: 0, to: 2, label: '0x', note: 'not a byte', tone: 'muted' },
+      { from: 2, to: 8, label: 'ef0100', note: '3 bytes — startsWith', tone: 'accent' },
+      { from: 8, to: 48, label: 'the delegate', note: '20 bytes — code.slice(8)', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+viem ships the same read pre-parsed. `getDelegation` returns the address the account has delegated
+to, or `undefined` when it is not delegated, and takes the same optional `blockNumber` and `blockTag`
+that `getCode` does.<Cite src="viem-get-delegation" /><Cite src="viem-get-code" /> Use it when you
+only need the delegate; keep the raw read when you need to tell a delegated EOA apart from an
+ordinary contract, because `undefined` collapses those two into one answer.
+
+In React the hook is `useBytecode` — wagmi kept the v2 name even though viem's action was renamed to
+`getCode`, so this is one of the few places a pre-v3 tutorial is accidentally
+right.<Cite src="wagmi-use-bytecode" /> It takes `address`, optional `blockNumber` or `blockTag`, and
+a `chainId`, and it is a TanStack Query hook, which matters later in this lesson more than it looks
+like it should.<Cite src="wagmi-use-bytecode" />
+
+<Aside kind="note">
+Off-chain this is one JSON-RPC round trip. From *inside* a contract the same read is a cold account
+access, measured at 2600 gas on this repository's
+harness.<Cite src="measured-gas-constants" /><Cite src="eip-2929" /> Keep the branch in your
+application where you can — and if it is a security decision, the next section is about why neither
+location saves it.
+</Aside>
+
+## Four things the designator does not tell you
+
+Reading the code answers one question precisely: what is in this account's code field, at this block.
+Every product decision people try to hang on that answer needs something more.
+
+**It does not tell you what will run.** The designator names an address; the code at that address is
+what executes, in your user's account context, and you have not read it. Resolution stops after one
+hop: if the delegate address itself holds a designator, the EVM does not follow it — those bytes are
+executed as code.<Cite src="eip-7702" /> A designator naming an address with no code at all produces
+an account that is delegated and inert; the same is true of a designator naming a precompile, where
+the retrieved code is treated as empty and calls succeed having executed
+nothing.<Cite src="eip-7702" /> So "delegated" and "has smart-account behaviour" are different findings,
+and only the first is cheap: reading the delegate's code is a second RPC call that still leaves you
+looking at a proxy in the common case. This is
+[delegations are not chained](/c/delegation-not-chained) restated as a product constraint.
+
+<Figure
+  caption="Delegated is one read; what will run is a second one — and resolution stops there whatever it finds."
+  alt="Reading an account's code yields a designator naming an address; a second getCode against that address finds code that runs as the account, no code at all, or another designator that is executed as code rather than followed."
+>
+  <Flow
+    nodes={[
+      { id: 'a', label: 'getCode(account)', note: '23 bytes back', col: 0 },
+      { id: 'd', label: 'a designator', note: 'names an address', col: 1, tone: 'accent' },
+      { id: 'b', label: 'getCode(delegate)', note: 'a second round trip', col: 2 },
+      { id: 'live', label: 'code', note: 'this is what runs', col: 3, tone: 'good' },
+      { id: 'inert', label: 'no code', note: 'delegated and inert', col: 3, tone: 'warn' },
+      { id: 'nest', label: 'another designator', note: 'executed, never followed', col: 3, dashed: true, tone: 'muted' },
+    ]}
+  />
+</Figure>
+
+**It does not tell you the account can batch.** Capability is a property of the software you are
+talking to, not of the state you have read. ERC-5792's `atomic` capability is reported per chain with
+one of three statuses: `supported`, `ready`, or `unsupported`.<Cite src="eip-5792" /><Cite src="eip5792-atomic-capability" />
+Read it with viem's `getCapabilities` or wagmi's `useCapabilities`.<Cite src="viem-get-capabilities" /><Cite src="wagmi-use-capabilities" />
+The two reads are orthogonal in both directions. `ready` means the account is an EOA the wallet can
+upgrade through an EIP-7702 delegation pending the user's approval — an account with *no* code that
+will nonetheless batch for you.<Cite src="eip5792-atomic-capability" /> And `supported` says nothing
+about how: it is equally true of a delegated EOA, an ERC-4337 smart account and a contract wallet the
+user has been using since 2021. If your branch is "can I send this as one call", ask the wallet; if it is
+"what is this account", read the code. Substituting one for the other looks correct in every test you
+write with your own wallet.
+
+**It does not tell you the user knows.** In a wallet-mediated flow the wallet selects the delegate it
+is willing to install and raises the prompt itself; MetaMask's walkthrough is an application sending
+two ordinary calls, with the upgrade offered by the wallet rather than requested by the
+app.<Cite src="metamask-7702-upgrade" /> Your user may be delegated without ever having seen the word,
+which has a copy consequence: an interface that greets a designator with "you created a smart account
+with us" is claiming credit for a change it did not make, to people who upgraded somewhere else last
+month.
+
+**It does not stay true.** A delegation persists until an authorization naming the zero address clears
+it, and any transaction from that account can change it.<Cite src="eip-7702" /> There is no event you
+can subscribe to that means "this user is still delegated". An answer read at block N is a fact about
+block N, which is why both viem actions take a block
+parameter.<Cite src="viem-get-code" /><Cite src="viem-get-delegation" /> In a React app the hazard is
+sharper than it sounds, because `useBytecode` is a query with a cache: the value that renders your
+badge was fetched once at mount, and the user can upgrade in a wallet popup without your component
+ever remounting.<Cite src="wagmi-use-bytecode" />
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'getCode', note: "the account's state", tone: 'accent' },
+    { title: 'getCapabilities', note: "the wallet's willingness" },
+  ]}
+  rows={[
+    {
+      label: 'What does it answer?',
+      cells: [
+        "What is in this account's code field, at this block",
+        'Whether this wallet will batch for this account, on this chain',
+      ],
+    },
+    {
+      label: 'What can come back?',
+      cells: [
+        'No code · a 23-byte designator · other contract code',
+        'supported · ready · unsupported · nothing at all',
+      ],
+    },
+    {
+      label: 'Does an empty code field mean no batching?',
+      cells: [
+        'It cannot say',
+        'No — ready is an EOA with no code that will batch once the user approves',
+      ],
+    },
+    {
+      label: 'When does the answer go stale?',
+      cells: [
+        'Whenever that account sends a transaction anywhere',
+        'Whenever the wallet updates or the user switches chains',
+      ],
+    },
+    {
+      label: 'Where does the answer come from?',
+      cells: ['A node, through a public client — no wallet, no user', 'The connected wallet'],
+    },
+  ]}
+  caption="Neither read can answer the other's question, and they stop being true on different events — so one cached boolean is stale against at least one of them."
+  alt="A comparison of reading an account's code against querying wallet capabilities, across what each answers, what values come back, whether an empty code field implies no batching, when each goes stale, and where each answer comes from."
+/>
+
+<Misconception
+  belief="Once I have the delegate address I know which smart-account implementation the user has, so I can branch on it."
+  reality="The delegate address identifies a pointer, not a behaviour. The code behind it can change, it may be a proxy, it may be empty, and a familiar address is not a safety signal — the empirical study of delegation activity found the same delegate contracts reused across incidents, alongside a share of delegations associated with criminal activity."
+  why="For ordinary contracts, address and behaviour are close enough to identical that we stopped distinguishing them. A designator reintroduces the gap and there is no local way to see it."
+  src="arxiv-7702-phishing"
+/>
+
+## The two checks that stopped meaning what you used them for
+
+One of them lives in application code as often as in contracts, and the application copies get audited
+less.
+
+**`address.code.length == 0`**, and its JavaScript twin `code === '0x'`, was never a sound test for
+"not a contract" — it returns zero for an account whose constructor is still running — and EIP-7702
+broke it in the opposite direction as well, since an ordinary key-controlled user who has delegated
+now has non-empty code.<Cite src="eip-7702" /><Cite src="nethermind-7702-attack-surfaces" /> The full argument is
+[the code-length check](/c/code-length-check-broken). What is new at this layer is where it hides:
+the eligibility snapshot in a rewards campaign, the "this looks like a contract" warning on a send
+screen, the address-type column in an analytics pipeline. None of those is a contract, none gets a
+security review, and each excluded a class of real users the day Pectra shipped.
+
+**`msg.sender == tx.origin`** deserves more precision than it usually gets, because EIP-7702
+enumerates three things the idiom was used for and rates them differently.
+
+1. **Ensuring `msg.sender` is an EOA.** The EIP states that this invariant does not depend on
+   execution-layer depth and is therefore *not affected*, `tx.origin` still being required to be an
+   EOA.<Cite src="eip-7702" />
+2. **Protecting against atomic sandwich attacks such as flash loans.** The EIP states this protection
+   *would be broken* — while noting that relying on `tx.origin` this way was already considered bad
+   practice, and was already circumventable by block producers choosing what to
+   include.<Cite src="eip-7702" />
+3. **Preventing reentrancy.** The EIP states this use is *more severely affected*, while recording
+   that its authors found no examples of it in a search they describe as
+   non-exhaustive.<Cite src="eip-7702" />
+
+The invariant that actually broke is the one stated alongside them: `msg.sender == tx.origin` no
+longer implies the topmost execution frame, because a delegated account runs code in its own context
+and calls onward from there.<Cite src="eip-7702" /> That is why the ranking comes out the way it does.
+The literal claim in (1) survives; the inference almost everybody was drawing from it — that nothing
+programmable is on the other end — is (2) and (3), and those are the ones that
+fell.<Cite src="eip-7702" /> [The idiom's post-Pectra status](/c/tx-origin-check-broken) is worth
+re-reading with that split in mind before you decide your own guard is in category one.
+
+<Aside kind="warn">
+Two consequences land in backend code rather than in the interface, and both are invariants the EIP
+lists as broken. An account's balance can now decrease from a call it did not originate, because once
+delegated, any call to the account may spend it. And its nonce can increase more than once inside a
+single transaction, because delegated code can create contracts.<Cite src="eip-7702" /> Reconciliation
+that derives a user's outflows from transactions *sent by* that account will silently miss money, and
+nonce-tracking that assumes one increment per transaction will desynchronise. Relatedly, the EIP
+recommends that clients accept no more than one pending transaction from an account with a non-zero
+delegation indicator — a client policy rather than a protocol rule, so it varies by provider, but a
+queue-three-and-let-them-land flow can stop working for exactly your upgraded
+users.<Cite src="eip-7702" />
+</Aside>
+
+## Worked example: the classifier the withdrawal screen needed
+
+**Subgoal 1 — name the property the branch needs, not the type of the account.** "Is this a contract"
+is not a property; it is a proxy for one. The withdrawal screen wants "will this address accept the
+token I am about to send". The rewards filter wants "is this one person rather than a pool contract".
+The checkout wants "can this be one confirmation". Three different questions, and only the third has a
+reliable answer, which comes from capabilities rather than
+code.<Cite src="eip-5792" /><Cite src="eip5792-atomic-capability" />
+
+**Subgoal 2 — read at a block you can name.** Pass `blockNumber` when the answer feeds anything you
+must later reproduce, such as an eligibility snapshot; take the default `latest` for a live
+interface.<Cite src="viem-get-code" /> A snapshot built from `latest` across several minutes of paging
+is a snapshot of no particular state.
+
+**Subgoal 3 — match the designator exactly, and keep the third answer.** Prefix and length, not
+prefix alone, and do not collapse `contract-code` into the delegated case. The whole value of the read
+is that it distinguishes three states where your old boolean had two.<Cite src="eip-7702" />
+
+**Subgoal 4 — resolve the delegate only when the answer changes what you render.** One more `getCode`,
+against the delegate address, tells you whether the account is inert or live. Skip it for a label; do
+it before you tell the user their account can do something.<Cite src="eip-7702" />
+
+**Subgoal 5 — ask the wallet separately, and treat the answers as independent.** `atomic` per chain,
+from the connected wallet, at the moment you are about to offer the
+batch.<Cite src="viem-get-capabilities" /><Cite src="eip5792-atomic-capability" />
+
+**Subgoal 6 — decide each answer's shelf life before you cache it.** The code read expires whenever
+the user sends a transaction anywhere; the capability answer expires whenever the wallet updates or
+the user switches chains.<Cite src="eip-7702" /><Cite src="eip-5792" /> Neither belongs in a value you
+compute once at connect time.
+
+```ts
+// Subgoal 3 + 4 together. `client` is a public client (viem 2.x).
+async function describe(address: Address, blockNumber?: bigint) {
+  const code = await client.getCode({ address, blockNumber })
+  const shape = shapeOf(code)
+  if (shape.kind !== 'delegated') return shape
+
+  const delegateCode = await client.getCode({ address: shape.delegate, blockNumber })
+  const live = Boolean(delegateCode && delegateCode !== '0x')
+  return { ...shape, live }
+}
+```
+
+<Check type="spot-bug" concept="detect-delegated-eoa">
+This component shipped last week. It renders a checkout for the connected account and decides which
+one to show.
+
+```tsx
+function Checkout({ address }: { address: Address }) {
+  const { data: code } = useBytecode({ address })
+  const { data: capabilities } = useCapabilities()
+
+  const isSmartAccount = Boolean(code && code !== '0x')
+
+  return isSmartAccount
+    ? <BatchedCheckout account={address} />
+    : <SequentialCheckout account={address} />
+}
+```
+
+Find the defects. There is more than one, they are of different kinds, and one of them harms exactly
+the users the batch path was written for.
+
+<Answer>
+**The boolean fuses three states into two.** Non-empty code is true for a delegated EOA, for an
+ordinary contract wallet the user has held since 2021, and for an account delegated to an address with
+no code — delegated and inert.<Cite src="eip-7702" /> `isSmartAccount` measures none of that; it
+measures "the code field is not empty". The correct read distinguishes no-code, a twenty-three-byte
+designator beginning `0xef0100`, and anything else.<Cite src="eip-7702" />
+
+**It infers a capability from a state, which is the load-bearing error.** Nothing in the account's
+code field tells you the connected wallet will accept `wallet_sendCalls` for this account on this
+chain. `capabilities` is fetched and then never read; the value that should drive this branch is the
+`atomic` status for the current chain.<Cite src="eip-5792" /><Cite src="eip5792-atomic-capability" />
+
+**The inverse failure is the expensive one.** An EOA with no code whose wallet reports
+`atomic: ready` can batch — `ready` means precisely that the wallet can upgrade the account through an
+EIP-7702 delegation, pending the user's approval.<Cite src="eip5792-atomic-capability" /> This
+component sends every one of those users down the sequential path and never offers the upgrade. The
+users it was built for are the ones it fails, and the failure is invisible: three prompts instead of
+one is indistinguishable from working.
+
+**No chain is in scope.** ERC-5792 reports capabilities per chain because a wallet may support
+different capabilities across the chains authorised in one session.<Cite src="eip-5792" /> A single
+boolean cannot represent that, and `useBytecode`'s own answer is also chain-scoped through its
+`chainId` parameter.<Cite src="wagmi-use-bytecode" />
+
+**The answer is cached and the state is not stable.** `useBytecode` is a TanStack Query
+hook.<Cite src="wagmi-use-bytecode" /> The user can approve an upgrade in a wallet popup, or clear a
+delegation with a transaction to the zero address, without this component remounting; a delegation
+persists until explicitly cleared and any transaction can change
+it.<Cite src="eip-7702" /> Re-read it when you are about to act on it, and do not derive anything
+durable from it.
+
+**The shape of the mistake.** One variable was asked to carry an account's state, an account's
+behaviour and a wallet's willingness, all at once. Those are three sources with three different
+lifetimes: the code field changes when the user sends a transaction, the delegate's behaviour changes
+when whoever controls the delegate deploys, and the wallet's capabilities change when the wallet
+updates.<Cite src="eip-7702" /><Cite src="oz-eoa-delegation" /> Any one boolean spanning them is stale
+against at least one of the three.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The module's practice exercise** is this bug in its natural habitat: an application that branches on
+code length, pointed at a delegated EOA, taking the wrong path — then rewritten into a three-answer
+classifier that names the delegate.
+
+**Every branch in the previous lesson** started with "read the account's code", including the one
+after a transaction that carried an `authorizationList`. That case is the sharpest use of everything
+above: the designator survives the failure of the transaction that installed it, so a receipt tells
+you nothing and the code read tells you everything.<Cite src="eip-7702" />
+
+**The session-keys module** is where the delegate's own code becomes a surface rather than an address
+you print. It opens with the question this lesson refused to answer — given that the account is
+delegated, what can it actually do — and the honest answer is that you ask the wallet rather than read
+bytes.<Cite src="metamask-7702-upgrade" />
+
+**Anything you build that classifies addresses** — an indexer's account-type column, a fraud rule, an
+allowlist. Each encodes a two-valued account model that stopped being true in May 2025, and each keeps
+returning confident answers of the wrong kind until someone reads the code field and finds three
+shapes where the schema has room for two.<Cite src="eip-7702" />
+
+**And the transferable habit.** When a check is one line and passes every test, ask what property it
+stands in for and whether the protocol ever promised that property. `code.length` stood in for "not
+programmable"; `msg.sender == tx.origin` stood in for "outermost frame"; neither was ever the thing
+measured.<Cite src="eip-7702" /><Cite src="nethermind-7702-attack-surfaces" /> The designator is the
+rare case where the protocol says in writing exactly what it broke, before your code finds out.

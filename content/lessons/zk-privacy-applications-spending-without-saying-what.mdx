@@ -1,0 +1,440 @@
+---
+id: zk-privacy-applications-spending-without-saying-what
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [privacy-pools-docs-core-concepts, privacy-pools-docs-withdrawal-circuit, privacy-pools-docs-withdrawal-flow, privacy-pools-docs-asp-layer, privacy-pools-docs-entrypoint, aztec-docs-keys, aztec-docs-state-management, aztec-docs-indexed-merkle-tree, railgun-docs-privacy-system, measured-gas-constants]
+stack: {}
+---
+
+Write down the requirement the contract has to satisfy and it reads like a joke:
+
+```text
+Reject the second spend of a note you have never seen,
+whose owner you do not know,
+whose amount you do not know,
+and whose position in the tree you must never learn.
+```
+
+Every ordinary answer is unavailable. You cannot flip a spent flag on the note, because you do not
+know which note. You cannot mark the leaf, because learning which leaf is exactly the disclosure the
+system exists to prevent. You cannot track balances, because there are none.
+
+The mechanism that solves this is one published value per spend. It is not complicated. What is
+complicated — and what this lesson is really about — is that it carries **two independent
+requirements**, only one of which is obvious, and a system that satisfies the obvious one and misses
+the other passes every test you would think to write while providing no privacy whatsoever.
+
+## The nullifier
+
+Spending a note publishes a **nullifier**: a value derived deterministically, through a one-way
+function, from a secret that only the note's owner knows. The contract keeps a set of nullifiers it
+has seen and rejects any repeat.
+
+Look at a deployed instance. Privacy Pools' note carries four fields, of which one is literally
+called `nullifier` — a secret — and the published value is its
+hash:<Cite src="privacy-pools-docs-core-concepts" />
+
+<Figure
+  caption="One secret feeds both published values, and no public function joins them."
+  alt="The nullifier and the secret hash into precommitmentHash, which with value and label hashes into commitmentHash, published at deposit. The same nullifier hashes on its own into nullifierHash, published at spend."
+>
+  <Flow
+    lanes={['secret to the owner', 'derived', 'published on chain']}
+    nodes={[
+      { id: 'nul', label: 'nullifier', note: 'a secret in the note', col: 0, tone: 'accent' },
+      { id: 'sec', label: 'secret', note: 'hides the nullifier', col: 0 },
+      { id: 'vl', label: 'value, label', note: 'amount and pool binding', col: 0 },
+      { id: 'pre', label: 'precommitmentHash', note: 'PoseidonHash(nullifier, secret)', col: 1 },
+      { id: 'com', label: 'commitmentHash', note: 'published at deposit', col: 2 },
+      { id: 'nh', label: 'nullifierHash', note: 'published at spend', col: 2 },
+    ]}
+    edges={[
+      { from: 'nul', to: 'pre' },
+      { from: 'sec', to: 'pre' },
+      { from: 'pre', to: 'com' },
+      { from: 'vl', to: 'com' },
+      { from: 'nul', to: 'nh' },
+    ]}
+  />
+</Figure>
+
+**Subgoal: trace where each value becomes visible.** At deposit, only `commitmentHash` is published.
+At spend, only `nullifierHash` is published. And `nullifierHash` is emitted by the circuit as an
+*output* — the withdrawal circuit's declared outputs are `newCommitmentHash` and
+`existingNullifierHash`, computed inside the constraint system from private
+material.<Cite src="privacy-pools-docs-withdrawal-circuit" /> The contract does not accept a
+nullifier as an argument it could be talked into; it receives one the circuit computed.
+
+That distinction — output, not argument — is the same discipline as binding a public input, arriving
+from the privacy side. A nullifier the caller supplies is a nullifier the caller can choose.
+
+The same circuit closes the matching hole on the other side. Its sixth constraint verifies that a
+`context` signal matches on-chain data, where `context` is a hash over the entire withdrawal
+struct — processor, pool scope, and for a relayed withdrawal the encoded fee data naming the final
+recipient, the relayer and the fee.<Cite src="privacy-pools-docs-withdrawal-circuit" /><Cite src="privacy-pools-docs-withdrawal-flow" />
+So one proof simultaneously establishes *this note is mine and unspent* and *this withdrawal goes
+exactly where I said*. A nullifier without that second half would leave a valid proof in the mempool
+that anyone could redirect — the privacy mechanism intact, the money gone.
+
+### Now go up one level of generality
+
+Aztec derives nullifiers from a dedicated key rather than from a per-note secret, and the mechanism
+is worth seeing because it answers a question the simple version leaves open: how does the protocol
+know the spender was entitled to nullify?
+
+Each account has a master nullifier key pair. For each application, an **app-siloed** key is derived
+as `nhk_app = hash(nhk_m, app_contract_address)`. To spend a note, the spender computes its nullifier
+from the note hash and that app-siloed key. The protocol then verifies that the app-siloed key came
+from the account's master key, and that the master public key is in the account's
+address.<Cite src="aztec-docs-keys" />
+
+Which raises the obvious objection, and the documentation answers it directly: how can a protocol
+verify one secret key was derived from another without knowing either? **You perform the derivation
+and prove it. The protocol verifies the proof.**<Cite src="aztec-docs-keys" />
+
+Two consequences worth carrying:
+
+- **App-siloing means a key compromised in one application cannot nullify notes in
+  another.**<Cite src="aztec-docs-keys" /> Same idea as the contract-address siloing in note hashes,
+  applied to the spend authority.
+- **Nullifier keys are protocol-managed and not rotatable**, unlike signing keys, which are entirely
+  abstracted to the account contract.<Cite src="aztec-docs-keys" /> The ability to spend and the
+  ability to authenticate have been deliberately separated, and only one of them is yours to change.
+
+<Aside kind="warn">
+Aztec's own documentation adds a blunt instruction: do not compute nullifier keys by hand or invent
+your own blinding factors, because the protocol kernel validates that the app-siloed key derives
+correctly and a hand-rolled value simply fails
+verification.<Cite src="aztec-docs-keys" /> Failing verification is the *good* outcome. The bad
+outcome — a nullifier scheme that verifies and leaks — is the subject of the next section.
+</Aside>
+
+## Two requirements, and only one is obvious
+
+### Requirement one: uniquely determined by the note
+
+The nullifier must be a **function** of the note and its spending secret, with no freedom left to the
+spender. If a spender can produce two distinct valid nullifiers for one note, they spend it twice:
+the first nullifier goes into the set, the second is not in the set, and the contract has no way to
+notice they refer to the same note.
+
+Anything that introduces prover-chosen randomness into the derivation breaks this. A nullifier
+computed as `H(secret, r)` for a freely chosen `r` is a licence to mint. This requirement is obvious
+the moment you state the mechanism, and it is what every test suite checks: spend twice, expect a
+revert.
+
+### Requirement two: uncorrelatable with the commitment
+
+The nullifier must be computationally impossible to link to the commitment of the note it spends —
+by anyone without the owner's secrets.
+
+This one is not obvious, because it has nothing to do with correctness. Break it and every unit test
+still passes. Nothing is double-spent, nothing is lost, no user notices. The system does exactly what
+it says and provides zero privacy.
+
+**Subgoal: run the attack on the classic mistake.** Suppose a designer, reaching for something
+guaranteed to be unique per note, derives the nullifier from the note's commitment:
+
+```text
+nullifierHash = H(commitmentHash)
+```
+
+Determinism: satisfied, perfectly. One commitment, one nullifier, no freedom for the spender.
+Double-spends: impossible. Now the attack, which requires no cryptanalysis and no privileged access:
+
+1. Read every commitment ever appended to the tree. They are public leaves.
+2. For each one, compute `H(commitmentHash)`. This is a public function of public data.
+3. Read every nullifier ever published. Also public.
+4. Join the two lists.
+
+You now have an exact map from every withdrawal back to the deposit that funded it. The link the
+proof was hiding is recoverable by anyone with a laptop and the chain. The zero-knowledge proof is
+still sound — it never claimed the nullifier was unlinkable; it proved exactly what it was asked to
+prove.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Requirement one', note: 'uniquely determined by the note' },
+    { title: 'Requirement two', note: 'uncorrelatable with the commitment', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What does breaking it cost?',
+      cells: [
+        { v: 'One note yields two valid nullifiers, so it can be spent twice.', tone: 'danger' },
+        { v: 'Every withdrawal can be joined back to the deposit that funded it.', tone: 'danger' },
+      ],
+    },
+    {
+      label: 'Does a test suite catch it?',
+      cells: [
+        { v: 'Yes — spend twice, expect a revert.', tone: 'good' },
+        { v: 'No. Nothing reverts, nothing is lost, no user notices.', tone: 'warn' },
+      ],
+    },
+    {
+      label: 'What does deriving the nullifier from the commitment do to it?',
+      cells: [
+        { v: 'Satisfies it perfectly — one commitment, one nullifier.', tone: 'good' },
+        { v: 'Destroys it, using nothing but public data.', tone: 'danger' },
+      ],
+    },
+    {
+      label: 'What does satisfying it require of the input?',
+      cells: [
+        'That it be fixed by the note at deposit time.',
+        { v: 'That it be private — a secret the owner never publishes.', tone: 'accent' },
+      ],
+    },
+  ]}
+  caption="Break requirement one and the pool is drained; break requirement two and nothing happens at all, which is what makes it the dangerous one."
+  alt="The two nullifier requirements compared across what breaking each costs, whether a test suite catches it, what deriving the nullifier from the commitment does to it, and what each requires of the input."
+/>
+
+<Misconception
+  belief="A nullifier is a spent-flag with a hash on it, so any one-way function of the note will do."
+  reality="It must be uniquely determined by the note and its spending secret, and computationally uncorrelatable with the note's commitment. Deriving it from the commitment satisfies the first requirement and destroys the second, linking every deposit to its withdrawal."
+  why="The double-spend requirement is obvious and testable; the unlinkability requirement is invisible to every test you would naturally write, because breaking it changes no behaviour."
+  src="aztec-docs-keys"
+/>
+
+The general rule falls out: **derive the nullifier from the spending secret, never from the
+commitment.** Both are unique per note. Only one of them is private. Privacy Pools takes the
+nullifier from a secret field of the note; Aztec takes it from a key that never leaves the
+owner.<Cite src="privacy-pools-docs-core-concepts" /><Cite src="aztec-docs-keys" /> Neither takes it
+from anything an observer can compute.
+
+### A third condition hiding in a constraint list
+
+Read Privacy Pools' published constraint list for its withdrawal circuit. Six items, and the fifth
+is:<Cite src="privacy-pools-docs-withdrawal-circuit" />
+
+```text
+Checks the existing and new nullifier don't match
+```
+
+Why would a circuit need to constrain that? Because a partial withdrawal spends one note and creates
+another for the remainder — the circuit's inputs include both `existingNullifier` and
+`newNullifier`, and its outputs include a `newCommitmentHash`.<Cite src="privacy-pools-docs-withdrawal-circuit" />
+If a careless or malicious user reused the same nullifier for the change note, then the moment they
+tried to spend the change, its nullifier would already be in the set and the contract would reject
+it. The funds would be permanently unspendable — provably present in the tree, and impossible to
+withdraw.
+
+**A constraint that exists to stop a user destroying their own money.** That is what production
+circuits are full of, and it is a fair preview of the difference between the mechanism and a system.
+
+### Which root, and the window nobody mentions
+
+There is a second public input in that circuit that looks like plumbing and is not: `stateRoot`, the
+Merkle root the membership proof is checked against.<Cite src="privacy-pools-docs-withdrawal-circuit" />
+
+**Subgoal: work out why the contract cannot simply demand the current root.** You generate a proof
+against the tree as it stands. Between generation and inclusion, somebody else deposits. The tree
+grows, the root changes, and your proof — correct when made — is now about a root the contract no
+longer holds. Under a strict rule it reverts, you regenerate, and somebody else deposits again. In a
+busy pool you might never land.
+
+So contracts accept a **window of recent roots**. Privacy Pools does exactly this on its compliance
+tree, keeping a history of roots for proof verification in a circular
+buffer.<Cite src="privacy-pools-docs-asp-layer" /> The design question is how deep that history goes,
+and the trade is sharp in both directions:
+
+- **Too shallow** and honest users' proofs go stale during traffic spikes — a liveness failure that
+  looks like the product being broken, and one that hits hardest exactly when the pool is busiest.
+- **Too deep** and you keep accepting proofs against old states for a long time. If a root ever has
+  to be invalidated — a compliance update, a discovered bug, a wound-down pool — the window is the
+  period during which the stale root remains spendable.
+
+And there is a privacy dimension that is easy to miss. **Which root you prove against is itself a
+signal.** A withdrawal proved against a root from six hours ago tells an observer the proof was
+generated around then, narrowing the deposit window it could have come from. The membership proof
+hides *which leaf*; the root choice quietly leaks *roughly when*.
+
+The general shape recurs across this whole domain: a value the system needs for correctness turns out
+to carry information, and nobody notices until someone builds the join.
+
+## Transfers, and the operation that never touches the boundary
+
+Everything so far has been deposit and withdraw. The systems that do more allow a **private
+transfer**: nullify one of your notes, append two new commitments — one for the recipient, one for
+your change — and never move value across the pool boundary at all.
+
+Aztec describes this as the general form of private state modification rather than as a special case:
+you nullify the existing record and create a new one, which is what gives private state its
+unspent-output structure, and the recipient learns about their new note through delivery of the
+encrypted note data.<Cite src="aztec-docs-state-management" /> Railgun offers the same shape as
+middleware, with private sends between its private addresses and no public
+transfer involved.<Cite src="railgun-docs-privacy-system" />
+
+Two things follow, and the second is the one to remember.
+
+**From outside, every private transfer looks identical.** One nullifier consumed, some commitments
+appended. No amount, no parties, no distinction between a payment and a rebalance.
+
+**And each internal transfer improves everyone's privacy, not just the sender's.** A pool where value
+only enters and leaves has a much simpler graph than one where value moves around inside — an
+observer of the first is joining two public event streams; an observer of the second is joining them
+across an unknown number of intermediate hops. Railgun's documentation makes exactly this argument
+for its own system, that every interaction decreases the likelihood any interaction can be linked to
+a specific asset.<Cite src="railgun-docs-privacy-system" /> It is a vendor arguing its own case, and
+the structural part of the argument is sound: **activity inside the boundary is what the hiding
+actually consumes.**
+
+## Where the set lives, and why the answer differs by system
+
+A nullifier set has one job: answer "have I seen this before". Two implementations, chosen for two
+different reasons.
+
+**On L1, a mapping.** The contract holds `mapping(uint256 => bool)` and checks it directly. Cheap to
+read, and the write is a zero-to-non-zero `SSTORE` on a cold slot: 20,000 gas for the write plus
+2,100 for the cold access, measured at 22,113 end to end on forge 1.7.1 with solc 0.8.36 and the
+optimizer off.<Cite src="measured-gas-constants" /> The set grows forever — every spend in the
+system's history is a permanent storage entry — which is a real cost but a linear and predictable
+one.
+
+**Inside a circuit, an indexed Merkle tree.** A rollup that must *prove* a nullifier is absent has a
+harder problem, because proving non-membership is not the same as proving membership. Aztec's
+documentation walks the reasoning: private state requires an unspent-output model in append-only
+trees, and to spend a note you must create a nullifier and prove it does not already exist in the
+nullifier tree; modelling that tree as a sparse Merkle tree makes non-membership conceptually
+trivial, since you prove the leaf at the index corresponding to your value is
+empty.<Cite src="aztec-docs-indexed-merkle-tree" /> Indexed Merkle trees are the refinement that
+makes those exclusion proofs and batch insertions efficient in
+constraints.<Cite src="aztec-docs-indexed-merkle-tree" />
+
+The lesson generalises past this topic. **"Prove X is absent" is a fundamentally different data
+structure problem from "prove X is present"**, and a design that assumed they were symmetric will
+discover the difference at circuit-size time.
+
+## The shielded pool: one contract, everyone's money
+
+Assemble the pieces and you have a **shielded pool**: a contract that custodies deposited value on
+behalf of everybody in it.
+
+<Figure
+  caption="Two of the three operations cross the boundary in public; the one that does not is the only one that adds hiding."
+  alt="A shielded pool: a deposit transfers value in and appends a commitment to the state tree. From the tree, a private transfer nullifies and appends entirely inside the pool and returns more leaves to it, while a withdrawal proof establishes that the note is the spender's, unspent, consistently valued and correctly changed, and the withdrawal publishes the nullifier, the new commitment and the payout."
+>
+  <Flow
+    lanes={['crossing in', 'the state tree', 'inside the pool', 'crossing out']}
+    nodes={[
+      { id: 'dep', label: 'deposit', note: 'transfer value in', col: 0, tone: 'warn' },
+      { id: 'com', label: 'commitment', note: 'a leaf on the state tree', col: 1 },
+      { id: 'xfer', label: 'private transfer', note: 'nullify, append, all inside the pool', col: 2, dashed: true },
+      { id: 'proof', label: 'withdrawal proof', note: 'mine, unspent, amount consistent, change well-formed', col: 2 },
+      { id: 'wd', label: 'withdraw', note: 'publish: nullifier, new commitment, payout', col: 3, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'dep', to: 'com' },
+      { from: 'com', to: 'xfer' },
+      { from: 'xfer', to: 'com', tone: 'good', label: 'more leaves, no crossing' },
+      { from: 'com', to: 'proof' },
+      { from: 'proof', to: 'wd' },
+    ]}
+  />
+</Figure>
+
+Three properties of that arrangement matter more than the cryptography.
+
+**The pool is the privacy boundary.** Inside it, activity is unlinkable. Crossing it in either
+direction is an ordinary public transfer with an address, an amount and a timestamp. Everything the
+next lesson is about lives at that boundary.
+
+**The pool is a single custody point.** All the value is in one contract's balance. A bug in the
+withdrawal circuit or in the contract does not leak one user's funds; it drains the pool. And the
+value of your own privacy depends on other people's money staying in there, which is an incentive
+alignment nobody designed and everybody inherits.
+
+**And the pool is where governance shows up.** Privacy Pools coordinates its pools through an
+Entrypoint contract that follows the UUPS upgradeable-proxy pattern with role-based access control,
+carrying an owner role that can register, remove, reconfigure and wind down pools, and a separate
+role that updates the compliance data withdrawals are checked
+against.<Cite src="privacy-pools-docs-entrypoint" /> The cryptography is not the whole system, which
+is the point the last lesson of this module makes at length.
+
+### The exit that costs you your privacy
+
+One mechanism deserves naming now because it shows what the pool boundary really is. Privacy Pools
+supports **ragequit**: the original depositor proves ownership of a commitment, recovers its full
+remaining value, and marks it spent.<Cite src="privacy-pools-docs-core-concepts" /> The
+documentation describes it as an exit path for a depositor whose funds are not approved for private
+withdrawal — recovering them by **publicly** exiting the
+pool.<Cite src="privacy-pools-docs-entrypoint" />
+
+Read the trade. Ragequit converts a private position into a public one, on demand, in exchange for
+guaranteed access to your money. It exists because the alternative — funds locked in a pool whose
+compliance layer will not approve them — is worse. **The escape hatch from a privacy system is
+publicity**, and that is not a flaw in this particular design; it is what an escape hatch has to be
+when the thing being escaped is a hiding mechanism.
+
+<Check type="spot-bug" concept="nullifier-must-be-deterministic-and-hiding">
+A team builds a fixed-denomination pool. Deposits append `commitment = H(secret, nullifierSeed)` to a
+Merkle tree. Withdrawals present a proof and a nullifier. Two engineers propose two schemes.
+
+```text
+Scheme A:  nullifier = H(leafIndex)
+Scheme B:  nullifier = H(secret, blockNumber)
+```
+
+Both pass the team's test suite: a valid withdrawal succeeds, a repeated withdrawal reverts. Evaluate
+each.
+
+<Answer>
+**Scheme A is deterministic and completely non-private.**
+
+`leafIndex` is public — it is the position in a public tree. Anyone can compute `H(i)` for every
+index and match the results against published nullifiers, producing an exact map from each withdrawal
+to the deposit that funded it. This is the classic mistake in its purest form: the nullifier is a
+function of public data, so unlinkability was never possible.
+
+Note precisely which property survives. Double-spend protection: intact. Soundness: intact. Funds
+safety: intact. The test suite passes because the test suite tests the property that still
+works.<Cite src="aztec-docs-keys" /> The pool has become a rather expensive way of adding a delay
+between two public transfers.
+
+**Scheme B is private and permits unlimited withdrawals.**
+
+`blockNumber` is not part of the note. The same note therefore yields a different nullifier in every
+block, so a depositor withdraws in block `n`, again in block `n+1`, and again forever, draining the
+pool. The team's test suite misses it because the test almost certainly submits both withdrawals in
+the same block or the same test context — and if it does not, the intended failure and the actual
+behaviour look similar enough in a passing-test log to escape notice.
+
+This is requirement one failing: the nullifier is not uniquely determined by the note, because it
+depends on a value the spender chooses by choosing when to act.
+
+**The correct scheme, and why.** Derive the nullifier from a secret that is committed to at deposit
+time and known only to the owner — as in `nullifierHash = PoseidonHash(nullifier)` where the
+commitment binds `PoseidonHash(nullifier, secret)`.<Cite src="privacy-pools-docs-core-concepts" />
+That is unique per note (requirement one: the secret is fixed at deposit) and uncorrelatable with the
+commitment (requirement two: the secret is not public, and the extra `secret` field means the
+precommitment does not reveal it either).
+
+**The test the team is missing.** Not a double-spend test — they have one. A **linkability test**:
+given only public chain data, attempt to match withdrawals to deposits. If any function of public
+data reproduces a published nullifier, the scheme is broken. That test would have failed Scheme A
+immediately and is the one nobody writes, because it asserts the absence of a capability rather than
+the presence of a behaviour.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next lesson** takes everything you have just built — a sound nullifier, an unlinkable commitment, a
+correct pool — and asks how much privacy it actually delivers to a specific person on a specific
+afternoon. The answer is a number rather than a guarantee, it is usually much smaller than the pool's
+size, and almost none of what shrinks it involves the cryptography at all.
+
+**In review**, you now have a question that finds a whole bug class in one line: *what is this
+nullifier a function of, and is every input to that function private?* If any input is public, the
+system is a delay mechanism wearing a proof.
+
+**And the deeper habit is about what tests can express.** Requirement one is a behaviour, so a test
+asserts it. Requirement two is the absence of an inference, and no assertion in an ordinary test
+suite ranges over "things an observer could compute". Properties like that need an adversary written
+down explicitly, which is the discipline the security track calls threat modelling and which this
+domain cannot function without.<Cite src="railgun-docs-privacy-system" />

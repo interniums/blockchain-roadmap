@@ -1,0 +1,259 @@
+---
+id: fundamentals-crypto-one-root-many-leaves
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [yellow-paper, oz-merkle-tree-js, oz-merkleproof-source, rfc-6962, nist-sp-800-107, bitcoin-core-merkle, ssz-specs-merkleization, solidity-abi-spec]
+stack: { cast: "1.7.1" }
+---
+
+An airdrop has 1,048,576 eligible addresses. Storing that list on chain is out of the question, and
+so is having the contract iterate it. But the contract still has to answer, for any caller, whether
+they are on the list.
+
+The answer is to store one 32-byte value and make the *caller* bring the evidence.
+
+## The construction
+
+Hash each entry into a leaf. Hash leaves in pairs to get the next level up. Repeat until one value
+remains. That value is the **root**, and it is a commitment to everything below it: change any leaf
+and every hash on the path to the root changes with it.<Cite src="yellow-paper" />
+
+A tree over 2²⁰ leaves has 20 levels, because each level halves the count. That is the whole reason
+this structure is worth the trouble: membership evidence is proportional to the *depth*, not the
+size. Doubling the airdrop adds one hash to every proof.
+
+Four leaves is enough to see the whole mechanism. Computed with `cast` 1.7.1 on 26 August 2026, with
+each pair sorted before hashing:
+
+<Figure
+  caption="Sorting each pair before hashing collapses these four entries into one 32-byte value that no other set of four would produce."
+  alt="A four-leaf Merkle tree. Leaves a, b, c and d hash to 3ac22516…, b5553de3…, 0b42b639… and f1918e85…. Nodes ab and cd hash to 805b21d8… and d253a52d…, and the root is 68203f90…ce9ce1bf. A claim for leaf c travels with sibling d and node ab."
+>
+  <Tree root={{
+    label: '68203f90…ce9ce1bf', note: 'root = keccak256(ab ‖ cd)', tone: 'accent',
+    children: [
+      { label: '805b21d8…0c6ae1f8', tone: 'muted', dashed: true, note: 'node ab · in proof', children: [
+        { label: 'leaf a', tone: 'muted', note: '3ac22516…f9a5f1cb' },
+        { label: 'leaf b', tone: 'muted', note: 'b5553de3…166c5510' },
+      ] },
+      { label: 'd253a52d…14415669', note: 'node cd = keccak256(c ‖ d)', children: [
+        { label: 'leaf c', tone: 'good', note: '0b42b639…2299b9b2' },
+        { label: 'leaf d', tone: 'muted', dashed: true, note: 'f1918e85…75b3d2f3 · in proof' },
+      ] },
+    ],
+  }} />
+</Figure>
+
+**Subgoal — see what a proof has to contain.** To convince a verifier that leaf `c` is under that
+root, it needs whatever it cannot compute itself. It can hash `c`. It cannot produce `d`, and it
+cannot produce `ab`. So the proof is `[d, ab]` — one sibling per level, two levels, 64 bytes.
+
+**Subgoal — see what the verifier does with it.** Fold: `keccak256(c ‖ d)` gives `node cd`, then
+`keccak256(ab ‖ cd)` gives `68203f90…`, which equals the stored root. Accept.
+
+**Subgoal — see what it never learned.** The verifier does not know there were four leaves rather
+than four thousand, does not know `a`, and does not know where in the tree `c` sat. It knows one
+thing: starting from the value it was given and folding in the hashes it was given, it arrived at
+the root.
+
+Scale that to the airdrop and the numbers are 20 hashes and 640 bytes, against a list of a million
+entries. A production tree builder does more than this — OpenZeppelin's, for one, ABI-encodes each
+entry and hashes it twice before it ever becomes a leaf<Cite src="oz-merkle-tree-js" /> — but the
+shape of the proof and the shape of the fold are exactly what you just walked.
+
+## The loop that checks it
+
+```solidity
+function verify(bytes32[] calldata proof, bytes32 root, bytes32 leaf)
+    internal pure returns (bool)
+{
+    bytes32 computed = leaf;
+    for (uint256 i = 0; i < proof.length; i++) {
+        bytes32 sibling = proof[i];
+        computed = computed <= sibling            // sorted pair
+            ? keccak256(abi.encodePacked(computed, sibling))
+            : keccak256(abi.encodePacked(sibling, computed));
+    }
+    return computed == root;
+}
+```
+
+Two things to notice, because both come back to bite in the next lesson.
+
+**The pair is sorted before hashing.** Ordering the two 32-byte values means the proof does not have
+to carry a left/right bit per level: verification is smaller and simpler. OpenZeppelin's library
+builds on exactly this — it hashes commutatively, and it can only prove inclusion in trees built the
+same way.<Cite src="oz-merkleproof-source" />
+
+**Every input to `keccak256` in that loop is exactly 64 bytes.** Two 32-byte words, concatenated.
+Hold that thought; it is the whole of the next lesson.
+
+<Check type="predict" concept="merkle-inclusion-proof">
+The airdrop above ships. Marketing asks to add 12 late entries. The team regenerates the tree from
+the new list, publishes the new root, and updates the claim contract.
+
+Every previously issued proof now fails, including for addresses whose entry did not change. Why —
+and what would have to be true for old proofs to keep working?
+
+<Answer>
+Adding leaves changes the pairing at every level above the insertion points, and with sorted-pair
+hashing and a regenerated list it usually changes leaf *order* as well. Different siblings mean a
+different path, so the old sibling list no longer folds to the new root.
+
+For old proofs to survive, every original leaf would have to keep the same position and the same
+siblings all the way up — which in practice means appending only, into pre-reserved empty slots, in
+a tree whose depth was fixed in advance. That is a real design and it is a decision made before
+launch, not after.
+
+Certificate Transparency shows what the mature version looks like: an append-only log that also
+defines **Merkle consistency proofs**, which demonstrate that one published root is a prefix-extension
+of an earlier one.<Cite src="rfc-6962" /> If your users need old proofs to survive growth, you are
+not building a Merkle airdrop; you are building a log, and the log has a second proof type you have
+to design for from the start.
+
+The general lesson: a Merkle root is a commitment to one exact tree. "The same data plus a bit more"
+is a different tree, and proofs do not transfer between them.
+</Answer>
+</Check>
+
+## What the root actually commits to
+
+It is tempting to read the root as a fingerprint of the *set* of entries. It is not. It is a
+fingerprint of the **tree** — the entries, their arrangement, and every rule used to build it.
+
+<Misconception
+  belief="The Merkle root commits to the set of items."
+  reality="It commits to the tree: the items plus their order, the leaf encoding, and how odd levels are handled. Two implementations that disagree on any of those produce different roots from identical data."
+  why='The root is universally described as "a fingerprint of the data", which leaves out that the construction rules are part of what is being fingerprinted.'
+/>
+
+This is why a Merkle tree is only well-defined once you have written down the boring parts. Compare
+two real conventions:
+
+- OpenZeppelin's standard trees are complete binary trees with **sorted leaves**, leaves formed by
+  ABI-encoding the entry<Cite src="solidity-abi-spec" />, `keccak256` as the hash, and each leaf
+  hashed **twice**.<Cite src="oz-merkle-tree-js" />
+- Certificate Transparency keeps leaves in submission order and defines the tree hash recursively:
+  the empty tree is `SHA-256()`, a single leaf is `SHA-256(0x00 ‖ d(0))`, and for `n > 1` the tree
+  splits at the largest power of two smaller than `n` and hashes
+  `SHA-256(0x01 ‖ MTH(left) ‖ MTH(right))`.<Cite src="rfc-6962" />
+
+Both are correct Merkle trees. Neither can verify the other's proofs. Before a root means anything,
+the prover and the verifier must already agree on the entire recipe — and that agreement is a part of
+your protocol, not a detail of your tooling.
+
+The difference between them is not arbitrary, and it tracks what the data *is*. Certificate
+Transparency is a log: entries arrive in an order, that order is part of the claim, and an audit path
+is defined as the shortest list of additional nodes needed to recompute the tree
+hash.<Cite src="rfc-6962" /> An airdrop is a set: the order carries no meaning, so OpenZeppelin sorts
+the leaves and derives the arrangement from the data itself.<Cite src="oz-merkle-tree-js" /> Sorting
+buys canonicalisation — the same set always yields the same tree, no matter who builds it — at the
+cost of positional information the log convention keeps. Pick the one whose lost property you do not
+need.
+
+<Aside kind="note">
+There is a third proof shape worth knowing exists before you need it. A **multiproof** verifies
+several leaves against one root in a single call, sharing the internal nodes their paths have in
+common; OpenZeppelin's library exposes `multiProofVerify` alongside the single-leaf
+form.<Cite src="oz-merkleproof-source" /> For a claim contract batching many entries this is a real
+saving, because a large fraction of a proof set is redundant.
+
+It is also strictly harder to get right than the single-leaf case, and the next lesson gives the
+recorded reason.
+</Aside>
+
+<Aside kind="note">
+RFC 6962's split rule repays attention, because it is the answer to a question every implementation
+has to answer somehow: what do you do when a level has an odd number of nodes?
+
+Certificate Transparency does not require the leaf count to be a power of two, and the resulting tree
+may be unbalanced — but its **shape is uniquely determined by the number of
+leaves**.<Cite src="rfc-6962" /> That last clause is the requirement. Any rule works as long as one
+leaf count yields exactly one shape.
+</Aside>
+
+## When the padding rule is the vulnerability
+
+Bitcoin picked a different rule for odd levels — duplicate the last hash — and it is the most
+instructive mistake in this whole area, because the flaw is documented in a warning at the top of the
+implementation.
+
+Bitcoin Core's `merkle.cpp` opens with a note addressed to exactly this audience: if you are reading
+this because you are learning about crypto or designing a system that uses Merkle trees, be aware
+that the algorithm below has a serious flaw related to duplicate transaction ids
+(CVE-2012-2459).<Cite src="bitcoin-core-merkle" /> Because an odd level duplicates its last entry,
+the transaction lists `[1,2,3,4,5,6]` and `[1,2,3,4,5,6,5,6]` produce **the same
+root** — the hash of `(F)` and of `(F,F)` are the same node.<Cite src="bitcoin-core-merkle" />
+
+The consequence was not theft. It was that an attacker could send a block with the duplicated
+transaction list, identical root and identical block hash; a node that rejected it as invalid and
+marked that hash permanently invalid would then refuse the honest version of the same
+block.<Cite src="bitcoin-core-merkle" /> The defence shipped is to detect the case where two
+identical hashes would be combined at the end of a level and treat that as an invalid
+root.<Cite src="bitcoin-core-merkle" />
+
+Read that against the misconception above. Nothing was wrong with SHA-256 and nothing was wrong with
+the proofs. Two different leaf *sets* mapped to one tree because the padding rule was not injective —
+and injectivity of the construction, not strength of the hash, is what a root's meaning rests on.
+
+<Aside kind="warn">
+Notice the two odd-looking choices in the conventions above: OpenZeppelin hashes each leaf twice, and
+Certificate Transparency prefixes leaves and nodes with different bytes. Neither is decoration, and
+neither is about performance. They are the same defence against the same attack, which is the whole
+subject of the next lesson.<Cite src="rfc-6962" />
+</Aside>
+
+## What an inclusion proof does not give you
+
+- **It is not a proof of position.** With sorted-pair hashing there is no positional information in
+  the proof at all.<Cite src="oz-merkleproof-source" />
+- **It is not a proof of absence.** A plain Merkle tree cannot show that something is *not* in the
+  set; you would need an ordered structure and a proof about adjacent elements, which is one of the
+  reasons Ethereum's state lives in a trie rather than a plain tree.<Cite src="yellow-paper" />
+- **It is not a proof of uniqueness.** Nothing stops the same leaf appearing twice, so a claim
+  contract still needs its own "already claimed" mapping. The proof answers membership, not
+  multiplicity.
+- **It is not a statement about your data model.** Verification proves that some 32-byte value,
+  combined with the supplied siblings, reproduces the root. Whether that value was ever a legitimate
+  leaf is a question about your leaf encoding — and it is the verifier's job to make that question
+  unanswerable in the attacker's favour.<Cite src="oz-merkleproof-source" />
+
+<Misconception
+  belief="A valid inclusion proof means the claimed item was in the original data set."
+  reality="It means some 32-byte value hashed into the tree along the supplied path. Whether that value is a legitimate leaf depends entirely on the leaf encoding rule the verifier enforces."
+  why="Verification returns a boolean, and a boolean invites being read as a statement about the data rather than about the arithmetic."
+/>
+
+And one thing it never was: a statement about where the root came from. Everything above is
+conditional on the verifier holding the *right* root. A contract with a mutable `root` and an
+`onlyOwner` setter has a Merkle tree bolted onto a trusted-admin system, and the cryptography is
+decoration — whoever can set the root can mint any claim by publishing a tree that contains it. The
+proof machinery bounds what a *claimant* can assert; it says nothing about the publisher. Whenever
+you review one of these, read the setter before you read the verifier.
+
+<Aside kind="note">
+One more thing the root is not: a hiding commitment. Publishing a root does not conceal the leaf set
+if the entries are guessable, for exactly the reason the previous lesson gave — a verifier can hash
+any candidate leaf and walk a published proof. Airdrop trees are almost always published in full
+anyway, which matters in the next lesson: the attacker there needs the tree's contents, and by
+convention they already have them.
+</Aside>
+
+## Where this pays off
+
+Every account and every storage slot in Ethereum lives under a root of this family, which is what
+lets a light client verify a balance it never downloaded. Beacon-chain state is merkleised by a
+scheme that derives roots and proofs directly from the SSZ type definition, so a proof about one
+validator is small and its shape is fixed by the schema rather than by
+convention.<Cite src="ssz-specs-merkleization" /> Cross-chain messaging and storage-proof bridges are
+built on the same primitive, and rollups post roots rather than state.
+
+Two habits carry forward. First, the strength of a root is the collision resistance of its hash —
+half the digest length against an adversary who supplies leaves<Cite src="nist-sp-800-107" /> — which
+is why 32-byte nodes and not 16. Second, and more useful day to day: whenever a system compresses
+many things into one hash, write down the construction rules before you write the verifier, because
+those rules are the commitment.
+
+The next lesson takes the last bullet above seriously and turns it into a working forgery.

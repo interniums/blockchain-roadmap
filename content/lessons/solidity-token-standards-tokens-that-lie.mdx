@@ -1,0 +1,323 @@
+---
+id: solidity-token-standards-tokens-that-lie
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-20, weird-erc20, oz-safe-erc20-source, eip-7702, eip-1363, measured-gas-constants]
+stack: { solidity: "0.8.36" }
+---
+
+The test suite is green. Every path is covered, the mock token is the OpenZeppelin `ERC20`, and the
+deposit function has been reviewed twice.
+
+It is deployed, and the first user tries to deposit USDT. The transaction reverts. Nothing in the
+trace points at your contract's logic — the revert happens on the line that calls the token, and the
+token did not revert.
+
+The bug is a type mismatch between what the interface promises and what one of the largest deployed
+tokens actually returns, and the only reason it did not show up in testing is that the mock obeyed
+the interface.
+
+## The mechanism, exactly
+
+```solidity
+IERC20(token).transfer(to, amount);
+```
+
+You know what the compiler emits: encode the selector and arguments, `CALL`, then — because the
+declared return type is `bool` — [decode the returndata](/c/abi-decode-validates). The decode
+requires 32 bytes. Solidity's ABI decoder validates; it does not shrug and hand you a zero.
+
+USDT's `transfer` returns no data at all. So `returndatasize()` is 0, the decode finds nothing where
+a word should be, and the *calling contract* reverts. The token succeeded. Your contract failed on
+the next instruction.
+
+Read that again, because the attribution matters when you are staring at a trace: **the revert is in
+your code, not in the token's.** The state change the token made is rolled back along with
+everything else, so it looks like the transfer failed. It did not; the decode did.
+
+There are three populations of deployed token, and the catalogue names examples of each:<Cite src="weird-erc20" />
+
+- **Returns `bool`.** The standard's shape.<Cite src="eip-20" />
+- **Returns nothing.** USDT, BNB and OMG are the usual names, and the catalogue links a longer
+  list.<Cite src="weird-erc20" />
+- **Declares `bool` and returns `false` even on success.** Tether Gold is the recorded case, and the
+  catalogue draws the conclusion for you: its existence makes it *impossible* to correctly handle
+  return values for all tokens.<Cite src="weird-erc20" />
+
+There is a fourth, worse shape: partial compliance. BNB returns a `bool` for some methods and fails
+to do so for others, and the catalogue records that this is what left BNB tokens stuck in Uniswap
+v1.<Cite src="weird-erc20" /> A token cannot be classified by testing one function.
+
+<Matrix
+  corner="What transfer returns"
+  cols={['Returndata', 'Catalogued examples', 'IERC20(t).transfer(…)', 'SafeERC20.safeTransfer']}
+  rows={[
+    {
+      label: 'A bool, true',
+      cells: ['32 bytes, value 1', 'the standard shape', { v: 'works', tone: 'good' }, { v: 'accepts', tone: 'good' }],
+    },
+    {
+      label: 'Nothing',
+      cells: ['0 bytes', 'USDT, BNB, OMG', { v: 'reverts on the decode', tone: 'danger' }, { v: 'accepts, if the address has code', tone: 'good' }],
+    },
+    {
+      label: 'A bool, false — on success',
+      cells: ['32 bytes, value 0', 'Tether Gold', { v: 'reads success as failure', tone: 'danger' }, { v: 'reverts on a transfer that happened', tone: 'danger' }],
+    },
+    {
+      label: 'bool for some methods only',
+      cells: ['depends on the method', 'BNB', { v: 'works until it does not', tone: 'warn' }, { v: 'judges each call alone', tone: 'warn' }],
+    },
+  ]}
+  caption="Three of these four rows are a compile-time-correct call failing at runtime, and the last row is why one passing method proves nothing about the next."
+  alt="Four populations of deployed ERC-20 token by what transfer returns — a true bool, nothing, a false bool on success, and bool on some methods only — against what a typed call and SafeERC20 each do with them."
+/>
+
+<Misconception
+  belief="IERC20(token).transfer(...) works for every ERC-20, because that is what the interface file says."
+  reality="The interface file is your declaration of what you expect, not a description of what is deployed. Against a token that returns no data the ABI decode reverts, and the code compiled fine."
+  why="Every other kind of interface in a typed language is checked somewhere. Here nothing checks it: the address is a runtime value, and the first time your assumption meets reality is on mainnet against one specific asset."
+  src="weird-erc20"
+/>
+
+## Reading the fix
+
+`SafeERC20` handles this by refusing to let the compiler type the return value at all. Here is the
+core of its transfer path in the current source, which carries a `v5.7.0` header:<Cite src="oz-safe-erc20-source" />
+
+```solidity
+success := call(gas(), token, 0, 0x00, 0x44, 0x00, 0x20)
+// if call success and return is true, all is good.
+// otherwise (not success or return is not true), we need to perform further checks
+if iszero(and(success, eq(mload(0x00), 1))) {
+    // if the call was a failure and bubble is enabled, bubble the error
+    if and(iszero(success), bubble) {
+        returndatacopy(fmp, 0x00, returndatasize())
+        revert(fmp, returndatasize())
+    }
+    // if the return value is not true, then the call is only successful if:
+    // - the token address has code
+    // - the returndata is empty
+    success := and(success, and(iszero(returndatasize()), gt(extcodesize(token), 0)))
+}
+```
+
+Walk it as a decision, naming what each step is for.
+
+**Subgoal: make the call without committing to a return type.** A raw `CALL` with a 32-byte output
+window. Nothing here can revert on a decode, because there is no decode. This is the whole trick;
+everything else is interpreting the result.
+
+**Subgoal: accept the unambiguous success.** The call succeeded *and* the first returned word is
+exactly 1. Note it compares against the word, not a decoded `bool` — a token returning a non-boolean
+word does not slip through as truthy.
+
+**Subgoal: distinguish a genuine revert from a silent success.** If the call itself failed, copy the
+returndata out and re-revert with it, so the token's own error reaches the caller instead of a
+generic failure. That is what `bubble` is for, and the reason the library still gives you a useful
+message.
+
+**Subgoal: accept empty returndata only from an address that has code.** `returndatasize() == 0`
+*and* `extcodesize(token) > 0`. This is the clause that makes USDT work, and the second half of it
+is the part people leave out when they write this by hand.
+
+That second half matters because of something you already know: a `CALL` to an address with no code
+succeeds. It consumes gas, returns nothing, and reports success. Without the `extcodesize` check, a
+`safeTransfer` to a mistyped address — or to a token that was never deployed on this chain — would
+be indistinguishable from a successful transfer to USDT. Every token integration written against a
+config file needs that check, and most hand-rolled versions do not have it.
+
+<Figure
+  caption="Two of these four outcomes are byte-for-byte identical at the call boundary; only extcodesize separates them."
+  alt="A raw CALL branches into four outcomes: returns one, returns nothing from an address with code, returns nothing from an address with no code, and the call reverted. The first two are accepted; the last two revert."
+>
+  <Flow
+    lanes={['no decode', 'what came back', 'result']}
+    nodes={[
+      { id: 'call', label: 'raw CALL', note: '32-byte output window', col: 0, tone: 'accent' },
+      { id: 'one', label: 'returns 1', note: 'unambiguous', col: 1, tone: 'good' },
+      { id: 'usdt', label: 'returns nothing', note: 'address has code', col: 1, tone: 'good' },
+      { id: 'void', label: 'returns nothing', note: 'address has no code', col: 1, tone: 'danger' },
+      { id: 'rev', label: 'the CALL failed', note: "bubble the token's error", col: 1, tone: 'danger' },
+      { id: 'ok', label: 'accepted', col: 2, tone: 'good' },
+      { id: 'no', label: 'reverts', col: 2, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'call', to: 'one' },
+      { from: 'call', to: 'usdt' },
+      { from: 'call', to: 'void' },
+      { from: 'call', to: 'rev' },
+      { from: 'one', to: 'ok', tone: 'good' },
+      { from: 'usdt', to: 'ok', tone: 'good' },
+      { from: 'void', to: 'no', tone: 'danger' },
+      { from: 'rev', to: 'no', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+### Two details in that assembly that are not about tokens
+
+The snippet is written against the memory layout you already know, and two lines are there to keep
+that layout intact rather than to handle any token behaviour.<Cite src="oz-safe-erc20-source" />
+
+`let fmp := mload(0x40)` at the top and `mstore(0x40, fmp)` at the bottom save and restore the free
+memory pointer. The call arguments are built in the scratch space at `0x00`, which is exactly what
+scratch space is for, and the pointer is put back so the rest of the function sees no change. The
+`transferFrom` variant additionally does `mstore(0x60, 0)`, because its 100 bytes of calldata run
+past `0x5f` and clobber the zero slot, which Solidity requires to stay zero.
+
+The other detail is the output window. `call(gas(), token, 0, 0x00, 0x44, 0x00, 0x20)` asks for at
+most 32 bytes of return data to be copied into memory. A token that returns a megabyte cannot force
+memory expansion on the caller through this path — the excess stays in the
+[returndata buffer](/c/returndata-buffer) and is never copied, unless the bubble branch runs and
+deliberately copies it to re-revert. Hand-written versions that use `returndatacopy` unconditionally
+give that property away.
+
+Neither line has anything to do with USDT. Both are the reason this can be assembly at all without
+being a liability, and they are the standard you should hold your own low-level token calls to.
+
+### The check answers a question that changed
+
+`extcodesize(token) > 0` asks "does this address have code". Until Pectra that was the same question
+as "is this a contract". It is not any more: an account carrying a
+[delegation designator](/c/delegation-designator) holds 23 bytes of code while remaining an
+externally owned account.<Cite src="eip-7702" />
+
+So the guard's guarantee is narrower than it looks. It rules out the empty address, which is the
+case it was written for, and it does not establish that the callee is a token. If your product
+accepts a user-supplied token address, the code-length check is a sanity filter and not a type
+check, and post-Pectra it is a weaker filter than it was.
+
+Cost, while you are here: `EXTCODESIZE` is an account access, 2,600 gas cold and 100 warm on forge
+1.7.1 with solc 0.8.36 — and it is warm in this path, because the `CALL` to the token happened
+first.<Cite src="measured-gas-constants" /> Ordering the check after the call is not only logically
+necessary, it is also the cheap ordering.
+
+## What else the library gives you, and what it does not
+
+The 5.x surface worth knowing:<Cite src="oz-safe-erc20-source" />
+
+- **`safeTransfer`, `safeTransferFrom`** — the paths above, reverting with
+  `SafeERC20FailedOperation(token)` when the result cannot be read as success.
+- **`trySafeTransfer`, `trySafeTransferFrom`** — the same logic returning a `bool` instead of
+  reverting, for callers that want to handle failure rather than abort.
+- **`forceApprove`** — try, then zero-and-retry, for the tokens from the previous lesson.
+- **`safeIncreaseAllowance`, `safeDecreaseAllowance`** — read then absolute-approve, with the
+  ERC-7674 caveat noted in the source.
+- **`tryGetDecimals`** — a `staticcall` to `decimals()` that treats a missing or oversized answer as
+  failure rather than assuming the optional metadata exists.
+- **`transferAndCallRelaxed`, `transferFromAndCallRelaxed`, `approveAndCallRelaxed`** — ERC-1363
+  paths that fall back to the plain ERC-20 call when the recipient has no code.<Cite src="eip-1363" />
+
+And here is the boundary, stated plainly because the library's name encourages the opposite belief:
+**`SafeERC20` normalises return-value handling. That is all it does.**
+
+It does not tell you that the amount you sent is the amount that arrived. It does not tell you that
+the balance you recorded yesterday still means the same thing. It does not tell you the token has 18
+decimals, or that the recipient is not on a blocklist, or that the implementation behind the proxy
+is the one you reviewed. Against Tether Gold — which returns `false` on a successful transfer — it
+will revert on a transfer that actually happened, and no return-value discipline can fix
+that.<Cite src="weird-erc20" />
+
+Those are the next lesson's subject. The relevant discipline here is narrow and worth holding
+separately: return values are one axis of non-compliance, and the library closes exactly that axis.
+
+<Misconception
+  belief="Using SafeERC20 makes any token safe to integrate."
+  reality="It makes the return value readable. Fee-on-transfer, rebasing, blocklists, pausing, upgradeability, non-18 decimals and reentrant transfer hooks are all untouched by it, and each breaks a different assumption in your code."
+  why="The word 'safe' in the name, plus the fact that adopting it genuinely fixes the first bug most teams hit, so it gets remembered as the fix rather than as a fix."
+  src="oz-safe-erc20-source"
+/>
+
+## The other direction: failure that does not revert
+
+The mirror image of the USDT problem is a token that reports failure the way the standard allows and
+your code ignores it.
+
+ZRX and EURS return `false` instead of reverting, which is technically compliant and which the
+catalogue notes "goes against common solidity coding practices" and is routinely
+overlooked.<Cite src="weird-erc20" /> The standard is not ambiguous about whose job this is: callers
+MUST handle `false`, and MUST NOT assume that `false` is never
+returned.<Cite src="eip-20" />
+
+A bare `token.transfer(to, amount);` with the return value discarded therefore has two distinct
+bugs in one line — it reverts against tokens that return nothing, and it silently continues against
+tokens that return `false`. The second is the dangerous one, because your contract proceeds to
+credit, mint or release on the strength of a transfer that did not happen.
+
+## What this means for how you build
+
+**Use the library for every external token call, without exception.** Not "for the tokens we know
+are weird" — the point is that you do not know, and a token can become weird by upgrade. USDC and
+USDT are both upgradeable.<Cite src="weird-erc20" />
+
+**Test against adversarial mocks, not against your own token.** The catalogue is a compilable
+Foundry project of nonstandard implementations for exactly this: `MissingReturns` and `ReturnsFalse`
+are two files that would have caught both bugs in this lesson before
+deployment.<Cite src="weird-erc20" />
+
+**Fork-test against the real asset.** A mainnet fork with the actual USDT address is the only test
+that proves your deposit path works against USDT, and it takes about as long to write as this
+paragraph took to read.
+
+<Check type="spot-bug" concept="safe-erc20">
+A treasury contract sweeps a configured list of tokens to a cold wallet.
+
+```solidity
+function sweep(address[] calldata tokens) external onlyOperator {
+    for (uint256 i = 0; i < tokens.length; i++) {
+        IERC20 t = IERC20(tokens[i]);
+        uint256 bal = t.balanceOf(address(this));
+        if (bal > 0) {
+            t.transfer(coldWallet, bal);
+            emit Swept(tokens[i], bal);
+        }
+    }
+}
+```
+
+Find every way this goes wrong against the token populations in this lesson, and say which failure
+produces a wrong event rather than a failed transaction.
+
+<Answer>
+**It reverts on the whole sweep when it reaches a token that returns no data.** One USDT entry in
+the list and the loop dies at the decode, taking every earlier transfer with it, because they are
+all in one transaction. The other tokens are not swept and there is no partial progress.
+
+**It emits `Swept` for transfers that did not happen.** The return value is discarded, so against a
+token that returns `false` on failure — ZRX, EURS — the loop continues and emits an event recording
+a movement that never occurred.<Cite src="weird-erc20" /><Cite src="eip-20" /> This is the failure
+that produces a wrong event rather than a failed transaction, and it is the worst outcome here:
+downstream accounting, alerting and reconciliation are all reading that log.
+
+**It reverts against a token that reverts on zero-value transfers** — except that the `bal > 0`
+guard happens to cover that one. Worth noticing that the guard is load-bearing for a reason nobody
+wrote down.<Cite src="weird-erc20" />
+
+**It emits an amount that may not be the amount received.** `bal` is what left, and against a
+fee-on-transfer token the cold wallet gets less. The event says otherwise. That is the next lesson.
+
+**It can be blocked entirely.** If `coldWallet` or this contract is added to a token's blocklist,
+the transfer reverts and — because everything is one loop in one transaction — nothing can be swept
+at all until the list is edited.<Cite src="weird-erc20" />
+
+The fix has two independent parts. Use `SafeERC20.safeTransfer`, which handles the first two
+failures. And make each token's sweep independently failable — either one transaction per token, or
+`trySafeTransfer` with the event emitted only on success — so that one bad asset cannot hold the
+treasury hostage.<Cite src="oz-safe-erc20-source" />
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** is the second axis: tokens that honour the interface exactly and still deliver a
+different amount than you asked for, or change your balance while you are not looking.
+
+**ERC-721 and ERC-1155** have the same class of problem in a different place — a magic return value
+from the *recipient* rather than the token, checked for a reason that is worth understanding before
+you write a receiver.
+
+**The Foundry track's fork testing** is where this stops being a reading exercise. The catalogue's
+mocks plus a mainnet fork is a two-file test suite that catches everything in this lesson.

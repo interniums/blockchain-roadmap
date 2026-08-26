@@ -1,0 +1,389 @@
+---
+id: app-passkeys-the-precompile
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-7951, rip-7212, webauthn-sol, daimo-p256-verifier, fresh-crypto-lib, smooth-crypto-lib, eip-4337, ethereum-org-history, nist-fips-186-5, oz-changelog]
+stack: { solidity: "0.8.36", foundry: "1.7.1" }
+---
+
+One sentence from EIP-7951 breaks the habit of every Solidity engineer who has ever written a low-level
+call:
+
+> The precompile MUST NOT revert under any circumstances. Invalid inputs or verification failures MUST
+> return `` and consume the same amount of gas had verification succeeded.<Cite src="eip-7951" />
+
+Read it twice. There is no input — not a malformed length, not a public key that is not on the curve,
+not a signature that verifies against nothing — for which this call fails. The boolean that
+[a low-level call returns](/c/call-returns-a-boolean) is true every time. The gas is the same every
+time. The only thing that differs between "this user authorised the transfer" and "this is garbage" is
+the *length of the returned data*.
+
+So the verifier at `0x100` is a good precompile with a hostile interface, and this lesson is about
+calling it correctly, pricing it honestly, and knowing what it is on a chain that does not have it.
+
+## Where it came from, and what it costs
+
+EIP-7951 is Final. It places `P256VERIFY` at address `0x100` at a gas cost of **6900
+gas**.<Cite src="eip-7951" /> It shipped to Ethereum mainnet in the Fusaka upgrade of December
+2025.<Cite src="ethereum-org-history" /><Cite src="eip-7951" />
+
+The price has a stated derivation, which is worth knowing because it tells you the precompile is not
+free the way `ecrecover` is nearly free. The EIP benchmarked against the existing `ECRECOVER`
+precompile at 3000 gas, found that the actual cost of R1 verification was significantly slower, and
+raised the price to 6900 to match.<Cite src="eip-7951" /> Roughly 2.3 times an `ecrecover`, for the
+same security level — the EIP states P-256 provides approximately 128 bits of security, equivalent to
+secp256k1.<Cite src="eip-7951" />
+
+The EIP also states two things about that price that engineers reliably plan around wrongly.
+
+**It is flat.** There is no input-dependent component. A valid signature and a 160-byte string of zeros
+cost the same.
+
+**It is charged on failure.** The gas-burning rule above is explicit: invalid inputs consume the same
+gas as a success.<Cite src="eip-7951" /> A validation function that tries a signature and rejects it
+has still spent 6900 gas, and under ERC-4337 that spend lands somewhere real — the account is required
+to complete the normal flow rather than return early on a signature failure, precisely so gas
+estimation stays meaningful.<Cite src="eip-4337" />
+
+## The 160 bytes
+
+The input is exactly 160 bytes, as five 32-byte big-endian words in a fixed order:<Cite src="eip-7951" />
+
+| Offset | Field | What it is |
+|---|---|---|
+| 0–31 | `h` | the message hash — for a passkey, the double-SHA-256 digest from the previous lesson |
+| 32–63 | `r` | signature component |
+| 64–95 | `s` | signature component |
+| 96–127 | `qx` | public key x-coordinate |
+| 128–159 | `qy` | public key y-coordinate |
+
+<Figure
+  caption="The five words reach the precompile from three different places: your reconstruction, the assertion, and the account's own storage."
+  alt="The precompile's input as five consecutive 32-byte words: the message hash h, which the contract rebuilds; r and s, which arrive in the assertion; and qx and qy, the public key coordinates the account has stored since registration."
+>
+  <ByteLayout
+    offsets
+    caption="abi.encode(h, r, s, qx, qy) — exactly 160 bytes"
+    fields={[
+      { label: 'h', size: 32, tone: 'accent', note: 'you rebuild this' },
+      { label: 'r', size: 32, note: 'from the assertion' },
+      { label: 's', size: 32, note: 'from the assertion' },
+      { label: 'qx', size: 32, tone: 'muted', note: 'stored at registration' },
+      { label: 'qy', size: 32, tone: 'muted', note: 'stored at registration' },
+    ]}
+  />
+</Figure>
+
+Two coincidences make this easy to build in Solidity and easy to break.
+
+`abi.encode(h, r, s, qx, qy)` on five static 32-byte values produces exactly those 160 bytes, with no
+length prefix and no offset words, because [ABI encoding](/c/abi-encoding) only adds those for dynamic
+types. That is why `webauthn-sol` can write `abi.encode(messageHash, r, s, x, y)` and hand the result
+straight to the address.<Cite src="webauthn-sol" /> Change any one of those arguments to a `bytes` or a
+`bytes32[]` and the encoder silently starts emitting offsets, the length is no longer 160, and the
+precompile returns failure for a signature that is perfectly valid.
+
+And the ordering has no redundancy in it. Swap `r` and `s`, or `qx` and `qy`, and you get 160 bytes that
+are structurally valid and semantically wrong. There is no checksum, no tag, and no error message —
+just a shorter return.
+
+Note also where `qx` and `qy` come from. Registration handed you a COSE-encoded public key, not two
+integers; something off-chain decoded that structure into the two 32-byte coordinates the account stores.
+The precompile never sees COSE, DER, or any of the encodings the WebAuthn stack uses. By the time bytes
+reach `0x100`, every structure from the ceremony has been flattened into five raw words, which is why the
+decoding correctness lives in your registration path and shows up months later as a key that verifies
+nothing.
+
+### What the precompile checks before it does any arithmetic
+
+The specification lists the validation the precompile MUST perform, returning failure if any of it
+fails:<Cite src="eip-7951" />
+
+- input length is exactly 160 bytes;
+- both `r` and `s` satisfy `0 < r < n` and `0 < s < n`, where `n` is the subgroup order;
+- both `qx` and `qy` satisfy `0 <= qx < p` and `0 <= qy < p`, where `p` is the field modulus;
+- the point `(qx, qy)` satisfies the curve equation;
+- the point is not the point at infinity, which for this curve is encoded by convention as 64 zero
+  bytes.<Cite src="eip-7951" />
+
+That list is the reason you do not need to sanity-check a stored public key before calling. It is also
+the reason a zeroed-out owner slot is safe by construction: an account whose stored key is `(0, 0)`
+fails at the point-validity check rather than accepting anything.
+
+## Reading the answer
+
+There are exactly two possible return values, and the difference between them is not a value:<Cite src="eip-7951" />
+
+```
+success →  0x0000000000000000000000000000000000000000000000000000000000000001   (32 bytes)
+failure →                                                                        (0 bytes)
+```
+
+Not `0x…00`. Not a revert. Nothing.
+
+Now combine that with a second fact you already know from the core tracks: a `staticcall` to an address
+holding no code succeeds. `webauthn-sol` states it in a comment right at the call site — "staticcall
+will not revert if address has no code" — and then checks the return length instead.<Cite src="webauthn-sol" />
+Precompiles hold no code in state, which is the same
+[EXTCODESIZE asymmetry](/c/extcode-vs-code-asymmetry) that makes "is this a contract" checks unreliable,
+showing up in a new place.
+
+Put the two together and you get the shape of the bug:
+
+```solidity
+// WRONG — accepts every invalid signature
+(bool ok, ) = P256_VERIFIER.staticcall(abi.encode(h, r, s, qx, qy));
+require(ok, "bad signature");
+```
+
+`ok` is true for a valid signature. `ok` is true for an invalid signature. `ok` is true on a chain where
+`0x100` is an ordinary empty account. This is not a rare edge case that fuzzing will surface — it is the
+behaviour on **every** input, and a test suite that only ever feeds it valid signatures will never
+notice.
+
+The correct read is on the [returndata](/c/returndata-buffer), and it needs both halves:
+
+```solidity
+function _verifyP256(bytes32 h, uint256 r, uint256 s, uint256 qx, uint256 qy)
+    internal
+    view
+    returns (bool)
+{
+    (bool ok, bytes memory ret) = P256_VERIFIER.staticcall(abi.encode(h, r, s, qx, qy));
+    // length first: an empty return means "invalid" OR "no verifier here"
+    if (!ok || ret.length != 32) return false;
+    return abi.decode(ret, (uint256)) == 1;
+}
+```
+
+`webauthn-sol` does exactly this — `bool valid = ret.length > 0;` before decoding — and its comment
+records the reason in one line: even if the precompile exists, `ret.length` is 0 when verification
+returns false.<Cite src="webauthn-sol" />
+
+<Misconception
+  belief="The precompile reverts, or returns false, when the signature is invalid — so require(success) is the check."
+  reality="It MUST NOT revert under any circumstances, and it returns zero-length output rather than a 32-byte zero. The success flag carries no information at all; the return length does."
+  why="Every other failure in Solidity arrives as a revert or a false, and require(success) around a low-level call is a decade-old reflex. Here the reflex produces a verifier that accepts everything, and it does so on the happy path of every test that only supplies valid inputs."
+  src="eip-7951"
+/>
+
+## The same empty return means two opposite things
+
+This is the part worth sitting with, because it is the only place in the module where the same observable
+outcome is both "an attacker sent nonsense" and "we shipped to a chain that cannot run this account".
+
+An empty return tells you the signature did not verify **or** that nothing at `0x100` verified anything.
+The account cannot distinguish them, and the two failure modes have opposite consequences: the first is
+the system working, the second is every user of that deployment locked out simultaneously.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'A valid signature', tone: 'good' },
+    { title: 'An invalid signature', tone: 'warn' },
+    { title: 'No verifier on this chain', tone: 'danger' },
+  ]}
+  rows={[
+    {
+      label: 'Does the call revert?',
+      cells: [
+        <>No — the precompile MUST NOT revert<Cite src="eip-7951" /></>,
+        'No',
+        <>No — a staticcall to an address holding no code succeeds<Cite src="webauthn-sol" /></>,
+      ],
+    },
+    {
+      label: 'What does the success flag say?',
+      cells: ['true', 'true', 'true'],
+    },
+    {
+      label: 'How many bytes come back?',
+      cells: ['32', '0', '0'],
+    },
+    {
+      label: 'What should the account do?',
+      cells: [
+        'Accept',
+        'Reject — the system is working',
+        'Reject — and every user of this deployment is locked out at once',
+      ],
+    },
+  ]}
+  caption="The success flag says the same thing in all three columns; only the return length separates an authorised user from a chain that can verify nothing."
+  alt="Three outcomes of calling the secp256r1 verifier — a valid signature, an invalid signature, and a chain with no verifier at the address — compared on whether the call reverts, what the success flag says, how many bytes are returned, and what the account should do."
+/>
+
+The mitigations are all off-chain, and they are cheap:
+
+**Probe at deployment.** A single `staticcall` with a known-good vector — `webauthn-sol`'s README publishes
+one, with its `authenticatorData`, `clientDataJSON`, public key coordinates and `(r, s)` — tells you in one
+call whether this chain has a working verifier at that address.<Cite src="webauthn-sol" /> Run it in the
+deploy script, not in the account.
+
+**Know what your library does when the probe fails.** `webauthn-sol` attempts the precompile and, if that
+fails, falls back to FreshCryptoLib in Solidity.<Cite src="webauthn-sol" /> That fallback carries its own
+dependency, which the README flags as important: FreshCryptoLib uses the `ModExp` precompile at
+`address(0x05)`, which is not supported on some chains, and the library will not work on such chains
+unless they support the secp256r1 precompile.<Cite src="webauthn-sol" /> A fallback with a precondition is
+not a fallback everywhere.
+
+**Price the fallback path.** The same code comment is unusually candid about the cost: an invalid signature
+gets checked twice, once by the precompile and once by the Solidity implementation, and the authors note
+that ideally this failure is simulated off-chain so nobody actually pays that gas.<Cite src="webauthn-sol" />
+That is the reason your wallet should simulate before it prompts, and it is the same discipline as
+[simulate-then-write](/c/viem-simulate-before-send) applied to a signature check.
+
+<Aside kind="warn">
+There is a third reading of an empty return that is neither of the above, and it is the one that gets found
+in an audit rather than in testing: your account calls a **verifier contract address you store in state**
+rather than the precompile constant. If that address can be set to an account with no code — by an owner
+mistake, an uninitialised proxy, or a governance action — then every signature check returns empty, and
+whether that means "reject everything" or "accept everything" depends entirely on which of the two code
+patterns above you wrote. One of them bricks the account. The other one hands it away.
+</Aside>
+
+## What this did to the economics
+
+Before a native verifier existed, verifying a P-256 signature meant running the elliptic-curve arithmetic
+in the EVM, and that is the reason passkey accounts were a subsidised experiment rather than a default.
+
+Be careful how you quote the old number, because it is a claim with a weaker provenance than it usually gets.
+The most-cited implementation is Daimo's `p256-verifier`, whose README describes itself as the only audited
+open-source P-256 verifier, states that verifying a signature costs about 330k gas, and publishes a
+deterministic CREATE2 address so it can be deployed on any EVM chain.<Cite src="daimo-p256-verifier" /> That
+is the project's own figure for its own implementation, not an independent measurement, and this curriculum
+has not measured a pure-Solidity verifier. Treat "hundreds of thousands of gas" as the right order of
+magnitude and measure the specific library you are considering — the module's practice exercise exists for
+exactly that reason.
+
+The library landscape has moved too, and the movement matters more than the numbers:
+
+- **FreshCryptoLib** — the implementation `webauthn-sol` falls back to. Its own README is marked
+  **deprecated as of 15/05/24**, describes itself as an experimental prequel, and states plainly that FCL has
+  no audit.<Cite src="fresh-crypto-lib" />
+- **SmoothCryptoLib (SCL)** — the successor the FCL README directs readers to, which supports passkeys on
+  any chain via RIP-7696 and RIP-7212 contracts.<Cite src="fresh-crypto-lib" /><Cite src="smooth-crypto-lib" />
+- **OpenZeppelin's `P256` library**, added in Contracts 5.1.0 on 17 October 2024, which is the route most
+  teams take now because it arrives with the rest of the account machinery.<Cite src="oz-changelog" />
+
+The consequence for a product decision is not "the precompile is cheaper", which is obvious. It is that the
+argument that used to end the conversation no longer exists. When P-256 verification cost two orders of
+magnitude more than an `ecrecover`, a passkey account on L1 only made sense if somebody else paid, which made
+a paymaster a hard dependency of the product rather than a UX choice. At a flat 6900 gas, verification is a
+line item comparable to a couple of cold storage reads, and whether to sponsor gas becomes a decision about
+onboarding rather than about arithmetic.
+
+<Misconception
+  belief="P-256 verification is too expensive to do on Ethereum, so passkey accounts only work on L2 or with a sponsor."
+  reality="A native verifier has been live on L1 at 0x100 since Fusaka in December 2025, at a flat 6900 gas — about 2.3 times an ecrecover, whose price the EIP benchmarked against directly."
+  why="The Solidity-implementation cost was the accepted wisdom for years, and it was correct for years. It stopped being correct in December 2025, and blog posts written before that date are still the top search results."
+  src="eip-7951"
+/>
+
+## Same address, different chain, different contract
+
+`0x100` is not one thing. This is the detail that turns a deployment plan into a per-chain question.
+
+RIP-7212 is also Final, and it put a secp256r1 verifier at the same address `0x100`, with the same 160-byte
+input and the same output convention, for L2s — years before L1 had one.<Cite src="rip-7212" /> EIP-7951
+explicitly supersedes it, implementing the same functionality with the same interface, and states that the
+same contract bytecode that works with RIP-7212 will work with the new specification.<Cite src="eip-7951" />
+
+Two things differ, and only one of them is the price.
+
+**The price.** RIP-7212 specifies 3450 gas.<Cite src="rip-7212" /> EIP-7951's own interface-compatibility
+section records the difference as 3450 versus 6900, and its rationale says outright that the 6900 figure
+does not maintain compatibility with L2s but matches the benchmarks of actual
+implementations.<Cite src="eip-7951" /> What neither document tells you is what any particular rollup
+charges in August 2026 — chains adopt specifications on their own schedule, and whether a given L2 re-priced
+after Fusaka is not something this curriculum established. **Do not quote an L2 gas number from memory or
+from a table.** Measure it on the chain you are shipping to, in a fork test, the same way you would measure
+anything else.
+
+**The semantics, at the edges.** EIP-7951's rationale names two critical vulnerabilities in RIP-7212 that it
+fixes: the original failed to check whether the recovered point `R'` is the point at infinity, which could
+produce non-deterministic behaviour depending on the implementation and potentially cause consensus failures;
+and the comparison `r' == r` should be `r' ≡ r (mod n)`, to handle the case where the x-coordinate of `R'`
+exceeds the curve order.<Cite src="eip-7951" /> The EIP describes the fixes as transparent to correctly
+implemented callers, affecting only edge cases that should have failed verification anyway.<Cite src="eip-7951" />
+
+Take that pairing seriously as an engineering fact rather than as trivia. The same address, reached by the
+same 160 bytes, returning the same shapes, may be running either specification depending on the chain, and
+the difference lives in inputs your tests will not generate by accident. It is one more reason the answer to
+"does this account work here" is a probe against the chain, not an assumption.
+
+<Check type="spot-bug" concept="eip-7951-precompile">
+An account library exposes this helper. It is covered by tests that pass a real assertion from a real
+authenticator and assert `true`, and by tests that corrupt `r` and assert `false`.
+
+```solidity
+address constant VERIFIER = address(0x100);
+
+function verifyP256(bytes32 h, uint256 r, uint256 s, uint256 qx, uint256 qy)
+    internal
+    view
+    returns (bool)
+{
+    (bool ok, bytes memory ret) = VERIFIER.staticcall(abi.encode(h, r, s, qx, qy));
+    if (!ok) return false;
+    return abi.decode(ret, (uint256)) == 1;
+}
+```
+
+The corruption test passes. Explain why, say what happens on a chain without the precompile, and give the
+fix.
+
+<Answer>
+**Why the corruption test passes, by accident.** With a corrupted `r`, the precompile returns zero-length
+output.<Cite src="eip-7951" /> `ok` is true, so the early return does not fire. Then `abi.decode` is asked to
+read a `uint256` out of a zero-length `bytes`, and **reverts**. The test asserted the call returns `false`,
+but if it was written as `vm.expectRevert` or as a `try/catch`, or if the assertion is one level up in a
+function that treats any failure as rejection, it looks like a pass. The library never returned `false`. It
+threw.
+
+**Why that is worse than it looks in an ERC-4337 account.** Validation must return `SIG_VALIDATION_FAILED`
+without reverting on a signature mismatch; any *other* error must revert.<Cite src="eip-4337" /> This helper
+converts the first case into the second. Every wrong signature — including the ordinary case of a user's
+device producing an assertion for a stale operation — becomes a hard failure of the operation rather than a
+clean rejection, and it takes the gas-estimation path down with it. OpenZeppelin shipped a fix of exactly this
+shape in Contracts 5.7.0, making WebAuthn verification return `false` instead of reverting when the client
+data contains an out-of-bounds `challengeIndex`.<Cite src="oz-changelog" />
+
+**On a chain without the precompile.** `0x100` is an ordinary account with no code. The `staticcall` succeeds
+and returns nothing — `webauthn-sol` notes this behaviour in its own source.<Cite src="webauthn-sol" /> So the
+code takes the same path as a corrupted signature: it reverts, on every operation, for every user. Not a
+security hole — a total outage, discovered by the first user rather than by the deploy script.
+
+**The fix is one condition:**
+
+```solidity
+if (!ok || ret.length != 32) return false;
+return abi.decode(ret, (uint256)) == 1;
+```
+
+Check the length *before* decoding, and treat a wrong length as a rejection rather than as an exception.
+
+**The test that was missing.** Every test in that suite varied the signature and expected a rejection. Not one
+asserted on `returndatasize` directly, and not one ran against a chain state where `0x100` is empty. Both are
+one-line tests: assert that a corrupted signature makes the helper return `false` — not revert — and run the
+same suite against a fork of a chain that has no verifier, asserting the deploy-time probe fails loudly there.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** is about a property of this precompile that is not a bug and is not going to be fixed:
+it accepts two different signatures for the same message, on purpose, following the NIST standard it
+implements.<Cite src="nist-fips-186-5" /><Cite src="eip-7951" /> Everything you know about low-s enforcement
+from secp256k1 is inverted here.
+
+**Your deploy checklist** gains an item that is not optional: a probe of `0x100` against a known-good vector
+on every chain you deploy to, run before the factory, with the result recorded next to the deployment
+addresses.
+
+**Your gas model** gains a fixed 6900 per signature check, charged whether the signature is good or not, which
+is the number to put in your paymaster budget and your `verificationGasLimit` — and which the operation's
+signer commits to when the challenge is the [UserOperation hash](/c/user-operation), because the gas fields are
+inside it.

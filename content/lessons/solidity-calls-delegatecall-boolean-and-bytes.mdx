@@ -1,0 +1,382 @@
+---
+id: solidity-calls-delegatecall-boolean-and-bytes
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    solidity-docs-control-structures,
+    solidity-docs-global-vars,
+    solidity-docs-security,
+    solidity-abi-spec,
+    solidity-changelog,
+    solidity-blog-custom-errors,
+    solidity-0831-release,
+    oz-address-lib,
+    oz-lowlevelcall-lib,
+    eip-140,
+    eip-211,
+    eip-150,
+    eip-1884,
+  ]
+stack: { solidity: "0.8.36" }
+---
+
+An airdrop contract ran for four months.
+
+```solidity
+for (uint256 i = 0; i < recipients.length; i++) {
+    recipients[i].call{value: amounts[i]}("");
+    emit Paid(recipients[i], amounts[i]);
+}
+```
+
+Every event fired. The subgraph showed every payout. Support tickets came in from people who had
+never received anything, and the answer each time was "the transaction succeeded, check your wallet".
+It had succeeded. The contract sent ether to eleven addresses that rejected it, discarded eleven
+booleans, and emitted eleven events saying it had paid.
+
+The compiler had something to say about this. It emitted a warning — *return value of low-level calls
+not used* — on every build for four months, in a project whose build log had two hundred other
+warnings in it.
+
+This lesson is about what those two return values actually contain, why the language hands you the
+error instead of throwing it, and how to put it back.
+
+## The two exception regimes
+
+Solidity has exactly one rule for failures and one documented set of exceptions to it. The rule: when
+exceptions happen in a sub-call they bubble up automatically — exceptions are rethrown — unless they
+are caught in a `try`/`catch` statement.<Cite src="solidity-docs-control-structures" /> The
+exceptions to the rule: `send` and the low-level functions `call`, `delegatecall` and `staticcall`
+return `false` as their first return value in case of an exception instead of bubbling
+up.<Cite src="solidity-docs-control-structures" />
+
+That is the entire behavioural difference, and it is why two call sites that look almost identical
+behave in opposite ways when the callee fails:
+
+```solidity
+IVault(v).deposit();                         // callee reverts -> your frame reverts
+(bool ok, ) = v.call(abi.encodeCall(IVault.deposit, ()));   // callee reverts -> ok is false, you continue
+```
+
+The docs attach a second warning to the same paragraph, and it is the one from the previous lesson
+restated at the point where it bites: the low-level functions return `true` as their first return
+value if the account called is non-existent, as part of the design of the EVM, and account existence
+must be checked prior to calling if needed.<Cite src="solidity-docs-control-structures" />
+
+Put the two together and the boolean has three meanings, not two. `false` means a frame opened and
+threw. `true` means either a frame opened and returned, or no code ran at all. Nothing in the tuple
+distinguishes the last two.
+
+<Misconception
+  belief="A failed low-level call reverts the transaction, the same way a failed typed call does."
+  reality="It sets success to false and execution continues in your frame. Only an unhandled revert in your own frame reverts the transaction."
+  why="Typed calls auto-revert, the two call sites are one word apart, and the failing path is the path your tests do not cover."
+  src="solidity-docs-control-structures"
+/>
+
+## The bytes: four shapes of revert data
+
+The second return value is the callee's error, raw. Exceptions can contain error data passed back to
+the caller in the form of error instances, and the built-in errors `Error(string)` and
+`Panic(uint256)` are used by special functions — `Error` for regular error conditions and `Panic` for
+errors that should not be present in bug-free code.<Cite src="solidity-docs-control-structures" />
+
+Four shapes, and being able to classify a blob by its first four bytes is a practical skill:
+
+**`Error(string)`.** The docs give the encoding explicitly. `revert("Not enough Ether provided.")`
+returns `0x08c379a0` — the function selector for `Error(string)` — followed by a data offset of
+`0x20`, a string length of `0x1a`, and the UTF-8
+bytes.<Cite src="solidity-docs-control-structures" /> It is an ordinary ABI encoding of a call to a
+function that does not exist.<Cite src="solidity-abi-spec" /> This is what `require(cond, "msg")` and
+`revert("msg")` produce.
+
+<Figure
+  caption="A revert is a call that will never be dispatched: four bytes naming a function nobody implements, then its arguments."
+  alt="The revert data for revert with the message Not enough Ether provided: the four-byte Error(string) selector, a head word holding the offset 0x20, the string length 0x1a, twenty-six UTF-8 bytes, and six zero bytes of padding to fill the word."
+>
+  <Anatomy
+    value="0x08c379a00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000001a4e6f7420656e6f7567682045746865722070726f76696465642e000000000000"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 10, label: 'selector', note: 'Error(string)', tone: 'accent' },
+      { from: 10, to: 74, label: 'offset 0x20', note: 'the one head word' },
+      { from: 74, to: 138, label: 'length 0x1a', note: '26 bytes' },
+      { from: 138, to: 190, label: 'the message', note: 'UTF-8', tone: 'accent' },
+      { from: 190, to: 202, label: 'padding', tone: 'muted' },
+    ]}
+  />
+</Figure>
+
+**`Panic(uint256)`.** Produced by `assert` and inserted by the compiler. Its selector is derived the
+same way as any other, from the canonical signature.<Cite src="solidity-abi-spec" /> The single
+argument is a code, and the documented table is worth having in front of you rather than
+recalled: `0x00` for generic compiler-inserted panics, `0x01` for a failing `assert`, `0x11` for
+arithmetic overflow or underflow outside an `unchecked` block, `0x12` for division or modulo by zero,
+`0x21` for an out-of-range enum conversion, `0x22` for accessing an incorrectly encoded storage byte
+array, `0x31` for `.pop()` on an empty array, `0x32` for an out-of-bounds index, `0x41` for
+allocating too much memory or creating an array that is too large, and `0x51` for calling a
+zero-initialised variable of internal function type.<Cite src="solidity-docs-control-structures" />
+Two of those — `0x22` and `0x51` — are worth reading twice, because they are the ones that show up in
+a trace and get misdiagnosed as anything but what they are.
+
+**A custom error.** Four bytes of selector plus ABI-encoded arguments. The docs make the size
+argument directly: using a custom error instance will usually be much cheaper than a string
+description, because the name of the error is encoded in only four
+bytes.<Cite src="solidity-docs-control-structures" /> Note what that claim is and is not — it is
+about the size of the revert *data*, not a gas benchmark, and circulating gas comparisons for custom
+errors versus strings come from blog benchmarks with unstated optimiser settings that disagree with
+each other. Measure it on your build if the number matters.
+
+**Nothing at all.** `revert()` and `require(bool)` produce a revert without any data, not even an
+error selector.<Cite src="solidity-docs-control-structures" /> So does an out-of-gas, a stack-depth
+failure, and a value transfer to a contract with no `receive` or `fallback`. Empty revert data is the
+most common thing you will find in a failed low-level call and the least informative.
+
+<Matrix
+  corner="Shape"
+  cols={['What the first four bytes are', 'Who produces it', 'Decodable without the callee ABI?']}
+  rows={[
+    { label: 'Error(string)', cells: ['0x08c379a0', 'require with a string, revert with a string', { v: 'yes', tone: 'good' }] },
+    { label: 'Panic(uint256)', cells: ['its own fixed selector', 'assert, and compiler-inserted checks', { v: 'yes', tone: 'good' }] },
+    { label: 'A custom error', cells: ['four bytes of its canonical signature', 'revert MyError(...)', { v: 'no', tone: 'warn' }] },
+    { label: 'Nothing at all', cells: [{ v: 'there are no bytes', tone: 'danger' }, 'revert(), require(bool), out of gas, stack depth', { v: 'nothing to decode', tone: 'danger' }] },
+  ]}
+  caption="Only the two built-in shapes can be read by a caller that has never seen the callee's source, and the fourth shape cannot be read by anyone."
+  alt="The four shapes of revert data against their leading four bytes, what produces each, and whether a caller can decode them without the callee's ABI."
+/>
+
+There is also a list of situations where the compiler generates an `Error(string)` exception, or an
+exception with no data, without you having written a `revert` at all. Two of them are the ones this
+module keeps returning to: performing an external function call targeting a contract that contains no
+code, and receiving ether via a public function without the `payable`
+modifier.<Cite src="solidity-docs-control-structures" /> A revert blob you did not author is not
+evidence that the callee authored one either.
+
+<Aside kind="note">
+The gas behaviour of these two error types changed under your feet if you learned Solidity before
+0.8. A failing `assert` used to compile to the invalid opcode, which consumed all the gas available
+to the call, and `require` consumed all gas until the Metropolis
+release.<Cite src="solidity-docs-control-structures" /> Both now use `REVERT`, which returns the
+unused gas.<Cite src="eip-140" /> Any advice you have absorbed about "prefer `require` because
+`assert` burns your gas" is describing a compiler that no longer exists — though the semantic
+distinction the docs draw is still live: `assert` is for internal errors and invariants, and properly
+functioning code should never create a `Panic`, not even on invalid external
+input.<Cite src="solidity-docs-control-structures" />
+</Aside>
+
+<Aside kind="note">
+The single most repeated stale claim about Solidity error handling is that `require` cannot take a
+custom error. The `require(bool, Error)` overload landed in 0.8.26 for the via-IR pipeline and was
+made available on the legacy pipeline in 0.8.27.<Cite src="solidity-changelog" /> The docs now list
+three overloads: `require(bool)` reverting with no data, `require(bool, string)` reverting with
+`Error(string)`, and `require(bool, error)` reverting with the user-supplied custom
+error.<Cite src="solidity-docs-control-structures" /> The canonical 2021 Solidity blog post
+introducing custom errors still says the combination is unsupported and has never been
+amended.<Cite src="solidity-blog-custom-errors" />
+
+One trap that survives the upgrade: `require` arguments are evaluated unconditionally, so in
+`require(condition, CustomError(f()))` the function `f` is called whether or not the condition
+holds.<Cite src="solidity-docs-control-structures" />
+</Aside>
+
+## Putting the error back on the wire
+
+`require(success, "call failed")` is the most common thing written after a low-level call and it
+does the wrong thing twice: it discards a byte string that was sitting in a local variable, and it
+replaces it with a string that tells the user nothing about what went wrong three frames down.
+
+Preserving it requires re-reverting the raw bytes, which means assembly, because Solidity has no
+statement for "throw these bytes". OpenZeppelin's 5.7.0 source has both forms, and the difference
+between them is worth understanding rather than copying.<Cite src="oz-lowlevelcall-lib" />
+
+```solidity
+// From a bytes memory you already copied
+function bubbleRevert(bytes memory returndata) internal pure {
+    assembly ("memory-safe") {
+        revert(add(returndata, 0x20), mload(returndata))
+    }
+}
+
+// Straight from the return-data buffer, never materialising a variable
+function bubbleRevert() internal pure {
+    assembly ("memory-safe") {
+        let fmp := mload(0x40)
+        returndatacopy(fmp, 0x00, returndatasize())
+        revert(fmp, returndatasize())
+    }
+}
+```
+
+**Subgoal — read the first form as pointer arithmetic on Solidity's memory layout.** A `bytes memory`
+value is a pointer to a length word followed by the data. `add(returndata, 0x20)` skips the length;
+`mload(returndata)` reads it. Those two expressions are the offset and size that `REVERT`
+wants.<Cite src="eip-140" />
+
+**Subgoal — see why the second form exists at all.** The return data lives in a buffer the caller can
+copy from, and its size is available without copying: EIP-211 advises compiler implementors to
+reserve a zero-length area for return data when the size is unknown before the call, and then use
+`RETURNDATACOPY` together with `RETURNDATASIZE` to retrieve it.<Cite src="eip-211" /> The second form
+does exactly that — it never allocates a `bytes memory`, which matters when the reason you are in
+assembly is that you refused to copy the buffer in the first place. That is the next lesson.
+
+**Subgoal — justify the `memory-safe` annotation, which is not decoration.** Writing at the free
+memory pointer without advancing it would normally be a violation. It is safe here because the very
+next instruction is `REVERT`: the frame is about to cease existing, so no later allocation can
+observe the scribble. The annotation is a promise to the optimiser, and this is one of the few places
+where "the frame is about to die" is the whole justification.
+
+**Subgoal — check what the caller then sees.** A custom error thrown several frames down arrives at
+the top-level caller with its selector and its arguments intact, which is what makes
+`vm.expectRevert(abi.encodeWithSelector(MyError.selector, 1, 2))` pass across a whole chain of
+bubbling frames. If any link in that chain used `require(ok)`, the top-level caller gets a bare
+failure instead and the test can only assert that *something* went wrong.
+
+`Address.functionCallWithValue` shows the full decision, including the case bubbling cannot cover: on
+failure with return data it bubbles, and on failure with no return data it reverts with a dedicated
+`FailedCall` error rather than pretending to know more than it does.<Cite src="oz-address-lib" />
+That third branch is the honest handling of an ambiguous empty blob.
+
+## `try`/`catch`, and the five things it does not do
+
+`try`/`catch` is the structured form, and it is narrower than it appears. The `try` keyword has to be
+followed by an expression representing an external function call or a contract creation via
+`new ContractName()`.<Cite src="solidity-docs-control-structures" /> The clauses are
+`catch Error(string memory reason)` for the built-in string revert, `catch Panic(uint errorCode)` for
+panics, `catch (bytes memory lowLevelData)` for everything else including custom errors, and a bare
+`catch { ... }` if you do not want the data; to catch all error cases you must have at least the bare
+clause or the bytes clause.<Cite src="solidity-docs-control-structures" />
+
+Five documented limits, each of which has produced a production incident somewhere:
+
+**It does not cover the expression you are calling.** Errors inside the `try` expression are not
+caught — for example if it is a complex expression that also involves internal function calls — only
+a revert happening inside the external call itself.<Cite src="solidity-docs-control-structures" /> So
+`try oracle.price(computeArgs())` leaves `computeArgs()` completely unprotected, and the argument
+evaluation is the part most likely to overflow.
+
+**It does not cover decoding the success case.** If an error happens during the decoding of the
+return data inside a `try`/`catch` statement, this causes an exception in the currently executing
+contract and because of that is not caught in the catch clause.<Cite src="solidity-docs-control-structures" />
+A callee that returns malformed data for your declared return type takes your transaction down
+through a `try` that was written to prevent exactly that.
+
+**It does not cover a failure in your own frame.** There is no way to wrap an internal call. The only
+route to a catchable failure in your own code is `this.f()` — a real message call into your own
+account, with all the consequences the previous lesson listed.
+
+**It cannot tell a deliberate failure from an out-of-gas.** The docs say it plainly: do not assume
+that the error message is coming directly from the called contract, since it might have happened
+deeper down the call chain and been forwarded, and it could be an out-of-gas situation rather than a
+deliberate error condition — noting that the caller always retains at least one sixty-fourth of the
+gas in a call, so even if the callee runs out, the caller still has gas
+left.<Cite src="solidity-docs-control-structures" /><Cite src="eip-150" /> This is a security
+property, not a diagnostic inconvenience: anyone who controls how much gas your call receives can
+choose which branch of your `try` executes.
+
+**It does not tell you nothing happened.** If execution reaches a catch block, the state-changing
+effects of the external call have been reverted; if execution reaches the success block, the effects
+were not reverted.<Cite src="solidity-docs-control-structures" /> That is a guarantee about the
+*callee's* effects. Your own frame keeps everything it did before the call, which is exactly what you
+want and exactly what makes a half-completed multi-step operation possible.
+
+<Aside kind="warn">
+The related deprecation is worth carrying because it changes advice most existing material still
+gives. `send` and `transfer` are deprecated and scheduled for removal.<Cite src="solidity-docs-global-vars" />
+The compiler team's stated reasoning is that these functions limit the callee to a hard-coded stipend
+of 2,300 gas, which came with an implicit assumption that opcode pricing would never change — an
+assumption that quickly turned out not to hold — and that `address.call()` with an empty payload is
+the recommended alternative, with the explicit caveat that it provides no reentrancy protection
+because the gas forwarded to the callee is not limited by
+default.<Cite src="solidity-0831-release" /><Cite src="eip-1884" /> If you relied on `send` or
+`transfer` for that property, the replacement is a reentrancy guard or
+checks-effects-interactions.<Cite src="solidity-0831-release" /><Cite src="solidity-docs-security" />
+</Aside>
+
+<Check type="spot-bug" concept="low-level-call-returns-bool">
+A staking contract lets users exit. The author has read about unchecked return values and has been
+careful:
+
+```solidity
+function exit() external {
+    uint256 amount = staked[msg.sender];
+    staked[msg.sender] = 0;
+
+    (bool ok, bytes memory data) = rewardToken.call(
+        abi.encodeCall(IERC20.transfer, (msg.sender, amount))
+    );
+    require(ok, "reward transfer failed");
+
+    (ok, ) = payable(msg.sender).call{value: bond[msg.sender]}("");
+    require(ok, "bond refund failed");
+    bond[msg.sender] = 0;
+}
+```
+
+Effects come before interactions, both booleans are checked, and both `require` calls have messages.
+Name three separate defects, in order of how much money each one can lose.
+
+<Answer>
+**Defect one, and it is the expensive one: `ok` being `true` does not mean the transfer happened.**
+
+Two independent ways this passes while moving nothing. If `rewardToken` holds no code — a wrong
+address, a token not deployed on this chain, a proxy whose implementation pointer was corrupted —
+the call returns `true` with empty data, as the docs warn for exactly these low-level
+forms.<Cite src="solidity-docs-control-structures" /> And if `rewardToken` is a token that returns
+`false` on failure instead of reverting, `ok` is `true` because the *call* succeeded; the token's
+own boolean is sitting unexamined in `data`. The code declares `data` and never reads it — which the
+compiler notes as an unused variable and nothing more.
+
+The check has to be: the call succeeded, *and* either it returned data that decodes to `true` or the
+target has code and returned nothing. That is the condition OpenZeppelin's `Address` library
+implements — `success && (returndata.length > 0 || target.code.length > 0)`, with a dedicated
+`AddressEmptyCode` error on the other branch — which is why the answer in practice is `SafeERC20`
+rather than a hand-rolled call.<Cite src="oz-address-lib" />
+
+**Defect two: both `require` calls destroy the reason.**
+
+`data` holds whatever the token reverted with — an `Error(string)` blob starting `0x08c379a0`, a
+`Panic(uint256)`, or a custom error's four-byte selector and
+arguments.<Cite src="solidity-docs-control-structures" /> `require(ok, "reward transfer failed")`
+throws all of it away and substitutes a string that tells a user nothing about whether they were
+blacklisted, whether the token was paused, or whether the contract was out of tokens. Bubble the raw
+bytes when there are bytes, and fall back to a dedicated error when there are
+not.<Cite src="oz-lowlevelcall-lib" />
+
+**Defect three: `bond[msg.sender] = 0` is after the interaction, and the interaction is the one that
+calls back.**
+
+The token transfer is above the effect for its own storage, but the bond refund is a value transfer
+to `msg.sender` with all remaining gas forwarded, and `bond[msg.sender]` is still non-zero when
+control reaches the recipient.<Cite src="solidity-docs-security" /> A contract recipient re-enters
+`exit`, reads a non-zero bond, and is refunded again. `staked` is already zeroed so the reward leg is
+harmless on re-entry, which is precisely why this survives a casual reading — half the function
+follows checks-effects-interactions and half does not.
+
+**What is not a defect, and is worth saying.** Zeroing `staked` before the calls is correct and is
+the reason only one of the two legs is re-enterable. The author's instinct was right; the execution
+was inconsistent. That is the normal shape of this bug in production — not an author who had never
+heard of the pattern, but one who applied it to the line they were thinking about.
+
+**One more consideration for the fix.** After bubbling revert data from an untrusted token you are
+copying that token's output into your own memory, which the next lesson shows is something a hostile
+callee gets to choose the size of.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next:** the gas you cannot promise a callee and the return data you should not copy. This lesson's
+advice — preserve the callee's bytes — is in direct tension with the next lesson's — do not copy the
+callee's bytes — and resolving that tension correctly is the difference between a relayer that works
+and one that can be griefed to a halt.
+
+**In the errors and events module**, the same four-shape taxonomy comes back from the other side: how
+you *design* errors so that a frontend and an indexer can decode them across a version change.
+
+**And a small habit with an outsized payoff.** Treat every unread `bytes memory` returned from a
+low-level call as a code smell. Either you needed it — in which case read it — or you did not, in
+which case say so by using the `callNoReturn` shape and not allocating it at all. A variable that
+holds an error nobody looks at is the single most reliable marker of this whole class of bug.

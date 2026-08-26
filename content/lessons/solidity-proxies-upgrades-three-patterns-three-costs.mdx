@@ -1,0 +1,406 @@
+---
+id: solidity-proxies-upgrades-three-patterns-three-costs
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-1967, eip-1822, eip-1167, eip-2535, oz-src-initializable, oz-src-transparent-proxy, oz-src-proxyadmin, oz-src-uups, oz-src-beacon-proxy, oz-src-upgradeable-beacon, oz-src-erc1967utils, oz-src-erc1967proxy, oz-changelog, oz-upgrades-faq, nomic-proxy-backdoors, zealynx-upgrade-patterns, measured-gas-constants, solidity-abi-spec]
+stack: { solidity: "0.8.36" }
+---
+
+ERC-1967 answers exactly one question: where the pointer lives. It says nothing about who may change
+it, nothing about where the function that changes it lives, and nothing about how many proxies one
+change should move.
+
+Three patterns dominate production, and they are three different answers to those three questions.
+They are usually compared on gas, which is the least interesting axis. The interesting axis is what
+each one does to the shape of your failures.
+
+## First, the problem that forces a choice
+
+A proxy has a fallback. If it *also* has ordinary external functions — `upgradeTo`, `admin`,
+`implementation` — then the compiler generates a dispatcher for those in front of the fallback.
+A call arriving at the proxy is matched against the proxy's own selectors first, and only reaches
+the fallback if nothing matched.
+
+You already know that a selector is four bytes of `keccak256` over the canonical
+signature, and that four bytes is a `2^32` space small enough to mine
+deliberately.<Cite src="solidity-abi-spec" /> You also know that the compiler rejects two functions
+with the same selector inside one contract — and that a proxy and its implementation are two
+separate compilations, so nothing rejects anything.
+
+```text
+upgradeTo(address)                      0x3659cfe6
+upgradeToAndCall(address,bytes)         0x4f1ef286
+upgradeAndCall(address,address,bytes)   0x9623609d
+proxiableUUID()                         0x52d1902d
+implementation()                        0x5c60da1b
+```
+
+Two consequences, in opposite directions.
+
+**Shadowing.** An implementation function whose selector equals one of the proxy's is unreachable
+through the proxy. The proxy's dispatcher wins, every time, for every caller. Your `implementation()`
+view function on a vault would never run.
+
+**Backdooring.** The reverse is the attack. Somebody who writes the implementation can name a
+function so that its selector collides with a proxy admin function, and the collision resolves in
+the proxy's favour or the implementation's depending on where the dispatcher sits — which means a
+proxy can be authored so that a call that looks like ordinary business logic reaches privileged
+proxy machinery, with nothing visible in either source file. This is old news, first written up in
+2018, and it is the reason OpenZeppelin's proxy source cites that write-up in the comment explaining
+why the transparent pattern exists at all.<Cite src="oz-src-transparent-proxy" /><Cite src="nomic-proxy-backdoors" />
+
+Every pattern below is a way of guaranteeing that one call is never ambiguous between two dispatch
+surfaces.
+
+<Aside kind="note">
+Shadowing is worth demonstrating on yourself once. Put a public
+`function implementation() external view returns (address)` on a proxy — a reasonable-looking
+convenience getter — and then deploy behind it any implementation that also exposes
+`implementation()`, which several vault and bridge interfaces do. Both are selector `0x5c60da1b`.
+Every caller in the world now gets the proxy's answer, the implementation's version is dead code,
+and neither compiler emitted a warning because neither compiler saw both files.<Cite src="solidity-abi-spec" />
+</Aside>
+
+## Transparent: split on the caller
+
+The transparent proxy's rule is a single branch. If the caller is the admin, the proxy handles the
+call itself. If the caller is anyone else, the call is forwarded, unconditionally, even if it
+matches an admin selector exactly.<Cite src="oz-src-transparent-proxy" />
+
+```solidity
+function _fallback() internal virtual override {
+    if (msg.sender == _proxyAdmin()) {
+        if (msg.sig != ITransparentUpgradeableProxy.upgradeToAndCall.selector) {
+            revert ProxyDeniedAdminAccess();
+        } else {
+            _dispatchUpgradeToAndCall();
+        }
+    } else {
+        super._fallback();
+    }
+}
+```
+
+Read what is *not* there. There is no compiler-generated dispatcher in front of this, because
+`TransparentUpgradeableProxy` deliberately does not inherit `ITransparentUpgradeableProxy`. The
+source says so directly: the compiler is unaware these functions exist and will not include them in
+the ABI, so `upgradeToAndCall` is implemented by a manual comparison against `msg.sig` inside the
+fallback.<Cite src="oz-src-transparent-proxy" /> The proxy's own ABI is empty. There is nothing for
+an implementation selector to collide *with*.
+
+**The admin cannot use the contract.** That is not a side effect, it is the design. Any call from
+the admin that is not `upgradeToAndCall` reverts with `ProxyDeniedAdminAccess`. If your deployer EOA
+is the admin and you try to call `balanceOf` from it, you get a revert with an error the
+implementation has never heard of.<Cite src="oz-src-transparent-proxy" /> This is why the pattern
+insists the admin be a dedicated account that does nothing else — and why, since Contracts 5.0, the
+proxy does not let you choose: its constructor deploys a fresh `ProxyAdmin` and makes *that* the
+admin.<Cite src="oz-src-transparent-proxy" />
+
+So the real upgrade key is the `ProxyAdmin`'s owner. `ProxyAdmin` is `Ownable` with one function,
+`upgradeAndCall(proxy, implementation, data)`, guarded by `onlyOwner`, which forwards to the
+proxy.<Cite src="oz-src-proxyadmin" /> Rotating who can upgrade is an ownership transfer on a
+separate, tiny, auditable contract rather than a change to the proxy.
+
+<Aside kind="note">
+**"Transparent costs an extra `SLOAD` on every call" is now wrong**, and it was right until
+Contracts 5.0. The admin used to be read from the ERC-1967 admin slot on every call. In 5.0 it moved
+into an `immutable`, set during construction, explicitly to avoid unnecessary storage reads — at the
+cost of removing the ability to ever change the admin address.<Cite src="oz-changelog" /><Cite
+src="oz-src-transparent-proxy" /> The per-call overhead today is a comparison against a value baked
+into the runtime bytecode, not a 2,100-or-100-gas storage read.<Cite src="measured-gas-constants" />
+The ERC-1967 admin slot is still written once at construction so external tools can read
+it.<Cite src="oz-src-transparent-proxy" />
+</Aside>
+
+<Aside kind="warn">
+The source carries a warning worth internalising before you subclass anything here: it is not
+recommended to extend `TransparentUpgradeableProxy` with additional external functions, because the
+compiler will not check for selector conflicts against the manually dispatched ones, and a clash
+resolves in favour of the new function — which could render `upgradeToAndCall` inaccessible and
+destroy both upgradeability and transparency.<Cite src="oz-src-transparent-proxy" /> The pattern
+that exists to prevent selector clashes reintroduces them the moment you add a function to it.
+</Aside>
+
+## UUPS: move the upgrade function into the implementation
+
+If the proxy has no functions of its own, no clash is possible and no caller check is needed. UUPS
+takes that to its conclusion: the proxy is a plain `ERC1967Proxy`, and `upgradeToAndCall` is a
+function on the *implementation*, reached through the fallback like any other business
+function.<Cite src="oz-src-uups" /><Cite src="oz-src-erc1967proxy" />
+
+The name and the compatibility check come from ERC-1822, which is still marked
+Stagnant.<Cite src="eip-1822" /> The slot comes from ERC-1967. Follow one upgrade call all the way
+down.
+
+**Step 1 — confirm we are executing inside a proxy that points at us.** `upgradeToAndCall` carries
+`onlyProxy`, which calls `_checkProxy`:<Cite src="oz-src-uups" />
+
+```solidity
+address private immutable __self = address(this);
+
+function _checkProxy() internal view virtual {
+    if (
+        address(this) == __self ||                       // must be through delegatecall
+        ERC1967Utils.getImplementation() != __self       // must be an active proxy pointing here
+    ) {
+        revert UUPSUnauthorizedCallContext();
+    }
+}
+```
+
+`__self` is an `immutable`, so it is burned into the implementation's runtime code at *its*
+deployment and holds the implementation's own address forever. Under delegatecall `address(this)` is
+the proxy, so the two differ — that is the first clause. The second reads the ERC-1967 slot of
+whatever account we are running in and requires it to name us. Together they stop anyone calling
+`upgradeToAndCall` directly on the implementation account, and stop a stale implementation being
+driven through a proxy that has already moved on.
+
+**Step 2 — apply your authorisation policy.** `_authorizeUpgrade(newImplementation)` is `internal
+virtual` with no body in the library. You must override it, and the documentation's example is
+exactly one line — `function _authorizeUpgrade(address) internal onlyOwner {}`.<Cite src="oz-src-uups" />
+An empty override with no modifier compiles, deploys, and hands the contract to whoever calls it
+first.
+
+**Step 3 — check the new implementation is upgradeable at all.**<Cite src="oz-src-uups" />
+
+```solidity
+try IERC1822Proxiable(newImplementation).proxiableUUID() returns (bytes32 slot) {
+    if (slot != ERC1967Utils.IMPLEMENTATION_SLOT) revert UUPSUnsupportedProxiableUUID(slot);
+    ERC1967Utils.upgradeToAndCall(newImplementation, data);
+} catch {
+    revert ERC1967Utils.ERC1967InvalidImplementation(newImplementation);
+}
+```
+
+This is the ERC-1822 splice: the standard's compatibility *call*, answering with ERC-1967's *slot*.
+An implementation that does not implement `proxiableUUID` at all lands in the `catch`. One that
+answers with a different slot — a contract built around some other proxy scheme — is rejected by
+name.
+
+**Step 4 — and note the one place `proxiableUUID` must fail.** It carries `notDelegated`, which
+reverts if `address(this) != __self`. The reason is stated in both ERC-1822's descendant interface
+and OpenZeppelin's source: a proxy pointing at a proxiable contract must not itself look proxiable,
+because upgrading a proxy *to another proxy* would leave it delegating to itself until it runs out
+of gas.<Cite src="oz-src-uups" /> A safety check that returns the right answer through a proxy would
+brick the very thing it exists to protect.
+
+**What UUPS buys.** No per-call caller branch, and a proxy small enough that deploying many of them
+is cheap. **What it costs**: the upgrade path is now part of the code you ship. Ship one
+implementation without it, or with an `_authorizeUpgrade` that can never pass, and the door closes
+permanently — which is the entire next lesson.
+
+<Misconception
+  belief="UUPS is the better modern choice; transparent is legacy."
+  reality="UUPS is cheaper per call and leaves a smaller proxy. It also moves the bricking risk out of a contract you deploy once and into every implementation you will ever ship. Transparent's upgrade machinery lives in the proxy, so it cannot be removed by a bad release."
+  why="Gas comparisons are one-dimensional and immediate; the risk is conditional on a future mistake by a future engineer, so it does not show up in any benchmark."
+  src="zealynx-upgrade-patterns"
+/>
+
+## Beacon: one pointer, many proxies
+
+A beacon proxy stores the address of a *beacon* contract, and asks the beacon for the implementation
+on every call.<Cite src="oz-src-beacon-proxy" />
+
+```solidity
+function _implementation() internal view virtual override returns (address) {
+    return IBeacon(_getBeacon()).implementation();
+}
+```
+
+The beacon itself is `Ownable` with a single `upgradeTo(address newImplementation) onlyOwner` that
+stores the address and emits `Upgraded`, rejecting anything with no code via
+`BeaconInvalidImplementation`.<Cite src="oz-src-upgradeable-beacon" />
+
+**The shape this is for**: many instances of the same contract. A vault factory, a per-user account,
+a per-market pool. Upgrading ten thousand transparent or UUPS proxies is ten thousand transactions;
+upgrading ten thousand beacon proxies is one.
+
+**The costs, precisely.**
+
+- Every call performs an **external call to the beacon** — not a storage read of a local slot, an
+  actual `CALL` into another account. That is a cold account access at 2,600 gas or a warm one at
+  100, plus the beacon's own `SLOAD` of its implementation variable at 2,100 cold or 100
+  warm.<Cite src="measured-gas-constants" /> The first call in a transaction pays the cold prices;
+  the rest are warm. This is the one pattern where the per-call overhead is genuinely larger, and it
+  scales with how often your users touch a cold beacon.
+- The blast radius is the point and the danger. One key, one transaction, every instance. A bad
+  implementation or a compromised beacon owner takes the entire fleet at once, with no partial
+  rollout and no canary.
+- Since Contracts 5.0 the beacon address lives in an `immutable` on the proxy and cannot be
+  changed.<Cite src="oz-changelog" /><Cite src="oz-src-beacon-proxy" /> A `BeaconProxy` is bound to
+  its beacon for life; the ERC-1967 beacon slot is written once at construction for external
+  readers, and `ERC1967Utils.upgradeBeaconToAndCall` carries an explicit caution that invoking it
+  has no effect on a v5 `BeaconProxy`.<Cite src="oz-src-erc1967utils" />
+
+<Aside kind="note">
+An EIP-1167 minimal proxy is the fourth thing in this family and is not an upgrade pattern at all:
+its target is hard-coded in the clone's own immutable bytecode, so a clone is cheap to deploy and
+frozen forever.<Cite src="eip-1167" /> If you want many cheap instances *and* the ability to change
+their logic, the beacon is the pattern that gives you both. ERC-2535 diamonds are a fifth answer,
+replacing the compiler's dispatcher with an explicit selector-to-facet mapping so one logical
+contract can exceed the code size limit.<Cite src="eip-2535" />
+</Aside>
+
+## Initialization is the same problem three times
+
+None of these proxies runs the implementation's constructor, so all three need the same thing: a
+call that runs once, in the proxy's context, before anyone else can get in. All three take it as a
+constructor argument and forward it as a delegatecall during
+deployment.<Cite src="oz-src-erc1967proxy" /><Cite src="oz-src-beacon-proxy" />
+
+The atomicity is the point. Deployment and initialization in one transaction leaves no window in
+which the proxy exists uninitialized. Splitting them across two transactions leaves a window in
+which anyone can call `initialize` and become the owner — an ordinary front-run, not an exotic
+attack. Contracts 5.6.0 made the safe version the default: `ERC1967Proxy` and
+`TransparentUpgradeableProxy` now revert with `ERC1967ProxyUninitialized` if constructed with empty
+data, and opting out requires overriding `_unsafeAllowUninitialized` to return
+true.<Cite src="oz-changelog" /><Cite src="oz-src-erc1967proxy" />
+
+Later upgrades that add a module needing setup use `reinitializer(n)` rather than `initializer`,
+with each version number consumed exactly once.<Cite src="oz-src-initializable" />
+
+## Talking to a proxy you did not deploy
+
+Scripting an upgrade against a contract someone else deployed is where the abstract distinctions
+become concrete, because the two generations of OpenZeppelin's interface are not
+call-compatible.<Cite src="oz-src-uups" /><Cite src="oz-src-proxyadmin" />
+
+Both `UUPSUpgradeable` and `ProxyAdmin` expose a constant string for exactly this purpose:
+
+```text
+UPGRADE_INTERFACE_VERSION() -> "5.0.0"
+```
+
+The documented meaning is precise. **If the getter is missing**, you are talking to a pre-5.0
+contract that has both `upgradeTo(address)` and `upgradeToAndCall(address,bytes)`, and you must use
+`upgradeTo` when there is no call to make — because on those versions `upgradeToAndCall` with empty
+data invokes the `receive` function. **If it returns `"5.0.0"`**, only `upgradeToAndCall` exists, the
+data argument must be the empty byte string when there is nothing to call, and invoking `receive`
+during an upgrade is no longer possible at all.<Cite src="oz-src-uups" /><Cite src="oz-src-proxyadmin" />
+
+So the identification procedure for an unknown address is three reads and no source code:
+
+1. Read the ERC-1967 beacon slot. Non-zero means beacon; the logic is at whatever that beacon
+   returns now.<Cite src="eip-1967" />
+2. Otherwise read the implementation slot, then `eth_call` `proxiableUUID()` on the *implementation*
+   address. A UUPS implementation answers with the ERC-1967 implementation slot; anything else
+   reverts, which points at transparent.<Cite src="oz-src-uups" />
+3. Read `UPGRADE_INTERFACE_VERSION()` to pick the calling convention.
+
+<Figure
+  caption="Three reads classify any proxy on any chain, and no step of it needs source code or an ABI."
+  alt="A decision flow: read the ERC-1967 beacon slot; a non-zero value means a beacon proxy. Otherwise read the implementation slot and eth_call proxiableUUID on the implementation — an answer naming the ERC-1967 implementation slot means UUPS, a revert means transparent. Then read UPGRADE_INTERFACE_VERSION to pick the calling convention."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'b', label: 'read the beacon slot', note: 'ERC-1967, no ABI needed', col: 0 },
+      { id: 'isbeacon', label: 'beacon proxy', note: 'logic is whatever the beacon returns now', col: 1, tone: 'accent' },
+      { id: 'i', label: 'read the implementation slot', note: 'beacon slot was zero', col: 1 },
+      { id: 'uuid', label: 'eth_call proxiableUUID()', note: 'on the implementation address', col: 2 },
+      { id: 'uups', label: 'UUPS', note: 'answers with the implementation slot', col: 3, tone: 'accent' },
+      { id: 'transp', label: 'transparent', note: 'reverts', col: 3, tone: 'accent' },
+      { id: 'ver', label: 'UPGRADE_INTERFACE_VERSION()', note: 'missing, or "5.0.0"', col: 4 },
+    ]}
+    edges={[
+      { from: 'b', to: 'isbeacon', label: 'non-zero' },
+      { from: 'b', to: 'i', label: 'zero' },
+      { from: 'i', to: 'uuid' },
+      { from: 'uuid', to: 'uups' },
+      { from: 'uuid', to: 'transp' },
+      { from: 'uups', to: 'ver' },
+      { from: 'transp', to: 'ver' },
+    ]}
+  />
+</Figure>
+
+## The comparison that actually matters
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Transparent', note: 'branch on the caller' },
+    { title: 'UUPS', note: 'branch removed entirely', tone: 'accent' },
+    { title: 'Beacon', note: 'one pointer, many proxies' },
+  ]}
+  rows={[
+    { label: 'Where is the pointer stored?', cells: ['ERC-1967 implementation slot', 'ERC-1967 implementation slot', 'ERC-1967 beacon slot, plus an immutable'] },
+    { label: 'Where does the upgrade function live?', cells: ['In the proxy', 'In the implementation', 'In the beacon'] },
+    { label: 'Who is authorised to call it?', cells: ['Owner of a separate ProxyAdmin', '_authorizeUpgrade in the implementation', 'Owner of the beacon'] },
+    { label: 'What does every call cost?', cells: ['A comparison of msg.sender against an immutable', 'Nothing beyond the base proxy', 'An external call to the beacon, then the beacon’s own SLOAD'] },
+    { label: 'Can the admin use the contract?', cells: ['No — reverts ProxyDeniedAdminAccess', 'Yes', 'Yes'] },
+    { label: 'How many proxies does one upgrade move?', cells: ['One', 'One', 'Every proxy on that beacon'] },
+    { label: 'Can upgradeability be lost?', cells: ['No — it is in the proxy', 'Yes — every release re-ships it', 'Only by losing the beacon key'] },
+    { label: 'What does one bad release cost?', cells: ['A selector clash on an added proxy function can make upgradeToAndCall unreachable', 'A permanently frozen proxy', 'Every instance on that beacon, in one transaction'] },
+  ]}
+  caption="Every row here is downstream of one decision — where the upgrade function lives."
+  alt="Transparent, UUPS and beacon proxies compared on where the pointer lives, where the upgrade function lives, who may call it, per-call cost, whether the admin can use the contract, how many proxies one upgrade moves, whether upgradeability can be lost, and what one bad release costs."
+/>
+
+Read the last two rows together, because they are the actual decision. Transparent concentrates
+permanence in a contract you deploy once. UUPS distributes fragility across every release. Beacon
+concentrates blast radius in a single transaction.
+
+<Check type="explain" concept="beacon-proxy">
+You are designing two systems in the same protocol.
+
+**System A** is a router: one singleton contract, called constantly, integrated by dozens of external
+protocols, upgraded perhaps twice a year under a timelock.
+
+**System B** is a per-user margin account: one instance per user, expected in the tens of thousands,
+each holding collateral, with an active roadmap of feature changes.
+
+Choose a pattern for each and name the specific failure you are accepting.
+
+<Answer>
+**System A — transparent.** Two reasons dominate. The call volume is high and the transparent
+overhead is now a comparison against an immutable, not a storage read, so the per-call cost argument
+that used to favour UUPS is much weaker than the folklore says.<Cite src="oz-src-transparent-proxy" />
+More importantly, "upgraded twice a year" means twelve chances over six years for a release to omit
+or misconfigure an upgrade hook, and transparent removes that class of mistake entirely by keeping
+the upgrade machinery in a contract that is never redeployed.
+
+*The failure you accept*: the `ProxyAdmin` owner is a permanent key over a contract dozens of
+protocols depend on, and the admin account can never call the router normally — so any operational
+tooling that reads through the proxy must use a different address, or it will fail with an error
+that names no function it recognises.
+
+**System B — beacon.** Tens of thousands of instances with an active roadmap makes per-instance
+upgrades operationally impossible: at one transaction per account you would be upgrading for days,
+during which different users run different code and your invariants hold across neither.
+
+*The failure you accept*: one key, one transaction, every account. There is no canary, no staged
+rollout, and no partial revert. A beacon upgrade that reverts on some state your test fixtures did
+not have freezes every account simultaneously. The mitigations are procedural rather than
+architectural — a timelock on the beacon owner, a fork-simulated upgrade against real mainnet state,
+and a second beacon serving a small cohort so you have somewhere to canary at all.
+
+**Why not UUPS for B?** You could, and the proxies would be cheaper to call. But you would be
+shipping the upgrade hook into thirty thousand independently-upgradeable instances, and the recovery
+story for "release 7 forgot `_authorizeUpgrade`" is thirty thousand permanently frozen accounts
+rather than one.
+
+**Why not clones for B?** Clones are the cheapest per instance and cannot be upgraded at all — the
+implementation address is immutable bytecode inside each clone.<Cite src="eip-1167" /> That is the
+right answer for B only if you are prepared to make the accounts immutable, which "an active roadmap
+of feature changes" rules out.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Next lesson** takes the row that reads "yes — every release re-ships it" and works out exactly how
+many ways there are to get it wrong, what OpenZeppelin checks on-chain, what it checks off-chain,
+and what neither of them can see. The plugins' own FAQ frames it as two layers of mitigation — an
+off-chain check by the tooling, and an on-chain fallback in the contract
+itself.<Cite src="oz-upgrades-faq" /> Both have holes, and the holes are specific.
+
+**After that**, the question moves from *can I still upgrade* to *should this upgrade be allowed at
+all*, which is a question about storage layout and is where a live contract on BNB Smart Chain
+currently sits, permanently stuck.
+
+And carry this forward from the table: the three patterns are not three qualities of engineering.
+They are three different places to keep a single point of failure, and choosing one is choosing
+which failure you would rather have.

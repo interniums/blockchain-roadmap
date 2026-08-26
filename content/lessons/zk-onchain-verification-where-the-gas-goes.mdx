@@ -1,0 +1,331 @@
+---
+id: zk-onchain-verification-where-the-gas-goes
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-197, eip-1108, eip-196, eip-2537, orbiter-verifier-gas, gnark-schemes-curves, eip-2028, eip-7623, measured-gas-constants, ef-zkevm-security-foundations, barretenberg-docs]
+stack: {}
+---
+
+Almost every number you will read about verifier gas traces back to one community write-up from
+2024. Almost none of them mention that. So before quoting anyone, derive the dominant term
+yourself — it takes two specifications and one division, and once you have it, the published
+figures become checkable rather than quotable.
+
+## Deriving the number that matters
+
+Start with what the pairing precompile at address `0x08` actually is. EIP-197 defines it to take an
+input of `(a1, b1, ..., ak, bk)` pairs of curve points, where **k is the length of the input divided
+by 192**, and to return one if a particular sum of discrete-log products vanishes and zero
+otherwise. Empty input is valid and returns one. If the length is not a multiple of 192, the call
+fails.<Cite src="eip-197" />
+
+Two facts hide in that definition and both matter later. It is not a pairing *evaluation* — the
+codomain of a pairing is an awkward field, so the precompile only exposes the equality check every
+SNARK verifier needs.<Cite src="eip-197" /> And it takes **k pairs at once**, priced per pair.
+
+The pricing is not in EIP-197 any more. EIP-197 set it at `80,000 * k + 100,000`; EIP-1108 repriced
+it in 2019 to:<Cite src="eip-197" /><Cite src="eip-1108" />
+
+<Matrix
+  numeric
+  corner="Contract"
+  cols={['Address', 'Old gas', 'Gas since EIP-1108']}
+  rows={[
+    { label: 'ECADD', cells: [<code>0x06</code>, '500', { v: '150', tone: 'good' }] },
+    { label: 'ECMUL', cells: [<code>0x07</code>, '40,000', { v: '6,000', tone: 'good' }] },
+    { label: 'Pairing check', cells: [<code>0x08</code>, '80,000·k + 100,000', { v: '34,000·k + 45,000', tone: 'good' }] },
+  ]}
+  caption="One fork moved the floor under every pairing-based verifier on Ethereum, and it can move again."
+  alt="EIP-1108 repriced ECADD at 0x06 from 500 to 150 gas, ECMUL at 0x07 from 40,000 to 6,000, and the pairing check at 0x08 from 80,000 per pair plus 100,000 to 34,000 per pair plus 45,000."
+/>
+
+Now the division. A Groth16 verification equation is checked as a single four-pair product:
+`e(-A, B) · e(α, β) · e(vk_x, γ) · e(C, δ) = 1`. Four `(G1, G2)` pairs, and a `G1` point is 64 bytes
+with a `G2` point at 128, so the precompile input is always **768 bytes** — the same length whatever
+the circuit or the number of public inputs.<Cite src="orbiter-verifier-gas" /> Therefore:
+
+```text
+k    = 768 / 192          = 4
+gas  = 34,000 × 4 + 45,000 = 181,000
+```
+
+**181,000 gas, derived from two specifications with no vendor in the chain.** That is the floor
+under every Groth16-on-BN254 verifier on Ethereum, and it does not move with your circuit size,
+your proof's contents, or how much computation you proved.
+
+## Everything else is noise, and here is how much
+
+The published community analysis measures the total fixed cost of a snarkjs-generated Groth16
+verifier at approximately **207,700 gas**, and attributes the bulk of it to that pairing
+check.<Cite src="orbiter-verifier-gas" /> Set the derived 181,000 against it:
+
+<Figure
+  caption="The large bar is derived from two specifications. The small one is the remainder of a single 2024 community measurement, and should be quoted as such."
+  alt="The fixed cost of a snarkjs-generated Groth16 verifier split into 181,000 gas for the pairing check at 0x08 and roughly 26,700 gas for everything else."
+>
+  <Bars
+    unit="gas"
+    axisLabel="fixed cost of a snarkjs-generated Groth16 verifier"
+    items={[
+      { label: 'pairing check at 0x08', value: 181000, display: '181,000', tone: 'warn', note: '~87%, derived from EIP-197 and EIP-1108' },
+      { label: 'everything else', value: 26700, display: '~26,700', tone: 'muted', note: '~13% — calldata, memory allocation, field-range checks, the fixed part of the input folding' },
+    ]}
+  />
+</Figure>
+
+Roughly seven eighths of a Groth16 verifier's fixed cost is one precompile call. That single ratio
+explains the shape of the entire field:
+
+- It is why the 2019 repricing mattered so much. Under EIP-197's original schedule the same check
+  cost `80,000 × 4 + 100,000 = 420,000` gas.<Cite src="eip-197" /> EIP-1108 cut the floor by a
+  factor of 2.3 in one fork — and the EIP says outright that it expected this to help batch multiple
+  zk-SNARK proofs together and to make splitting monolithic circuits practical.<Cite src="eip-1108" />
+- It is why every optimisation in this area — batching, recursion, curve choice — is ultimately
+  about **performing fewer pairings**. Nothing else in the verifier is large enough to be worth
+  attacking.
+- And it is why "make the proof smaller" is not the lever people assume. The proof is already
+  256 bytes and the pairing input is already a fixed 768. Shrinking either does not touch the
+  181,000.
+
+<Misconception
+  belief="The pairing precompile computes one pairing, so a verifier that needs four pairings makes four calls."
+  reality="EIP-197 specifies a single call taking k pairs and checking their combined product against one, priced per pair on top of a fixed base. A Groth16 verifier makes exactly one staticcall with 768 bytes of input."
+  why="The name 'pairing check' reads as one operation, and the batched shape is buried in the sentence that says k is derived from the input length."
+  src="eip-197"
+/>
+
+That misconception is worth clearing now, because the batched shape of the precompile is the entire
+mechanism behind the next lesson.
+
+## The per-input slope, and why it is a design axis
+
+The other half of the published model is the term that grows with the public-input count `l`. The
+same analysis gives, for snarkjs-generated verifiers on BN254:<Cite src="orbiter-verifier-gas" />
+
+```text
+Groth16   ≈  207k  +  7.16k × l
+FFLONK    ≈  200k  +  0.9k  × l
+```
+
+**These formulas come from a single 2024 community analysis, not from a specification.** They are
+repeated everywhere and independently confirmed nowhere. Treat the *shape* as real and the constants
+as indicative, and measure the verifier you actually deploy.
+
+The shape is real because the analysis decomposes it, and the decomposition is checkable. The
+per-input 7,160 gas for Groth16 breaks down as:<Cite src="orbiter-verifier-gas" />
+
+```text
+  512   calldata for one 32-byte signal, at 16 gas per non-zero byte
+   61   the field-range check on that signal
+6,587   the scalar multiplication and accumulation that folds it into vk_x
+-----
+7,160
+```
+
+The 6,587 is the honest part: each public input requires one `ECMUL` plus one `ECADD` plus stack and
+memory work, and `ECMUL` alone is 6,000 gas since EIP-1108.<Cite src="eip-1108" /><Cite src="eip-196" />
+So the dominant per-input cost is a spec-priced curve operation, and the model's slope is close to
+what the precompile schedule alone implies. That is why the shape survives even though the total is
+one team's measurement.
+
+The calldata line is the part that has aged. It assumes 16 gas per non-zero calldata byte, the
+EIP-2028 price.<Cite src="eip-2028" /> Since EIP-7623 introduced a floor price computed from a
+transaction's token count, the *effective* cost of calldata in a data-heavy transaction is no longer
+a simple per-byte multiplication.<Cite src="eip-7623" /> The analysis itself notes the per-input cost
+ranges from about 6,776 to 7,160 depending on how many of those bytes are
+zero.<Cite src="orbiter-verifier-gas" /> A model with a 5% band from byte content and an untracked
+repricing underneath it is a model, not a constant.
+
+### The lever: fold your public inputs into one
+
+Now the design consequence. At the Groth16 slope, thirty-two public signals cost roughly
+`32 × 7,160 ≈ 229,000` gas — more than the entire fixed cost of the verifier. The same analysis's
+recommended fix is to hash them: combine the signals inside the circuit and expose the digest as the
+*sole* public input, then have the contract recompute the same digest from its own trusted values
+and pass that one field element.<Cite src="orbiter-verifier-gas" />
+
+That is the same construction you saw a live pool use for front-running protection, arriving from
+the opposite direction: there it was a binding technique, here it is a gas technique, and it is one
+mechanism.
+
+**Subgoal: name what the saving costs.** Nothing is free; the work moved.
+
+| Where it goes | Effect |
+|---|---|
+| On-chain verifier | 31 fewer folded inputs — roughly 222,000 gas saved at the published slope |
+| Inside the circuit | The hash is now constrained. A SNARK-unfriendly hash costs a great many constraints |
+| Prover time | More constraints, longer proving, higher prover bill — invisible in the gas number |
+| Contract | Must recompute the digest identically, including field reduction |
+
+The third row is the trap and it recurs through this whole module. **A gas optimisation that moves
+work into the circuit is charged to the prover, and the prover's bill does not appear in any block
+explorer.**
+
+## Groth16 versus the PLONK family: what actually differs on-chain
+
+The two families are usually compared on setup and proof size. gnark's own documentation states the
+trade plainly: Groth16 is a circuit-specific preprocessing construction needing a circuit-specific
+trusted setup, with constant proof size and appealing verifier time; PLONK is a universal
+preprocessing construction whose setup can be *updated*, with short and constant verification, at
+the cost of proofs that are bigger and slower to generate.<Cite src="gnark-schemes-curves" /> It also
+gives the practical rule: Groth16 when you generate many proofs for one circuit and performance is
+critical, PLONK when you must handle many different circuits at reasonable
+performance.<Cite src="gnark-schemes-curves" />
+
+For a contract engineer, notice what that comparison does *not* say. It does not say the on-chain
+verification cost differs much. A pairing-based PLONK instantiation still finishes with the same
+`0x08` precompile check, and that check is still most of the gas. gnark supports PLONK with a KZG
+polynomial commitment, and PLONK exists in FRI-based and other variants whose on-chain shape is
+completely different.<Cite src="gnark-schemes-curves" /> "PLONK" names a family, not a gas number.
+
+Where the families genuinely diverge on-chain is the slope: about 7.16k per public input against
+about 0.9k for FFLONK, an eight-fold difference in the term you control by
+design.<Cite src="orbiter-verifier-gas" /> Same caveat as before — one source, re-measure — but the
+*direction* is a real axis. If your statement needs many public signals and you cannot fold them,
+that difference is the argument.
+
+<Misconception
+  belief="Proof size is constant, so verification cost is constant too."
+  reality="Only the fixed part is constant. Public-input count adds a per-input curve operation, and at the published Groth16 slope thirty-two signals cost more than the rest of the verifier put together."
+  why="Succinctness is taught as 'constant-size proof, constant-time verification', and the second clause quietly means constant in the size of the computation proved, not in the size of the statement."
+  src="orbiter-verifier-gas"
+/>
+
+## Two things that will move this floor
+
+**The curve.** BN254 is not the only pairing-friendly curve with precompiles any more. EIP-2537
+added BLS12-381 operations at `0x0b` through `0x11`, with the pairing check at `0x0f` priced at
+`32,600 · k + 37,700`.<Cite src="eip-2537" /> Run the same four-pair arithmetic:
+
+```text
+BN254      34,000 × 4 + 45,000 = 181,000
+BLS12-381  32,600 × 4 + 37,700 = 168,100
+```
+
+Cheaper per check — but the comparison is not finished there, because the BLS12-381 precompiles take
+padded uncompressed encodings, so points on the wire are larger and the calldata term grows. Price
+your own shape rather than the headline.
+
+The reason anyone is having this conversation is security level, and here the sources genuinely
+disagree. EIP-2537's own motivation says its purpose is to reach 120+ bits of security "compared to
+the existing BN254 precompile that only provides 80 bits".<Cite src="eip-2537" /> Other analyses put
+BN254 at roughly 100 to 103 bits after the exTNFS advances. Nobody in this range agrees on a figure;
+everybody agrees BN254 sits well below the 128 bits originally claimed for it. Meanwhile the
+Ethereum Foundation's own zkEVM programme reset its milestones around *provable* security — 100 bits
+at M2, 128 at M3 — after foundational STARK conjectures were mathematically disproven and figures
+advertised as 100 bits turned out possibly to be 80.<Cite src="ef-zkevm-security-foundations" /> A
+verifier's gas cost is downstream of a security argument that is currently being renegotiated.
+
+**The gas schedule itself.** The 181,000 is a spec constant, and spec constants change. EIP-1108
+moved this exact number by a factor of 2.3 because client implementations got faster and the old
+price no longer reflected the work.<Cite src="eip-1108" /> Any break-even you compute from it is a
+break-even against a schedule, not against physics.
+
+<Aside kind="warn">
+**A gap worth knowing you have.** No public gas benchmark for UltraHonk verifiers — the default
+backend behind Noir's Solidity output — turned up during this module's research. Barretenberg
+documents the toolchain and will generate you a verifier;<Cite src="barretenberg-docs" /> what it
+costs on-chain, at what public-input count, is something you will have to measure. If you are
+building the Noir-to-L1 path, budget an afternoon for that measurement rather than assuming the
+Groth16 numbers transfer. They are a different proof system on a possibly different curve.
+</Aside>
+
+## Measuring your own, and the trap that eats the measurement
+
+Every figure above is somebody else's. The verifier you deploy is generated by your toolchain, for
+your circuit, at your public-input count, and measuring it is a twenty-minute job. Do it in three
+steps, and notice that step two is where a previous measurement effort in this project produced
+pure garbage.
+
+**Subgoal one: get a curve, not a point.** Generate the same circuit at several public-input counts —
+1, 4, 16, 64 — and call `verifyProof` on each. One measurement gives you a number; four give you an
+intercept and a slope, which is the thing you can actually reason with. Fit them and compare against
+`207k + 7.16k · l`. If your intercept is near 207,000 and your slope near 7,000, the published model
+describes your toolchain. If not, you have just learned something the ecosystem does not know.
+
+**Subgoal two: make the result observable, or the compiler deletes it.** A `view` function whose
+return value is discarded is dead code, and the compiler removes dead code *even with the optimizer
+off*. That is not a hypothetical: the first gas-probe run in this project measured every storage read
+at 9 gas, because `pop(sload(0))` has no observable effect and was eliminated. The fix was to assign
+each result into a storage sink so it could not be removed.<Cite src="measured-gas-constants" /> The
+same trap applies here with a bigger blast radius, because a deleted `staticcall` to `0x08` takes
+181,000 gas out of your measurement and leaves a plausible-looking number behind. Assign the boolean
+somewhere it must be kept.
+
+**Subgoal three: subtract the harness.** Wrapping an operation in `gasleft()` deltas costs about
+16 to 17 gas for the two `GAS` opcodes and the surrounding stack work — subtract it to recover the
+operation's own cost.<Cite src="measured-gas-constants" /> Against 181,000 this is noise, but the
+discipline is what makes your 61-gas field-check figure meaningful when you go looking for the
+remaining 13%.
+
+One framing point about *whose* gas this is. The verifier is a `view` function; it spends nothing of
+its own. Every gas figure in this lesson is charged to the transaction that calls it — the user
+claiming, the sequencer settling, the relayer submitting. When you decide whether 379,000 or 214,000
+is acceptable, you are deciding it on behalf of whoever sends that transaction, and on a chain where
+they may not be the same party who chose the design.
+
+<Check type="predict" concept="pairings-dominate-gas">
+You are choosing between two designs for a contract that verifies one proof per user action.
+
+**Design A** exposes 24 public signals: a root, a recipient, an amount, a deadline, and twenty
+per-item flags.
+
+**Design B** hashes all 24 values inside the circuit and exposes a single field element; the
+contract recomputes the same hash from its own state and passes it in.
+
+Using the published Groth16 model, predict each design's verifier gas, then state what Design B
+costs that the gas figure does not show, and what could make Design A the right answer anyway.
+
+<Answer>
+**The arithmetic.** At `207k + 7.16k × l`:<Cite src="orbiter-verifier-gas" />
+
+```text
+A:  207,000 + 7,160 × 24  =  207,000 + 171,840  =  ~379,000 gas
+B:  207,000 + 7,160 × 1   =  207,000 +   7,160  =  ~214,000 gas
+```
+
+Design B saves roughly 165,000 gas per action — comparable to the entire pairing check, which is
+181,000 by derivation from EIP-197's `k = bytes / 192` and EIP-1108's
+`34,000·k + 45,000`.<Cite src="eip-197" /><Cite src="eip-1108" />
+
+**What the gas figure hides.** Three things.
+
+1. *The hash is now inside the circuit.* Every constraint it adds is paid by the prover in time and
+   hardware on every single proof, forever. Choosing a hash your proving system is efficient over
+   matters enormously here, and getting it wrong can cost more in proving than the 165,000 gas is
+   worth.
+2. *The contract must reproduce the digest exactly*, including reduction into the scalar field. A
+   mismatch between the circuit's encoding and the contract's is a total-outage bug, not a subtle
+   one — no honest proof will ever verify.
+3. *Debuggability.* With one opaque field element, a failing verification tells you nothing about
+   which of the 24 values disagreed. Design A fails loudly at the exact signal.
+
+**When A is still right.** When some of those signals need to be *readable on-chain* — indexed in an
+event, compared against a limit, used in later logic. A hashed input is not available to the
+contract. And when the constants stop applying: the model is one 2024 community analysis, not a
+specification, its own per-input figure ranges from about 6,776 to 7,160 with calldata byte
+content,<Cite src="orbiter-verifier-gas" /> and the calldata component assumes EIP-2028 per-byte
+pricing that EIP-7623 has since put a floor
+under.<Cite src="eip-2028" /><Cite src="eip-7623" /> If this decision is worth 165,000 gas per
+action, it is worth deploying both and measuring.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next lesson** takes the fact you now hold — the pairing precompile accepts k pairs in one call and
+prices them per pair — and turns it into the standard answer to verification cost. Many independent
+proofs fold into a single product check, so the terms that repeat across proofs get paid once. You
+will derive the per-proof cost curve rather than quoting a vendor's multiple.
+
+**In design reviews**, you now have two numbers with different provenance and should say which you
+are using. 181,000 is derived from two specifications and is as solid as the gas schedule. 207,700
+and 7,160 are one team's measurement of one tool's output in 2024, and belong in a sentence that
+names them as such.
+
+**And the transferable habit** is the division that started this lesson. When a cost figure
+circulates without a source, look for the priced primitive underneath it and re-derive. Most of the
+time the specification gives you the dominant term for free, and what remains — the 13% — is the
+only part you actually needed anyone else's measurement for.

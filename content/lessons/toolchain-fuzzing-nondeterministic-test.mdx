@@ -1,0 +1,375 @@
+---
+id: toolchain-fuzzing-nondeterministic-test
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [foundry-testing-config, foundry-inline-test-config, forge-test-reference, foundry-fuzz-corpus-guide, foundry-issue-3001, foundry-config-overview, measured-fuzz-probe-1-7-1, measured-forge-1-7-1]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+A pull request that edits one line of a README goes red. The failing test is a fuzz property nobody
+has touched in three months, on code the branch does not modify. Someone re-runs the job; it goes
+green. The PR merges.
+
+Everything in that paragraph is working correctly, and the last sentence is the mistake.
+
+## Why it moved
+
+Fuzzing is nondeterministic across runs unless `[fuzz] seed` is set. Unset is the default: `forge
+config` on forge 1.7.1 does not report a seed at all until you give it
+one.<Cite src="foundry-testing-config" /><Cite src="measured-forge-1-7-1" /> Each invocation draws a
+fresh sequence.
+
+You can watch it happen. Same test, same commit, `show_logs` on, printing the first six values the
+fuzzer produced:<Cite src="measured-fuzz-probe-1-7-1" />
+
+```text
+--fuzz-seed 42   ->  12  1  0  100  0  53
+--fuzz-seed 42   ->  12  1  0  100  0  53      (identical, as promised)
+--fuzz-seed 43   ->  34  5  1  0  63  15
+no seed, run A   ->  53  74 11 0  3  70
+no seed, run B   ->  68  3  14 2  57 12
+```
+
+So a fuzz test that went red on unchanged code did not flake. It searched somewhere it had not
+searched before and found something. Re-running until it is green is the exact opposite of the
+correct response: you are discarding the only evidence you have.
+
+<Misconception
+  belief="A fuzz test that passed in CI will pass again on the same commit."
+  reality="Without a pinned seed, each invocation draws a fresh input sequence, so a failure can legitimately appear on code that has not changed."
+  why="CI is expected to be deterministic, and every other kind of red build on an untouched file really is infrastructure noise."
+  src="foundry-testing-config"
+/>
+
+Forge helps here more than people notice. At the end of a run that involved fuzzing, it
+prints:<Cite src="measured-fuzz-probe-1-7-1" />
+
+```text
+Fuzz seed: 0xd9db27e91b516050816b9ef4e6e428eedc5ecfbdeae2a6bfef06d3b588ac3e68 (use `--fuzz-seed` to reproduce)
+```
+
+That line is the first thing to copy out of a failing CI log, before anything else scrolls away.
+
+## Pinning, and what it costs
+
+Setting a seed makes the campaign reproducible. It also freezes the search: the same 256 points,
+every run, forever. A pinned suite will never surprise you, which is the point and also the
+problem — you have converted a search into a large, slow, randomly chosen set of unit tests.
+
+The shape that works is two campaigns with different jobs:
+
+- **The PR gate runs pinned.** Reproducible, comparable between runs, and a red build means the diff
+  did it. Gas figures are stable enough to diff, which matters for the gas-profiling module.
+- **A scheduled job runs unpinned, with a much higher `runs`.** Nobody is waiting on it. It is
+  allowed to find things, and when it does, the finding is filed as an issue with the counterexample
+  attached rather than blocking a merge.
+
+Pinning only the gate is the part people get wrong in both directions. Pinning everywhere means you
+stop searching. Pinning nothing means every red build starts an argument about whether it is real.
+
+<Aside kind="note">
+A pinned seed is only reproducible against the same binary and the same compiled artifacts. Change
+the compiler version, the optimizer settings, or a constant in the contract, and the same seed
+explores a different search — partly because the code is different and partly because the dictionary
+scraped from it is different.<Cite src="foundry-testing-config" /> "Pinned" means reproducible, not
+stable across upgrades.
+</Aside>
+
+## Reading a counterexample
+
+When a property does break, forge reports the concrete arguments. Here is a real failure on forge
+1.7.1:<Cite src="measured-fuzz-probe-1-7-1" />
+
+```text
+[FAIL: assertion failed: 183271978579 >= 10000; counterexample:
+  calldata=0xd571e1f90000000000000000000000000000000000000000000000000000058e60b4bd7c
+  args=[6109065952636 [6.109e12]]] testFuzz_NeverAboveTier(uint256) (runs: 6, μ: 7094, ~: 7093)
+```
+
+Four fields, and each answers a different question.
+
+- **The assertion, rendered with actual values** — `183271978579 >= 10000`. This is what broke, not
+  what you wrote. The left-hand side is the computed value.
+- **`args`** — the decoded parameters, with a scientific-notation hint. This is what you promote to a
+  unit test.
+- **`calldata`** — the same thing as raw bytes. Useful when the decoding is ambiguous or when you
+  want to replay the call with `cast` outside the test framework.
+- **`runs: 6`** — how far the campaign got. A low number means the property is broken over a large
+  share of the domain; a number near your configured `runs` means the failure is rare, and both facts
+  change how you triage it.
+
+### Do not assume the counterexample is minimal
+
+`6109065952636` is not the smallest input that breaks that property. The threshold in the contract is
+far lower.
+
+Whether forge reduces a stateless fuzz counterexample before reporting it is something I could not
+settle. `shrink_run_limit`, which governs counterexample reduction, appears in the `[invariant]`
+table with a default of 5000, and `forge config` on forge 1.7.1 prints it only there — there is no
+`[fuzz]` equivalent in the resolved configuration or in the config
+reference.<Cite src="foundry-testing-config" /><Cite src="measured-forge-1-7-1" /> Sources are silent
+rather than in agreement, and the absence of a key is not proof that the behaviour is absent.
+
+The practical consequence does not depend on resolving it: **treat the reported arguments as a
+witness, not a minimal witness.** Reduce them by hand when you promote them. Halve the value, re-run
+the unit test, repeat — three or four iterations usually take a fourteen-digit number down to
+something that names the boundary, and the boundary is what a reviewer needs.
+
+For a corpus-based workflow there is tooling: `forge fuzz tmin` simplifies the transactions in a
+corpus entry while preserving either its failure or its coverage
+contribution.<Cite src="foundry-fuzz-corpus-guide" /> That is part of the coverage-guided path — off
+by default — rather than something the standard campaign does for you.
+
+## Failures are persisted and replayed
+
+When a fuzz test fails, forge writes the failing input to disk. `failure_persist_dir` defaults to
+`cache/fuzz` on forge 1.7.1, and the file lands under a per-contract, per-test
+path:<Cite src="foundry-testing-config" /><Cite src="measured-forge-1-7-1" />
+
+```text
+cache/fuzz/failures/MagicTest/testFuzz_AlwaysOne
+```
+
+```json
+{"warp":null,"roll":null,"sender":null,"addr":null,
+ "calldata":"0x37cf121b000000000000000000000000000000000000000000000000112210f47de98115",
+ "contract_name":null,"func_name":null,"signature":null,
+ "args":"1234567890123456789 [1.234e18]","raw_args":"1234567890123456789"}
+```
+
+That input is then replayed ahead of fresh draws on subsequent runs. Proving it takes a little care,
+because a bug the fuzzer finds easily will simply be re-found. Disable the dictionary so a fresh
+search cannot find it, and the two cases separate
+cleanly:<Cite src="measured-fuzz-probe-1-7-1" /><Cite src="foundry-testing-config" />
+
+```text
+dictionary off, cache/fuzz present:
+  [FAIL: assertion failed: 0 != 1; counterexample: args=[1234567890123456789]]
+    testFuzz_AlwaysOne(uint256) (runs: 0, μ: 0, ~: 0)
+
+dictionary off, cache/fuzz deleted:
+  [PASS] testFuzz_AlwaysOne(uint256) (runs: 256, μ: 6429, ~: 6429)
+```
+
+`runs: 0` again — the same tell you learned for rejection failures, here meaning the failure happened
+before the first fresh draw. The persisted input went first.
+
+Three things follow.
+
+**A "flaky" failure is locally reproducible without copying anything.** Pull the branch, run the
+test. If CI wrote the cache and you have it, the input replays. If not, the seed line from the CI log
+gets you there with `--fuzz-seed`.
+
+**Deleting the cache directory discards regression coverage.** `cache/` is a natural thing to add to
+a clean script or to `.gitignore`, and doing so quietly removes the guarantee that a fixed bug stays
+fixed. That is an argument for promoting counterexamples into real tests, not for committing the
+cache.
+
+**A fix is automatically re-checked against the exact input that broke it** — for as long as the file
+survives. Which is the honest reason the next section exists.
+
+<Figure
+  caption="A counterexample leaves two automatic traces, and both of them live on the machine that found it."
+  alt="A broken property writes a file under cache/fuzz and prints a Fuzz seed line; either route lets you reproduce the failure, and only a hand-written named test case outlives the runner."
+>
+  <Flow
+    nodes={[
+      { id: 'fail', label: 'property breaks', note: 'args and calldata printed', col: 0, tone: 'danger' },
+      { id: 'cache', label: 'cache/fuzz file', note: 'on the runner, not in git', col: 1, tone: 'warn' },
+      { id: 'seed', label: 'the Fuzz seed line', note: 'in the CI log', col: 1, tone: 'warn' },
+      { id: 'repro', label: 'you reproduce it', note: 'replay, or --fuzz-seed', col: 2 },
+      { id: 'named', label: 'a named test_ case', note: 'the durable copy', col: 3, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+## Promote the counterexample into a test
+
+The persistence mechanism is a safety net, not the workflow. The workflow is four steps, and the
+order matters.
+
+**Subgoal 1 — make the failure deterministic.** Copy the arguments into a plain `test_` case. Now it
+fails the same way every time, on every machine, with no seed and no cache.
+
+```solidity
+function test_FeeAboveTierIsCapped_Regression() public view {
+    // counterexample from testFuzz_NeverAboveTier, 2026-08-26
+    assertLt(f.feeOn(6_109_065_952_636), 10_000);
+}
+```
+
+**Subgoal 2 — confirm it is red before you touch the contract.** If it passes, you have copied the
+wrong value, or the failure depended on state the fuzz test's `setUp` built and your unit test does
+not. That second case is worth catching now rather than after a "fix".
+
+**Subgoal 3 — reduce it, then fix.** Shrink the argument by hand until it stops failing, back off one
+step, and rename the test after what the number actually is. `6_109_065_952_636` tells a reviewer
+nothing; `333_334` next to a comment saying "first amount whose 3% fee exceeds the 10,000 cap" tells
+them everything, and it will still be legible when the constant changes.
+
+**Subgoal 4 — confirm both.** The named test and the fuzz campaign. The campaign because the fix may
+have moved the bug rather than removed it, and the fuzzer is better than you at noticing that.
+
+The named test is the artefact that survives. A year later, `cache/fuzz` will have been wiped by
+someone's clean build, the seed will have rotated, and the only durable record that this input ever
+mattered is a function with a name.
+
+<Aside kind="note">
+`forge test --rerun` retries only the tests that failed last time, and forge suggests it in the
+failure output.<Cite src="measured-fuzz-probe-1-7-1" /> It is the right inner loop while you are
+fixing, and the wrong thing to trust as a final check — run the whole suite before you push.
+</Aside>
+
+## Per-test configuration, and where the trap actually is
+
+One property guarding real money deserves ten thousand runs. The other three hundred do not. Inline
+configuration is how you say that without a second profile.
+
+The syntax is a doc comment above the function:
+`/// forge-config: ${PROFILE}.{fuzz|invariant}.${KEY} = ${VALUE}`, where the fuzz keys are `runs`,
+`max-test-rejects` and `show-logs` — hyphenated here, unlike their underscored form in
+`foundry.toml`.<Cite src="foundry-inline-test-config" /> Everything you do not override is inherited
+from the active profile.
+
+Now the part worth measuring rather than repeating, because widely circulated material gets its
+direction wrong. Set up a `foundry.toml` with `[profile.default]` at the default 256 runs and
+`[profile.ci.fuzz] runs = 50`, then run four functions under each
+profile:<Cite src="measured-fuzz-probe-1-7-1" /><Cite src="foundry-config-overview" />
+
+<Matrix
+  numeric
+  corner="inline comment on the function"
+  cols={['runs under default', 'runs under FOUNDRY_PROFILE=ci']}
+  rows={[
+    { label: 'default.fuzz.runs = 1000', cells: ['1000', { v: '1000', tone: 'good' }] },
+    { label: 'ci.fuzz.runs = 700', cells: [{ v: '256', tone: 'danger' }, '700'] },
+    { label: 'both of the above', cells: ['1000', '700'] },
+    { label: 'none', cells: ['256', '50'] },
+  ]}
+  caption="The override that survives a profile switch is the default-scoped one; the profile-specific one is inert everywhere else."
+  alt="Measured on forge 1.7.1 with profile.default at 256 runs and profile.ci.fuzz at 50. A default-scoped inline override of 1000 applies under both profiles. A ci-scoped override of 700 applies only under the ci profile, leaving 256 locally. Both comments together give 1000 and 700. Neither gives 256 and 50."
+/>
+
+Read the second row first, because that is the real trap: **a `ci.`-scoped inline override does
+nothing locally.** The expensive property you pinned for CI runs at the default budget on your
+machine, so you cannot reproduce what CI is doing without setting `FOUNDRY_PROFILE=ci` yourself.
+
+The first row is the one that contradicts the folklore. A `default.`-scoped comment **does** apply
+under the `ci` profile on forge 1.7.1 — because non-default profiles
+[inherit from `[profile.default]`](/c/foundry-profiles), and the inline override inherits along the
+same path as everything else.<Cite src="foundry-config-overview" /><Cite src="measured-fuzz-probe-1-7-1" />
+You will find material asserting the opposite. Check it against your own binary with the
+four-function table above; it takes two minutes and it is the kind of claim that rots.
+
+<Misconception
+  belief="`default` in an inline forge-config comment means 'when no profile is selected', so the override is inert under another profile."
+  reality="Measured on forge 1.7.1, a `default.`-scoped inline override applies under the `ci` profile too, because non-default profiles inherit from `[profile.default]`. The override that goes missing is the profile-specific one, which does nothing under any other profile."
+  why="The word 'default' reads as a fallback rather than as the name of the base table everything else inherits from."
+  src="foundry-config-overview"
+/>
+
+One more measured behaviour, and it is a pleasant one: a profile name in an inline comment that does
+not exist in your configuration is a **hard error**, not a silent
+no-op.<Cite src="measured-fuzz-probe-1-7-1" />
+
+```text
+Error: Inline config error at test/Inline.t.sol:17:5: invalid profile `nosuchprofile.fuzz.runs = 900`;
+valid profiles: ci, default
+```
+
+So a typo cannot silently drop your override. What can still go missing is a correctly spelled
+profile that the current run is not using — which is the second row of the table, and which nothing
+warns you about.
+
+**The pattern that survives review:** write both scopes explicitly on any test whose budget you care
+about, exactly as the documentation's own example does.<Cite src="foundry-inline-test-config" />
+
+```solidity
+/// forge-config: default.fuzz.runs = 100
+/// forge-config: ci.fuzz.runs = 10000
+function testFuzz_SolvencyIsPreserved(uint256 amount) public { /* ... */ }
+```
+
+## Getting fuzz results out of CI in a machine-readable form
+
+Two constraints worth knowing before you build tooling around this.
+
+**`--junit` and `--gas-report` are mutually exclusive.** Not "produce odd output together" —
+forge 1.7.1 rejects the combination at argument parsing:<Cite src="measured-fuzz-probe-1-7-1" />
+
+```text
+error: the argument '--junit' cannot be used with '--gas-report'
+```
+
+If your pipeline wants both structured test results and a gas report, that is two invocations of
+`forge test`, and the second one re-runs the suite. Budget for it.
+
+**`--junit` is the format CI runners consume natively.** It emits a JUnit XML report, with each test
+as a `testcase` element whose `system-out` carries the familiar
+line.<Cite src="forge-test-reference" /><Cite src="measured-fuzz-probe-1-7-1" /> Prefer it for
+anything that needs to render in a CI UI.
+
+**`--json` has a long-standing open issue about the cleanliness of its stdout** — foundry issue
+#3001, still open, is the one to read before you write a pipeline that pipes it into a
+parser.<Cite src="foundry-issue-3001" /> The JSON payload itself is informative when you do get it:
+the fuzz result object carries `runs`, `mean_gas`, `median_gas` and a `counterexample` field, which
+is where the μ and ~ identification in lesson two came
+from.<Cite src="measured-fuzz-probe-1-7-1" />
+
+<Check type="predict" concept="inline-fuzz-config">
+A team ships this. `foundry.toml` has `[profile.default]` with no `[fuzz]` block, and a
+`[profile.ci.fuzz]` with `runs = 5000`. CI runs `FOUNDRY_PROFILE=ci forge test --junit --gas-report`
+on every pull request, with no seed set anywhere.
+
+Three things about this setup will go wrong. Name them and say what each one looks like when it does.
+
+<Answer>
+**One — the command does not run at all.** `--junit` cannot be combined with `--gas-report`; forge
+1.7.1 rejects the pair during argument parsing with
+`error: the argument '--junit' cannot be used with '--gas-report'`.<Cite src="measured-fuzz-probe-1-7-1" />
+This one is loud and gets fixed on the first CI run, so it is the least interesting of the three —
+but it is worth naming because the fix is not a flag change, it is a second `forge test` invocation
+and a decision about which one gates the merge.
+
+**Two — the build is intermittently red for reasons unrelated to the diff.** No seed is set, so every
+CI run draws a fresh sequence over 5,000 runs per fuzz test.<Cite src="foundry-testing-config" /> A
+much larger budget than the local 256 means CI is genuinely searching harder than any developer, and
+it will eventually find something on a PR that did not cause it. The visible symptom is a fuzz test
+failing on a branch that does not touch the relevant code, followed by a green re-run — and the
+organisational symptom, which is the expensive one, is that people learn to hit re-run. The fix is
+not to pin CI and stop searching; it is to pin the gate and move the aggressive unseeded campaign to
+a scheduled job that files issues instead of blocking merges.
+
+**Three — nobody can reproduce a CI failure locally.** Local runs use the default profile, so they
+get the default 256 runs, a different seed, and — if any test carries a `ci.`-scoped inline override —
+none of it.<Cite src="measured-fuzz-probe-1-7-1" /> Reproduction requires copying the
+`Fuzz seed: 0x…` line out of the CI log and running with `FOUNDRY_PROFILE=ci --fuzz-seed 0x…`, which
+nobody will discover unless it is written in the repository. The `cache/fuzz` directory that would
+otherwise replay the failure lives on the CI runner and is discarded with
+it.<Cite src="foundry-testing-config" />
+
+**What good looks like.** Seed the gate; run an unseeded high-budget campaign on a schedule; put the
+reproduce command in the contributing guide; and when a counterexample does arrive, promote it to a
+named unit test on the same day, because that is the only copy that outlives the runner.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**This closes stateless fuzzing.** You can write a property, constrain it without destroying it,
+read what the campaign actually did, reproduce a failure on demand, and configure budgets per test
+and per profile. That is the complete loop for one function.
+
+**The CI module** picks up the seed decision as a policy question rather than a flag: which jobs are
+allowed to be nondeterministic, what happens to a counterexample once it exists, and how fuzz budgets
+interact with profile inheritance across a repository with more than one team in it.
+
+**Invariant testing** is next in this track, and it inherits every mechanism in this lesson —
+persistence to `cache/invariant`, inline config with `invariant.*` keys, seeds, profiles — while
+adding the one thing stateless fuzzing structurally cannot do: search over *sequences* rather than
+over arguments.<Cite src="foundry-testing-config" /> The counterexample you will read there is a call
+sequence rather than an argument list, and `shrink_run_limit` — the key that is documented for
+invariant campaigns and only for them — is what decides how readable it is when it
+arrives.<Cite src="foundry-testing-config" />

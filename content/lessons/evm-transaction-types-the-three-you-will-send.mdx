@@ -1,0 +1,372 @@
+---
+id: evm-transaction-types-the-three-you-will-send
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    eip-2930,
+    eip-2929,
+    eip-3651,
+    eip-7623,
+    eip-1559,
+    eip-7702,
+    eip-2,
+    eip-4844,
+    geth-legacypool,
+    nethermind-7702-attack-surfaces,
+    reth-transaction-types,
+  ]
+stack: {}
+---
+
+A team running arbitrage bots reads that access lists save gas. They already simulate every trade, so
+producing a list is nearly free for them. They flip a config flag, every transaction goes out as type
+`0x01`, and the next week's gas spend is measurably *higher*.
+
+Nothing malfunctioned. The list was correct in the sense that every address in it was real. It was
+wrong in the only sense that matters: it named things the transaction did not go on to touch, and an
+access list is not a hint. It is a prepayment.
+
+This lesson covers the three envelopes you will construct yourself — `0x01`, `0x02` and `0x04` — and
+each one is presented the same way: what field it added, what that field costs, and what you are
+trading away by using it. None of the three is an upgrade of the one before. Two of them are bets, and
+one of them changes what an account *is* for as long as it remains in effect.
+
+## Type `0x01`: paying now to pay less later
+
+The payload is
+`rlp([chainId, nonce, gasPrice, gasLimit, to, value, data, accessList, signatureYParity, signatureR, signatureS])`,
+signed as `keccak256(0x01 || rlp([chainId, nonce, gasPrice, gasLimit, to, value, data, accessList]))`.<Cite src="eip-2930" />
+
+Two things are new relative to type `0x00`. The chain id is now an ordinary field rather than an
+arithmetic relationship hidden in `v`, and the signature carries a plain `yParity` of 0 or
+1.<Cite src="eip-2930" /> That alone would have been worth a transaction type. But the field the type
+is named after is the second one.
+
+An `accessList` has the shape `[[{20 bytes}, [{32 bytes}...]]...]` — a list of addresses, each paired
+with a list of that address's storage keys.<Cite src="eip-2930" /> At the start of execution, at the
+same moment the intrinsic calldata cost is charged, the listed items are loaded into the
+`accessed_addresses` and `accessed_storage_keys` sets that
+[EIP-2929](/c/cold-vs-warm-access) introduced, and the sender is charged
+`ACCESS_LIST_ADDRESS_COST` of **2400 gas per address** and `ACCESS_LIST_STORAGE_KEY_COST` of
+**1900 gas per storage key**.<Cite src="eip-2930" />
+
+EIP-2930 writes that companion charge as `21000 + 4 * zeroes + 16 * nonzeroes`.<Cite src="eip-2930" />
+Do not carry the formula forward as current. EIP-7623 rebuilt intrinsic calldata pricing around a
+floor: the intrinsic cost became the larger of a standard per-token charge and a floor per-token
+charge, and a transaction whose gas limit does not reserve that floor is invalid
+outright.<Cite src="eip-7623" /> The access-list constants are unaffected by it.
+
+### Do the arithmetic once and you will never mis-sell this feature again
+
+The numbers on the other side come from EIP-2929, and they are the ones measured directly on this
+machine: a cold storage read costs 2100 and a warm one 100; a cold account access costs 2600 and a
+warm one 100.<Cite src="eip-2929" />
+
+<Matrix
+  numeric
+  corner="One access-list entry"
+  cols={['No list', 'With the list', 'Net']}
+  rows={[
+    { label: 'Address the tx does touch', cells: [{ v: '2,600' }, { v: '2,400 + 100' }, { v: '+100', tone: 'good' }] },
+    { label: 'Storage key the tx does touch', cells: [{ v: '2,100' }, { v: '1,900 + 100' }, { v: '+100', tone: 'good' }] },
+    { label: 'Address the tx never touches', cells: [{ v: '0' }, { v: '2,400' }, { v: '−2,400', tone: 'danger' }] },
+    { label: 'Storage key the tx never touches', cells: [{ v: '0' }, { v: '1,900' }, { v: '−1,900', tone: 'danger' }] },
+    { label: 'Address EIP-2929 warms for free', cells: [{ v: '100' }, { v: '2,400 + 100' }, { v: '−2,400', tone: 'danger' }] },
+  ]}
+  caption="A correct entry returns 100 gas; a wrong one costs the whole entry price, and the entry for an already-warm address can never be repaid at all."
+  alt="Gas for a single access-list entry with and without the list: a touched address costs 2600 cold versus 2400 plus 100 warm, a touched storage key 2100 versus 1900 plus 100, and an untouched or already-warm entry pays the full 2400 or 1900 for nothing."
+/>
+
+**Subgoal — price a correctly predicted address.** Without the list: one cold account access, 2600.
+With the list: 2400 up front, then a warm access at 100, for 2500. **Net saving: 100 gas.**
+
+**Subgoal — price a correctly predicted storage key.** Without: 2100. With: 1900 plus 100 warm, for
+2000. **Net saving: 100 gas.**
+
+**Subgoal — price a wrong guess.** The transaction does not touch the item. Without the list: nothing.
+With: the full 2400 or 1900, charged regardless. **Net loss: the entire entry cost.**
+
+So the payoff is asymmetric by a factor of roughly twenty-four to one on addresses and nineteen to one
+on keys. You need two dozen correct address predictions to pay for a single wrong one. EIP-2930 says
+this in its own voice: the discount is described as "only a 10% initial discount", with the explicit
+observation that there is "almost no cost to not bothering with access list generation and only making
+a simple transaction".<Cite src="eip-2930" />
+
+Three more details decide real cases:
+
+- **Duplicates are legal and charged every time.** The specification permits non-unique addresses and
+  keys, notes they will be charged for repeatedly, and points out there is no gain and only cost in
+  listing something twice.<Cite src="eip-2930" /> A list assembled by concatenating per-call fragments
+  without de-duplication silently pays twice for shared state.
+- **Some addresses are already warm and must never be listed.** When execution begins,
+  `accessed_addresses` is initialised to contain the sender, the `to` address, and the entire set of
+  precompiles,<Cite src="eip-2929" /> and EIP-3651 added the block's `COINBASE` address to that
+  set.<Cite src="eip-3651" /> Listing any of them is a pure 2400-gas donation. This is the single most
+  common defect in hand-written access lists.
+- **The list is not priced like calldata.** It is charged per item rather than per byte, and the EIP
+  works out what that implies: 1900/32 = 59.375 gas per byte for storage keys and 2400/20 = 120 gas
+  per byte for addresses, which is far more expensive per byte than
+  calldata.<Cite src="eip-2930" /> The per-item price is covering bandwidth as well as the access
+  itself.
+
+<Misconception
+  belief="Adding an access list saves gas."
+  reality="It saves 100 gas per item you would have touched cold, and costs 2400 or 1900 per item you would not have touched at all. The list is a prepayment for state access, not an optimisation hint, and it is charged whether or not it is used."
+  why="It is introduced as an optimisation, which frames it as free-if-imperfect. The specification frames it the other way round — as a small discount offered to make state access predictable enough for clients to pre-load or parallelise."
+  src="eip-2930"
+/>
+
+The practical consequence is that hand-authored access lists are almost never worth it, and
+simulation-derived ones usually are — provided the simulation ran against the state the transaction
+will actually execute against. That proviso is doing work. A list generated against block N and
+included at block N+3, after the path through a router changed because a pool's liquidity moved, is a
+list of items you now pay for and do not touch.
+
+## Type `0x02`: two ceilings, and neither is a price
+
+The payload is
+`rlp([chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas, gas_limit, destination, amount, data, access_list, signature_y_parity, signature_r, signature_s])`.<Cite src="eip-1559" />
+
+Read the field order once and remember it, because it is a genuine trap: **`max_priority_fee_per_gas`
+comes before `max_fee_per_gas`.** Nothing about the names suggests that order, and a hand-rolled
+encoder that swaps them produces a transaction that is well-formed, signs cleanly, and offers a tip
+larger than its own ceiling.
+
+The type carries the `access_list` field that `0x01` introduced, which is why you almost never see
+`0x01` in the wild — everything it offers, `0x02` also offers.<Cite src="eip-1559" /><Cite src="reth-transaction-types" />
+
+### What you are actually charged
+
+The [fee mechanism](/c/eip-1559-tfm) is Track 01 material; what matters here is the arithmetic the
+envelope's two fields feed. From the reference implementation:
+
+```text
+priority_fee_per_gas = min(max_priority_fee_per_gas,
+                           max_fee_per_gas - base_fee_per_gas)
+effective_gas_price  = priority_fee_per_gas + base_fee_per_gas
+```
+
+The sender's balance is debited `gas_limit * effective_gas_price` before execution and credited back
+`gas_refund * effective_gas_price` afterwards. The proposer receives `gas_used * priority_fee_per_gas`
+and nothing else — the base fee is not given to anyone, it is burned.<Cite src="eip-1559" /> The
+`GASPRICE` opcode returns `effective_gas_price`, so a contract reading it sees the settled price, not
+either ceiling.<Cite src="eip-1559" />
+
+<Misconception
+  belief="maxFeePerGas is the price I pay."
+  reality="It is a ceiling. You pay the base fee plus whatever tip fits underneath it, and the unused headroom is never charged. Raising maxFeePerGas alone changes what you are willing to pay, not what you pay."
+  why="The field it replaced, legacy gasPrice, genuinely was the price paid. Wallet interfaces that show a single 'max fee' number preserve the old intuition."
+  src="eip-1559"
+/>
+
+Two operational consequences fall out of that block, and both cause incidents.
+
+**A `maxFeePerGas` below the base fee makes a transaction ineligible, not slow.** The relationship is
+not a preference; a transaction whose ceiling is under the current base fee cannot be included in that
+block at all. If the base fee stays above it, the transaction is unminable for as long as that
+lasts — and, as the next lesson develops, it is also blocking everything behind it.
+
+**The upfront debit is against `gas_limit`, not `gas_used`.** An account with enough balance for the
+transaction's actual cost can still be rejected for insufficient funds, because the balance check
+happens against the limit times the effective price.<Cite src="eip-1559" /> Sweep-and-send designs
+that leave an account with exactly the expected cost fail here, reliably and confusingly.
+
+## Type `0x04`: a transaction that changes what an account is
+
+`0x04` is where the envelope stops being about fees.
+
+The payload is the 1559 field set with one addition:
+`rlp([chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas, gas_limit, destination, value, data, access_list, authorization_list, signature_y_parity, signature_r, signature_s])`,
+where `authorization_list = [[chain_id, address, nonce, y_parity, r, s], ...]`. The transaction is
+invalid if that list is empty.<Cite src="eip-7702" />
+
+That last clause is deliberate. The rationale states the reason plainly: requiring at least one
+authorization disincentivises senders from using type 4 as a generic transaction
+format.<Cite src="eip-7702" /> Type `0x04` is not "type `0x02` with an optional extra"; it is a
+different tool with a mandatory payload.
+
+### What one authorization does
+
+Each tuple is verified and applied **before** the transaction's own call begins, but **after** the
+sender's nonce has been incremented.<Cite src="eip-7702" /> For each one, in order:
+
+1. **Establish who signed it.** `authority = ecrecover(keccak(MAGIC || rlp([chain_id, address, nonce])), y_parity, r, s)`
+   with `MAGIC = 0x05`, and `s` constrained to at most `secp256k1n/2` as required by
+   [EIP-2](/c/low-s-normalisation).<Cite src="eip-7702" /><Cite src="eip-2" /> The `MAGIC` prefix
+   is domain separation again: an authorization digest cannot collide with a transaction digest.
+2. **Check it applies here and now.** The chain id must be 0 or the current chain's, and the
+   authority's nonce must equal the tuple's nonce.<Cite src="eip-7702" />
+3. **Write the delegation.** The authority's code field is set to `0xef0100 || address` — the 23-byte
+   [delegation indicator](/c/delegation-designator).<Cite src="eip-7702" /> Delegating to the zero
+   address instead clears the code back to the empty code hash.<Cite src="eip-7702" />
+4. **Increment the authority's nonce by one.**<Cite src="eip-7702" />
+
+<Figure
+  caption="The two phases have different atomicity: everything above the line has already happened when the call below it reverts."
+  alt="A type-4 transaction increments the sender's nonce, then for each authorization tuple verifies the authority, writes the delegation indicator and increments the authority's nonce, and only then makes its own call. A revert in the call phase does not roll back the delegations."
+>
+  <Flow
+    dir="down"
+    lanes={['authorization phase', '', '', '', 'execution phase', '']}
+    nodes={[
+      { id: 'sn', label: 'sender nonce++', note: 'before any tuple is read', col: 0 },
+      { id: 'rec', label: 'recover authority', note: 'ecrecover over MAGIC 0x05', col: 1 },
+      { id: 'del', label: 'write delegation', note: '0xef0100 || address', col: 2, tone: 'accent' },
+      { id: 'an', label: "authority nonce++", note: 'a nonce you did not move', col: 3, tone: 'warn' },
+      { id: 'call', label: 'call destination', note: 'an ordinary 1559 call', col: 4 },
+      { id: 'rev', label: 'revert', note: 'delegations above stay written', col: 5, tone: 'danger', dashed: true },
+    ]}
+    edges={[
+      { from: 'sn', to: 'rec' },
+      { from: 'rec', to: 'del', tone: 'accent' },
+      { from: 'del', to: 'an', tone: 'warn' },
+      { from: 'an', to: 'call' },
+      { from: 'call', to: 'rev', tone: 'danger', dashed: true },
+    ]}
+  />
+</Figure>
+
+Step four is the one that reorganises how you think about nonces, and the next lesson is largely about
+it. A `chain_id` of 0 in step two is the other: it authorises the delegation on *every* chain where
+that address holds code, and the code at that address is only the same everywhere if its deployment
+was deterministic.<Cite src="eip-7702" /><Cite src="nethermind-7702-attack-surfaces" />
+
+### The gas model charges for the worst case and refunds
+
+The intrinsic cost is inherited from EIP-2930 —
+`21000 + 16 * non-zero calldata bytes + 4 * zero calldata bytes + 1900 * access list storage key count + 2400 * access list address count`
+— plus `PER_EMPTY_ACCOUNT_COST` of **25000 gas multiplied by the length of the authorization
+list**.<Cite src="eip-7702" /> While processing each tuple, if the authority already exists in state,
+`PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` is added to the refund counter, with
+`PER_AUTH_BASE_COST` set to **12500**.<Cite src="eip-7702" />
+
+The rationale explains the shape: charging the worst case up front means intrinsic gas can be computed
+with a state lookup on the sender's account alone, rather than one lookup per
+authorization.<Cite src="eip-7702" /> The effect for you is that a type-4 transaction's `gasLimit`
+must cover 25000 per tuple even when every authority already exists and half of it comes straight
+back.
+
+And the sentence that catches sponsors: **the sender pays for all authorization tuples regardless of
+validity or duplication.**<Cite src="eip-7702" /> An invalid tuple does not make the transaction
+invalid — it is skipped, and it is billed.
+
+<Figure
+  caption="What a type-4 authorization writes into an EOA is a pointer, not a program: three bytes of prefix and an address."
+  alt="The delegation indicator written into an authority's code field: a three-byte 0xef0100 prefix followed by the twenty-byte address whose code will run instead."
+>
+  <ByteLayout
+    offsets
+    fields={[
+      { label: '0xef0100', size: 3, tone: 'accent', note: 'delegation indicator' },
+      { label: 'address', size: 20, note: 'the code that runs instead' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="warn">
+Two more properties of type `0x04` that do not follow from anything else and are worth memorising.
+
+**Delegations survive a revert.** If transaction execution fails — any exceptional condition, or the
+called code reverting — the delegation indicators that were already written are **not** rolled
+back.<Cite src="eip-7702" /> The authorization phase and the execution phase have different atomicity.
+A "the transaction failed, so nothing happened" mental model is wrong here in a way that has security
+consequences.
+
+**No blobs and no contract creation.** Type `0x04` cannot carry blobs and cannot be a create
+transaction. The authors' reasoning is that blob transactions are handled differently at the p2p layer
+and that contract creation is a separate execution branch that would have to be re-tested against
+every EVM change; they did not expect demand for atomic delegation plus blob
+submission.<Cite src="eip-7702" />
+</Aside>
+
+<Misconception
+  belief="A type-4 transaction only installs code — you send it, then send a second transaction to use the delegated account."
+  reality="It is a full 1559 transaction that happens to process its authorizations first. The same transaction can install a delegation and then immediately call into it, and its `destination` may be any address, including the authority itself."
+  why="The name describes the field that was added, not the envelope. The envelope is 1559 plus one list."
+  src="eip-7702"
+/>
+
+Because the transaction's sender and the tuple's authority are recovered separately, they need not be
+the same party. That is the entire basis of sponsored delegation: a relayer pays, the user
+signs.<Cite src="eip-7702" /> It is also the basis for the griefing surface — the sponsor commits gas
+to an authorization the authority can invalidate before inclusion, simply by getting any other
+transaction of their own mined first and moving their nonce.<Cite src="nethermind-7702-attack-surfaces" />
+Clients push back on this at the pool: go-ethereum refuses a transaction carrying an authorization
+from an address that already has in-flight transactions known to the pool, and holds delegated
+accounts to at most one in-flight executable transaction.<Cite src="geth-legacypool" />
+
+## Choosing between them
+
+The decision collapses to three questions.
+
+**Are you installing or relying on a delegation in this transaction?** Then it is `0x04`, and you
+budget 25000 per authorization even though half comes back, and you accept that no blob rides along.
+
+**Do you have a list of state items derived from a simulation against current state?** Then `0x02`
+with an `access_list` is worth it, and the win is 100 gas per correctly predicted item — real at high
+volume, invisible on a single transfer. If the list came from anywhere else, send `0x02` without one.
+
+**Otherwise `0x02`, empty access list.** This is what wallets emit and it is the right
+default.<Cite src="reth-transaction-types" />
+
+Notice that `0x01` never wins. Its only distinguishing feature is the access list, and `0x02` carries
+that field too while also giving you the 1559 fee pair.<Cite src="eip-1559" /> You will still receive
+`0x01` transactions — anything that decodes traffic must handle them — but there is no live reason to
+originate one.
+
+<Check type="predict" concept="tx-type-1-access-list">
+A batching contract at address `B` is called by a transaction sent to `B`. During execution it makes
+one `CALL` to token contract `T`, which performs two `SLOAD`s from slots `s1` and `s2` in `T`'s own
+storage. All three items are cold at the start.
+
+You are asked to add an access list containing `B`, `T`, `s1` and `s2`. What is the exact gas delta,
+and what would it be if the call to `T` turned out to be skipped by a branch that was not taken during
+simulation?
+
+<Answer>
+**Enumerate what is already warm.** `accessed_addresses` starts out containing the sender, the `to`
+address and every precompile,<Cite src="eip-2929" /> plus the block's `COINBASE`.<Cite src="eip-3651" />
+The transaction's `to` is `B`, so **`B` is already warm** and listing it buys nothing.
+
+**Price the entries you would pay for.**
+
+- `B`: charged 2400, saves nothing, because it was warm regardless. **−2400.**
+- `T`: charged 2400 instead of a 2600 cold account access, and the access itself now costs 100.
+  **+100.**
+- `s1` and `s2`: each charged 1900 instead of a 2100 cold `SLOAD`, each access now 100. **+100
+  each.**<Cite src="eip-2929" /><Cite src="eip-2930" />
+
+**Net for the happy path: 2400 − 100 − 100 − 100 = 2100 gas worse off.** The list loses even though
+three of its four entries were predicted perfectly, because the fourth entry was an address that
+EIP-2929 had already warmed for free. Deleting `B` from the list turns this into a 300-gas saving.
+
+**Now take the branch away.** `T` is never called, so `s1` and `s2` are never read. You pay
+2400 + 2400 + 1900 + 1900 = 8600 gas for a set of prepayments that redeem nothing. Against the
+best case of a 300-gas saving, the ratio is roughly twenty-nine to one — which is the shape of every
+access-list decision, and the reason the EIP describes the discount as around 10% and expects most
+senders to skip it entirely.<Cite src="eip-2930" />
+
+**The transferable rule:** an access list is worth generating only when a machine derives it from an
+execution trace against the state the transaction will meet, and only after subtracting the items
+EIP-2929 warms for free.
+</Answer>
+</Check>
+
+## Where this pays off
+
+The two envelopes left out of this lesson are left out for a reason. Type `0x03` is next, because it
+does something none of these three do: it pays into a market that is not the one you have been reading
+about.<Cite src="eip-4844" /> And type `0x00` was the last lesson, because it is the one your decoder
+forgets.
+
+The 100-gas-per-item result comes back in the gas module, where the same cold-versus-warm accounting
+governs whether a storage layout change is worth making at all. The type-`0x04` nonce increment comes
+back in the very next lesson, where it turns a solved problem — computing the next nonce for an
+account you control — back into an unsolved one.
+
+And the delegation-survives-revert property comes back in the security track, where the pattern
+"authorization applied, execution reverted, indicator still installed" is one of the more surprising
+starting states an attacker can arrange for.<Cite src="nethermind-7702-attack-surfaces" />

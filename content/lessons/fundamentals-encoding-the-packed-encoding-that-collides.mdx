@@ -1,0 +1,299 @@
+---
+id: fundamentals-encoding-the-packed-encoding-that-collides
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solidity-abi-spec, solidity-abi-encoding-functions, nist-fips-202, nethermind-encodepacked-collisions, scsfg-abi-hash-collisions, kadenzipfel-hash-collision, arxiv-signature-replay, eip-712, eip-191]
+stack: { foundry: "1.7.1" }
+---
+
+Two encoding functions sit next to each other in the Solidity documentation. Their names differ by
+one word. One of them is a standard serialization; the other is a vulnerability class that has been
+written up repeatedly and still ships.
+
+The difference is not size. It is whether the bytes can be taken apart again.
+
+## What packed mode removes
+
+`abi.encode` produces what the previous lesson described: 32-byte alignment, offsets, an explicit
+length word in front of every dynamic value.
+
+`abi.encodePacked` removes all three, and the specification states the removals as four
+rules.<Cite src="solidity-abi-spec" />
+
+- Types shorter than 32 bytes are **concatenated directly, without padding or sign extension**.
+- Dynamic types are **encoded in place and without the length**.
+- **Array elements are padded**, but still encoded in place.
+- Structs and nested arrays are **not supported at all**.
+
+The third rule is the one nobody expects, and it means "packed" is not a description of the output
+so much as a description of the *top level* of the output. `abi.encodePacked(uint8(1), uint8(2))` is
+two bytes. `abi.encodePacked([uint8(1), uint8(2)])` — the same two numbers, handed over as an
+array — is two full 32-byte words, because the elements of an array are padded even in packed
+mode.<Cite src="solidity-abi-spec" /> Sixty-four bytes versus two, decided by a pair of brackets.
+
+The same asymmetry applies to strings: a `string` argument gets no trailing padding, but a `string`
+*inside* an array or struct is padded to a multiple of 32.<Cite src="solidity-abi-spec" />
+
+Here is the specification's own worked example, encoding `int16(-1)`, `bytes1(0x42)`, `uint16(0x03)`
+and the string `"Hello, world!"`:
+
+<Figure
+  caption="Every boundary here is held by the schema in your head; not one of them is written in the bytes."
+  alt="The packed encoding of int16 minus one, bytes1 0x42, uint16 3 and the string Hello, world! as eighteen contiguous bytes, with each value's span marked and the string carrying no length prefix."
+>
+  <Anatomy
+    value="ffff42000348656c6c6f2c20776f726c6421"
+    parts={[
+      { from: 0, to: 4, label: 'int16(-1)', note: '2 bytes, no sign extension' },
+      { from: 4, to: 6, label: 'bytes1(0x42)', note: '1 byte' },
+      { from: 6, to: 10, label: 'uint16(0x03)', note: '2 bytes' },
+      { from: 10, to: 36, label: '"Hello, world!"', note: '13 bytes, no length', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+Eighteen bytes total.<Cite src="solidity-abi-spec" /> The same four values through `abi.encode`
+occupy five words. Packed output really is smaller, and there really are places where that is the
+right call.
+
+Now read that byte string as a decoder would, knowing only the types. Where does the `int16` end? At
+byte 2 — the type says so. Where does the string end? Nowhere in the bytes says. It ends where the
+input ended, and only because the input ended. The specification draws the conclusion itself: since
+the encoding is ambiguous, **there is no decoding function**.<Cite src="solidity-abi-spec" /> Not
+"none is provided yet". None can exist.
+
+## The failure
+
+Take two `string` arguments. Concatenate their bytes with no padding and no length. Then hash the
+result with `keccak256`<Cite src="nist-fips-202" />, which is what packed mode is almost always used
+for.
+
+```text
+abi.encodePacked("AB", "C")  ->  0x414243
+abi.encodePacked("A", "BC")  ->  0x414243
+
+keccak256(0x414243)          ->  0xe1629b9dda060bb30c7908346f6af189c16773fa148d3366701fbaa35d54f3c8
+```
+
+Two different argument tuples. One byte string. One digest. The Solidity documentation states the
+identity directly — moving characters across the boundary between two dynamic arguments does not
+change the packed output.<Cite src="solidity-abi-spec" />
+
+<Figure
+  caption="The two meanings merge in the encoder; by the time keccak runs there is only one input left for it to be honest about."
+  alt="Two different string pairs — AB with C, and A with BC — both pass through abi.encodePacked to the single byte string 0x414243, which keccak256 maps to one digest."
+>
+  <Flow
+    lanes={['two tuples', 'one byte string', 'one digest']}
+    nodes={[
+      { id: 'ab', label: '("AB", "C")', col: 0 },
+      { id: 'a', label: '("A", "BC")', col: 0 },
+      { id: 'packed', label: '0x414243', note: 'no length, no padding', col: 1, tone: 'danger' },
+      { id: 'dig', label: 'keccak256', note: '0xe1629b9d…', col: 2 },
+    ]}
+    edges={[
+      { from: 'ab', to: 'packed', label: 'encodePacked' },
+      { from: 'a', to: 'packed', label: 'encodePacked' },
+      { from: 'packed', to: 'dig' },
+    ]}
+  />
+</Figure>
+
+Compare `abi.encode` on the same two tuples. The length words move, so the bytes differ, so the
+digests differ:
+
+```text
+abi.encode("AB", "C")
+  0000…0040   offset to arg 0
+  0000…0080   offset to arg 1
+  0000…0002   length 2
+  4142 0000…  "AB"
+  0000…0001   length 1
+  4300 0000…  "C"
+  keccak256 -> 0x2f935887c45f256dc1eaa1737c8202749e5480305c129f26c0d964f2f67dec00
+
+abi.encode("A", "BC")
+  … length 1, "A", length 2, "BC" …
+  keccak256 -> 0x361ca485b165236f6ce0b88c550b719e5e442513e395d93c202b31c7badb326e
+```
+
+The length words are the delimiters. Remove them and the boundary is gone.
+
+### The same failure without a single dynamic argument
+
+The two-dynamic-strings case is the famous one, and it makes the rule sound narrower than it is. The
+compiler documentation's own note on these helpers warns that a collision can be crafted using
+different **function parameter types**.<Cite src="solidity-abi-encoding-functions" />
+
+```text
+abi.encodePacked(uint16(0x0012))              ->  0x0012
+abi.encodePacked(uint8(0x00), uint8(0x12))    ->  0x0012
+```
+
+Nothing dynamic is involved. Every argument is fixed-width and the type system pins every boundary.
+What collides is not two values under one schema — it is two *schemas* writing into the same hash
+namespace. One code path hashes a `uint16`; another hashes a pair of `uint8`s; both land on the same
+digest, and whichever mapping or signature check consumes that digest cannot tell them apart.
+
+That is why the specification's condition has two clauses and is usually quoted with one. Its
+warning says to make sure you **always use the same types**, *and* that at most one of them is
+dynamic.<Cite src="solidity-abi-spec" /> "Same types" is a constraint across every site in your
+system that produces a key, not a property of any single call.
+
+<Misconception
+  belief="abi.encodePacked is just a cheaper abi.encode."
+  reality="It is a lossy, non-self-delimiting encoding. With two or more dynamic arguments it is ambiguous by construction, and there is no decoding function for it at all."
+  why="The two functions are adjacent in the docs and differ by one word in the name, which reads like an optimisation flag rather than a change of contract. The specification is explicit that packed mode has no decoder precisely because the encoding is ambiguous."
+  src="solidity-abi-spec"
+/>
+
+<Misconception
+  belief="That is a hash collision, so a stronger hash function would fix it."
+  reality="The two inputs are literally the same byte string. No hash function distinguishes them, because there is nothing to distinguish. The ambiguity is one layer up, in the encoder."
+  why="The word 'collision' points at the hash and hides where the defect lives. keccak256 behaved perfectly: identical input, identical output. Swapping in SHA-256, or a 512-bit digest, changes nothing."
+  src="scsfg-abi-hash-collisions"
+/>
+
+## Where this actually bites
+
+The pattern is always the same shape: a digest over packed arguments used as an identity.
+
+- **Role and permission keys.** `keccak256(abi.encodePacked(resource, action))` as a mapping key or
+  an access-control identifier. A caller who controls both strings can reach a key they were never
+  granted.<Cite src="nethermind-encodepacked-collisions" />
+- **Signed message digests.** A signature authorises a digest, not a tuple. If two tuples share a
+  digest, one signature authorises both — the holder of a signature over one meaning can present it
+  as the other.<Cite src="kadenzipfel-hash-collision" /> Signature replay of this shape is common
+  enough to have been studied systematically rather than anecdotally.<Cite src="arxiv-signature-replay" />
+- **Deduplication and idempotency keys.** Two logically distinct operations that hash the same are
+  silently treated as one.
+
+Note what is *not* required: no hash weakness, no compiler bug, no unusual configuration. The
+attacker needs only enough control over two adjacent variable-length fields to move a character
+across the boundary.<Cite src="scsfg-abi-hash-collisions" />
+
+<Check type="spot-bug" concept="packed-hash-collision">
+An access-control contract stores approvals keyed by a hash, and an admin grants them:
+
+```solidity
+mapping(bytes32 => bool) public approved;
+
+function grant(string calldata org, string calldata role) external onlyAdmin {
+    approved[keccak256(abi.encodePacked(org, role))] = true;
+}
+
+function isApproved(string calldata org, string calldata role) public view returns (bool) {
+    return approved[keccak256(abi.encodePacked(org, role))];
+}
+```
+
+The admin has granted `("acme", "reader")` and nothing else. Name a pair of arguments that
+`isApproved` will answer `true` for, and say which one line you would change.
+
+<Answer>
+`("acmer", "eader")` — or `("acm", "ereader")`, or `("", "acmereader")`. Every split of the ten
+bytes `acmereader` packs to the same byte string, `0x61636d65726561646572`, and therefore to the same
+key.<Cite src="solidity-abi-spec" />
+
+`("", "acmereader")` is the one worth staring at: an empty organisation name is not obviously
+invalid input, and a length check on `role` alone will not catch it.
+
+**The fix is one word.** Change both `abi.encodePacked` calls to `abi.encode` — both, since the two
+sites must agree — and the length words restore the boundary. The stored key changes, so any
+already-granted approvals must be re-granted; that is a migration, not an obstacle.
+
+Two fixes that do *not* work, and are worth being able to reject on sight:
+
+- **A stronger hash.** The inputs are byte-identical. Nothing downstream can help.
+- **A separator character**, such as packing `org`, `"|"`, `role`. This only works if the separator
+  cannot occur in either field, which means you now have to validate that, forever, in every code
+  path that writes a key. `abi.encode` gives you the same guarantee without a rule to remember.
+
+One more, for the version of this contract that "fixed" it by switching to fixed-width types: if
+`grant` hashes `(bytes4 org, bytes6 role)` while some other function in the system hashes
+`(bytes10 combined)` into the same mapping, the boundary is pinned in both and they still
+collide.<Cite src="solidity-abi-encoding-functions" /> Fixed width removes ambiguity *within* one
+schema. It does not stop two schemas from meeting in one key space.
+</Answer>
+</Check>
+
+## When packed mode is fine
+
+Packed encoding is not forbidden. It is ambiguous only when the boundaries are not recoverable, and
+the specification's condition for anything used in signatures, authentication or integrity checks is
+two-part: always the same types, and at most one of them dynamic.<Cite src="solidity-abi-spec" />
+Read as a checklist:
+
+- **Fix the schema first.** Every site that writes into a given digest namespace must hash the same
+  ordered list of types. This is the clause that gets dropped, and it is the one that cannot be
+  checked by looking at a single function.
+- **Then allow at most one dynamic argument.** With one variable-length field, its extent is
+  whatever is left over. With two, the boundary between them exists nowhere in the bytes.
+
+Everything else — two strings, a string and a `bytes`, two variable-length arrays — should use
+`abi.encode`. The output is longer and the hash costs more to compute over more words; that is the
+price of the encoding being decodable, and it is the correct trade for anything acting as an
+identity.
+
+<Aside kind="warn">
+The condition is about the *encoding sites*, not about one call. A digest built with `abi.encode` in
+one function and `abi.encodePacked` in another will simply never match, which is a loud failure. The
+dangerous version is the reverse: two packed sites that agree with each other, and with an attacker.
+</Aside>
+
+## What the standards do instead
+
+Two Ethereum standards solve exactly this problem, and both are worth reading as worked answers
+rather than as boilerplate you import.
+
+**EIP-712 makes every field fixed-width, then names the schema.** In its `encodeData`, each encoded
+member value is exactly 32 bytes long: atomic values are widened to 32, and the dynamic values
+`bytes` and `string` are encoded as the keccak256 hash of their
+contents.<Cite src="eip-712" /> A variable-length field becomes a fixed-length commitment to itself,
+so the "at most one dynamic" problem cannot arise. On top of that, `hashStruct` prefixes a
+`typeHash` derived from the type's own definition, with the stated effect that `encodeData` "only
+has to be injective within a given type" — two different structs are free to encode identically
+because their type hashes differ.<Cite src="eip-712" /> That is the schema clause above, enforced by
+construction rather than by discipline.
+
+**EIP-191 shows when a separator genuinely works.** The spot-bug answer above rejects separator
+characters, and that rejection holds whenever the separator could appear in the data. EIP-191
+prefixes signed data with the byte `0x19` specifically so that the result cannot be valid RLP: a
+single byte in the range `0x00`–`0x7f` is its own RLP encoding, so any such payload is a one-byte
+RLP item followed by something else, and therefore can never be an Ethereum
+transaction.<Cite src="eip-191" /> The separator is safe not because someone promised not to use
+`0x19`, but because a *different specification* guarantees no transaction can begin with it. That is
+the bar a delimiter has to clear.
+
+The byte after the prefix then selects which scheme is being signed — `0x00` for data with an
+intended validator, `0x01` for EIP-712 structured data, `0x45` for `personal_sign`
+messages.<Cite src="eip-191" /> And the `personal_sign` scheme, the oldest of the three, does the
+other thing this module keeps recommending: its prefix embeds `len(message)`, so the boundary
+between the framing and the payload is a length, not a delimiter.<Cite src="eip-191" />
+
+<Aside kind="note">
+Both standards are doing the same thing under different names: making the map from meanings to bytes
+injective, and doing it with a rule a reader can check rather than a convention a team has to
+remember. When you are tempted to invent your own digest scheme, the question to ask is which of
+those two mechanisms — fixed width, or a domain prefix nothing else can produce — you are relying
+on, and whether it actually holds.
+</Aside>
+
+## Where this pays off
+
+This is the first vulnerability in the curriculum that is entirely a data-modelling error — no
+reentrancy, no arithmetic, no privileged call. It reappears as signature replay, where a digest that
+means two things gets signed once and used twice, and as a family of access-control failures where
+the key space is not what the developer drew on the
+whiteboard.<Cite src="nethermind-encodepacked-collisions" />
+
+When typed-data signing arrives properly, EIP-712 will look like ceremony — a domain separator, a
+type hash, a struct hash, three levels of nesting to sign one transfer. Every level of it is one of
+the failures on this page, closed.<Cite src="eip-712" />
+
+It also gives you the sentence that the next two lessons are built around, now with an example
+underneath it: an encoding that is ambiguous is an encoding you cannot safely hash. The next lesson
+turns to the encoding the chain itself uses, and shows the same principle solved a different way —
+by putting a length in front of literally everything.

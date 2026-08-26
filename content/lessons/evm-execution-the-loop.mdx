@@ -1,0 +1,324 @@
+---
+id: evm-execution-the-loop
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    execution-specs,
+    execution-specs-osaka-interpreter,
+    execution-specs-osaka-system,
+    execution-specs-osaka-gas,
+    yellow-paper,
+    eip-2929,
+    eip-4399,
+    eip-7907,
+    eip-7825,
+    eip-7607,
+    philogy-selector-switches,
+    solc-contractcompiler-source,
+    solc-irgenerator-source,
+  ]
+stack: {}
+---
+
+There is a moment, the first time you open the executable specification looking for the virtual
+machine, where you expect a machine and find a `while` loop.
+
+```python
+while evm.running and evm.pc < ulen(evm.code):
+    op = Ops(evm.code[evm.pc])
+    op_implementation[op](evm)
+```
+
+That is it. Fetch the byte at the program counter, look it up in a table, call the function.<Cite src="execution-specs-osaka-interpreter" />
+The three hundred lines around it are entry, exit, value transfer and contract creation. The engine
+itself is three.
+
+The interesting question is not how this works. You could have written it. The interesting question
+is what is *missing* from it, because almost everything that surprises an engineer about smart
+contracts is a consequence of an absence — no scheduler, no clock, no allocator that frees, no way to
+observe your own failure. This lesson walks the loop and then names the absences.
+
+<Figure
+  caption="Everything in this module is either inside that third box or one of the three arrows leaving it."
+  alt="A transaction opens a frame with its own program counter, stack and memory. The frame runs a loop that pops operands, charges gas, performs the effect and advances the counter, until it leaves by one of three exits: a normal return that keeps state, a revert that undoes state and returns the remaining gas, or an exceptional halt that undoes state and consumes all of it."
+>
+  <Flow
+    lanes={['a transaction', 'one frame', 'the loop', 'one of three exits']}
+    nodes={[
+      { id: 'tx', label: 'transaction', note: 'gas budget and calldata', col: 0 },
+      { id: 'fr', label: 'a frame', note: 'own pc, stack, memory', col: 1, tone: 'accent' },
+      { id: 'lp', label: 'fetch and dispatch', note: 'pop, charge, effect, advance', col: 2, tone: 'accent' },
+      { id: 'ret', label: 'RETURN or STOP', note: 'state kept', col: 3, tone: 'good' },
+      { id: 'rev', label: 'REVERT', note: 'state undone, gas returned', col: 3, tone: 'warn' },
+      { id: 'halt', label: 'exceptional halt', note: 'state undone, gas gone', col: 3, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'tx', to: 'fr' },
+      { from: 'fr', to: 'lp', tone: 'accent' },
+      { from: 'lp', to: 'ret', tone: 'good' },
+      { from: 'lp', to: 'rev', tone: 'warn' },
+      { from: 'lp', to: 'halt', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+## The loop and the two brackets around it
+
+Each entry in `op_implementation` follows the same four-part shape, and the specification's own source
+files label the parts in comments: `# STACK`, `# GAS`, `# OPERATION`, `# PROGRAM COUNTER`.<Cite src="execution-specs-osaka-system" />
+Read in order, an instruction:
+
+1. **pops its operands** off the frame's stack, which is where a stack underflow is detected;
+2. **charges its gas**, which is where an out-of-gas condition is detected;
+3. **performs its effect** on stack, memory, transient storage, storage or the world state;
+4. **advances the program counter**, unless it is a jump, in which case it sets it.
+
+<Figure
+  caption="The stack is read top-down, so the value pushed last is the operand consumed first — which is why SSTORE wants its slot number on top and its data underneath."
+  alt="Six instructions incrementing a storage counter, with the stack drawn after each one, top of stack at the top. PUSH1 0x00 leaves the slot number; SLOAD replaces it with the stored value at a cold cost of 2,100; PUSH1 0x01 and ADD compute the new value; PUSH1 0x00 puts the slot number back on top; SSTORE consumes both and costs 2,900 because the slot is warm by then."
+>
+  <StackTrace
+    steps={[
+      { op: 'PUSH1 0x00', stack: ['0x00'], changed: [0], note: 'slot number' },
+      { op: 'SLOAD', stack: ['0x2a'], gas: '2,100', changed: [0], tone: 'warn', note: 'cold' },
+      { op: 'PUSH1 0x01', stack: ['0x01', '0x2a'], changed: [0] },
+      { op: 'ADD', stack: ['0x2b'], changed: [0], tone: 'accent' },
+      { op: 'PUSH1 0x00', stack: ['0x00', '0x2b'], changed: [0], note: 'slot on top' },
+      { op: 'SSTORE', stack: [], gas: '2,900', tone: 'warn', note: 'warm now' },
+    ]}
+  />
+</Figure>
+
+The loop exits in one of two ways. The instruction sets `running` to false — `STOP`, `RETURN`,
+`REVERT`, `SELFDESTRUCT` — or the byte at the counter is not a defined opcode at all, which raises
+`InvalidOpcode`.<Cite src="execution-specs-osaka-interpreter" />
+
+The two exception handlers wrapped around the loop are worth reading closely, because the difference
+between them is a difference you will spend real money on later:
+
+```python
+except ExceptionalHalt as error:
+    evm.gas_left = Uint(0)
+    evm.output = b""
+    evm.error = error
+except Revert as error:
+    evm.error = error
+```
+
+An exceptional halt zeroes the remaining gas and discards any output. A revert does neither. Both
+then restore the state snapshot taken when the frame opened.<Cite src="execution-specs-osaka-interpreter" />
+Three lines against one line is the entire mechanical basis of the failure taxonomy that costs
+teams the most time to internalise, and it gets a lesson of its own later in this module.
+
+### One thing happens before the first opcode
+
+Before the loop starts, the frame computes `valid_jump_destinations` over the whole code
+array.<Cite src="execution-specs-osaka-interpreter" />
+
+This exists because `JUMP` takes its destination off the stack. Control flow is decided at runtime, so
+nothing static tells the machine where a jump may land, and a byte that happens to equal `0x5B`
+inside the immediate data of a `PUSH` must not be a legal target. The analysis walks the code once,
+skipping over push data, and records the positions that hold a genuine `JUMPDEST`. A jump anywhere
+else is an exceptional halt.
+
+Two consequences worth carrying. First, this is why every EVM disassembler has to model `PUSH`
+immediates correctly to be trustworthy: the same byte means two different things depending on what
+precedes it. Second, the work is proportional to code length and is currently not metered per byte —
+loading a contract's code costs the flat cold-or-warm account access charge whatever the code's
+size.<Cite src="eip-2929" /> That asymmetry is exactly what EIP-7907 proposes to fix, by adding a
+per-word charge for code beyond the first 24 KB and raising the size ceiling in exchange. It is a
+Draft with no fork assigned, so it is a description of a known problem rather than a plan you can
+build against.<Cite src="eip-7907" />
+
+<Misconception
+  belief="The EVM compiles contracts before running them, the way every other virtual machine of comparable prominence does."
+  reality="The specification is an interpreter over a byte array. Production clients are free to cache, batch, or compile internally — but the observable result and the gas charged must be exactly what the interpreter produces."
+  why="JIT compilation is the defining feature of the JVM, of V8, of the CLR. The word 'virtual machine' has come to imply it. Here the constraint runs the other way: thousands of independent implementations must agree byte for byte, so the specification is written to be unambiguous rather than fast, and any optimisation a client makes is its own risk to carry."
+  src="execution-specs"
+/>
+
+## Gas is charged before the instruction, not after
+
+Step two of the four is where the countdown lives, and its position in the sequence is the whole
+point. `charge_gas` runs *before* the operation takes effect.<Cite src="execution-specs-osaka-system" />
+If the remaining gas is insufficient, `OutOfGasError` is raised, the operation never happens, and the
+frame lands in the `ExceptionalHalt` handler above: gas set to zero, output discarded, state
+restored.<Cite src="execution-specs-osaka-interpreter" />
+
+Two things follow that are not obvious from the outside.
+
+**Nothing half-executes.** A memory write you cannot afford does not write half the word. The
+expansion cost is computed and charged before a byte moves, so the failure is always at an
+instruction boundary. This is the reason a reverted frame is genuinely equivalent to a frame that
+never ran, rather than approximately equivalent.
+
+**Running out of gas is not an error you can handle.** There is no `finally` in a frame that has run
+out. The handler that could react — Solidity's `try`/`catch`, or a check on the boolean a low-level
+call pushes — always lives in an *outer* frame, and the only reason an outer frame still exists with
+gas to spend is the forwarding rule this module gets to in two lessons.
+
+<Misconception
+  belief="You can catch an out-of-gas condition and clean up before the frame dies."
+  reality="The frame halts immediately, its gas is set to zero and its state changes are undone. There is no handler inside it. Only a caller can observe that the call failed, and only because the protocol guaranteed the caller kept some gas back."
+  why="Solidity's try/catch reads like a general-purpose exception handler, and in most languages it is. Here it compiles to a low-level call plus a branch on the returned boolean — a construct in the caller, wrapping a frame that has already ended. Nothing is running inside the failed frame to run a handler."
+  src="execution-specs"
+/>
+
+<Aside kind="note">
+The gas counter is per frame, not per transaction. Each frame is handed a budget carved out of its
+caller's, spends it, and returns what is left. That is why "how much gas do I have" is a question
+with a different answer at every depth, and why `gasleft()` inside a library called by delegatecall
+tells you about the frame you are in, not the transaction.
+</Aside>
+
+## No clock, no dice, no network
+
+The loop has no I/O. That is not an oversight anyone has been meaning to fix.
+
+Every full node re-executes every transaction and must arrive at a byte-identical state root. If any
+instruction could read a value that differed between machines — a wall clock, a file, a random
+number, the result of a race between threads — the network would fork on the first use of it. So the
+only inputs are the transaction and the block.<Cite src="yellow-paper" />
+
+What that leaves is a short list of environment opcodes, each of which returns a fixed field of the
+current block or transaction: `TIMESTAMP`, `NUMBER`, `PREVRANDAO`, `CHAINID`, `BASEFEE`, `COINBASE`,
+`GASLIMIT`. Read that list again with a different question in mind — *who chooses these values* — and
+the security posture changes. Several of them are chosen by the block proposer, and the proposer
+knows every one of them before deciding whether to publish the block at all.
+
+`PREVRANDAO` is the sharpest case, because its name invites exactly the wrong use. EIP-4399's own
+security considerations section is explicit that the value is biasable — a proposer who dislikes the
+outcome can decline to propose — and that future randomness is predictable to a limited extent. Its
+recommendation to applications is to rely on randomness revealed far enough in the future that
+manipulating it costs more than the prize.<Cite src="eip-4399" />
+
+<Misconception
+  belief="block.timestamp is a clock, so it is safe for anything a clock is safe for."
+  reality="It is a proposer-supplied field constrained only to sit within a permitted window. Treat it as an adversarially chosen number in a range, not as time."
+  why="It has the name, the units and the monotonic behaviour of a clock, and for coarse purposes — 'has a week passed' — it behaves like one. The failure shows up only when the granularity of your decision approaches the granularity of the proposer's freedom, which is precisely where auctions, deadlines and randomness live."
+  src="eip-4399"
+/>
+
+Single-threading is the other half of the same requirement. One transaction executes alone, to
+completion, before the next begins. Nothing in this module is about locks, because there is nothing
+to lock against inside a transaction — which is also why reentrancy is confusing when you first meet
+it: the attack is not concurrency, it is a single thread re-entering your code before you finished
+updating it.
+
+The determinism requirement is the same one that makes
+[the state root an output rather than an input](/c/state-root-is-post-execution). It is also the
+constraint that [block-level access lists](/c/block-level-access-list) are designed to relax — by
+pre-declaring what each transaction reads and writes, so that execution could be parallelised
+without anyone having to guess. That work is a proposal, not a shipped feature.
+
+## A "function" is not a machine concept
+
+One more absence, and it is the one that most changes how you read a disassembly.
+
+The loop starts at program counter zero. There is one entry point per contract, no symbol table and
+no notion of a function. Everything you think of as calling `transfer(address,uint256)` is compiled
+prologue: load the first four bytes of calldata, compare against a list of constants, jump to the
+matching block. The dispatcher is code your compiler wrote, and it runs on every single call before
+your logic does.
+
+That prologue's *shape* is contested, and it is worth knowing that it is contested rather than
+picking a side.
+
+- A widely cited 2022 write-up describes Solidity's dispatcher as a linear if-else chain over
+  selectors, and derives the familiar advice that a function's dispatch cost depends on its position
+  in the chain.<Cite src="philogy-selector-switches" />
+- The compiler's own legacy code generator tells a different story: `appendInternalSelector` in
+  `ContractCompiler.cpp` emits a recursive binary search over selectors sorted as integers, with a
+  split decision driven by the optimiser's runs setting.<Cite src="solc-contractcompiler-source" />
+- The via-IR pipeline emits a Yul `switch` over the selector and leaves the lowering to the Yul code
+  transform, and this corpus could not confirm that the two pipelines produce the same dispatcher
+  shape or the same gas profile.<Cite src="solc-irgenerator-source" />
+
+Sources disagree, and the disagreement is not resolvable by reading more blogs. If dispatch cost
+matters to you, disassemble your own build, with your own compiler version and your own optimiser
+settings, and look. The general lesson survives either way:
+[dispatch gas is not uniform across your functions](/c/abi-dispatch-gas-not-uniform), and it is
+decided by code you did not write.
+
+<Aside kind="warn">
+The same caution applies to opcode-count reasoning generally. Since the Fusaka upgrade a single
+transaction is capped at 16,777,216 gas even though a block may carry far more, so a monolithic
+deployment or batch can now hit a ceiling that did not exist before, in a place where nothing in your
+source hints at one.<Cite src="eip-7825" /><Cite src="eip-7607" />
+</Aside>
+
+## What clients are allowed to do differently
+
+Nothing above says a real node runs this Python. Production clients maintain jump tables, reuse
+memory buffers, cache analyses and in some cases compile hot code. They are free to.
+
+What they are not free to do is disagree. The specification is normative for two things: the
+resulting state and the gas consumed. An optimisation that produces the right answer for the wrong
+gas is a consensus bug, and it is exactly the class of bug that splits a network — a failure of the
+transition function rather than of the network, which is the distinction Track 01 drew when it
+separated safety from liveness.<Cite src="execution-specs" />
+
+<Check type="predict" concept="deterministic-single-threaded">
+A team ships a raffle. Entries close, then anyone may call `draw()`, which picks a winner with:
+
+```solidity
+uint256 seed = uint256(
+    keccak256(abi.encodePacked(block.timestamp, block.prevrandao, msg.sender))
+);
+address winner = entrants[seed % entrants.length];
+```
+
+Predict, before reading on: who can influence the outcome, and what is the cheapest attack against
+this contract? Assume the prize is large.
+
+<Answer>
+**Every input is either chosen by the block proposer or chosen by the attacker.**
+
+`block.timestamp` is supplied by the proposer within a permitted window, so it is a small range of
+values the proposer selects from, not a reading. `block.prevrandao` is known to the proposer before
+they publish the block, and EIP-4399 states plainly that a proposer who dislikes the resulting value
+can bias it by declining to propose at all.<Cite src="eip-4399" /> `msg.sender` is chosen by whoever
+sends the transaction.
+
+**The cheapest attack does not require being a proposer.** Because the loop is deterministic and
+single-threaded, anyone can compute `draw()`'s result *before* sending it — a contract that computes
+the same `seed`, checks whether it wins, and reverts if it does not. The attacker calls that wrapper
+repeatedly and pays only failed-transaction gas until a block turns up where they win. There is no
+race to lose, because nothing else executes while their transaction runs.
+
+**The proposer's attack is strictly stronger and also available.** A proposer building the block sees
+every candidate transaction, can order them, can insert their own, and can discard the whole block if
+the outcome is unfavourable. That is the biasability EIP-4399 warns about, and it is why the EIP's
+own guidance is to use randomness revealed far enough in the future that manipulation costs more than
+the prize.<Cite src="eip-4399" />
+
+**The general form.** Determinism is what makes the chain verifiable, and the same property makes any
+on-chain value a value the attacker can compute in advance for free. There is no such thing as a
+secret in a public deterministic machine — only a value nobody has bothered to compute yet.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**A call is a new machine**, next, takes the single loop you have just read and asks what happens
+when one contract calls another: a second instance of exactly this loop, with its own counter, its
+own stack, its own zeroed memory and a slice of your gas.
+
+**Three ways out of a frame** is the two exception handlers above, expanded. Once you have seen that
+an exceptional halt zeroes `gas_left` and a revert does not, the difference between `require`,
+`assert` and a bad jump stops being folklore.
+
+**Forwarded gas is a ceiling** is the countdown from this lesson at frame boundaries. The reason an
+outer frame is still alive to notice a failed inner call is a rule about how much of the counter you
+are permitted to hand over.
+
+**The gas schedule** in the previous module and the loop here are the same subject viewed from two
+ends: `charge_gas` is where the schedule meets the machine, and the schedule's parameters are the
+prices in `GasCosts`.<Cite src="execution-specs-osaka-gas" />
+
+Further out, the determinism argument in this lesson is the load-bearing assumption of the whole
+proving stack. A zkEVM is only possible because the transition is a pure function of block and
+transaction — there is nothing non-deterministic to prove a statement about.

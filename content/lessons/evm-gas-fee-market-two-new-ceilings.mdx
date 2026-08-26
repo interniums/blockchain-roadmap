@@ -1,0 +1,373 @@
+---
+id: evm-gas-fee-market-two-new-ceilings
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    eip-150,
+    eip-1559,
+    eip-1884,
+    eip-2028,
+    eip-2929,
+    eip-3529,
+    eip-3860,
+    eip-7600,
+    eip-7607,
+    eip-7623,
+    eip-7825,
+    eip-7935,
+    eip-7976,
+    ethereum-org-history,
+  ]
+stack: {}
+---
+
+Two pieces of correct code stopped being correct without anyone editing them.
+
+The first is a cost estimator inside a data-posting service. It multiplies non-zero calldata bytes by
+16 and zero bytes by 4, adds 21,000, and quoted its customers accurately for years. Since Pectra it has
+been under-quoting the exact transactions it exists to price, by a factor approaching two and a half.
+
+The second is a deployment script with a line that reads, in effect, "set the gas limit to the block
+gas limit and let the refund sort it out." Since Fusaka the node it submits to rejects the transaction
+outright. Not out of gas — rejected, before the mempool, with an error most tooling surfaces as
+something unhelpful.
+
+Nothing about either program changed. Two ceilings appeared underneath them.
+
+## Ceiling one: calldata now has a floor price
+
+Calldata pricing was stable for a long time. EIP-2028 set it in 2019, cutting the non-zero byte from
+68 gas to 16 and leaving the zero byte unchanged at 4, on the argument that cheaper data meant more
+layer-two throughput.<Cite src="eip-2028" /><Cite src="eip-1559" /> That worked. It worked so well that by 2024 rollups posting data
+had become the dominant consumer of block space, and the pricing that invited them in had a problem
+nobody had needed to care about before.
+
+The problem is not the average. EIP-7623 states it plainly: under the old pricing a single execution
+payload could reach about 7.15 MB, while the average was around 100 KB.<Cite src="eip-7623" /> That
+gap of roughly seventy times is what every node's hardware, bandwidth and validation budget had to be
+sized against. The worst case sets the safety margin for everyone, and almost nobody was near it.
+
+EIP-7623 shipped in Pectra, which activated on 7 May 2025.<Cite src="eip-7600" /><Cite src="ethereum-org-history" />
+It does not raise the price of calldata. It adds a second branch and takes the larger of the two.
+
+### The formula, and the one thing to notice about it
+
+Define `tokens_in_calldata` as the zero-byte count plus four times the non-zero-byte count. Then:
+
+```text
+tx.gasUsed = 21000 + max(
+    4  * tokens_in_calldata + execution_gas_used + creation_terms,   # standard branch
+    10 * tokens_in_calldata                                          # floor branch
+)
+```
+
+with `STANDARD_TOKEN_COST` 4 and `TOTAL_COST_FLOOR_PER_TOKEN` 10.<Cite src="eip-7623" /> Because a
+non-zero byte is four tokens, the standard branch is the familiar 4-and-16 per byte and the floor
+branch is **10 gas per zero byte and 40 per non-zero byte**.<Cite src="eip-7623" />
+
+<Figure
+  caption="Two prices for the same bytes. The transaction pays whichever branch is larger, and never both."
+  alt="The calldata charge starts from tokens_in_calldata, the zero-byte count plus four times the non-zero-byte count. Two branches are evaluated from it: a standard branch of 4 gas per token plus execution gas and creation terms, and a floor branch of 10 gas per token with no execution term. The transaction is charged 21,000 plus whichever branch is larger."
+>
+  <Flow
+    lanes={['the input', 'two branches', 'the bill']}
+    nodes={[
+      { id: 't', label: 'tokens_in_calldata', note: 'zeros + 4 × non-zeros', col: 0, tone: 'accent' },
+      { id: 'std', label: 'standard branch', note: '4 × tokens + execution', col: 1 },
+      { id: 'flr', label: 'floor branch', note: '10 × tokens, and stop', col: 1, tone: 'warn' },
+      { id: 'max', label: '21,000 + max', note: 'the larger of the two', col: 2, tone: 'accent' },
+    ]}
+    edges={[
+      { from: 't', to: 'std' },
+      { from: 't', to: 'flr', tone: 'warn' },
+      { from: 'std', to: 'max' },
+      { from: 'flr', to: 'max', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+Now the thing to notice, which most summaries of this EIP omit: **the floor branch does not contain
+`execution_gas_used`.** It is a max, not a sum. A transaction in the floor regime pays for its data
+and nothing at all for its computation, right up until the computation grows large enough to make the
+standard branch win.
+
+That gives a break-even you can carry in your head. The floor binds whenever
+`10t > 4t + e`, which is `e < 6t`. For calldata that is entirely non-zero, `t = 4 × bytes`, so:
+
+> The floor applies unless the transaction spends more than **24 gas of execution per non-zero
+> calldata byte** — or 6 gas per zero byte.
+
+<Aside kind="note">
+`execution_gas_used` is defined as execution gas *with the refund subtracted*.<Cite src="eip-7623" />
+A large storage-clearing refund therefore lowers the standard branch and can tip a transaction into
+the floor regime, where the refund then buys nothing because execution gas is not in the branch being
+paid. The [refund cap](/c/refund-cap) from the previous lesson and this floor interact, and the
+interaction runs against intuition in both directions.
+</Aside>
+
+### Worked example: pricing a batch post
+
+**Subgoal — convert bytes to tokens.** Take 100 KiB of compressed batch data, 102,400 bytes, of which
+5% are zero: 5,120 zero and 97,280 non-zero.
+
+```text
+tokens = 5,120 + (97,280 × 4) = 5,120 + 389,120 = 394,240
+```
+
+**Subgoal — evaluate both branches.** The standard branch charges `4 × 394,240 = 1,576,960` plus
+whatever the transaction executes. The floor branch charges `10 × 394,240 = 3,942,400` and stops
+there.<Cite src="eip-7623" />
+
+**Subgoal — decide which one binds.** The floor wins unless execution exceeds
+`6 × 394,240 = 2,365,440` gas. A batch-posting transaction typically executes a signature check and a
+handful of storage writes — nowhere near that. So this transaction pays the floor: 21,000 + 3,942,400,
+against the 21,000 + 1,576,960 + execution that the old estimator predicts.
+
+**Subgoal — state the error in the estimator's own terms.** The estimator quoted 1,576,960 gas of
+calldata and the transaction is charged 3,942,400. Its quote is 40% of the real cost. That is the
+first program at the top of this lesson.
+
+The floor also raises the *validity* threshold, which is a separate failure. A transaction's gas limit
+must now clear `21000 + TOTAL_COST_FLOOR_PER_TOKEN × tokens_in_calldata` as well as its ordinary
+intrinsic cost — whichever is greater.<Cite src="eip-7623" /> A limit computed from the old model can
+therefore be rejected as invalid rather than merely running out.
+
+<Misconception
+  belief="Calldata costs 16 gas per non-zero byte and 4 per zero byte."
+  reality="Only on the standard branch, which applies to execution-heavy transactions. A data-dominated transaction pays a floor of 40 and 10, and 'data-dominated' has a precise definition: less than 24 gas of execution per non-zero calldata byte."
+  why="EIP-2028's numbers held unchanged from 2019 to 2025, which is long enough for them to be in every gas table, every calculator and every blog post that was ever written about calldata. The change did not alter those numbers — it added a branch above them, so the old figures are still printed and still correct in the case where they apply."
+  src="eip-7623"
+/>
+
+### The proposal that is not coming yet
+
+EIP-7976 would replace the 10-and-40 floor with a flat 64 gas per byte, zero and non-zero alike, and
+its authors estimate that this cuts the worst-case block size by about 37%; the same document notes
+that a 10 MiB payload would cost roughly 671M gas under 64/64 against roughly 105M under
+10/40.<Cite src="eip-7976" /> It is in peer review, and it is not assigned to any named
+fork.<Cite src="eip-7976" />
+
+<Misconception
+  belief="Calldata is about to get much more expensive again — 64 gas per byte is coming."
+  reality="EIP-7976 proposes exactly that and is in Review status with no fork assignment. Its numbers are proposal numbers, not scheduled ones."
+  why="Draft EIPs circulate in roadmap posts and conference talks with the same confidence as shipped ones, and the distinction between 'Final and in a hardfork meta' and 'Review' is not visible in a screenshot of a specification."
+  src="eip-7976"
+/>
+
+Read the direction rather than the number. Calldata is being pushed out of the data-availability
+business on purpose: EIP-7623's own motivation names blobs as the preferred path for data
+availability and calls the transition a reason to reprice calldata.<Cite src="eip-7623" /> If your
+product posts bulk data, the durable answer is not to model the floor precisely. It is to be in
+[the blob lane](/c/blob), which has [its own fee market](/c/separate-fee-markets) and does not compete
+with execution gas.
+
+## Ceiling two: a transaction cannot be as large as a block
+
+For a decade there was exactly one ceiling on a transaction's size: it had to fit in a block. That
+stopped being true on 3 December 2025.<Cite src="ethereum-org-history" />
+
+EIP-7825, shipped in Fusaka, caps any single transaction at **16,777,216 gas — 2^24**, and enforces it
+in two places: a transaction declaring a higher `gasLimit` is invalid and never enters the
+transaction pool, and a block containing such a transaction is itself invalid and
+rejected.<Cite src="eip-7825" /><Cite src="eip-7607" />
+
+The word that matters is `gasLimit`. The cap is on the limit you *declare*, not on the gas you
+consume. A transaction that would have used 200,000 gas is rejected outright if it asks for a limit
+of 20,000,000 — and asking for far more than you need is exactly what the "set it to the block limit"
+habit does. That is the second program at the top of this lesson, and the failure it produces is a
+node-side rejection rather than an on-chain receipt, so it does not appear in any block explorer for
+the team to look at.
+
+Meanwhile the block itself got larger, not smaller. EIP-7935 recommends that execution clients set the
+default block gas limit to 60M, up from the 36M it describes as the mainnet value at the time of
+writing.<Cite src="eip-7935" /> It is worth being precise about what that document is: it is
+Informational, and it changes client *default configurations* rather than a protocol constant. The
+block gas limit remains something validators adjust; the EIP coordinates where they start from and
+ties the change to a fork so that the testing happens.<Cite src="eip-7935" />
+
+Put the two numbers together and the shape of a block changed:
+
+```text
+60,000,000 / 16,777,216  =  3.58
+```
+
+At most three maximum-sized transactions fit in a block, and a block is no longer something a single
+transaction can fill. That was the point. EIP-7825's motivation lists the risks of one transaction
+consuming most of a block: uneven load, longer validation times, and larger single-transaction state
+changes feeding state growth.<Cite src="eip-7825" />
+
+<Misconception
+  belief="If it fits in a block, it can be one transaction."
+  reality="Since Fusaka a transaction is capped at 2^24 gas regardless of the block limit, which is currently defaulted several times higher."
+  why="For ten years the block gas limit genuinely was the only ceiling, so 'will it fit in a block' was the complete question. The two limits also moved in opposite directions in the same upgrade, which makes the intuition 'blocks got bigger, so transactions can be bigger' exactly backwards."
+  src="eip-7825"
+/>
+
+### Who this actually bites
+
+Not ordinary application transactions, which are two orders of magnitude below the cap. It bites the
+things that grew by looping:
+
+- **Monolithic deployments.** Deploying a large contract pays intrinsic creation gas, a per-word
+  charge on initcode, and a per-byte deposit for the code that ends up in state.<Cite src="eip-7623" /><Cite src="eip-3860" />
+  A deployment that was already uncomfortably large now has a hard rejection point rather than a
+  merely expensive one. The [code size and deposit limits](/c/code-deposit-and-size-limits) were
+  always the first constraint; the cap is a second one, further out and less forgiving.
+- **Batch operations that scale with a list.** Airdrop distributors, multi-send contracts, migration
+  scripts and anything with `for (uint i; i < recipients.length; ++i)` inside a single transaction.
+  These fail by growing, so they pass every test written against a short list.
+- **Anything that allocates large memory.** Memory is priced with a
+  [quadratic term](/c/memory-expansion-quadratic), so the per-transaction cap now puts a hard bound on
+  how much memory one transaction can ever afford to touch. The exact ceiling is arithmetic on the
+  expansion formula and is worth deriving yourself rather than reading — it is a number that moves if
+  the memory pricing is ever changed, and there is a live proposal to change it.
+
+The operational response is the same in all three cases and it is not "raise the limit". It is to
+split the work across transactions, which means your contract needs to be resumable — a cursor, a
+checkpoint, an idempotent step — rather than an all-or-nothing loop.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'EIP-7623 floor', note: 'Pectra, 7 May 2025', tone: 'warn' },
+    { title: 'EIP-7825 cap', note: 'Fusaka, 3 Dec 2025', tone: 'danger' },
+  ]}
+  rows={[
+    {
+      label: 'Is it a price or a bound?',
+      cells: ['A price — it changes what you are charged', 'A bound — it decides whether you are accepted'],
+    },
+    {
+      label: 'What quantity does it read?',
+      cells: ['tokens_in_calldata, against execution gas used', 'The declared gasLimit, never the gas used'],
+    },
+    {
+      label: 'What is the number?',
+      cells: ['10 gas per zero byte, 40 per non-zero', '16,777,216 gas, or 2^24'],
+    },
+    {
+      label: 'Where does the failure land?',
+      cells: ['In the invoice — the transaction is still mined', 'Before the mempool — the transaction never exists'],
+    },
+    {
+      label: 'What is left behind to debug?',
+      cells: ['A receipt showing more gas than you quoted', 'No receipt, no revert reason, no explorer entry'],
+    },
+    {
+      label: 'Can retrying unchanged ever work?',
+      cells: ['Yes — it succeeded, it just cost more', 'No — the same gasLimit is rejected every time'],
+    },
+  ]}
+  caption="Both ceilings broke working code in the same upgrade season, but only one of them leaves anything behind for the team to look at."
+  alt="The EIP-7623 calldata floor and the EIP-7825 per-transaction gas cap compared: the floor is a price read from calldata tokens that raises the bill on a mined transaction, while the cap is a bound read from the declared gas limit that rejects the transaction before the mempool and produces no receipt."
+/>
+
+## What the two ceilings have in common
+
+Take a step back from both, because the pattern is more useful than either number.
+
+Every significant gas change of the last decade has moved in the same direction: away from pricing
+the average case and toward bounding the worst case.
+
+| change | what was fine on average | what was catastrophic adversarially |
+|---|---|---|
+| EIP-150 | state-reading opcodes | transactions that only read state |
+| EIP-1884 | `SLOAD` at 200 gas | a trie that had grown underneath the price |
+| EIP-2929 | account and slot access | touching thousands of accounts in one transaction |
+| EIP-3529 | storage refunds | gas tokens, and real block gas near twice the nominal limit |
+| EIP-7623 | around 100 KB of calldata | a payload of roughly 7.15 MB |
+| EIP-7825 | transactions far below the block limit | one transaction filling a block |
+
+Each row is stated by the EIP that changed it: EIP-150 after the 2016 denial-of-service
+attacks,<Cite src="eip-150" /> EIP-1884 raising `SLOAD` from 200 to 800 as the trie
+grew,<Cite src="eip-1884" /> EIP-2929 citing malicious transactions that took 20 to 80 seconds to
+execute,<Cite src="eip-2929" /> EIP-3529 citing gas tokens and a block's real gas reaching nearly
+twice its nominal limit,<Cite src="eip-3529" /> EIP-7623 citing a 7.15 MB worst case against a
+roughly 100 KB average,<Cite src="eip-7623" /> and EIP-7825 citing uneven load and validation time
+from single-transaction gas hogs.<Cite src="eip-7825" />
+
+Six repricings, one argument. In every row the average user was unaffected and the tail was the
+problem, and in every row the fix made a previously-correct number conditional rather than replacing
+it. That is why stale gas knowledge does not fail loudly: the old figure remains correct in the
+ordinary case, which is the case you test.
+
+It also tells you where the next one lands. Anything currently cheap on average and unbounded in the
+worst case is a candidate, and both proposals in this lesson — the 64-gas floor and a linear
+replacement for quadratic memory pricing — are exactly that shape.
+
+### Three questions for any gas number
+
+Since every number in this module turned out to be conditional, carry the conditions with it.
+
+1. **Which fork was this measured under?** A number without a fork is a number with an expiry date you
+   cannot read. Both ceilings here are younger than most of the material that would teach you gas.
+2. **Is it a price or a bound?** A price is what you pay per unit. A bound is a ceiling that rejects
+   you. The estimator at the top of this lesson got a price wrong; the deployment script hit a bound.
+   They fail in completely different places — one in your invoice, one before the mempool.
+3. **Does it depend on transaction history?** If the answer is yes, as it is for every state access,
+   then the number is a property of a call path and not of an opcode, and a benchmark that does not
+   reproduce the path is not measuring your cost.
+
+<Check type="predict" concept="calldata-floor-price">
+Three transactions, all with 50,000 bytes of calldata that is entirely non-zero, so
+`tokens_in_calldata = 200,000` in each case.
+
+1. Executes 300,000 gas of EVM work.
+2. Executes 2,000,000 gas of EVM work.
+3. Executes 300,000 gas of EVM work and earns a 400,000-gas storage-clearing refund.
+
+For each, say which branch it lands on and what it is charged, and then say what happens if a fourth
+transaction with the same calldata declares a gas limit of 20,000,000.
+
+<Answer>
+The floor branch charges `10 × 200,000 = 2,000,000` in all three cases. The standard branch charges
+`4 × 200,000 = 800,000` plus execution.<Cite src="eip-7623" /> The crossover is at
+`6 × 200,000 = 1,200,000` gas of execution.
+
+**1 — floor branch. Charged 21,000 + 2,000,000.** Execution of 300,000 is well below the crossover,
+so the standard branch comes to 1,100,000 and loses. Note what this means at the margin: this
+transaction could do another 899,999 gas of computation for free, because execution gas does not
+appear in the branch it is paying.
+
+**2 — standard branch. Charged 21,000 + 800,000 + 2,000,000 = 21,000 + 2,800,000.** Execution is above
+the crossover, so the sum exceeds the floor and the floor does not bind. This transaction pays for
+both its data and its work, at the old calldata rates.
+
+**3 — floor branch, and the refund is worth nothing.** `execution_gas_used` is defined net of the gas
+refund, and the refund itself is capped at a fifth of the gas the transaction
+used.<Cite src="eip-7623" /><Cite src="eip-3529" /> Whatever the netted figure works out to, it is
+below 300,000 and therefore far below the 1,200,000 crossover, so the floor still binds and the
+transaction is charged 21,000 + 2,000,000. The refund reduced a branch that was not being paid. A team optimising this transaction by clearing more storage would
+measure zero improvement and have no obvious explanation for it.
+
+**The fourth transaction is rejected before the mempool.** 20,000,000 exceeds the per-transaction cap
+of 16,777,216, and EIP-7825 invalidates on the declared `gasLimit` rather than on gas
+used.<Cite src="eip-7825" /> It does not matter that this transaction would only have consumed about
+2 million. There is no receipt, no revert reason and no block explorer entry to inspect — which is
+why this failure is so much harder to diagnose than the other three.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Calldata cost modelling** on the scaling track is this lesson applied to the question rollups
+actually face: for a given payload, is calldata or a blob cheaper today, and how does the answer move
+with each fee market independently.<Cite src="eip-7623" />
+
+**Gas profiling** in the toolchain track needs both ceilings to interpret its own output. A gas
+snapshot taken locally has no calldata floor in it unless the harness sends realistic calldata, and a
+test that passes at 20M gas tells you nothing about a transaction that cannot be submitted at 20M
+gas.
+
+**Transaction UX** in the application track inherits the failure mode that has no receipt. Pool-level
+rejection is a category your error handling has to carry, alongside revert and out-of-gas, and it is
+the only one of the three where retrying with the same parameters can never work.
+
+And the reflection this module asks for comes out of the same place. Every number in these three
+lessons was either measured on a pinned toolchain or read out of a specification with a fork attached
+to it, because the alternative — a number remembered from a table — was wrong for the cold storage
+read, wrong for the reentrancy guard, and wrong for calldata. The habit is not scepticism about other
+people's numbers. It is attaching the conditions to your own.

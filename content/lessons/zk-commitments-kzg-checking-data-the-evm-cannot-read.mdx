@@ -1,0 +1,419 @@
+---
+id: zk-commitments-kzg-checking-data-the-evm-cannot-read
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    eip-4844,
+    eip-7594,
+    consensus-specs-deneb-polynomial-commitments,
+    consensus-specs-trusted-setup-4096,
+    c-kzg-4844,
+    kate-zaverucha-goldberg,
+    measured-gas-constants,
+    chainpath-conflict-register,
+  ]
+stack: { solidity: "0.8.36" }
+---
+
+The entire interface between the EVM and 128 KiB of blob data is 192 bytes wide, and the
+specification lays it out to the byte:<Cite src="eip-4844" />
+
+<Figure
+  caption="Which blob, the claim, and the evidence for it. Nothing in the input refers to the blob's contents."
+  alt="The 192-byte input to the point-evaluation precompile: a 32-byte versioned hash at offset 0, a 32-byte z at 32, a 32-byte y at 64, a 48-byte commitment at 96 and a 48-byte proof at 144."
+>
+  <ByteLayout
+    offsets
+    caption="input to the point-evaluation precompile at 0x0A — 192 bytes exactly"
+    fields={[
+      { label: 'versioned_hash', size: 32, tone: 'accent', note: 'which blob' },
+      { label: 'z', size: 32, note: 'padded big-endian field element' },
+      { label: 'y', size: 32, note: 'padded big-endian field element' },
+      { label: 'commitment', size: 48, note: 'a G1 point' },
+      { label: 'proof', size: 48, note: 'a G1 point' },
+    ]}
+  />
+</Figure>
+
+Send those 192 bytes to the precompile at address `0x0A` and it performs two checks and charges a
+flat **50,000 gas**.<Cite src="eip-4844" /> There is no other route. A contract cannot read a byte of
+blob data, cannot iterate it, cannot hash it, and cannot ask how long it is. It can call this, or it
+can know nothing.
+
+This lesson is about what those 192 bytes actually establish, what they conspicuously do not, and the
+pattern — proof of equivalence — that turns one point evaluation into a claim about a rollup's entire
+published batch.
+
+## Two checks and a constant
+
+The specification's pseudocode is short enough to read in full:<Cite src="eip-4844" />
+
+```python
+def point_evaluation_precompile(input: Bytes) -> Bytes:
+    assert len(input) == 192
+    versioned_hash = input[:32]
+    z = input[32:64]
+    y = input[64:96]
+    commitment = input[96:144]
+    proof = input[144:192]
+
+    # Verify commitment matches versioned_hash
+    assert kzg_to_versioned_hash(commitment) == versioned_hash
+
+    # Verify KZG proof with z and y in big endian format
+    assert verify_kzg_proof(commitment, z, y, proof)
+
+    # Return FIELD_ELEMENTS_PER_BLOB and BLS_MODULUS as padded 32 byte big endian values
+    return Bytes(U256(FIELD_ELEMENTS_PER_BLOB).to_be_bytes32() + U256(BLS_MODULUS).to_be_bytes32())
+```
+
+Four things in there deserve attention.
+
+**Check one re-binds a 48-byte commitment to a 32-byte handle.** The EVM never holds a KZG
+commitment. It holds a **versioned hash** — 32 bytes, produced as `0x01 || sha256(commitment)[1:]` —
+and that is what `BLOBHASH` returns.<Cite src="eip-4844" /> The caller supplies the full commitment
+in the input, and this check is what stops them supplying a *different* commitment that happens to
+suit them. Without it the precompile would verify openings against a polynomial nobody had committed
+to on-chain.
+
+**Check two is the pairing equation from two lessons ago.** `verify_kzg_proof` is the same routine
+the consensus layer uses: construct `[tau - z]_2` from the setup's second G2 point, construct
+`[p(tau) - y]_1` from the commitment, and run one pairing
+check.<Cite src="consensus-specs-deneb-polynomial-commitments" /> The reference string it verifies
+against is the ceremony output shipped with the client, not something the caller
+provides.<Cite src="consensus-specs-trusted-setup-4096" />
+
+**The return value is two constants.** `FIELD_ELEMENTS_PER_BLOB` and `BLS_MODULUS`, as two padded
+32-byte big-endian words — 64 bytes total.<Cite src="eip-4844" /> It tells you nothing about your
+call. It exists so a contract can learn the field parameters without hard-coding them, and it is
+*not* a success flag. Success is signalled the EVM way: the call either returns or it does not.
+
+**The gas is flat.** 50,000, regardless of anything.<Cite src="eip-4844" /> Compare `BLOBHASH`, whose
+cost is `HASH_OPCODE_GAS` — **3 gas**.<Cite src="eip-4844" /> Four orders of magnitude separate
+"which blob" from "one fact about the blob", and that gap is the pairing.
+
+<Aside kind="warn">
+**Canonicity is enforced, and it will surprise your encoder.** The precompile MUST reject
+non-canonical field elements: the supplied `z` and `y` must be strictly less than
+`BLS_MODULUS`.<Cite src="eip-4844" /> A 32-byte value produced by hashing something — a Fiat–Shamir
+challenge, say — is a uniformly random 256-bit number, and the modulus sits just below `2^255`, so a
+raw hash is out of range better than half the time. The consensus specification's own challenge
+derivation reduces modulo `BLS_MODULUS` for exactly this
+reason.<Cite src="consensus-specs-deneb-polynomial-commitments" /> Reduce before you send.
+</Aside>
+
+### Follow one claim from your laptop to the precompile
+
+The round trip is short enough to hold in your head, and holding it is what makes the failure modes
+obvious later. Five steps, three of them off-chain.
+
+**Step 1 — build the blob.** Pack your bytes into 4,096 field elements, each strictly below
+`BLS_MODULUS`.<Cite src="consensus-specs-deneb-polynomial-commitments" /> This is your encoding, and
+it is the step nobody writes about.
+
+**Step 2 — commit.** `blob_to_kzg_commitment` gives you 48 bytes: one linear combination of the
+setup's Lagrange points against your field
+elements.<Cite src="consensus-specs-deneb-polynomial-commitments" /><Cite src="c-kzg-4844" />
+
+**Step 3 — derive the versioned hash yourself.** `0x01 || sha256(commitment)[1:]`.<Cite src="eip-4844" />
+Read that slice carefully: you take the SHA-256 of the 48-byte commitment, **discard its first
+byte**, and prepend `0x01`. The result is 32 bytes, not 33. Prepending without discarding is the
+single most common way to get this wrong, and it produces a value that is the right shape and the
+wrong number — so it fails at the precompile with no diagnostic beyond a failed call. Computing this
+by hand and comparing it byte-for-byte against what your library returns is the cheapest possible
+confidence check, and it is the acceptance criterion of this module's practice exercise.
+
+**Step 4 — open at a point.** `compute_kzg_proof(blob, z)` returns the proof and the value `y`,
+computing the quotient in evaluation form with the special case for `z` inside the
+domain.<Cite src="consensus-specs-deneb-polynomial-commitments" />
+
+**Step 5 — assemble and call.** Concatenate the five fields in the specified order, `staticcall`
+address `0x0A`, and require the call to succeed.<Cite src="eip-4844" /> Then flip one bit of `y` and
+require that it fails. A test that only ever asserts the happy path has not tested a verifier.
+
+## What the version byte is for
+
+The `0x01` at the front of every versioned hash is not decoration. It is a scheme
+identifier.<Cite src="eip-4844" />
+
+The execution layer deliberately refers to blobs by a hash of the commitment rather than by the
+commitment itself, so that the 32-byte interface every contract is written against stays fixed while
+the cryptography underneath can be replaced. If a future scheme produces commitments of a different
+size or a different type, it gets a new version byte, and contracts that check
+`versionedHash[0] == 0x01` keep working — refusing, correctly, to interpret something they were not
+written for.
+
+Put that beside the previous lesson's closing point. The roadmap's direction of travel is away from
+pairing-based schemes with structured setups, and nobody has printed a date. The version byte is what
+the design put in place so that direction would not require rewriting every consumer. It is a
+migration affordance built years before the migration, and it is the reason a contract that pattern-
+matches on the version byte is doing something meaningful rather than defensive theatre.
+
+<Misconception
+  belief="A smart contract can read blob data."
+  reality="The EVM sees only the 32-byte versioned hash returned by BLOBHASH. Any statement about blob contents must be proved through the point-evaluation precompile, one evaluation at a time."
+  why="Blobs are described as 'cheap data on Ethereum', which sounds like calldata — and calldata is readable."
+  src="eip-4844"
+/>
+
+## What the boolean means, exactly
+
+A successful call establishes precisely this sentence:
+
+> The blob whose versioned hash is `H`, read as a polynomial over the fixed evaluation domain, takes
+> the value `y` at the point `z`.
+
+Everything else is your job. Four things it specifically does not say:
+
+**It does not say the blob is available.** The precompile never touches blob data; it checks
+consistency between a commitment and an opening. Whether anyone still holds the blob, or ever served
+it, is a property of the networking layer and its
+incentives.<Cite src="eip-7594" /> A blob that was withheld from the moment it was published still
+has a versioned hash on-chain and still passes this check for any opening the withholder chooses to
+produce.
+
+**It does not say `H` is the blob you meant.** `BLOBHASH` reads an index from the stack and returns
+`tx.blob_versioned_hashes[index]` — or, if the index is out of range, **a zeroed bytes32
+value**.<Cite src="eip-4844" /> Not a revert. A contract that reads `BLOBHASH(3)` on a transaction
+carrying two blobs gets thirty-two zero bytes and, unless it checks, treats that as a versioned hash.
+
+**It does not say `z` was a fair question.** If the caller chose `z`, the caller chose which fact
+about the polynomial gets established. That is fine when `z` encodes a position you care about; it is
+catastrophic when `z` is supposed to be a random challenge, for the reason two sections below.
+
+**It does not say anything about the other 4,095 values.** One opening, one value. The previous
+lessons said this; here it becomes an on-chain gas line. Establishing the whole blob one point at a
+time would cost 4,096 calls at 50,000 gas each, which is not a thing anyone does.
+
+So how does a rollup establish something about a *whole* blob for 50,000 gas?
+
+## Proof of equivalence
+
+Here is the problem in its real form.
+
+A validity rollup has two commitments to the same data, made with different machinery for different
+reasons. It publishes its transaction data as a **blob**, which the protocol commits to with KZG on
+BLS12-381 — that choice is not the rollup's to make.<Cite src="eip-4844" /> It proves its state
+transition inside its own proof system, which commits to that same data with **its own scheme**,
+chosen for proving performance and quite possibly hash-based rather than pairing-based.
+
+Nothing so far connects them. The proof says "I correctly executed the transactions in the data
+committed as `C_proof`". The chain sees a blob committed as `C_blob`. An operator who published one
+batch and proved a different one satisfies both checks independently and has told the chain nothing
+true.
+
+**Proof of equivalence bridges the two, and the bridge is one random point.**
+
+Both sides open their commitment at the *same* challenge point `z`, derived from the transcript. The
+proof system proves, inside the proof, that its committed polynomial evaluates to `y` at `z`. The
+blob side supplies a KZG opening for the same `z` and the same `y`, and the point-evaluation
+precompile checks it on-chain for 50,000 gas.<Cite src="eip-4844" /> If both openings agree, the two
+polynomials are equal — not certainly, but with the overwhelming probability you priced in the first
+lesson of this module: two distinct polynomials of degree at most 4,095 agree at no more than 4,095
+of the field's roughly `10^76` points.
+
+<Figure
+  caption="Two commitment schemes that cannot read each other, joined at a single point neither side was allowed to choose."
+  alt="Proof of equivalence: the blob's KZG commitment and the proof system's own commitment both feed a challenge point z derived from a transcript containing both. The blob side supplies a KZG opening checked by the precompile at 0x0A; the proof system proves the same evaluation inside its proof. Agreement on the value at z means the two polynomials are the same."
+>
+  <Flow
+    lanes={['two commitments', 'one challenge', 'two openings', 'the conclusion']}
+    nodes={[
+      { id: 'blob', label: 'blob commitment', note: 'KZG on BLS12-381, not the rollup to choose', col: 0 },
+      { id: 'own', label: 'the proof commitment', note: 'chosen for proving performance', col: 0 },
+      { id: 'z', label: 'one challenge z', note: 'hashed from a transcript holding both', col: 1, tone: 'accent' },
+      { id: 'k', label: 'KZG opening at z', note: 'checked on-chain at 0x0A', col: 2 },
+      { id: 'p', label: 'evaluation at z', note: 'proved inside the proof system', col: 2 },
+      { id: 'ok', label: 'the same y', note: 'so the two polynomials are equal', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'blob', to: 'z' },
+      { from: 'own', to: 'z' },
+      { from: 'z', to: 'k' },
+      { from: 'z', to: 'p' },
+      { from: 'k', to: 'ok' },
+      { from: 'p', to: 'ok' },
+    ]}
+  />
+</Figure>
+
+The economics are worth stating plainly. The check costs the same 50,000 gas whether the blob holds
+one transaction or ten thousand, because the pairing does not care how large the committed polynomial
+was. That constant is what makes the pattern usable at all, and it is the same constant-size property
+Kate, Zaverucha and Goldberg's paper claims for the scheme in
+general.<Cite src="kate-zaverucha-goldberg" />
+
+<Aside kind="note">
+**Do not assume adoption.** Whether any particular production rollup uses this pattern — rather than,
+say, posting and proving separately with the linkage established some other way — is something to
+check per system rather than to assume from the architecture. This project's research explicitly did
+not verify current adoption and does not assert it.<Cite src="chainpath-conflict-register" /> Learn
+the pattern as a design tool; verify the deployment before you describe someone's system with it.
+</Aside>
+
+### Everything rests on who picks `z`
+
+This is where the pattern is broken in practice, so it deserves its own treatment.
+
+Suppose the prover picks `z` freely, after both polynomials are fixed. Two different degree-4,095
+polynomials agree at up to 4,095 points, and a prover with free choice picks one of them. The
+soundness argument does not degrade — it **evaporates**, because the argument was never about the
+polynomials being close, only about the point being unpredictable.
+
+So `z` must be derived by hashing a transcript that already includes both commitments, using the
+[Fiat–Shamir](/c/non-interactivity-fiat-shamir) transform. Three failure modes follow, and all three
+have produced real bugs in shipped systems:
+
+**Incomplete transcript.** If any value the prover controls is left out of the hash, the prover can
+fix `z` first and then choose that value afterwards. The hash must cover every input the prover could
+still move.
+
+**Missing domain separation.** A challenge derived for one purpose must not be reusable as a
+challenge for another. The consensus specification does this explicitly, tagging its cell-batch
+challenges with a dedicated domain string rather than hashing bare
+inputs.<Cite src="consensus-specs-deneb-polynomial-commitments" />
+
+**Unreduced output.** The hash gives 256 bits; the field takes values below `BLS_MODULUS`. Reduce, or
+the precompile rejects your challenge as non-canonical — and a system that silently retries with a
+different challenge until one is in range has just handed the prover a grinding
+opportunity.<Cite src="eip-4844" />
+
+The rule to carry: **whenever a verifier's randomness has been replaced by a hash, the only question
+that matters is what went into the hash and whether the prover could still change any of it
+afterwards.**
+
+### Where the pattern generalises
+
+Nothing about proof of equivalence is specific to rollups, and recognising the shape is worth more
+than memorising the instance.
+
+The general problem is: **the same data has been committed twice, under two schemes, by two systems
+that cannot read each other's commitments.** That happens whenever a cheap, protocol-mandated
+commitment (KZG on blobs) meets a commitment chosen for a different reason (a proof system's internal
+scheme, a hash-based accumulator, another chain's format). The general solution is: open both at one
+point that neither side could predict, and check the openings agree.
+
+Two properties make the trick work, and both are properties of *polynomial* commitments rather than
+of KZG in particular:
+
+- The commitments bind **functions**, so "agree at a random point" is overwhelming evidence of
+  "identical everywhere" — the argument from this module's first lesson.
+- Openings are **constant size and constant to verify**, so the on-chain half costs the same
+  regardless of how much data is being bridged.<Cite src="kate-zaverucha-goldberg" />
+
+Swap either property out and the pattern collapses. Two Merkle roots over the same data cannot be
+compared at a random point at all, because there is no such thing as a Merkle root's value at a point
+— you would be reduced to comparing them leaf by leaf, which is the linear work you were avoiding.
+
+## Cost, and the ceiling on how much you can bridge
+
+The gas arithmetic is unusually simple, which makes it a good sanity check on any design.
+
+One point-evaluation call is 50,000 gas, flat.<Cite src="eip-4844" /> Reading the versioned hash to
+feed it is 3.<Cite src="eip-4844" /> A rollup posting the maximum a single transaction may carry —
+EIP-7594 caps that at **6 blobs per transaction** — and bridging each one with its own equivalence
+check pays six calls, 300,000 gas, plus the 18 gas of `BLOBHASH`
+reads.<Cite src="eip-7594" /><Cite src="eip-4844" />
+
+<Figure
+  caption="The gap between the two blob-facing costs is the pairing; the storage read is there only to give it a familiar scale."
+  alt="On a logarithmic gas axis: BLOBHASH costs 3 gas, a cold SLOAD costs 2,100, and one point-evaluation precompile call costs a flat 50,000."
+>
+  <Bars
+    scale="log"
+    unit="gas"
+    axisLabel="one operation, log scale"
+    items={[
+      { label: 'point evaluation (0x0A)', value: 50000, tone: 'accent', note: 'flat, whatever the blob holds' },
+      { label: 'cold SLOAD', value: 2100, note: 'measured on this toolchain, for scale' },
+      { label: 'BLOBHASH', value: 3, tone: 'good', note: 'HASH_OPCODE_GAS' },
+    ]}
+  />
+</Figure>
+
+Put that beside a number you measured yourself: a cold `SLOAD` is 2,100
+gas.<Cite src="measured-gas-constants" /> One equivalence check costs about what 24 cold storage
+reads cost, and it stands in for 128 KiB of data the contract will never see. That is the trade the
+whole design exists to offer.
+
+<Check type="spot-bug" concept="point-evaluation-precompile">
+A contract accepts a claim about blob data. Simplified:
+
+```solidity
+function attest(uint256 blobIndex, bytes32 z, bytes32 y, bytes calldata commitmentAndProof)
+    external
+{
+    bytes32 vh = blobhash(blobIndex);
+    bytes memory input = abi.encodePacked(vh, z, y, commitmentAndProof);
+    (bool ok, ) = address(0x0a).staticcall(input);
+    attested[msg.sender][z] = y;
+}
+```
+
+Find every defect, and say which single one would let an attacker attest to a value of their choosing
+with no valid blob at all.
+
+<Answer>
+**Four defects, and the fourth is the fatal one.**
+
+**1. The return of `staticcall` is ignored.** `ok` is assigned and never read. The precompile signals
+failure by failing the call, not by returning a flag — its 64-byte return value is
+`FIELD_ELEMENTS_PER_BLOB` and `BLS_MODULUS`, two constants that are identical on every successful
+call.<Cite src="eip-4844" /> As written, a call that reverts is indistinguishable from one that
+succeeds, and the attestation is recorded either way. This alone makes the whole function decorative:
+`require(ok)` is not optional.
+
+**2. `blobhash` on an out-of-range index returns zero, not a revert.** The opcode replaces the index
+with `tx.blob_versioned_hashes[index]` if the index is in range, and **a zeroed bytes32 value**
+otherwise.<Cite src="eip-4844" /> With `blobIndex = 99` on a transaction carrying no blobs, `vh` is
+thirty-two zero bytes. Combined with defect 1 the call fails and nobody notices; fixed in isolation,
+the call fails honestly — but the code should reject `vh == bytes32(0)` explicitly, because "no blob
+here" is a distinct condition worth naming.
+
+**3. Nothing checks the version byte or the input length.** `commitmentAndProof` is arbitrary
+caller-supplied bytes, so `input` may not be 192 bytes at all, and the precompile asserts on
+length.<Cite src="eip-4844" /> Encode the two 48-byte halves as fixed-size values rather than
+concatenating an unbounded `bytes`, and check `vh[0] == 0x01` so that a future scheme version cannot
+be silently reinterpreted by code written for this one.
+
+**4. The fatal one: `z` is chosen by the caller.** Everything above is a correctness bug. This is a
+soundness bug, and it survives fixing all three.
+
+Suppose the contract is repaired so that `ok` is required and `vh` genuinely comes from a real blob
+in this transaction. The attacker publishes a blob whose contents they control entirely, then calls
+`attest` with any `z` they like and the honest `y` at that point, with an honest proof. Every check
+passes, because every claim is true. What gets recorded is `attested[attacker][z] = y` — a true fact
+about a polynomial the attacker authored.
+
+If any consumer of this mapping treats `z` as "position 12 of the batch" or `y` as "the price at
+block N", the attacker has attested to a value of their choosing without forging anything. The
+precompile did its job perfectly; the contract asked the wrong question.
+
+**The repair is not a check, it is a design rule.** `z` must be either a position the contract itself
+determines, or a challenge derived by hashing a transcript that already contains the commitment — and
+in the second case the contract must derive it, not accept it. Anything the prover can still choose
+after seeing the commitment is not a challenge.
+
+**The one-line summary worth keeping.** The precompile answers exactly the question it was asked. The
+attack surface of a proof-consuming contract is almost never the proof — it is the question.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now read the whole on-chain path: 192 bytes in, a versioned-hash re-binding, a pairing check
+against the ceremony's reference string, 50,000 flat gas, and a boolean that means one carefully
+bounded sentence. You know the pattern that turns that single sentence into a statement about an
+entire published batch, and you know that the pattern's security lives entirely in how the challenge
+point is derived rather than in the cryptography around it. The reference implementation's API is
+where to go next if you want to build this rather than read about it.<Cite src="c-kzg-4844" />
+
+One gap remains, and it is the one this lesson kept naming and refusing to close. Everything here
+proves **consistency**: the piece you were shown matches the commitment. Nothing here proves
+**availability**: that the data is out there to be fetched at all. The module's last lesson is about
+the mechanism that attacks that problem — stretching each blob to twice its length before it is
+distributed, so that hiding any part of it requires hiding more than half. That is not redundancy.
+It is a way to make withholding detectable by someone who downloads almost nothing.

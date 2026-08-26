@@ -1,0 +1,286 @@
+---
+id: ledgers-mempool-blobs-are-different
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [geth-blobpool, geth-blobpool-config, geth-txpool-errors, geth-txpool-reserver, geth-legacypool, eip-4844, eip-8070, devp2p-eth-wire, eip-7594, eip-7702]
+stack: {}
+---
+
+A rollup's batcher is ported from posting calldata to posting blobs. The submission path is
+unchanged, the signing is unchanged, the fee-bump helper — battle-tested over two years and thousands
+of batches — is unchanged.
+
+Batches stop landing. The bump helper returns `replacement transaction underpriced` on every attempt,
+regardless of how far the fees are raised. A transaction sent slightly out of order disappears within
+a minute rather than waiting. And when the team adds a small ordinary transaction from the same
+address to nudge things along, that is rejected too.
+
+None of this is a bug in their code. Type-3 transactions are not admitted to the pool everything else
+uses. They go to a separate pool with a separate policy, and the policy differs in at least six ways
+that break tooling written against the ordinary one.
+
+<Compare
+  caption="There is no row here where the blob pool is the more permissive of the two."
+  alt="The legacy transaction pool and the blob pool at go-ethereum defaults, compared by how many fee fields must rise to replace a transaction and by how much, how long a gapped transaction survives, how many one account may hold, whether it is broadcast automatically, when it leaves the pool, and whether it can deploy a contract."
+  axis="Question"
+  columns={[
+    { title: 'The legacy pool', note: 'geth defaults', tone: 'muted' },
+    { title: 'The blob pool', note: 'geth defaults', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'How many fee fields must rise to replace?', cells: ['Two: the fee cap and the tip cap', 'Three: both of those plus maxFeePerBlobGas'] },
+    { label: 'By how much?', cells: ['PriceBump 10 — a nudge', 'PriceBump 100 — a doubling of every one of them'] },
+    { label: 'How long does a gapped transaction survive?', cells: ['Three hours, in 1024 shared slots', 'About a minute, in a 128-entry buffer'] },
+    { label: 'How many may one account hold?', cells: ['16 executable guaranteed, 64 queued', '16, as a hard ceiling'] },
+    { label: 'Is it broadcast to peers automatically?', cells: ['Yes — pushed in full to a fraction, announced to the rest', 'Never; announced by hash only, and most peers fetch only their custody cells'] },
+    { label: 'When does it leave the pool?', cells: ['The moment it appears in a block', 'Not until the block is finalised'] },
+    { label: 'Can it deploy a contract?', cells: ['Yes, with an empty to field', 'No — to must be a 20-byte address'] },
+  ]}
+/>
+
+## Why the rules are different at all
+
+The blob pool's design rationale is written out in go-ethereum's package documentation, and it is
+worth reading as design rather than as trivia, because every rule below follows from one of these
+lines.<Cite src="geth-blobpool" />
+
+Blob transactions are large — the initial design targets 128 KB blobs — so they must traverse the
+network as few times as possible.<Cite src="geth-blobpool" /> Block blob space is small, so pool
+churn is expected to be low and the pool can afford a persistent disk backend rather than living in
+memory.<Cite src="geth-blobpool" /> Blobs exist for layer twos committing to their own state, which
+means there is essentially no legitimate reason to cancel or replace one apart from a fee
+adjustment.<Cite src="geth-blobpool" /> Replacements are therefore expensive and should be
+"aggressively discouraged", and evicting an already-propagated blob transaction is described directly
+as "a huge DoS vector".<Cite src="geth-blobpool" />
+
+The through-line: the ordinary pool is optimised for a chaotic market of small transactions from
+strangers. The blob pool is optimised for a handful of well-behaved industrial senders posting large
+objects on a schedule. Nearly every difference is that assumption made concrete.
+
+## Rule one: three fee fields, all of them doubled
+
+The ordinary pool compares two fee fields against a threshold of the incumbent plus ten percent. The
+blob pool compares three, against a threshold of the incumbent plus one hundred percent.
+
+The default is explicit in the pool's configuration: `PriceBump: 100`, with the source comment
+"either have patience or be aggressive, no mushy ground".<Cite src="geth-blobpool-config" />
+
+The check runs in two stages, mirroring the ordinary pool's structure but over three
+dimensions.<Cite src="geth-blobpool" /> First, strict improvement: if the candidate's execution fee
+cap, execution tip cap, or blob gas fee cap is less than or equal to the incumbent's corresponding
+field, it is rejected.<Cite src="geth-blobpool" /> Then the threshold: each of the three minimums is
+computed as the incumbent's value multiplied by 100 plus the bump, divided by 100, and the candidate
+must meet all three.<Cite src="geth-blobpool" /> Failing any single one returns
+`replacement transaction underpriced`, with a message naming which field
+fell short.<Cite src="geth-blobpool" /><Cite src="geth-txpool-errors" />
+
+At the default bump that means: to replace a blob transaction you must **double** `maxFeePerGas`,
+**double** `maxPriorityFeePerGas`, and **double** `maxFeePerBlobGas`, all in the same
+transaction.<Cite src="geth-blobpool-config" /> A helper that raises two fields by ten percent fails
+at the first gate and never reaches the arithmetic.
+
+This is the rule that most often shows up as a mysterious production incident, because the bump
+helper is usually shared code and usually correct for everything else the service sends.
+
+<Misconception
+  belief="Blob transactions behave like normal transactions with extra data attached."
+  reality="They are held in a separate, disk-backed pool with its own configuration: a replacement bump that doubles rather than nudges, three fee fields rather than two, a hard cap on transactions per account, no automatic broadcast, and gap handling measured in a minute rather than hours."
+  why="An explorer renders a type-3 transaction as one more row alongside the others, with a couple of extra fields. Nothing in that view suggests it travelled a different path through the network under a different policy, and the transaction format genuinely does inherit its EIP-1559 fields unchanged."
+  src="geth-blobpool"
+/>
+
+## Rule two: a nonce gap is measured in minutes, not hours
+
+The design principle is stated flatly in the package documentation: nonce-gapped blob transactions
+are disallowed, as one of the measures against cancellation being used as a denial-of-service
+vector.<Cite src="geth-blobpool" />
+
+The current implementation is slightly softer than the principle, and the exact shape matters if you
+are writing a batcher.
+
+Gapped blob transactions are not admitted to the pool proper. They are held in a small in-memory
+buffer that exists purely to absorb out-of-order arrival, with three bounds. The buffer holds at most
+128 gapped transactions across the whole pool.<Cite src="geth-blobpool" /> Entries are evicted after
+a lifetime of one minute.<Cite src="geth-blobpool" /> And per-account admission to the buffer is
+governed by an allowance computed as the base-ten logarithm of the account's current nonce plus one,
+capped by the account's remaining pool slots and reduced by whatever it already has
+buffered.<Cite src="geth-blobpool" />
+
+Work the allowance through, because it produces a rule you can act on. An account that has never
+transacted has a nonce of 0, so its allowance is the logarithm of 1, which is 0: **no gapped blob
+transaction from a fresh account is buffered at all.** An account with a nonce in the tens gets 1. In
+the hundreds, 2. In the thousands, 3.<Cite src="geth-blobpool" /> Gap tolerance is earned by
+history, and even a long-running batcher earns only a handful of slots.
+
+<Matrix
+  numeric
+  caption="History buys a batcher more slots and never more time: the one-minute clock is the same at every nonce."
+  alt="Gapped blob transactions held for four account nonces — a fresh address, tens, hundreds and thousands of batches — showing how many are buffered at each and how long each is held."
+  corner="blob pool: allowance is log₁₀(nonce)"
+  cols={['Account nonce', 'Gapped blob transactions held', 'Held for']}
+  rows={[
+    { label: 'a fresh batcher address', cells: ['0', { v: 'none', tone: 'danger' }, { v: 'not admitted at all', tone: 'danger' }] },
+    { label: 'after tens of batches', cells: ['10', { v: '1', tone: 'warn' }, '1 minute'] },
+    { label: 'after hundreds', cells: ['100', { v: '2', tone: 'warn' }, '1 minute'] },
+    { label: 'after thousands', cells: ['1,000', { v: '3', tone: 'warn' }, '1 minute'] },
+  ]}
+/>
+
+Compare that with the ordinary pool: 1024 global non-executable slots, 64 per account, and a
+three-hour lifetime.<Cite src="geth-legacypool" /> A batcher that tolerates a brief nonce gap and
+recovers within minutes survives on the legacy pool and loses the transaction on the blob pool.
+
+**The operational rule: treat any out-of-order blob transaction as gone.** Do not build recovery
+logic that assumes it will still be there when the missing nonce lands.
+
+## Rule three: a hard cap per account, and only one pool at a time
+
+Two more constraints that have no analogue in the ordinary pool.
+
+**Sixteen blob transactions per account, full stop.** The cap exists to bound how much data one
+account can push onto the network before cancelling it with an ordinary transaction, and the source
+notes that transactions resurrected by a reorg count against the same limit — so pushing it lower
+would break reorg recovery.<Cite src="geth-blobpool" /> There is no per-account guarantee-versus-cap
+distinction as there is in the legacy pool. Sixteen is the ceiling.
+
+**An address may use one subpool at a time.** go-ethereum's subpools share a reservation tracker
+whose stated purpose is to ensure that one address "cannot initiate transactions, authorizations, and
+other state-changing behaviors in different pools at the same
+time".<Cite src="geth-txpool-reserver" /> A sender holding blob transactions in the blob pool cannot
+also have ordinary transactions pending in the legacy pool from the same address, which is the
+enforcement of the design note that the presence of blob transactions excludes non-blob
+ones.<Cite src="geth-blobpool" />
+
+That is why the "nudge it along with a small ordinary transaction" instinct fails, and it is a good
+reason to give a batcher its own address rather than sharing one with an operations wallet.
+
+**Delegated senders get one in-flight transaction.** If the sender has a delegation designator or a
+pending authorization, the blob pool permits a single in-flight executable transaction from that
+address, allowing a replacement at the same nonce but nothing stacked or gapped behind
+it.<Cite src="geth-blobpool" /> The comment gives the reason: without it, an attacker could endlessly
+stack blob transactions from a delegated sender.<Cite src="geth-blobpool" /><Cite src="eip-7702" />
+
+## Rule four: nobody broadcasts your blob, and most nodes never fetch it
+
+The ordinary pool pushes complete transaction objects to a random fraction of peers and announces
+hashes to the rest.<Cite src="devp2p-eth-wire" /> For blob transactions that is forbidden at the
+specification level: nodes "MUST NOT automatically broadcast blob transactions to their peers", and
+must announce them by hash only, to be requested explicitly.<Cite src="eip-4844" />
+
+Since Fusaka this has gone considerably further, and the direction is towards fewer nodes holding
+your data rather than more. Blobs are erasure-coded into cells, and as of eth/72 the announcement
+message itself carries the announcing peer's per-cell availability.<Cite src="devp2p-eth-wire" /> On
+receiving an announcement, a node makes a probabilistic choice: with probability `p`, no smaller than
+`MIN_P` of 0.15, it fetches the full blobs; otherwise it fetches only the cells in its own consensus
+node's custody set, and only after seeing `AVAILABILITY_THRESHOLD` of 2 distinct full-availability
+announcements.<Cite src="devp2p-eth-wire" /> EIP-8070, which introduced this, gives the arithmetic: a
+validator downloading as little as one eighth of the data brings average bandwidth to roughly a
+quarter of the full blobpool's, a fourfold reduction, while keeping a connected backbone of nodes
+that hold complete payloads.<Cite src="eip-8070" /> go-ethereum's blob pool carries the corresponding
+knob as a `FetchProbability` configuration field.<Cite src="geth-blobpool-config" />
+
+Two consequences for anyone reasoning about a blob transaction's whereabouts. **"Is it propagated" is
+not a yes-or-no question** — most nodes deliberately hold only a fraction of it. And the pre-Fusaka
+mental model of one proof per blob is wrong: blob transactions now carry per-cell proofs, and library
+code written against the original wrapper does not parse them.<Cite src="eip-7594" /><Cite src="geth-blobpool" />
+
+<Aside kind="warn">
+There is one more silence to know about. The pool deliberately suppresses announcement of blob
+transactions whose fee caps sit far below the current base fee and blob fee, delaying the
+announcement until fees come down, on the stated principle that it is not the blob pool's job to
+store limit orders below market.<Cite src="geth-blobpool" /> So a blob transaction can be accepted by
+your node, stored on its disk, and never mentioned to a single peer. Local acceptance is not evidence
+of anything.
+</Aside>
+
+## Rule five: they leave the pool late, and they cannot be creations
+
+Two smaller differences that catch specific classes of code.
+
+**Retention past inclusion.** An ordinary transaction is dropped from the pool the moment it appears
+in a block, because a reorg can recover it from that block. Blob data is not in the execution chain,
+so a reorg cannot re-pool it — which is why blobs are retained on disk until finalised, and why the
+Engine API has to hand back blobs from blocks the node never saw on the
+network.<Cite src="geth-blobpool" /> A "still in the pool" signal means something different here.
+
+**No contract creation.** EIP-4844 specifies that a blob transaction's `to` field must not be nil and
+must always be a 20-byte address, so a blob transaction can never take the form of a contract
+creation.<Cite src="eip-4844" /> Any generic transaction builder that treats a missing `to` as
+"deploy" produces an invalid type-3 transaction.
+
+<Check type="spot-bug" concept="blob-pool-different-rules">
+An L2 batcher has this retry policy, which has worked correctly for two years against calldata
+batches:
+
+```ts
+// Bump both fee fields by 15% (comfortably over the 10% minimum) and resend.
+const bumped = {
+  ...original,
+  maxFeePerGas: (original.maxFeePerGas * 115n) / 100n,
+  maxPriorityFeePerGas: (original.maxPriorityFeePerGas * 115n) / 100n,
+};
+await client.sendRawTransaction(sign(bumped));
+```
+
+It is now used for type-3 blob transactions. Name every way this fails, and give the policy that
+replaces it.
+
+<Answer>
+**Failure 1 — the third field is not bumped, and it is not optional.** A blob transaction carries
+`maxFeePerBlobGas` alongside the two execution fee fields.<Cite src="eip-4844" /> The blob pool checks
+all three: strict improvement on each, then a threshold on each.<Cite src="geth-blobpool" /> Spreading
+`...original` carries the old blob fee cap through unchanged, so the strict-improvement stage rejects
+the candidate before any percentage is evaluated.
+
+**Failure 2 — 15% is nowhere near enough.** The blob pool's default bump is 100, not
+10.<Cite src="geth-blobpool-config" /> The thresholds are the incumbent's values doubled, on all three
+fields.<Cite src="geth-blobpool" /> Even with the third field included, a 15% bump fails all three
+threshold checks.
+
+**Failure 3 — the error is uninformative unless you read it.** The rejection is
+`replacement transaction underpriced` with a message naming the specific field and the required
+penalty.<Cite src="geth-blobpool" /><Cite src="geth-txpool-errors" /> Retry logic that matches on the
+error class and escalates blindly will loop, because the field that is short may not be the field
+being escalated.
+
+**Failure 4 — the retry loop's structure is wrong for this pool.** Doubling three fees is expensive
+enough that a naive escalation loop is a real financial exposure rather than a nuisance. The blob
+pool's documentation is explicit that this is the intent: replacements should be aggressively
+discouraged, and layer twos are expected to have no reason to replace apart from a fee
+adjustment.<Cite src="geth-blobpool" />
+
+**Failure 5 — the surrounding recovery logic probably assumes the wrong gap semantics.** If a retry
+is ever sent at a nonce ahead of an outstanding one, the ordinary pool would park it for up to three
+hours<Cite src="geth-legacypool" /> while the blob pool buffers it for about a minute, within an
+allowance of at most the base-ten logarithm of the account's nonce, and drops it
+afterwards.<Cite src="geth-blobpool" />
+
+**The replacement policy.** Bump all three fields by the pool's configured factor with a margin,
+discovering that factor from the endpoint's rejection message rather than hard-coding it. Cap total
+escalations and the absolute fee, and alert rather than escalate past the cap. Serialise submissions
+so a gap is never created, and treat any gapped blob transaction as lost rather than waiting for it.
+Give the batcher a dedicated address, because a sender using the blob pool cannot simultaneously have
+ordinary transactions pending from the same address.<Cite src="geth-txpool-reserver" /> And never
+conclude anything from the transaction being absent at a peer, since most nodes now hold only their
+custody cells by design.<Cite src="devp2p-eth-wire" />
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Rollup economics** rest on batch posting landing predictably. The difference between a batcher that
+recovers from congestion and one that stalls is almost entirely the policy in this lesson.
+
+**The blob fee market** is a second EIP-1559-style mechanism running independently of the execution
+one, which is why `maxFeePerBlobGas` can be the binding constraint while your execution fees are
+generous.<Cite src="eip-4844" />
+
+**Data availability sampling** is where the fetch-probability rule comes from. The blob pool is
+becoming a sampling network rather than a replication network, and the same idea drives how the
+consensus layer distributes blob data.<Cite src="eip-8070" /><Cite src="eip-7594" />
+
+**Nothing guarantees inclusion**, the last lesson in this module, applies here with sharper edges: a
+batcher's transaction can be silently unannounced, silently dropped from a reorder buffer, or simply
+not selected, and none of those produce an error you receive.

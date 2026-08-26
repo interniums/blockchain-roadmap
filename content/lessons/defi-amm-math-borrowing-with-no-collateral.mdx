@@ -1,0 +1,227 @@
+---
+id: defi-amm-math-borrowing-with-no-collateral
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-3156, aave-v3-pool-docs, uniswap-v2-whitepaper, uniswap-v2-pair-source, arxiv-manipulation-cost-2026, eip-7702]
+stack: {}
+---
+
+An address with a balance of 0.4 ETH sends one transaction. Inside it, 50,000,000 USDC arrives from a
+lending pool, moves through four contracts, and leaves again. The transaction succeeds. The address
+ends the block with 0.39 ETH and whatever it made.
+
+No collateral was posted. No credit check happened. Nobody assessed the borrower, and if the borrower
+had absconded, the lender would have lost nothing — because the absconding would have been undone
+along with everything else.
+
+This is the last primitive in the module, and it is the one that changes how you read every argument
+in the preceding four. Every calculation about draining a pool, moving a price or exploiting a curve
+has quietly assumed that whoever does it can obtain the capital. That assumption is false, and this
+lesson is about what remains true anyway.
+
+## Atomicity replaces collateral
+
+The mechanism is one sentence long. ERC-3156 defines a flash loan as a transaction in which a lender
+contract lends assets to a borrower contract on the condition that they are returned, plus an
+optional fee, before the end of that transaction.<Cite src="eip-3156" />
+
+Why that is safe follows from something you already know about the EVM. A revert discards every state
+change made in the transaction. So the lender does not need the loan to be *repaid* in the ordinary
+sense; it needs the *non-repayment* to be impossible to observe. It gets that by asserting the
+balance at the end of its own call frame and reverting otherwise: if the assertion fails, the transfer
+that created the loan is rolled back along with everything the borrower did. **There is no credit
+risk because there is no state in which a defaulting borrower's actions persist.**
+
+<Figure
+  caption="The repayment is a back-edge inside one transaction, which is why no collateral is needed: the only alternative to repayment is that none of this happened."
+  alt="A flash loan drawn as a single transaction: the lending pool transfers assets out with no collateral, the borrower's callback runs arbitrary code, and a balance assertion either passes — closing the loop with a repayment plus fee back to the pool — or fails and reverts the whole transaction."
+>
+  <Flow
+    lanes={['the lender', 'the loan', 'the borrower', 'the assertion']}
+    nodes={[
+      { id: 'pool', label: 'lending pool', note: 'holds the liquidity', col: 0 },
+      { id: 'out', label: 'assets out', note: 'no collateral, no credit check', col: 1, tone: 'accent' },
+      { id: 'work', label: "borrower's callback", note: 'any contracts, any order', col: 2, tone: 'warn' },
+      { id: 'ok', label: 'balance assertion', note: 'amount + fee present', col: 3, tone: 'good' },
+      { id: 'bad', label: 'assertion fails', note: 'the whole transaction reverts', col: 3, tone: 'danger', dashed: true },
+    ]}
+    edges={[
+      { from: 'pool', to: 'out' },
+      { from: 'out', to: 'work' },
+      { from: 'work', to: 'ok' },
+      { from: 'work', to: 'bad', dashed: true, tone: 'danger' },
+      { from: 'ok', to: 'pool', label: 'repay + fee', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+Three implementations, one shape.
+
+**Aave.** `flashLoan` lets users access the pool's liquidity for a list of assets within one
+transaction, as long as the amount taken plus a fee is returned; the receiver must implement
+`IFlashLoanReceiver` and must have approved the Pool for at least the borrowed amount plus the fee,
+or the transaction reverts.<Cite src="aave-v3-pool-docs" /> The fee is a governance parameter rather
+than a constant in the code: `FLASHLOAN_PREMIUM_TOTAL()` returns the percentage the borrower pays,
+part of which is added to the reserve's liquidity index — that is, paid to suppliers — and part
+accrued to the treasury via `FLASHLOAN_PREMIUM_TO_PROTOCOL()`.<Cite src="aave-v3-pool-docs" /> Read
+those on-chain rather than quoting a number from memory.
+
+**Aave, with a twist worth knowing.** The `interestRateModes` argument does something that stops the
+loan from being flash at all. Passing 0 means the amount plus fee must be repaid or the transaction
+reverts; passing 2 opens a variable-rate borrow position for the flash-borrowed value against
+`onBehalfOf`, who must already have granted the caller sufficient borrow
+allowance.<Cite src="aave-v3-pool-docs" /> The same entry point is either an atomic loan or the
+opening of an ordinary collateralised one, decided by an array element. `flashLoanSimple` is the
+single-asset version and permits neither that debt-opening path nor the fee waiver available to an
+approved `FLASH_BORROWER`.<Cite src="aave-v3-pool-docs" />
+
+**Uniswap v2, which got there first and does not use the word.** A flash swap lets a user receive an
+asset and use it elsewhere before paying, as long as payment happens in the same atomic transaction;
+`swap` calls an optional user-specified callback between transferring out the tokens and enforcing the
+invariant, and if the contract does not have sufficient funds afterwards it reverts the entire
+transaction.<Cite src="uniswap-v2-whitepaper" /> You have already read that line of code — the
+`IUniswapV2Callee(to).uniswapV2Call(...)` sitting between the optimistic transfers and the `K`
+check.<Cite src="uniswap-v2-pair-source" /> The pool's invariant *is* the repayment assertion. There
+was never a separate mechanism.
+
+<Aside kind="note">
+The v2 pair's `swap` is wrapped in a `lock` modifier that sets a storage flag and reverts on
+re-entry.<Cite src="uniswap-v2-pair-source" /> Notice what that means about the design: the callback
+is not an accident that had to be guarded, it is the feature, and the guard exists so that the
+feature cannot be turned against the pool that offers it. Every flash-loan provider is a contract
+that deliberately hands control to untrusted code and then checks its own books —
+[the same shape](/c/reentrancy-guard) as the pattern you learned to defend against, run on purpose.
+</Aside>
+
+<Misconception
+  belief="Flash loans are an attack."
+  reality="They are a primitive, and the same primitive makes liquidations and arbitrage capital-free and therefore competitive. The exploitable defect is always in a protocol that assumed capital was scarce."
+  why="Headlines say 'flash loan attack', naming the loan because it is the first legible line of the transaction trace. 'Unbounded rate function consumed without a deviation bound' is not a headline."
+  src="aave-v3-pool-docs"
+/>
+
+## What it removes, and what it does not
+
+The removal is precise: **required capital is no longer a barrier to any strategy that is profitable
+within one transaction.** Every design that rested on "an attacker would need to hold a large
+fraction of this pool", "a position that size implies commitment", or "nobody has that much" lost its
+foundation. This is why the security track's guidance was to ask whether an argument still holds with
+a hundred million dollars behind it, and the answer is now that it must.
+
+What is *not* removed is cost, and the arithmetic is worth doing because the intuition here is
+usually wrong in an interesting direction.
+
+**Subgoal 1 — size the manipulation.** How much do you deposit to halve a constant-product pool's
+marginal price? From the previous lesson, depositing a fraction `α` of the input reserve leaves the
+marginal price at `1/(1+α)²` of its old value. Setting that to `1/2` gives `α = sqrt(2) - 1`, about
+41.4%. On a pool holding 1,000 WETH and 3,000,000 USDC, that is 414.21 WETH in, returning 876,814
+USDC out.
+
+**Subgoal 2 — cost the round trip with nobody else present.** Push all 876,814 USDC back into the same
+pool at the end of the transaction. Fee-free, you recover exactly 414.213562373 WETH — the amount you
+started with, to nine decimals, because the curve is reversible and depends only on the reserves. With
+the 0.3% fee on both legs you recover 412.4558 WETH, losing 1.7578 WETH. **In an otherwise empty
+block, a flash loan lets you move a pool's price by any factor for the price of two swap fees.**
+
+**Subgoal 3 — put one other actor in the transaction.** Now suppose an arbitrageur trades between your
+two legs, buying the WETH your first trade made cheap until the pool is back at 3,000. Your 876,814
+USDC now buys back only 225.6881 WETH. You are down **188.53 WETH**, about 565,000 USDC at the
+starting price — 107 times the cost in the empty-block case, and none of that difference is a fee.
+
+<Matrix
+  numeric
+  corner="414.21 WETH in, 876,814 USDC out, then reversed"
+  cols={['WETH recovered', 'net cost']}
+  rows={[
+    { label: 'fee-free, nobody else in the block', cells: ['414.213562373', { v: 'none', tone: 'good' }] },
+    { label: 'with the 0.3% fee on both legs', cells: ['412.4558', { v: '1.7578 WETH', tone: 'warn' }] },
+    { label: 'an arbitrageur trades in between', cells: ['225.6881', { v: '188.53 WETH', tone: 'danger' }] },
+  ]}
+  caption="The borrowed capital returns in every row. What does not return is whatever somebody else was able to do with the price while it was moved."
+  alt="Round-tripping a 1,000 WETH by 3,000,000 USDC pool: fee-free with nobody else present the attacker recovers 414.213562373 WETH at no cost; with the 0.3 per cent fee on both legs, 412.4558 WETH at a cost of 1.7578 WETH; with an arbitrageur trading in between, 225.6881 WETH at a cost of 188.53 WETH."
+/>
+
+That third number is the whole economics. The current research framing defines the cost of
+manipulation as the attacker's minimum **mark-to-market loss** required to move the oracle by a given
+factor, rather than the capital they deployed, precisely because the capital returns at the end of the
+transaction and the loss does not; and it identifies arbitrageurs restoring consistency across venues
+as what converts the round trip into a realised loss.<Cite src="arxiv-manipulation-cost-2026" />
+
+<Misconception
+  belief="A flash loan makes an attack free."
+  reality="It makes the capital free. The attacker still pays fees, price impact, and whatever value the distorted price hands to everyone else who can trade against it. Those are the real cost, and in a well-arbitraged market they dominate."
+  why="Coverage quotes the size of the loan because it is the largest number in the transaction. The attacker's net position change is the number that decides whether the attack was worth doing, and it is usually a small fraction of it."
+  src="arxiv-manipulation-cost-2026"
+/>
+
+The practical corollary, which is the one to carry into the oracle module: this is why a flash loan
+breaks a price source read inside a single transaction and does not break a deep time-averaged one.
+Within one transaction there is no arbitrageur, so subgoal 2's number applies and manipulation is
+nearly free. Across blocks the distortion has to be *held*, which means eating subgoal 3's number
+repeatedly against everyone who wants the other side of it.
+
+<Check type="explain" concept="flash-loan">
+A team proposes to defend a protocol against flash-loan attacks by rejecting calls from contracts —
+requiring `msg.sender == tx.origin` — and, as a second layer, by requiring that a depositor's funds
+sit for at least one block before they can be used.
+
+Evaluate both defences, then say what you would do instead.
+
+<Answer>
+**The first defence does not work and never fully did.** `tx.origin` checks were always crude, and
+under EIP-7702 an externally owned account can have code set on it,<Cite src="eip-7702" /> so the
+heuristic no longer even distinguishes the two categories it was meant to separate. It also breaks
+every legitimate contract integration — smart accounts, vaults, aggregators, routers — which is a
+large cost for a control that an attacker routes around.
+
+**The second defence works, and it is the only one of the two that is aimed at the actual property.**
+A flash loan is defined by repayment before the end of the same
+transaction.<Cite src="eip-3156" /> Any requirement that state persists across a block boundary
+cannot be satisfied by borrowed-and-returned capital, because the capital does not exist at the block
+boundary. This is the general form of the fix: *require duration, not identity.*
+
+**But notice what it costs, and where it fails.** It adds latency to every honest deposit, which is
+often unacceptable for the product. And it does nothing at all if the exploitable quantity is not the
+attacker's deposit — if the defect is a price read, a rate function or an accounting identity that a
+large swap distorts, the attacker never deposits anything and the delay never binds.
+
+**What to do instead — remove the assumption rather than the loan.** Find the sentence in the design
+that reads "an attacker could not obtain enough capital to do this" and rewrite it as though they
+can, because they can. Concretely: bound how far any externally-influenced input may move between
+observations, so a one-transaction distortion is rejected instead of consumed. Read prices from
+sources whose manipulation cost is a mark-to-market loss sustained over
+time.<Cite src="arxiv-manipulation-cost-2026" /> Do not derive value from a quantity an attacker can
+set within the transaction that reads it. And price the depth of any pool you rely on, using the
+previous lesson's arithmetic, as an explicit security parameter with an owner.
+
+**The framing that generalises.** There is no defence against a flash loan as such, any more than
+there is a defence against someone being rich. What is defensible is every assumption that quietly
+depended on them not being.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Liquidations, immediately.** A modern liquidator holds no inventory: flash-borrow the debt asset,
+repay the unhealthy position, seize the collateral, sell it, repay the loan, keep the spread. The
+capital requirement is zero, so the only barriers are gas and transaction ordering — which is why
+liquidation incentives are competed down to a thin margin rather than captured by whoever happens to
+hold the right token. [That construction](/c/liq-flash-loan-liquidator) is the lending track's first
+worked example.
+
+**Oracles, next.** Every price source in the DeFi track will be evaluated by the question this lesson
+set up: what does it cost to move this number by enough to matter, and for how long must it be held?
+Spot reads answer "two swap fees". The rest of the design space is about raising that number.
+
+**Reviewing anything.** The standing question to run over a protocol's assumptions, and it takes one
+pass: for every quantity the contract trusts, ask what it would take to set that quantity to a chosen
+value inside a single transaction, given unlimited borrowed capital. Where the answer is "a large
+balance", the defence has already failed. Where the answer is "sustained loss across many blocks",
+you have a design that survives the primitive rather than one that hoped not to meet it.
+
+**The rest of this track** now has all four of its recurring ingredients: a curve that prices, a size
+that moves it, a liquidity provider on the other side of the move, and capital that costs nothing to
+obtain for the length of one transaction. Every mechanism from here — lending, liquidation,
+stablecoins, MEV — is built out of them.

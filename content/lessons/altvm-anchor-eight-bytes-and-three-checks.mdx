@@ -1,0 +1,483 @@
+---
+id: altvm-anchor-eight-bytes-and-three-checks
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [anchor-docs-idl, anchor-docs-account-types, anchor-account-constraints, anchor-lang-error-docsrs, anchor-docs-footguns, anchor-repo-changelog, anchor-docs-program-structure, anchor-docs-zero-copy, sealevel-attacks, anchor-docs-security-exploits]
+stack: {}
+---
+
+Two account types from the same program, defined a screen apart.
+
+```rust
+#[account]
+pub struct Vault {
+    pub authority: Pubkey,   // 32 bytes
+    pub total: u64,          //  8 bytes
+}
+
+#[account]
+pub struct Config {
+    pub admin: Pubkey,       // 32 bytes
+    pub fee_bps: u64,        //  8 bytes
+}
+```
+
+Forty bytes of payload each. Identical layouts. As raw bytes in an account's data buffer, a `Vault`
+and a `Config` are the same object.
+
+Now suppose the withdraw instruction takes a `Vault`, checks `vault.authority` against the signer,
+and pays out `vault.total`. An attacker who can create a `Config` — and creating a `Config` is a
+public instruction, because configs are meant to be created — sets `admin` to their own key,
+`fee_bps` to something enormous, and passes that account where the `Vault` goes. The deserializer
+does not object. There is nothing to object to: forty bytes went in, forty bytes came out, the
+`Pubkey` matches the signer, and the program pays.
+
+This is [account type confusion](/c/account-type-confusion), and it is the failure the first eight
+bytes of every Anchor account exist to prevent. This lesson takes those eight bytes apart, then takes
+apart the wrapper type that checks them — because the wrapper does three things, not one, and
+knowing which three is how you read an unfamiliar program.
+
+## The discriminator, derived rather than asserted
+
+Anchor assigns each instruction and each account type an eight-byte discriminator: the first eight
+bytes of the SHA-256 hash of a prefix joined to the item's name.<Cite src="anchor-docs-idl" />
+
+For instructions the prefix is `global`. The documentation's worked example is `sha256("global:initialize")`,
+whose hexadecimal output begins `af af 6d 1f 0d 98 9b ed`, giving the discriminator
+`[175, 175, 109, 31, 13, 152, 155, 237]` — which is exactly what appears in the IDL's
+`discriminator` field for that instruction.<Cite src="anchor-docs-idl" /> For account types the prefix
+is `account`, so the type `NewAccount` hashes as `sha256("account:NewAccount")`.<Cite src="anchor-docs-idl" />
+
+<Figure
+  caption="Nothing here is secret: the discriminator is a hash of a prefix and a name anybody can read off your source, which is why it identifies a type and authenticates nothing."
+  alt="The string hashed to produce an instruction discriminator: sha256 of the literal global, a colon, and the instruction's own name — here initialize."
+>
+  <Anatomy
+    value={'sha256("global:initialize")'}
+    parts={[
+      { from: 8, to: 14, label: 'prefix', note: 'global for instructions, account for types', tone: 'accent' },
+      { from: 14, to: 15, label: 'separator', tone: 'muted' },
+      { from: 15, to: 25, label: "the item's own name", note: 'as written in the source', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+Apply the same rule to the two types above and `Vault` is `[211, 8, 232, 43, 2, 152, 117, 119]` while
+`Config` is `[155, 12, 170, 224, 30, 250, 204, 130]`. The attack in the opening now fails at byte
+zero, before a single field is read.
+
+**Where the bytes live.** For an account, the discriminator is the first eight bytes of the data
+buffer and the state follows it — which is why account sizing in Anchor is always written
+`8 + <your fields>`.<Cite src="anchor-docs-program-structure" /> For an instruction, it is the first
+eight bytes of the instruction payload, prepended by the client
+automatically.<Cite src="anchor-docs-idl" />
+
+<Figure
+  caption="The discriminator is not metadata beside the account — it is the first eight bytes of the account's own data, which is why every Anchor space calculation starts at 8."
+  alt="The data buffer of a Vault account: eight bytes of discriminator, then the 32-byte authority pubkey, then the 8-byte total."
+>
+  <ByteLayout
+    offsets
+    caption="Vault, as it sits in the account data buffer"
+    fields={[
+      { label: 'discriminator', size: 8, tone: 'accent', note: 'sha256("account:Vault")[0..8]' },
+      { label: 'authority', size: 32, note: 'Pubkey' },
+      { label: 'total', size: 8, note: 'u64' },
+    ]}
+  />
+</Figure>
+
+### Against the EVM selector, which is the closest thing you know
+
+The instruction discriminator plays the role a function selector plays: a short prefix on the
+payload that tells the callee which entry point was meant. But the two differ in ways that matter,
+and the differences run in both directions.
+
+<Compare
+  axis=""
+  columns={[
+    { title: 'EVM function selector', tone: 'muted' },
+    { title: 'Anchor discriminator', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'Length', cells: ['4 bytes', <>8 bytes<Cite src="anchor-docs-idl" /></>] },
+    {
+      label: 'Hash',
+      cells: [
+        'Keccak-256 of the canonical signature',
+        <>SHA-256 of a prefix plus the name<Cite src="anchor-docs-idl" /></>,
+      ],
+    },
+    {
+      label: 'Covers',
+      cells: [
+        <>Function name <strong>and parameter types</strong></>,
+        <>The name only<Cite src="anchor-docs-idl" /></>,
+      ],
+    },
+    {
+      label: 'Applies to',
+      cells: [
+        'Calls',
+        <>Instruction payloads <strong>and account data</strong><Cite src="anchor-docs-idl" /></>,
+      ],
+    },
+    {
+      label: 'Enforced by',
+      cells: [
+        'The compiler-generated dispatcher',
+        <>Generated code inside the program<Cite src="anchor-docs-program-structure" /></>,
+      ],
+    },
+  ]}
+  caption="The discriminator does the selector's job in twice the space, and one job the selector never had: it also tags the bytes sitting in an account."
+  alt="EVM function selectors and Anchor discriminators compared on length, hash function, what the hash covers, what they are applied to, and what enforces them."
+/>
+
+Two entries deserve more than a table row.
+
+**Eight bytes rather than four changes the collision story.** You have already met
+[selector collisions](/c/abi-selector-collision-risk) as a real hazard — four bytes is a small space,
+collisions are findable by brute force, and proxy patterns have been bitten by them. Doubling to
+eight bytes moves accidental collision far out of reach. It does not make deliberate collision
+*impossible*, and Anchor 1.0 added the ability to override a discriminator with a constant
+explicitly, which is a feature and therefore also a thing to look for in a
+review.<Cite src="anchor-account-constraints" />
+
+**Covering only the name, not the types, is the sharper difference and it cuts the wrong way.**
+Change a Solidity function's parameter types and the selector changes; old callers now hit a
+different selector and fail loudly. Change an Anchor account's *fields* and the discriminator does
+not move, because the name did not move. A `Vault` whose `total` you widened from `u64` to `u128` has
+the same first eight bytes as every `Vault` already on chain, and those old accounts will pass the
+discriminator check and then deserialize wrongly — or fail to deserialize, if you are lucky. Anchor's
+answer is an explicit `Migration<'info, From, To>` account type that deserializes as the old shape,
+requires migration before exit, and is normally paired with the `realloc`
+constraint.<Cite src="anchor-docs-account-types" /> The existence of a dedicated type is the
+framework telling you that schema change is a hazard it cannot infer.
+
+### One more asymmetry: there is no fallback
+
+An EVM contract whose dispatcher matches no selector falls through to the fallback function, and
+that fallback is load-bearing — it is how proxies forward calls at all. Anchor's generated dispatcher
+has no such path. An instruction payload whose first eight bytes match nothing produces
+`InstructionFallbackNotFound`, error 101, whose message is that fallback functions are not
+supported.<Cite src="anchor-lang-error-docsrs" /> A payload with no discriminator at all produces
+`InstructionMissing`, 100.<Cite src="anchor-lang-error-docsrs" />
+
+That absence is not an oversight, and it removes a whole family of EVM problems along with a whole
+family of EVM patterns. Nothing on Solana silently accepts a call it does not recognise, so there is
+no "the proxy forwarded it to the wrong implementation" bug and no accidental payable fallback. The
+corresponding capability — running somebody else's code against your state — is unavailable by
+construction, because a program can only write accounts it owns and there is no `delegatecall`. Upgrade
+happens by replacing the program's bytecode at the same address instead, which is a different
+mechanism with different risks and belongs to a different module.
+
+<Misconception
+  belief="An eight-byte discriminator is a type system, so type confusion is solved."
+  reality="It is a hash of a type's name checked at deserialization. It stops the wrong type being read. It says nothing about whether this instance of the right type belongs to the caller, and it does not move when the type's fields change."
+  why="Type safety and authorization feel like one guarantee, because in Solidity the compiler usually supplies both at once — a typed storage pointer is also, implicitly, a pointer the caller could not have chosen."
+  src="anchor-docs-idl"
+/>
+
+## `Account<'info, T>` does three things, in this order
+
+Here is the manual version first, because the ordering is the part worth memorising and the ordering
+is invisible once it is a type name.
+
+```rust
+// manual: the three checks, in the order Anchor performs them
+let info = &accounts[0];
+
+// 1. ownership — does this program own the account at all?
+if info.owner != program_id {
+    return Err(ProgramError::IllegalOwner);
+}
+
+// 2. type — are the first eight bytes this type's discriminator?
+let data = info.try_borrow_data()?;
+if data.len() < 8 { return Err(/* no discriminator present */); }
+if data[..8] != Vault::DISCRIMINATOR {
+    return Err(/* right shape, wrong type */);
+}
+
+// 3. decode — only now is it safe to interpret the remaining bytes
+let vault = Vault::try_from_slice(&data[8..])?;
+```
+
+And the Anchor version:
+
+```rust
+pub vault: Account<'info, Vault>,
+```
+
+`Account<'info, T>` is an account container that checks ownership on
+deserialization.<Cite src="anchor-docs-account-types" /> Constructing it performs those three steps
+and fails on the first one that does not hold.
+
+<Figure
+  caption="One field name, three assertions, evaluated in order — and the first failure ends the instruction, so the later steps never see a malformed account."
+  alt="A four-step chain inside Account of Vault: the raw account from the caller, then the owner check against the program id, then the eight-byte discriminator comparison, then Borsh deserialization."
+>
+  <Flow
+    nodes={[
+      { id: 'raw', label: 'accounts[0]', note: 'a byte buffer the caller chose', col: 0, tone: 'muted' },
+      { id: 'own', label: 'owner', note: 'runtime metadata, unforgeable', col: 1, tone: 'accent' },
+      { id: 'disc', label: 'discriminator', note: 'eight bytes compared, nothing decoded', col: 2, tone: 'accent' },
+      { id: 'de', label: 'deserialize', note: 'the only step whose cost scales', col: 3 },
+    ]}
+  />
+</Figure>
+
+**Why the order is not arbitrary.** Ownership comes first because it is the only check that is cheap
+*and* unforgeable: the owner field is account metadata maintained by the runtime, outside the data
+buffer, and only the owning program may write that buffer at all. If the owner is wrong, the bytes
+are attacker-controlled and reading them further tells you nothing. The discriminator comes second
+because it is a comparison of eight bytes and rejects the whole class of shape-compatible confusions
+before you spend compute deserializing. Deserialization comes last because it is the expensive step
+and the only one whose cost scales with the account.
+
+Skip step one and you have the [missing owner check](/c/missing-owner-check) class: an account whose
+bytes an attacker wrote directly, in a program they control, carrying a correct discriminator they
+simply copied. The discriminator is not a secret. It is a hash of a public name, computable by
+anyone, and it authenticates nothing about *who wrote* the bytes. Owner and discriminator are two
+different questions and each is useless without the other — which is precisely why they are bundled
+into one type rather than offered as two constraints you might apply one of.
+
+### Which error tells you which step failed
+
+The three steps have distinct error codes, and this is the fastest triage tool the framework gives
+you. From `anchor-lang-error` 1.1.2:<Cite src="anchor-lang-error-docsrs" />
+
+<Matrix
+  corner="Code"
+  cols={['Variant', 'What it means']}
+  rows={[
+    {
+      label: '3007',
+      cells: [<code>AccountOwnedByWrongProgram</code>, 'Step 1 failed — a different program owns this account'],
+    },
+    {
+      label: '3001',
+      cells: [
+        <code>AccountDiscriminatorNotFound</code>,
+        'Step 2 failed — there were not eight bytes of discriminator to read',
+      ],
+    },
+    {
+      label: '3002',
+      cells: [<code>AccountDiscriminatorMismatch</code>, 'Step 2 failed — right length, wrong type'],
+    },
+    {
+      label: '3003',
+      cells: [
+        <code>AccountDidNotDeserialize</code>,
+        'Step 3 failed — owner and type were right, the body was not decodable',
+      ],
+    },
+    {
+      label: '3012',
+      cells: [<code>AccountNotInitialized</code>, 'The account does not hold initialized program state'],
+    },
+  ]}
+  caption="A container failure is never ambiguous: each step, and each way a step can fail, carries its own number."
+  alt="Anchor account error codes: 3007 wrong owning program, 3001 no discriminator present, 3002 discriminator mismatch, 3003 body did not deserialize, 3012 account not initialized."
+/>
+
+Read the number before reading the logs. A 3007 and a 3002 point at completely different bugs — the
+first says you were handed something from another program, the second says you were handed the wrong
+one of yours — and both look identical in a wallet's "transaction failed" toast.
+
+<Aside kind="note">
+These constants are stable across a release but they are constants in a crate, not protocol
+constants. Confirm the numbers against the `ErrorCode` enum for the `anchor-lang` version you
+actually build with rather than against any table, including this one.<Cite src="anchor-lang-error-docsrs" />
+</Aside>
+
+## The wrapper type is the check
+
+Anchor's second idea, after the discriminator, is that the *type of the field* carries the assertion.
+There is no separate list of validations to keep in sync with the account list, because the account
+list is the list of validations.<Cite src="anchor-docs-account-types" />
+
+**`Signer<'info>`** asserts the account signed the transaction.<Cite src="anchor-docs-account-types" />
+This is as close as Solana comes to `msg.sender`, and the gap is instructive: `msg.sender` is a single
+authenticated caller the EVM hands you, whereas a Solana transaction can carry several signers and
+the program must say which field is required to be one of them. Failure is
+`AccountNotSigner`, 3010.<Cite src="anchor-lang-error-docsrs" />
+
+**`Program<'info, T>`** asserts the account is the given program — both its key and its executable
+flag.<Cite src="anchor-docs-account-types" /> `Program<'info, System>` is the ubiquitous case, present
+on every instruction that creates an account. Anchor 1.0 also added a bare `Program<'info>` for
+executable-only validation when you do not want to pin a specific
+id.<Cite src="anchor-repo-changelog" /> Failures are `InvalidProgramId` 3008 and
+`InvalidProgramExecutable` 3009.<Cite src="anchor-lang-error-docsrs" />
+
+**`SystemAccount<'info>`** asserts the account is owned by the System Program — that is, a plain
+account with no program state.<Cite src="anchor-docs-account-types" /> Failure is
+`AccountNotSystemOwned`, 3011.<Cite src="anchor-lang-error-docsrs" />
+
+**`Interface<'info, T>` and `InterfaceAccount<'info, T>`** validate against a *set* of programs rather
+than one, which is how a program accepts either the original token program or Token-2022 without
+branching.<Cite src="anchor-docs-account-types" /> If you have read
+[Token-2022 is a separate program](/c/token2022-is-a-separate-program), this is the type that
+expresses that fact.
+
+**`AccountLoader<'info, T>`** is on-demand zero-copy deserialization for accounts too large to
+copy.<Cite src="anchor-docs-account-types" /> The last lesson in this module is about when to reach
+for it.
+
+**`Sysvar<'info, T>`** validates that the account is the sysvar you named and deserializes
+it.<Cite src="anchor-docs-account-types" /> The manual equivalent is comparing against a hard-coded
+address, and forgetting to is its own vulnerability class.
+
+**`Box<Account<'info, T>>`** changes no checks at all — it moves the deserialized struct to the heap
+to save stack space.<Cite src="anchor-docs-account-types" /> Worth recognising so you do not read it
+as a security modifier when it is a memory-layout one.
+
+**`Option<Account<'info, T>>`** marks an account as optional.<Cite src="anchor-docs-account-types" />
+Every optional account is a branch, and every branch is a path somebody has to have thought about.
+
+**`UncheckedAccount<'info>` and `AccountInfo<'info>`** assert nothing. `UncheckedAccount` exists
+specifically as the explicit wrapper that emphasises no checks are
+performed,<Cite src="anchor-docs-account-types" /> and Anchor 1.0 went further by deprecating
+`AccountInfo` inside the `Accounts` macro with a compile-time
+warning.<Cite src="anchor-repo-changelog" /> Both require a `CHECK` doc comment justifying the
+omission.<Cite src="anchor-docs-account-types" />
+
+**Reviewing an Anchor program starts by finding every unchecked field and reading its
+justification.** Not because unchecked accounts are wrong — a program that never needs to interpret
+an account genuinely does not need to validate it — but because that is where the framework stopped
+helping and a human started asserting. The `CHECK` comment is the only place in an Anchor program
+where a security argument is made in prose, which makes it the only place where it can be made
+badly.
+
+<Misconception
+  belief="A `CHECK` comment is a formality the compiler makes me write."
+  reality="It is the one assertion in the program that nothing verifies. Anchor forces the comment precisely because it cannot force the check, and every serious Solana audit finding starts with one that was written to silence a compiler error."
+  why="It behaves like a lint suppression, and engineers learn to satisfy lints rather than to answer them."
+  src="anchor-docs-account-types"
+/>
+
+## The zeroed-discriminator footgun
+
+Anchor lets you override a discriminator with a constant expression — but all-zero discriminators are
+explicitly unsupported for accounts, while remaining allowed for events and
+instructions.<Cite src="anchor-account-constraints" /><Cite src="anchor-docs-footguns" />
+
+The reason is worth understanding rather than obeying. A freshly allocated Solana account is
+zero-filled. So an all-zero account discriminator is indistinguishable from an account that has been
+created but never initialized.<Cite src="anchor-docs-footguns" /> Every check that asks "does this
+account already hold state of type T" collapses, in both directions: uninitialized accounts pass as
+initialized, and initialized ones look empty.
+
+Anchor's own documentation names the historical consequence: in versions before 1.0, program-owned
+accounts with zeroed discriminators — created for instance by manually initializing an `AccountInfo`,
+or as preparation for `#[account(zero)]` initialization — could be taken over via IDL
+instructions.<Cite src="anchor-account-constraints" /> The framework now rejects all-zero account
+discriminators outright.<Cite src="anchor-repo-changelog" />
+
+Keep the shape of that bug even after the specific version is irrelevant. A sentinel value that
+collides with the natural empty state is a bug generator, and it is the same defect as an EVM
+`initialize()` that treats slot zero as "not yet initialized" — a pattern you met on the proxy side of
+the toolchain track. Solana simply has more zero-filled buffers lying around than the EVM does.
+
+<Check type="spot-bug" concept="account-wrapper-does-three-checks">
+A program manages staking positions. The reviewer is told "the discriminator check makes type
+confusion impossible here", and this instruction is presented as evidence:
+
+```rust
+#[derive(Accounts)]
+pub struct Harvest<'info> {
+    /// CHECK: we verify the discriminator manually below
+    pub position: AccountInfo<'info>,
+    pub claimant: Signer<'info>,
+    #[account(mut)]
+    pub reward_vault: Account<'info, Vault>,
+}
+
+pub fn harvest(ctx: Context<Harvest>) -> Result<()> {
+    let data = ctx.accounts.position.try_borrow_data()?;
+    require!(data[..8] == Position::DISCRIMINATOR, MyError::WrongType);
+    let position = Position::try_from_slice(&data[8..])?;
+    require_keys_eq!(position.owner, ctx.accounts.claimant.key());
+    pay_out(&ctx.accounts.reward_vault, position.accrued)?;
+    Ok(())
+}
+```
+
+Find every defect. For each, say which of the three checks it corresponds to and what an attacker
+does with it.
+
+<Answer>
+**Defect one, and it is the whole exploit: the owner check is missing.** `AccountInfo` asserts
+nothing.<Cite src="anchor-docs-account-types" /> The handler checks the discriminator and the stored
+`owner` field, but never checks that *this program* owns the account. That is step one of the three,
+and it is the step that makes the other two mean anything.<Cite src="anchor-docs-account-types" />
+
+The attack: deploy your own program, allocate an account it owns, and write into it eight bytes equal
+to `Position`'s discriminator followed by a `Position` body naming yourself as `owner` and an
+`accrued` value of your choosing. The discriminator is not a secret — it is the first eight bytes of
+`sha256("account:Position")`, computable by anyone from the type's public
+name.<Cite src="anchor-docs-idl" /> `require!` passes. `require_keys_eq!` passes, because you wrote
+the owner field. The program pays out a number you invented. This is the
+[missing owner check](/c/missing-owner-check) class in its purest form, and the `CHECK` comment above
+the field is exactly the failure mode described earlier: it justifies the omission by naming the one
+check that *is* performed, which is not the one that was skipped.
+
+**Defect two: the manual discriminator comparison can panic instead of erroring.** `data[..8]` on a
+buffer shorter than eight bytes panics rather than returning an error. Anchor's own path returns
+`AccountDiscriminatorNotFound`, 3001, for precisely this case.<Cite src="anchor-lang-error-docsrs" />
+A panic aborts the instruction, so this is a denial-of-service and correctness wart rather than a
+theft, but it is the reason "I'll check it myself" is worse than it looks: the generated code handles
+edge cases the hand-written version forgets.
+
+**Defect three, subtler: no constraint ties `reward_vault` to `position`.** `Account<'info, Vault>`
+gives you owner plus discriminator plus deserialization — a real `Vault` owned by this
+program.<Cite src="anchor-docs-account-types" /> It does not say *which* vault, and nothing in this
+instruction says the position's rewards come from this particular one. If the program has more than
+one vault, or if the vault is a PDA per pool, an attacker harvests a position against a richer
+vault. That is the third of the three questions, and the next two lessons are about the constraints
+that answer it.
+
+**The fix, which is one line.** Replace the `AccountInfo` and the manual block with:
+
+```rust
+#[account(has_one = claimant)]
+pub position: Account<'info, Position>,
+```
+
+renaming `Position::owner` to `claimant` so the field name matches. That single field now performs
+the owner check, the discriminator check, the deserialization, and the binding of the position to the
+signer, with distinct error codes for
+each.<Cite src="anchor-docs-account-types" /><Cite src="anchor-account-constraints" /><Cite src="anchor-lang-error-docsrs" />
+The vault linkage still has to be stated separately.
+
+**The general lesson.** "We verify the discriminator manually" is a sentence that should trigger a
+full re-derivation of all three checks, every time. The discriminator is the memorable one, so it is
+the one that gets reimplemented, and the owner check is the one that gets forgotten — which is why
+Anchor bundles them into a type rather than offering them as separate constraints you could apply one
+of.<Cite src="anchor-docs-security-exploits" /><Cite src="sealevel-attacks" />
+</Answer>
+</Check>
+
+## What this unlocks
+
+The three checks are the floor. Everything after them is about the questions a type cannot answer.
+
+- **Constraints as generated code**, next, takes `mut`, `has_one`, `seeds`, `close` and the rest and
+  shows the `if` statements they expand into — including why the expansion order determines which
+  error a malformed call produces.
+- **`has_one` and `seeds`** answer the "which instance" question that this lesson deliberately left
+  open, and they are the difference between a program that type-checks and a program that
+  authorises.
+- **The error-code ranges** you met here (3000-series for account checks) become a complete map in
+  the next lesson, once the 2000-series constraint failures are in view.<Cite src="anchor-lang-error-docsrs" />
+- **`AccountLoader`** returns in the final lesson, where the three checks meet an account too big to
+  copy onto a 4KB stack.<Cite src="anchor-docs-zero-copy" />
+
+One habit to start now. Whenever you read an Anchor `Accounts` struct, silently annotate each field
+with what it asserts — signed, owned-by-us, is-this-program, nothing — and then ask which of the
+three questions is still unanswered for that field. On most fields the answer will be "which
+instance", and that is the subject of the next two lessons.

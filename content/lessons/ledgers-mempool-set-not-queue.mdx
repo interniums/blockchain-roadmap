@@ -1,0 +1,270 @@
+---
+id: ledgers-mempool-set-not-queue
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [geth-legacypool, devp2p-eth-wire, eip-1559, eip-7782, mev-boost-docs, ethereum-roadmap-pbs, arxiv-private-orderflow, ethereum-org-mev, geth-rpc-txpool]
+stack: {}
+---
+
+Two transactions are eligible for the next block. One has been in the pool for forty minutes. The
+other arrived two hundred milliseconds ago.
+
+The older one has no advantage. Not a small advantage, not a tie-breaking advantage — none. There is
+no field anywhere recording when it arrived, no structure ordered by that field, and nobody
+consulting it. If the newer transaction offers a better effective tip, or arrives inside a bundle
+that pays the builder more, it goes in and the older one waits again.
+
+This is the mental model that costs teams the most money, because first-in-first-out makes every
+failure look like a delay. If you believe there is a line, then a transaction that has not landed is
+a transaction that is *nearly there*, and the correct response is patience. There is no line, so
+waiting is not progress, and the correct response is to change something.
+
+<Compare
+  caption="A queue stores your position; the pending set recomputes it, so your standing can change while nothing about your transaction does."
+  alt="A queue and the pending transaction set compared by what fixes your position, how often it changes, whether waiting moves you forward, who takes the next item, and what goes first under pressure."
+  axis="Question"
+  columns={[
+    { title: 'A queue', note: 'the structure people assume', tone: 'muted' },
+    { title: 'The pending set', note: 'the structure that exists', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'What fixes your position?', cells: ['Arrival time, recorded when you joined', 'Nothing is stored; rank is derived from the effective tip'] },
+    { label: 'How often does it change?', cells: ['Only as entries in front of you leave', 'Re-heaped on every new head, against a new base fee'] },
+    { label: 'Does waiting move you forward?', cells: ['Yes, that is what a queue does', 'No. It moves you toward the lifetime limit and an eviction'] },
+    { label: 'Who takes the next item?', cells: ['The server, from the front', 'A builder, choosing the combination that pays it most'] },
+    { label: 'What goes first under pressure?', cells: ['Nothing; the line just grows', 'The cheapest on admission, and the largest sender’s highest nonces on truncation'] },
+  ]}
+/>
+
+## The pool is indexed by sender and sorted by price
+
+Look at the structures. `txpool_content` returns transactions keyed by sender address and then by
+nonce.<Cite src="geth-rpc-txpool" /> That is the only ordering the pool imposes on your
+transactions, and it is a *constraint* — nonce 8 cannot execute before nonce 7 — rather than a
+position.
+
+Across senders there is no order at all except price, and the price ordering is not fixed. On every
+new head, go-ethereum computes the base fee that will apply to the *next* block, sets it on the
+pool's priced list, and re-heaps.<Cite src="geth-legacypool" /> In the same pass it demotes anything
+that has become unexecutable and promotes anything that has become executable, deleting transactions
+invalidated by low nonce or low balance.<Cite src="geth-legacypool" />
+
+Read that as a claim about your transaction: **its rank is recomputed from scratch every slot —
+twelve seconds at the current slot time<Cite src="eip-7782" /> — against a base fee that has
+changed.** Nothing about the transaction changed. Its position
+did, because position is derived rather than stored.
+
+The reason the re-computation matters is the arithmetic from the previous lesson. What the pool
+sorts on is the effective tip — the smaller of your priority fee and the gap between your ceiling
+and the base fee.<Cite src="eip-1559" /> When the base fee moves, every transaction's effective tip
+moves, and they do not move together: a transaction with a generous ceiling barely notices while one
+sitting near its ceiling loses most of its bid. Relative ordering reshuffles without a single new
+transaction arriving.
+
+## Selection belongs to whoever builds the block
+
+The pool does not decide anything. The wire specification's own framing is that nodes exchange
+pending transactions in order to relay them to block producers, "which will pick them for inclusion
+into the blockchain".<Cite src="devp2p-eth-wire" /> *Pick* is the operative verb, and everything
+downstream of it is outside the pool's control.
+
+In 2026 the picker is usually not the validator. Under proposer-builder separation the right to
+assemble a block is auctioned to specialised builders, and the proposer signs a header for the
+winning bid.<Cite src="ethereum-roadmap-pbs" /><Cite src="mev-boost-docs" /> A builder is running an
+optimiser whose objective is the value it can pay the proposer, over a candidate set that includes
+the public pool *and* whatever reached it privately.
+
+So the selection rule is not "highest tip first". It is "the combination of transactions, in the
+order that maximises what I can bid". Those coincide when every candidate is an independent
+fee-paying transaction. They diverge as soon as any candidate's value depends on its position
+relative to another — which is what the searcher economy is built on, and which is why a
+higher-tipping transaction can lose to a lower-tipping one that completes somebody's profitable
+sequence.
+
+<Misconception
+  belief="Pending transactions are a queue, and mine is in line."
+  reality="Pending is a set whose price ordering is recomputed against a new base fee every block, and whose selection is made by a builder maximising its own revenue over the whole set. Arrival time is recorded nowhere and consulted by nothing."
+  why="Every other system with a 'pending' state the reader has used is FIFO — print queues, payment processors, support tickets, message brokers. The word carries the queue with it, and the interface reinforces it: a spinner implies progress toward a front of a line."
+  src="arxiv-private-orderflow"
+/>
+
+## Eviction is not FIFO either, and it is not always about price
+
+When capacity binds, the natural guess is that the pool drops the cheapest transactions. It does that
+in one place and something quite different in another, and the difference is what turns a batch
+sender's bad day into a nonce gap.
+
+**On admission, when the pool is over capacity, price decides.** If the total occupied slots would
+exceed `GlobalSlots` plus `GlobalQueue`, go-ethereum first checks whether the arriving transaction is
+underpriced relative to the pool's current contents and rejects it outright with `transaction
+underpriced` if so. Otherwise it discards enough of the cheapest entries to make
+room.<Cite src="geth-legacypool" /> There is a throttle on top: if more than a quarter of
+`GlobalSlots` worth of changes have already happened since the last reorg, the pool stops evicting
+and returns a pool-overflow error instead.<Cite src="geth-legacypool" />
+
+**On truncation, when the pending set is over its limit, fairness decides — and it is price-blind.**
+`truncatePending` assembles a "spam order" of accounts holding more than `AccountSlots` pending
+transactions, penalises the largest transactors first, and removes their **highest-nonce**
+transactions, on the reasoning that these are the ones executing furthest in the
+future.<Cite src="geth-legacypool" /> Fee fields are not consulted at any point in that
+procedure.<Cite src="geth-legacypool" />
+
+Sit with the consequence, because it is genuinely counter-intuitive. A service running one hot EOA
+with thirty pending transactions is, by definition, over the sixteen-slot per-account guarantee and
+therefore in the spam order. Under global pressure it loses the *tail* of its own nonce sequence
+first — regardless of how well those transactions are priced. And the tail is exactly where a gap
+does the most damage: everything the service sends next sits behind a hole it did not
+create.<Cite src="geth-legacypool" />
+
+The design intent is defensible: without it, one well-funded account could occupy the whole pool. The
+operational lesson is that **paying more does not protect you from every eviction path**, and that
+"spread across several sending accounts" is a real availability measure rather than an optimisation.
+
+<Figure
+  caption="Two eviction paths, and only one of them consults price — which is why a well-funded sender still loses the tail of its own nonce sequence."
+  alt="Under pressure a pool takes two different paths: on admission it rejects or discards the cheapest entries, while truncating an oversized pending set penalises the largest transactors and removes their highest-nonce transactions without looking at fees, opening a gap."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'hot', label: 'the pool runs hot', note: 'occupied slots exceed the limits', col: 0, tone: 'warn' },
+      { id: 'adm', label: 'admission is over capacity', note: 'price decides', col: 1 },
+      { id: 'tru', label: 'the pending set is over its limit', note: 'a spam order decides', col: 1 },
+      { id: 'cheap', label: 'cheapest entries discarded', note: 'or the arrival is refused outright', col: 2, tone: 'warn' },
+      { id: 'tail', label: 'your highest nonces removed', note: 'fee fields are never consulted', col: 2, tone: 'danger' },
+      { id: 'gap', label: 'a hole you did not create', note: 'everything behind it becomes queued', col: 3, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'hot', to: 'adm' },
+      { from: 'hot', to: 'tru' },
+      { from: 'adm', to: 'cheap' },
+      { from: 'tru', to: 'tail', tone: 'danger' },
+      { from: 'tail', to: 'gap', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="warn">
+Notice how this closes the loop with the nonce-gap lesson. The third source of gaps listed there — a
+transaction in the middle of your sequence disappearing through no fault of yours — is this
+procedure. A correctly built, correctly priced batch can develop a hole because a shared pool ran
+hot.<Cite src="geth-legacypool" />
+</Aside>
+
+## The other half: the pool is a broadcast
+
+Everything above concerns what happens to your transaction. The second property of the public pool
+concerns what happens to your *information*, and it operates from the instant you broadcast.
+
+A transaction in the public pool is fully specified and fully readable. Recipient, calldata, value,
+gas limit, both fee fields, and a signature proving the sender authorised exactly this. Any node that
+asks a peer for it receives the complete object.<Cite src="devp2p-eth-wire" /> Pool synchronisation
+is designed to spread it widely and quickly: on connection both sides exchange hashes for their
+entire pools, and new transactions are pushed in full to a random fraction of peers and announced by
+hash to the rest.<Cite src="devp2p-eth-wire" />
+
+So the honest description of `eth_sendRawTransaction` against a public endpoint is: **publish a
+signed, machine-readable statement of what you are about to do, to everyone who will listen, before
+it happens.**
+
+That is the precondition for everything in the extractable-value literature. An observer who can read
+your intent before execution, and who can pay a builder to place transactions around yours, can
+profit from the difference between the price you expected and the price you get. Ethereum's own
+documentation describes maximal extractable value as the value that can be extracted from block
+production in excess of the block reward and fees, by including, excluding and changing the order of
+transactions.<Cite src="ethereum-org-mev" />
+
+Two things follow that are worth stating flatly, because they are usually softened.
+
+**Frontrunning is not an exploit of a bug.** It is the correct use of published information combined
+with a selection process that was never promising you an order. Nothing is being violated. If your
+design assumed otherwise, the assumption was the defect.
+
+**Visibility is not the only ingredient — ordering power is.** Seeing your transaction is worthless
+without the ability to be placed relative to it. That ability is bought from builders, which is why
+the answer to this problem in practice has been to change *who sees the transaction* rather than to
+change how blocks are ordered. That is the next lesson, and it is a trade rather than a fix.
+
+<Misconception
+  belief="A small transaction is not worth attacking, so the public pool is fine for it."
+  reality="The threshold is set by the attacker's marginal cost of including two extra transactions in a block someone is building anyway, not by any notion of a worthwhile target. And profitability is a property of the pool state your transaction moves through, not of its size."
+  why="Intuitions about attacker economics are imported from systems where an attack costs the attacker time and attention. Here the search is automated, continuous, and already running against every transaction in the pool; your transaction is evaluated whether or not anyone decided to target you."
+  src="ethereum-org-mev"
+/>
+
+## What this forbids in your product
+
+Four rules, all of them things teams ship anyway.
+
+**Never display a queue position or a place in line.** There is no such quantity. Any number you show
+is invented, and users will hold you to it.
+
+**Never derive an estimate from elapsed time.** "Usually confirms in thirty seconds, it has been
+twenty-five, nearly there" is reasoning about a queue. The correct inputs are the current base fee
+against your ceiling, and the current distribution of effective tips against yours — quantities that
+say whether you are eligible and competitive right now, which is the only thing that determines the
+next block.
+
+**Never treat elapsed time as evidence of anything except elapsed time.** A transaction pending for
+ten minutes is not closer to inclusion than one pending for ten seconds. It is, however, closer to
+its pool's lifetime limit and more likely to have seen an eviction event.<Cite src="geth-legacypool" />
+Time makes things worse, not better.
+
+**Never design a flow whose safety depends on ordering you did not enforce.** If two of your own
+transactions must execute in order, they must share a sender and use consecutive nonces, or be
+atomic within one transaction. Submitting them a second apart and hoping is not a design.
+
+<Check type="explain" concept="mempool-pending-is-not-a-queue">
+A team is asked why their exchange withdrawal, submitted at 14:02, is still pending at 14:11 while
+withdrawals submitted at 14:09 have confirmed. Their support macro says: "the network is congested
+and transactions are processed in order; yours is next."
+
+Rewrite that explanation truthfully in a way a non-technical user can act on. Then name the one
+timing consideration that genuinely does exist, and say why it does not rescue the original macro.
+
+<Answer>
+**The truthful version.** Transactions are not processed in order. Every twelve
+seconds<Cite src="eip-7782" />, whoever builds the next block selects from all currently valid
+transactions and picks the set that pays them the most. Your withdrawal has been offered for
+selection roughly forty-five times and not chosen. The
+later withdrawals were not ahead of it — they were priced for the market as it stood when they were
+signed, and yours was priced for the market nine minutes ago.
+
+What the user can do: authorise a replacement at a higher fee, or wait for the network price to fall
+back below the maximum they already agreed to. Those are the only two levers, and which one applies
+depends on whether the transaction is currently ineligible or merely outbid.
+
+**Why "yours is next" is worse than wrong.** It is falsifiable in the user's favour and then
+immediately falsified, which converts one support ticket into an escalation. It also removes the
+user's agency: it tells them to wait, when waiting is the one action with no effect.
+
+**The one real timing consideration.** Eligibility is evaluated per block, and a block's contents are
+fixed at some point before it is proposed — a builder is assembling and bidding on a deadline. So a
+transaction that reaches a builder after it has frozen its candidate set is competing for the block
+after that one. Arriving in time to be *considered* is a real constraint measured in hundreds of
+milliseconds.
+
+That does not rescue the macro, for two reasons. It is a threshold, not a queue: being considered
+confers no ranking, and a transaction that has been considered forty-five times has exactly the same
+standing as one being considered for the first time. And it operates on a timescale of milliseconds
+before each block, which has nothing to do with the nine minutes the user has been waiting.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Private order flow** is the next lesson, and it is what happens when a large share of the network
+concludes that publishing intent to everyone is a bad trade. Everything there follows from the two
+halves of this one: selection is a revenue calculation, and the public pool is a broadcast.
+
+**Extractable value** as a field is this lesson monetised. Nothing in it is a new mechanism —
+sandwiching is visibility plus ordering power, and both were established here.
+
+**Order flow auctions** invert the same two facts: if your intent is worth something to somebody,
+that value can be auctioned on your behalf instead of taken from you.
+
+**Inclusion guarantees.** The last lesson in this module asks what obliges a builder to include you
+at all. Once you accept that selection is discretionary and revenue-driven, the answer stops being
+surprising and becomes a design question the protocol has not yet answered.

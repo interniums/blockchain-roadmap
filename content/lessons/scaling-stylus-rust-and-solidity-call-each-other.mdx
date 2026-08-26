@@ -1,0 +1,366 @@
+---
+id: scaling-stylus-rust-and-solidity-call-each-other
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [arbitrum-stylus-exporting-abi, arbitrum-stylus-importing-interfaces, arbitrum-stylus-contracts-fundamentals, arbitrum-stylus-vm-differences, arbitrum-stylus-gentle-intro, arbitrum-stylus-rust-to-solidity-differences, arbitrum-stylus-non-rust-wasm, arbitrum-stylus-sdk-overview, arbitrum-stylus-cli-overview]
+stack: {}
+---
+
+Here is a Solidity contract that calls another contract.
+
+```solidity
+interface IStylusContract {
+    function computeHash(bytes calldata data) external view returns (bytes32);
+}
+
+contract EvmContract {
+    function useStylus(address stylusAddr, bytes calldata data) public view returns (bytes32) {
+        return IStylusContract(stylusAddr).computeHash(data);
+    }
+}
+```
+
+That snippet is lifted from Arbitrum's own VM-differences page, where it appears under the heading
+"Solidity calling Stylus".<Cite src="arbitrum-stylus-vm-differences" /> Read it again with that
+context and notice what is missing. No adapter contract. No encoding shim. No import from a Stylus
+package. No annotation anywhere marking `stylusAddr` as a different kind of address. The interface
+is an ordinary Solidity interface and the call is an ordinary external call.
+
+The previous lesson established that the two VMs share one account space and one storage layer. This
+lesson is about the third thing they share, which is the one that makes incremental adoption
+realistic rather than theoretical: they share the calling convention, all the way down to the four
+bytes.
+
+## Why the caller cannot tell
+
+Work out what a caller would need in order to notice.
+
+**Subgoal 1 — the address.** It would need Stylus addresses to look different. They do not: a Stylus
+contract has an ordinary address in the same 160-bit space, reached by the same
+`CALL`.<Cite src="arbitrum-stylus-vm-differences" />
+
+**Subgoal 2 — the encoding.** It would need argument or return encoding to differ. Arbitrum's page
+records that ABI encoding is identical for both.<Cite src="arbitrum-stylus-vm-differences" /> Your
+[function selector](/c/abi-function-selector) and your 32-byte-padded head-and-tail layout are the
+same bytes going into either machine.
+
+**Subgoal 3 — the gas.** It would need gas accounting at the call boundary to differ. Gas forwarding
+follows [the 63/64 rule](/c/63-64-rule) in both cases, base call overhead is described as similar in
+both directions, and call depth is capped at the same 1024
+levels.<Cite src="arbitrum-stylus-vm-differences" />
+
+**Subgoal 4 — the failure mode.** It would need reverts to arrive differently. Both environments
+support revert and error handling, and return data is handled
+consistently.<Cite src="arbitrum-stylus-vm-differences" />
+
+There is nothing left. The Stylus documentation states the general principle directly: interfaces
+operate at the ABI level, so they work identically whether the target contract is written in
+Solidity, Rust, or any other language.<Cite src="arbitrum-stylus-importing-interfaces" /> The
+language a contract was written in does not affect
+interoperability.<Cite src="arbitrum-stylus-gentle-intro" />
+
+<Misconception
+  belief="Calling a Rust contract from Solidity needs special tooling — a bridge contract, a wrapper, or at least a different call helper."
+  reality="It is an ordinary external call to an ordinary address. The only artefact you need is a Solidity interface declaration, and `cargo stylus export-abi` writes that for you."
+  why="Every other cross-language boundary an engineer has met — FFI, gRPC, WASM in a browser — needed marshalling code, so the absence of any here reads as an omission rather than a design property."
+  src="arbitrum-stylus-exporting-abi"
+/>
+
+<Figure
+  caption="Only one step on this path knows Stylus exists, and it lives inside the chain's node rather than in your build."
+  alt="A Solidity caller ABI-encodes a selector and arguments, the node checks the callee's code prefix and routes to the WASM VM, the Rust method runs, and ABI-encoded return data travels back to the caller."
+>
+  <Flow
+    lanes={['caller', 'the wire', 'the node', 'callee']}
+    nodes={[
+      { id: 'sol', label: 'Solidity caller', note: 'an ordinary interface call', col: 0 },
+      { id: 'enc', label: 'ABI encode', note: 'four-byte selector, then args', col: 1 },
+      { id: 'disp', label: 'prefix check', note: '0xEFF00000 → WASM VM', col: 2, tone: 'accent' },
+      { id: 'rust', label: 'the Rust method', note: 'annotated #[public]', col: 3 },
+    ]}
+    edges={[
+      { from: 'sol', to: 'enc' },
+      { from: 'enc', to: 'disp' },
+      { from: 'disp', to: 'rust' },
+      { from: 'rust', to: 'sol', label: 'ABI-encoded return data', tone: 'plain' },
+    ]}
+  />
+</Figure>
+
+## Direction one: Solidity calling Rust
+
+The artefact that carries a Rust contract into the Solidity world is a generated interface file.
+
+Annotate your methods with `#[public]`, enable the `export-abi` Cargo feature — it is off by
+default — and run the command.<Cite src="arbitrum-stylus-exporting-abi" /><Cite src="arbitrum-stylus-sdk-overview" />
+
+```shell
+cargo stylus export-abi --output=./interfaces/IMyContract.sol
+```
+
+What comes out is a Solidity `interface` block with a generated header comment, an SPDX line and a
+pragma.<Cite src="arbitrum-stylus-exporting-abi" /> The documentation lists the transformations that
+happen on the way out, and they are worth memorising because each one is a place your assumptions
+can quietly diverge from the artefact:<Cite src="arbitrum-stylus-exporting-abi" />
+
+- `snake_case` becomes `camelCase` in function names.
+- Rust types map to Solidity types: `U256` to `uint256`, `Address` to `address`, `FixedBytes<N>` to
+  `bytesN`, `Bytes` to `bytes`, `String` to `string`, `Vec<T>` to `T[]`, `[T; N]` to `T[N]`.
+- `&self` becomes `view`, `&mut self` becomes non-view, and a method with no `self` at all becomes
+  `pure`.
+- `Result<T, E>` becomes return type `T` with error `E`.
+
+Two details in that output surprise people the first time.
+
+**Custom error parameter names are dropped.** A Rust error declared as
+`InsufficientBalance(address account, uint256 requested, uint256 available)` is exported as
+`error InsufficientBalance(address, uint256, uint256)` — types only, names
+gone.<Cite src="arbitrum-stylus-exporting-abi" /> The selector is unchanged, because parameter names
+never entered the signature hash, but any tooling of yours that reads names out of the `.sol` file
+to build a decoder will produce positional labels instead of meaningful ones.
+
+**The constructor is not in the interface.** `export-abi` does not emit it. There is a separate
+top-level command that prints the constructor signature, and it prints `payable` when the
+constructor carries `#[payable]`:<Cite src="arbitrum-stylus-exporting-abi" />
+
+```shell
+cargo stylus constructor
+# constructor(address owner, uint256 initial_value)
+```
+
+**Events come along.** Events declared with the `sol!` macro in Rust appear in the generated
+interface with their `indexed` markers intact — `event Transfer(address indexed from, address indexed to, uint256 value)`
+exports as exactly that.<Cite src="arbitrum-stylus-exporting-abi" /> Since the topic hash is computed
+from the event signature and the ABI is identical across both VMs, an existing indexer, subgraph or
+log filter keeps working against a Stylus contract with no change beyond pointing at a different
+address. This is the part of the interop story that most often goes unexamined until someone asks
+whether the analytics pipeline has to be rewritten. It does not.
+
+If you build contracts out of traits, the export follows the structure: a contract implementing a
+trait with `#[implements(IErc20)]` exports as `interface IMyToken is IIErc20`, with the trait's
+methods on the parent interface.<Cite src="arbitrum-stylus-exporting-abi" /> The doubled `I` is not a
+typo in this lesson — the generator prefixes `I` to a trait already named `IErc20`.
+
+### The transformation that will cost you an afternoon
+
+Of the four transformations above, one has teeth: `snake_case` to
+`camelCase`.<Cite src="arbitrum-stylus-exporting-abi" />
+
+You write `pub fn get_count(&self) -> U256`. The exported interface says
+`function getCount() external view returns (uint256)`. The selector the chain will route on is the
+first four bytes of the hash of `getCount()`, because the ABI's function signature is built from the
+exported name.
+
+Now suppose you skip the generated file and hand-write the interface from memory of the Rust source.
+You write `function get_count() external view returns (uint256);`. That is a different string, so it
+is a different hash, so it is a different four bytes.
+
+**What happens next depends on a detail of the callee.** If the Stylus contract has no `#[fallback]`
+method, the router finds no match and the call reverts — annoying, but loud. If it does have one,
+the fallback is invoked precisely because the call did not match any existing function
+signature.<Cite src="arbitrum-stylus-contracts-fundamentals" /> The example fallback in Arbitrum's
+own documentation logs the unmatched selector and returns `Ok(vec![])` — that is, it succeeds, with
+empty return data.<Cite src="arbitrum-stylus-contracts-fundamentals" /> A Solidity caller expecting
+`uint256` decodes empty return data and, depending on how the call was made, either reverts on the
+decode or reads zero.
+
+Reading zero is the bad outcome. Nothing failed, nothing logged on your side, and a price or a
+balance is now `0` in a code path that never considered that possibility.
+
+<Figure
+  caption="One character of case decides which of two four-byte routes a call takes, and only one of the two fails loudly."
+  alt="A Rust method get_count exports as getCount. The generated interface produces a selector the router matches, returning the real value. A hand-written get_count interface produces a selector nothing matches, so the fallback runs and returns empty data that the caller decodes as zero."
+>
+  <Flow
+    nodes={[
+      { id: 'rs', label: 'pub fn get_count', note: 'the Rust method', col: 0 },
+      { id: 'gen', label: 'generated interface', note: 'getCount()', col: 1, tone: 'good' },
+      { id: 'hand', label: 'hand-written one', note: 'get_count()', col: 1, tone: 'danger' },
+      { id: 'hit', label: 'selector matches', note: 'the router dispatches', col: 2, tone: 'good' },
+      { id: 'miss', label: 'nothing matches', note: 'the #[fallback] runs', col: 2, tone: 'danger' },
+      { id: 'val', label: 'the real value', col: 3, tone: 'good' },
+      { id: 'zero', label: 'empty return data', note: 'decoded as 0', col: 3, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'rs', to: 'gen' },
+      { from: 'rs', to: 'hand' },
+      { from: 'gen', to: 'hit' },
+      { from: 'hand', to: 'miss' },
+      { from: 'hit', to: 'val' },
+      { from: 'miss', to: 'zero' },
+    ]}
+  />
+</Figure>
+
+The SDK gives you two ways out when the name has to be something specific — matching an existing
+Solidity interface exactly is the documented motivation:<Cite src="arbitrum-stylus-contracts-fundamentals" />
+
+```rust
+#[public]
+impl Token {
+    // Rename in the ABI: the exported name and the selector become `balanceOf`.
+    #[selector(name = "balanceOf")]
+    pub fn get_balance(&self, account: Address) -> U256 {
+        self.balances.get(account)
+    }
+
+    // Or pin the four bytes directly.
+    #[selector(bytes = "0x70a08231")]
+    pub fn balance_of_custom(&self, account: Address) -> U256 {
+        self.balances.get(account)
+    }
+}
+```
+
+The same page names the third use for `#[selector]`: implementing several methods that share a name
+but need different selectors, which Rust's own overloading rules cannot express.<Cite src="arbitrum-stylus-contracts-fundamentals" />
+
+The operational rule that falls out of all this is dull and correct. Generate the interface, commit
+it, and treat a hand-written one as a bug. Arbitrum's own best-practice note says exactly that:
+export the ABI to a versioned file rather than relying on manual interface
+definitions.<Cite src="arbitrum-stylus-exporting-abi" />
+
+## Direction two: Rust calling Solidity
+
+Going the other way, you declare the interface in Solidity syntax inside a Rust macro. The macro
+generates a Rust struct per interface, and the SDK computes the four-byte selectors from the exact
+names and parameter types you wrote.<Cite src="arbitrum-stylus-importing-interfaces" />
+
+```rust
+sol_interface! {
+    interface IToken {
+        function balanceOf(address account) external view returns (uint256);
+        function transfer(address to, uint256 amount) external returns (bool);
+    }
+}
+```
+
+Note the symmetry with the previous section, and the fact that it does not create a second trap. The
+macro converts Solidity's `balanceOf` to Rust's `balance_of` so your call sites read like Rust — and
+it preserves the original name for computing the selector, so the call reaches the right
+method.<Cite src="arbitrum-stylus-importing-interfaces" /> The renaming is a surface convenience on
+the Rust side only; the wire stays Solidity's.
+
+That is the whole reason the two directions have different risk profiles. Going out, the exported
+name is authoritative and your memory of the Rust name is not. Coming in, you wrote the Solidity
+name yourself, and the macro treats it as the truth.
+
+### The call configuration is not decoration
+
+Calls take a config object, and the SDK exposes three constructors that are not
+interchangeable:<Cite src="arbitrum-stylus-importing-interfaces" />
+
+<Matrix
+  corner="Constructor"
+  cols={['Use case', 'State access', 'ETH transfer']}
+  rows={[
+    { label: <code>Call::new()</code>, cells: ['view and pure calls', 'read-only', 'no'] },
+    { label: <code>Call::new_mutating(self)</code>, cells: ['write calls', 'read and write', 'no'] },
+    { label: <code>Call::new_payable(self, value)</code>, cells: ['payable calls', 'read and write', { v: 'yes', tone: 'warn' }] },
+  ]}
+  caption="The config object is where a call's authority is declared — read-only, mutating, or carrying value."
+  alt="Three Stylus SDK call constructors compared by use case, state access and whether ETH can be transferred: Call::new is read-only with no transfer, Call::new_mutating reads and writes with no transfer, Call::new_payable reads and writes and transfers value."
+/>
+
+The documentation attaches a hard requirement to the second and third: a method using
+`Call::new_mutating(self)` must take `&mut self` as its first parameter, which is how the runtime
+handles state changes and reentrancy correctly.<Cite src="arbitrum-stylus-importing-interfaces" />
+Rust's borrow checker enforces that for you at compile time — one of the few places where the
+language's own rules are load-bearing for contract correctness rather than merely for memory safety.
+
+You can also cap forwarded gas with `.gas(...)` on the config, which composes with the
+[63/64 rule](/c/63-64-rule) rather than replacing it — the SDK's own example computes a limit from
+`self.vm().evm_gas_left() / 2`.<Cite src="arbitrum-stylus-importing-interfaces" />
+
+## The boundary is the ABI, not the language
+
+One more correction, because it changes how you scope the technology in a design document.
+
+Rust has the first-class, fully supported SDK, and C and C++ are also supported. Any other language
+that compiles to WASM is described as theoretically possible with experimental rather than officially
+maintained support.<Cite src="arbitrum-stylus-gentle-intro" /><Cite src="arbitrum-stylus-non-rust-wasm" />
+So the interop story is not "Solidity and Rust interoperate". It is "anything that speaks the ABI and
+lives at an address interoperates", and Rust merely happens to be the language with the mature
+toolchain — `stylus-sdk` v0.10.7, Rust 1.91.0 or later, target
+`wasm32-unknown-unknown`.<Cite src="arbitrum-stylus-sdk-overview" /><Cite src="arbitrum-stylus-cli-overview" />
+
+<Misconception
+  belief="Stylus only supports Rust, so the interop question is really a Rust-versus-Solidity question."
+  reality="The VM's contract is with WASM. Rust, C and C++ are supported today, with a documented path for other WASM-producing toolchains, and the ABI boundary does not care which one you used."
+  why="The SDK, the CLI, the quickstart and every tutorial are Rust, so the tooling's shape gets mistaken for the platform's shape."
+  src="arbitrum-stylus-non-rust-wasm"
+/>
+
+There is a real asymmetry worth stating alongside that, though, and it is not about the ABI. Solidity
+idioms do not survive the trip: no inline assembly, no `selfdestruct`, no modifier
+syntax.<Cite src="arbitrum-stylus-rust-to-solidity-differences" /> The *interface* ports mechanically.
+The *implementation* does not. The final lesson of this module takes that apart properly.
+
+<Check type="spot-bug" concept="abi-is-the-boundary">
+A team ships a Rust pricing engine and a Solidity vault that calls it. The Rust side:
+
+```rust
+#[public]
+impl PricingEngine {
+    pub fn quote_price(&self, amount: U256) -> U256 { /* ... */ }
+
+    #[fallback]
+    pub fn fallback(&mut self, calldata: &[u8]) -> ArbResult {
+        Ok(vec![])
+    }
+}
+```
+
+The Solidity side declares `function quote_price(uint256 amount) external view returns (uint256);`
+and calls it. Integration tests on a fork pass. Every quote comes back as `0` in staging and nobody
+notices for two days, because a zero quote reads as "no liquidity for this size" in the vault's own
+logic.
+
+Name the defect, name the mechanism that hid it, and name the two changes that each independently
+prevent it.
+
+<Answer>
+**The defect** is the hand-written Solidity interface. The exported ABI name for
+`pub fn quote_price` is `quotePrice`, because `export-abi` converts `snake_case` to
+`camelCase`.<Cite src="arbitrum-stylus-exporting-abi" /> `quote_price(uint256)` and
+`quotePrice(uint256)` are different strings and therefore different four-byte selectors, so the call
+never reaches the method.
+
+**The mechanism that hid it** is the fallback. A call whose selector matches no existing function
+signature is routed to `#[fallback]`, and this one returns `Ok(vec![])` — success with empty return
+data.<Cite src="arbitrum-stylus-contracts-fundamentals" /> The `CALL` succeeds, so no revert
+propagates, and the caller decodes an absent `uint256` as zero. Had the contract carried no fallback
+at all, the router would have found no match and the call would have reverted on the first
+integration test.
+
+**Two independent fixes.** First: delete the hand-written interface and use the generated one —
+`cargo stylus export-abi --output=./interfaces/IPricingEngine.sol`, committed to the repo, which is
+Arbitrum's own stated best practice.<Cite src="arbitrum-stylus-exporting-abi" /> Second: if the
+Solidity name genuinely has to be `quote_price` — say it is fixed by an interface you do not own —
+pin it on the Rust side with `#[selector(name = "quote_price")]`, which is documented precisely for
+matching existing Solidity interfaces exactly.<Cite src="arbitrum-stylus-contracts-fundamentals" />
+
+**The point worth carrying out of this.** A fallback that returns success is a silent-failure
+generator for *any* contract, in either VM — you met this shape in the security track. What Stylus
+adds is a second, language-level way to produce a selector mismatch in the first place, and it fires
+on the ordinary act of writing an interface by hand from the source you are looking at.
+</Answer>
+</Check>
+
+## What this unlocks
+
+The coequality claim is now operational. A Rust contract and a Solidity contract are, from any
+caller's position, the same kind of object: one address space, one ABI, one gas-forwarding rule, one
+depth limit. The only new artefact in your build is a generated `.sol` interface, and the only new
+failure mode is a naming transformation you now know about.
+
+That matters because it makes the interesting decision a *per-component* decision instead of a
+per-project one. You are not choosing a language for a system. You are choosing, function by
+function, which side of an ABI boundary a piece of work belongs on.
+
+**The next lesson** is the one that answers that question with arithmetic rather than taste. Ink and
+its conversion to gas, the published per-opcode and per-host-I/O price tables, what the SDK's storage
+cache does and does not save, the page-based memory model, and the fixed overheads — activation and
+per-call initialisation — that a small function will never earn back.

@@ -1,0 +1,340 @@
+---
+id: defi-oracles-twap-buys-time
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [uniswap-v2-oracles-docs, uniswap-v2-core-pair, uniswap-v3-core-oracle, uniswap-v3-pos-oracles, euler-twap-cost-of-attack, chainsecurity-multiblock-mev, arxiv-manipulation-cost-2026]
+stack: {}
+---
+
+Same pool, same flash loan, same $150 of fees. This time the consuming protocol does not
+[read reserves](/c/orac-spot-price-is-not-an-oracle); it reads a thirty-minute time-weighted average. The attacker sends the identical
+transaction. The pool's reserves go to 100,000 and 25,000, the marginal price reads 4, and the
+protocol's price moves by roughly seven tenths of one percent.
+
+Nothing was blocked. No check fired. The attack simply did not accomplish anything, and the reason is
+arithmetic rather than defence: the consumer is reading an integral, and the attacker contributed one
+block's worth of area to a window that is a hundred and fifty blocks wide.
+
+That is the whole idea, and this lesson is about both halves of it — what the integral buys, and what
+it costs, because they are the same parameter.
+
+## The accumulator, as built
+
+The construction is simpler than its reputation. A pair maintains a running sum of price multiplied
+by time, and any observer can recover an average over any interval by differencing the sum at two
+points.
+
+In `UniswapV2Pair._update`, which runs on every state-changing interaction, the contract computes the
+seconds since the last update and — only when that is non-zero — adds the pre-trade reserve ratio,
+scaled by the elapsed seconds, into two cumulative variables, one per
+direction.<Cite src="uniswap-v2-core-pair" />
+
+```solidity
+uint32 timeElapsed = blockTimestamp - blockTimestampLast;
+if (timeElapsed > 0 && _reserve0 != 0 && _reserve1 != 0) {
+    price0CumulativeLast += uint(UQ112x112.encode(_reserve1).uqdiv(_reserve0)) * timeElapsed;
+    price1CumulativeLast += uint(UQ112x112.encode(_reserve0).uqdiv(_reserve1)) * timeElapsed;
+}
+```
+
+Three details in those four lines carry the entire security argument.
+
+**The reserves used are `_reserve0` and `_reserve1` — the values from *before* this transaction's
+swap.** The price being accumulated is the one the previous block left behind.
+
+**The `timeElapsed > 0` guard makes it once per block, not once per trade.** The first interaction in
+a block writes the accumulator; every later interaction in the same block contributes
+nothing.<Cite src="uniswap-v2-core-pair" /> The documentation states the design intent directly:
+every pair measures — but does not store — the market price at the beginning of each block, before
+any trades take place.<Cite src="uniswap-v2-oracles-docs" />
+
+**Nothing is stored per interval.** The pair keeps one running sum, described as a sum of the price
+for every second in the contract's entire history.<Cite src="uniswap-v2-oracles-docs" /> A consumer
+reads the cumulative value at the start and end of the interval it cares about and divides the
+difference by the interval's length.<Cite src="uniswap-v2-oracles-docs" /> The consumer chooses the
+window; the pool has no opinion about it.
+
+The corollary the documentation spells out is operational and often missed: for a ten-minute average
+you must sample once every ten minutes, and for a one-week average once every
+week.<Cite src="uniswap-v2-oracles-docs" /> The pool stores no history for you. Somebody's contract
+has to have written down the earlier cumulative value.
+
+### What v3 changed
+
+Uniswap v3 keeps an array of observations inside the pool, which removes the need for a consumer to
+checkpoint anything — but introduces a parameter that quietly decides what window you actually get.
+
+Each `Observation` holds a block timestamp, a **tick accumulator** (tick multiplied by time elapsed
+since the pool was initialised), a seconds-per-liquidity accumulator, and an initialised
+flag.<Cite src="uniswap-v3-core-oracle" /> Writes happen at most once per block: if an observation
+already exists for this block timestamp, `write` returns
+early.<Cite src="uniswap-v3-core-oracle" /> Because the accumulated quantity is a tick rather than a
+price, and ticks are logarithmic, the resulting average is a **geometric** mean of prices rather than
+an arithmetic one.<Cite src="uniswap-v3-pos-oracles" />
+
+The parameter is **cardinality**: the number of populated elements in the observation array, tracked
+alongside `cardinalityNext`, the array's length independent of population, which can be grown by
+anyone.<Cite src="uniswap-v3-core-oracle" /> The array is a fixed 65,535
+slots.<Cite src="uniswap-v3-core-oracle" />
+
+<Aside kind="warn">
+This is the failure that produces silent short windows. Ask a pool for a one-hour average and you get
+one only if the observation array still holds an entry from at least an hour ago; if the oldest
+retained observation is more recent, **you get something shorter and nothing tells you
+so**.<Cite src="euler-twap-cost-of-attack" /> The number of initialised observations decides a pool's
+TWAP behaviour as much as, or more than, the window you request — so the actionable step is to
+monitor cardinality as an input to oracle quality, not to assume the requested window is the
+delivered one.<Cite src="euler-twap-cost-of-attack" /> A pool whose cardinality was sized for calm
+conditions can be pushed to overwrite its own history precisely when interactions spike, which is
+during volatility.<Cite src="euler-twap-cost-of-attack" />
+</Aside>
+
+## Worked example: what the window demands of an attacker
+
+Now derive the number the last lesson could not produce: how far the *spot* price must move to shift
+the *average* by a useful amount. Work it on the geometric construction, because that is what a v3
+pool reports.
+
+**Subgoal 1 — write the average as a product.** Over `n` blocks with per-block prices `pᵢ`, the
+geometric mean is the `n`th root of their product.<Cite src="euler-twap-cost-of-attack" />
+
+**Subgoal 2 — split the window into the blocks the attacker controls and the ones they do not.**
+Suppose the spot price is manipulated to `q` for `m` blocks and sits at the market price `p` for the
+remaining `n − m`. Then<Cite src="euler-twap-cost-of-attack" />
+
+```text
+TWAP = ( p^(n−m) · q^m )^(1/n)
+```
+
+**Subgoal 3 — invert it, because the attacker knows the target and needs the input.** Rearranging for
+`q` gives the spot price the attacker must achieve on each manipulated
+block:<Cite src="euler-twap-cost-of-attack" />
+
+```text
+q = ( TWAP^n / p^(n−m) )^(1/m)
+```
+
+**Subgoal 4 — pick a target derived from the victim's parameters, not from a round number.** Euler's
+worked case: a lending market with a 0.75 loan-to-value cap. To borrow even slightly more than
+permitted, the price must move by at least 35%, so the attacker wants a manipulated TWAP of
+1.35.<Cite src="euler-twap-cost-of-attack" /> Take `n = 144` blocks — roughly a thirty-minute window —
+and an initial price of 1.<Cite src="euler-twap-cost-of-attack" />
+
+**Subgoal 5 — evaluate at one block.** With `m = 1` the formula is just `1.35^144`:
+
+```text
+q = 1.35^144 ≈ 5.86 × 10^18
+```
+
+Not a typo, and not a special case. To shift a 144-block geometric average by 35% using a single
+block, that block's price must be raised by eighteen orders of
+magnitude.<Cite src="euler-twap-cost-of-attack" /> There is not enough of most assets in existence to
+do it, and a flash loan does not help, because the attack necessarily spans more than one
+transaction.<Cite src="euler-twap-cost-of-attack" />
+
+**Subgoal 6 — evaluate at ten blocks, and watch the curve collapse.** With `m = 10`, the exponent
+becomes `144/10`:
+
+```text
+q = 1.35^14.4 ≈ 75.3
+```
+
+A seventy-five-fold manipulation — still absurd, but eighteen orders of magnitude
+closer.<Cite src="euler-twap-cost-of-attack" /> At `m = 20` the same formula gives `1.35^7.2 ≈ 8.7`.
+At `m = 72` — half the window, about fifteen minutes — it gives `1.35² ≈ 1.82`, under a
+doubling.<Cite src="euler-twap-cost-of-attack" />
+
+<Matrix
+  numeric
+  corner="Blocks controlled, m"
+  cols={['Exponent 144 / m', 'Spot price q required on each']}
+  rows={[
+    { label: '1', cells: ['1.35^144', { v: '5.86 × 10^18', tone: 'good' }] },
+    { label: '10', cells: ['1.35^14.4', { v: '75.3', tone: 'warn' }] },
+    { label: '20', cells: ['1.35^7.2', { v: '8.7', tone: 'warn' }] },
+    { label: '72 — half the window', cells: ['1.35^2', { v: '1.82', tone: 'danger' }] },
+  ]}
+  caption="Eighteen orders of magnitude separate one controlled block from ten, and nothing about the pool changed between the rows."
+  alt="For a 144-block window and a target manipulated TWAP of 1.35, the spot price required on each controlled block is 5.86 times ten to the eighteenth at one block, 75.3 at ten blocks, 8.7 at twenty blocks, and 1.82 at seventy-two blocks."
+/>
+
+**Subgoal 7 — read the shape, not the individual numbers.** The requirement falls off exponentially
+in the number of blocks controlled. This is the single most important property of the construction
+and it cuts both ways: a TWAP is astronomically expensive against an attacker who can hold the
+distortion for one block, and merely expensive against one who can hold it for a quarter of the
+window. **What a TWAP prices is duration**, and every additional block the attacker can hold is worth
+far more to them than additional capital.
+
+<Misconception
+  belief="A TWAP is safe because it averages out manipulation."
+  reality="It converts a cheap instantaneous attack into an expensive sustained one. The cost is finite, computable from pool depth and window length, and falls exponentially in the number of consecutive blocks the attacker controls."
+  why="'Average' is heard as 'robust', and the exponential relationship between blocks held and price required is invisible until you write the formula down."
+  src="chainsecurity-multiblock-mev"
+/>
+
+### Arithmetic versus geometric is not a detail
+
+The v2 accumulator sums prices; the v3 accumulator sums ticks, which are logarithms of prices. That
+difference decides how much damage a single outlying block can do, and it is worth carrying because
+it explains why the same nominal window behaves differently on the two versions.
+
+An arithmetic mean is dominated by its largest term. ChainSecurity's illustration makes it concrete:
+with a true price of 1 and a 100-block arithmetic average, an attacker who wants the average to read
+2 does not need to hold a price of 2 for all hundred blocks — they can set the price to 101 for a
+single block and leave it at 1 for the other ninety-nine, because `(101 + 99) / 100 = 2`.<Cite src="chainsecurity-multiblock-mev" />
+One block of an extreme value buys the whole distortion.
+
+A geometric mean cannot be dragged that way, which is why v3 oracles are described as much more
+resilient to single-block manipulation than v2 ones.<Cite src="chainsecurity-multiblock-mev" /> The
+`1.35^144` figure above is exactly this resilience expressed as a number. But resilience is not
+immunity, and the same analysis names the escape: the attack can be repeated to create multiple
+outliers, as many times as the attacker controls blocks within one TWAP period, and the capital
+requirement shrinks dramatically with repetition because each individual manipulation can be
+smaller.<Cite src="chainsecurity-multiblock-mev" />
+
+Which returns you to the same variable. Not capital, not depth — **how many blocks in the window the
+attacker gets to choose the contents of**. Everything in the next lesson is about that number.
+
+## The other readout on the same dial
+
+Everything above argues for a longer window. Here is the bill.
+
+The reported price is an average over the past `n` blocks, which means that after any genuine move
+the reported price is a blend of the new world and the old one, and stays a blend for a full window.
+Work a crash on the arithmetic construction, which is easier to compute by hand and directionally
+identical to the geometric one.
+
+An asset falls from 100 to 60 — a 40% move — linearly over ten minutes, then stabilises. The consumer
+reads a thirty-minute average. Sampling once per minute:
+
+| Time | Spot | 30-minute average |
+|---|---|---|
+| End of the crash | 60 | **93.4** |
+| 10 minutes later | 60 | **80.1** |
+| 20 minutes later | 60 | **66.7** |
+| 30 minutes later | 60 | **60.0** |
+
+Trace the first row. The window still contains twenty minutes at 100 and ten minutes averaging 80,
+giving `(20 × 100 + 10 × 80) / 30 = 93.4`. The market has repriced the asset by 40% and the protocol
+believes it fell by 6.6%.
+
+Now put a borrower in it. Suppose their position is liquidatable at 80. On spot they crossed the
+threshold during the crash. On the thirty-minute average they are not liquidatable at the end of the
+crash, not liquidatable ten minutes later — at 80.1 they are exactly at the boundary, ten minutes
+after they should have been seized — and comfortably liquidatable only once most of a window has
+passed. Liquidators cannot act during the window, because the protocol will reject the call. By the
+time the price catches up, the collateral is worth 60 against a debt sized for 80, and the difference
+is [bad debt](/c/liq-bad-debt-threshold) the protocol absorbs.
+
+<Figure
+  caption="The average reaches the liquidation threshold ten minutes after the crash has already finished, and full convergence takes another whole window."
+  alt="An asset falls from 100 to 60 over ten minutes; the consuming protocol reads a thirty-minute average, which stays above the liquidation threshold for a further ten minutes and only converges on the new price thirty minutes after the crash ends."
+>
+  <Timeline
+    from={0}
+    to={40}
+    unit="minutes"
+    ticks={[0, 10, 20, 30, 40]}
+    spans={[
+      { label: 'spot falls 100 → 60', start: 0, end: 10, tone: 'danger', note: 'a 40% move' },
+      { label: 'the protocol refuses the seizure', start: 10, end: 20, tone: 'warn', note: 'its price is still above the threshold' },
+      { label: 'the average is still converging', start: 10, end: 40, tone: 'muted', note: 'one full window behind the market' },
+    ]}
+    marks={[{ at: 20, label: 'average reaches the threshold', tone: 'warn' }]}
+  />
+</Figure>
+
+This is not a hypothetical failure mode invented to balance the argument. The Uniswap Labs study
+names it as the concrete downside of long windows: using a TWAP with a long window makes prices
+smooth but lagging, and the lag is problematic if spot prices naturally jump enough to mint bad debt
+to the protocol.<Cite src="uniswap-v3-pos-oracles" /> Their mitigation is a scoping decision rather
+than a technical one — restrict which assets may be used as collateral so that such jumps are not
+realistic.<Cite src="uniswap-v3-pos-oracles" />
+
+<Misconception
+  belief="Longer TWAP windows are strictly safer."
+  reality="They are strictly harder to manipulate and strictly more wrong during genuine moves. Both effects scale with the same parameter, so there is no window that is good at both."
+  why="Only the manipulation axis is usually discussed, and lag has no incident report attached to it — the loss shows up as bad debt weeks later, attributed to volatility."
+  src="uniswap-v3-pos-oracles"
+/>
+
+### Stating the trade honestly
+
+Window length is one dial with two coupled readouts. Lengthening it raises the number of blocks an
+attacker must control, and raises how far the reported price trails a real move. Shortening it does
+the reverse. There is no setting that is both hard to manipulate and accurate under stress.
+
+What a designer actually chooses is therefore not "the safe window" but **which failure they prefer**,
+and the choice is worth making explicitly because it will otherwise be made by whoever copied a
+constant from a tutorial. Two honest framings:
+
+- *We would rather take bad debt occasionally than be manipulated once.* Long window, tight
+  collateral scope, and a written expectation that gap moves will cost money.
+- *We would rather be manipulable at a computable price than insolvent during a crash.* Short window,
+  and the manipulation cost had better exceed the borrow cap — which is next lesson's arithmetic.
+
+The design that fails is the third one, where nobody chose, the window came from an example
+repository, and the collateral list grew afterwards.
+
+<Check type="explain" concept="orac-twap-lag">
+A perpetual futures venue prices its mark against a 30-minute TWAP of a deep on-chain pool, and its
+funding rate against the same number. A risk reviewer says the TWAP is a good choice because it makes
+the mark expensive to manipulate. A trader says the venue is systematically exploitable and has been
+paying for it since launch.
+
+Explain how both can be right, and say what specifically is being extracted.
+
+<Answer>
+**Both are right because they are talking about different sides of the same lag.** The reviewer is
+correct that shifting a 30-minute geometric average by a useful amount requires holding a distorted
+spot price for a large fraction of the window, and the requirement grows explosively as the number of
+controlled blocks falls.<Cite src="euler-twap-cost-of-attack" /> Nobody is manipulating this mark
+cheaply.
+
+**The trader is describing something that requires no manipulation at all.** During any genuine move
+the mark trails the market — smooth but lagging.<Cite src="uniswap-v3-pos-oracles" /> A trader who
+watches the real market can open a position at a mark that is already known to be wrong, in the
+direction it is known to be wrong, and wait for the average to catch up. That is not an exploit in
+any technical sense: no contract misbehaves, no input is falsified. It is the venue selling
+yesterday's price to someone holding today's.
+
+**What is extracted, precisely.** The difference between the lagging mark and the true price,
+captured by whoever notices the move first, paid for by the venue's counterparties or its insurance
+fund. Because the lag is largest during fast moves, the extraction concentrates exactly when the
+venue is least able to absorb it.
+
+**The funding rate makes it worse, not better.** Funding computed from a lagging mark points in the
+wrong direction for the length of the lag, so the mechanism that is supposed to pull the mark toward
+the index is instead paying traders to sit on the correct side of a known error.
+
+**Why "make the window longer" is the wrong instinct.** It raises manipulation cost and raises the
+extractable lag by the same parameter. The reviewer's control and the trader's opportunity are one
+dial.
+
+**What actually fits this product.** Latency-sensitive marks are the case pull feeds exist for: a
+signed update attached to the transaction, with a tight maximum age, plus a structural rule that a
+position cannot be opened and closed within one block. A time-weighted on-chain price belongs in this
+design as a *sanity cross-check* on the fast source — a bound that catches a wild value — rather than
+as the source of truth. That is the pattern the rest of the module builds.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The next lesson** prices the attack this one only described. It combines the `Δx = √(k · q) − x`
+from the spot lesson with the `q` formula derived here, produces a dollar figure per manipulated
+block, and then examines the assumption the whole construction rests on: that somebody gets to trade
+against the attacker in between.<Cite src="chainsecurity-multiblock-mev" />
+
+**The aggregation question** returns there too — whether combining several pools helps, and why the
+weights matter more than the count.<Cite src="arxiv-manipulation-cost-2026" />
+
+**The hardening lesson** uses a TWAP the way most 2026 protocols now do: not as the primary source,
+but as the bound that a fast feed must agree with.
+
+**Reviewing a TWAP integration tomorrow.** Three questions. What window is actually delivered, given
+the pool's observation cardinality?<Cite src="uniswap-v3-core-oracle" /> What does the reported price
+say during a 40% gap, computed rather than guessed? And which of the two failures did the team choose
+— because if they cannot tell you, they did not choose.

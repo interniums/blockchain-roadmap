@@ -1,0 +1,264 @@
+---
+id: fundamentals-networks-the-mempool-you-imagine
+authorship: authored
+verifiedAt: "2026-08-25"
+volatility: evolving
+sources: [devp2p-eth-wire, geth-cli-options, tikuna-monitoring]
+stack: {}
+---
+
+`eth_sendRawTransaction` returned a hash. Your UI now says "pending". Where is the transaction?
+
+The picture almost everyone starts with is a queue: one shared waiting room, transactions lined up,
+the next block taking some from the front. Every part of that picture is wrong, and each wrong part
+produces a specific bug in production software. This lesson replaces it.
+
+The accurate one-sentence version: **your transaction is in the memory of one process, which will
+mention it to a few of its peers, which may or may not keep it.**
+
+<Compare
+  caption="Every guarantee in the left column is a promise the real pool never made."
+  alt="The imagined shared queue set against the transaction pool that actually exists, compared by how many there are, what decides the order, what being in one promises, whether something can leave without being included, and what absence proves."
+  axis="Question"
+  columns={[
+    { title: 'The queue you imagine', note: 'one shared waiting room' },
+    { title: 'The pool that exists', note: 'one process, bounded memory', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'How many are there?', cells: ['One, shared by the network', 'One per node, none of them authoritative'] },
+    { label: 'What decides the order?', cells: ['Arrival time', 'Whoever builds the block'] },
+    { label: 'What does being in it promise?', cells: ['A place in a coming block', 'Nothing'] },
+    { label: 'Can something leave without being included?', cells: ['No', 'Eviction, expiry or replacement'] },
+    { label: 'What does absence prove?', cells: ['The network rejected it', 'That the node you asked does not hold it'] },
+  ]}
+/>
+
+## What "the mempool" actually is
+
+The `eth` wire specification describes it in a single sentence that is worth reading slowly: client
+implementations keep track of the set of pending transactions in the transaction pool, and the pool
+"is subject to client-specific limits and can contain many (i.e. thousands of)
+transactions".<Cite src="devp2p-eth-wire" />
+
+Three claims in one sentence.
+
+**"Client implementations keep track"** — the pool is a per-client data structure, not a protocol
+object. Nothing in consensus refers to it. No block commits to it. Two clients can hold entirely
+different pools and both be flawlessly correct.
+
+**"Client-specific limits"** — bounded, and bounded differently per implementation and per operator.
+
+**"Thousands of"** — small enough that eviction is a routine event, not an emergency.
+
+There is no global pool. There is a set of local caches which, by continuous exchange, drift toward
+resembling each other and never arrive.
+
+## How a transaction gets from your node to anyone else's
+
+The propagation model is announce-then-fetch, and it is worth knowing precisely because its failure
+modes are visible from the outside.
+
+When a transaction enters a node's pool, the node relays it two ways. Complete transaction objects go
+in a `Transactions` message to a small, random fraction of connected peers. Everyone else gets a
+`NewPooledTransactionHashes` announcement — hashes, sizes, and types, no
+payloads.<Cite src="devp2p-eth-wire" /> A peer that sees an unfamiliar hash asks for the body with
+`GetPooledTransactions` and receives it in `PooledTransactions`.<Cite src="devp2p-eth-wire" />
+
+<Figure
+  caption="Most peers never receive your transaction — they receive a hash, and have to spend a round trip asking for the rest."
+  alt="Node A sends complete transaction objects in a Transactions message to a few random peers, and sends only hashes in a NewPooledTransactionHashes announcement to everyone else. Node B, holding only a hash, sends GetPooledTransactions to node A and receives the bodies back in PooledTransactions."
+>
+  <Flow
+    lanes={['the node that has it', 'two audiences', 'the fetch', 'the answer']}
+    nodes={[
+      { id: 'a', label: 'node A', note: 'holds the transaction', col: 0, tone: 'accent' },
+      { id: 'few', label: 'a few random peers', note: 'Transactions (0x02)', col: 1 },
+      { id: 'rest', label: 'everyone else', note: 'NewPooledTransactionHashes (0x08)', col: 1, tone: 'muted' },
+      { id: 'ask', label: 'node B asks', note: 'GetPooledTransactions (0x09)', col: 2, tone: 'warn' },
+      { id: 'send', label: 'node A answers', note: 'PooledTransactions (0x0a)', col: 3 },
+    ]}
+    edges={[
+      { from: 'a', to: 'few', label: 'full objects' },
+      { from: 'a', to: 'rest', label: 'hashes only' },
+      { from: 'rest', to: 'ask' },
+      { from: 'ask', to: 'send' },
+    ]}
+  />
+</Figure>
+
+Two rules keep this from turning into a flood. A node must never resend the same transaction to a
+peer within a session, and must never relay a transaction back to the peer it received it
+from.<Cite src="devp2p-eth-wire" /> In practice clients track this with a per-peer set or bloom filter
+of hashes.<Cite src="devp2p-eth-wire" />
+
+The message sizes tell you the intended scale: the recommended soft limit for an announcement is 4096
+items — roughly 150 KiB — and for a fetch request, 256 hashes, about 8 KiB.<Cite src="devp2p-eth-wire" />
+This is a chatty, incremental reconciliation protocol between caches, not a delivery system.
+
+<Aside kind="note">
+The `eth` spec adds an instruction that reveals what clients actually optimise for: nodes should
+announce hashes the remote peer probably does not know, but "it is better to return more transactions
+than to have a nonce gap in the pool".<Cite src="devp2p-eth-wire" /> A pool with a hole in an
+account's nonce sequence cannot execute anything after the hole, so redundant bandwidth is the
+cheaper mistake.
+</Aside>
+
+## The pool is a bounded cache with an admission policy
+
+Now the part that generates support tickets. A pool is not a container that holds what you put in it.
+It is a cache with capacity limits, eviction, expiry and a price floor — all configurable.
+
+go-ethereum's documented defaults make the shape concrete:<Cite src="geth-cli-options" />
+
+```text
+--txpool.globalslots   = 5120     executable slots, shared by all accounts
+--txpool.globalqueue   = 1024     non-executable slots (e.g. behind a nonce gap)
+--txpool.accountslots  = 16       executable slots guaranteed per account
+--txpool.lifetime      = 3h0m0s   how long a non-executable transaction is queued
+--txpool.pricelimit    = 1        minimum tip accepted into the pool
+--txpool.pricebump     = 10       percent fee bump required to replace a transaction
+```
+
+Look at the first row against the second sentence of this lesson. Roughly five thousand executable
+slots, shared across every account on Earth that is trying to transact through this node. During
+congestion that ceiling binds, and something has to go.
+
+Note also the split between *executable* and *non-executable*. A transaction whose nonce follows
+directly from the account's current nonce is executable; one that arrives with a gap in front of it
+is parked in the smaller queue with a three-hour clock on it.<Cite src="geth-cli-options" /> Send
+nonce 8 before nonce 7 and you have not scheduled anything — you have consumed one of 1024 shared
+parking slots and started a timer.
+
+<Aside kind="warn">
+Blob-carrying transactions use a **separate pool with different rules**. go-ethereum documents
+`--blobpool.pricebump` at 100, against 10 for the ordinary pool<Cite src="geth-cli-options" /> —
+replacing a blob transaction requires doubling the fee, not raising it a tenth. Tooling written
+against ordinary-pool assumptions mishandles this quietly.
+</Aside>
+
+### A number you should not repeat as a protocol rule
+
+That `pricebump` default deserves an explicit caution, because it is the single most commonly
+misquoted figure in this area.
+
+The replacement threshold is widely cited as 10%, and also widely cited as 12.5%; sources disagree,
+and the cross-client picture has not been established. What is verifiable is narrower and more
+useful: go-ethereum documents its own default as 10, as a command-line flag with a configurable
+value.<Cite src="geth-cli-options" /> It is not in any EIP. It is not a consensus rule. An operator
+can change it, another client can pick a different number, and a release can move it.
+
+Write code that reads the threshold from behaviour or configuration, not from a constant you
+remember.
+
+## Nothing here is a queue
+
+With the mechanics in place, take the word "queue" apart deliberately.
+
+**Not FIFO.** Nothing orders the pool by arrival. Order of arrival is not even well defined across
+nodes — the previous lesson showed you why.
+
+**Not a schedule.** Being in a pool is not a claim on any future block. The `eth` protocol's own
+framing of the pool's purpose is that transactions are relayed onward to whoever builds blocks, who
+then "pick them for inclusion".<Cite src="devp2p-eth-wire" /> *Pick* is the operative verb. The pool
+is an input to a selection, and the selection is made by the builder using its own criteria.
+
+**Not shared.** Two nodes hold two different sets. A transaction can sit in one pool and be entirely
+absent from another for its whole life — because the announcement never reached that node, or reached
+it and was rejected on price, or was evicted under pressure.
+
+**Not durable.** Transactions leave pools for reasons that have nothing to do with the network
+rejecting them: eviction when capacity binds, expiry after the lifetime, or replacement by another
+transaction with the same nonce.
+
+<Misconception
+  belief="The mempool is a global waiting room, and transactions leave it in order."
+  reality="It is a per-node cache with per-client admission and eviction policy. Ordering within a block is chosen by whoever builds the block, not by the pool's arrival order."
+  why="Block explorers render a single 'pending transactions' list. That list is one node's pool at one instant, presented with the same authority as confirmed on-chain data — which makes it look like the queue rather than a sample of one participant's view."
+  src="devp2p-eth-wire"
+/>
+
+## "It disappeared" almost never means what you think
+
+The specification anticipates the confusing case directly. It is explicitly permissible for a node to
+announce a transaction via `NewPooledTransactionHashes` and then refuse to serve it when asked —
+because it may have been included in a block and dropped from the pool in between announcement and
+request.<Cite src="devp2p-eth-wire" />
+
+So a monitoring system watching one node can observe: hash announced, hash requested, request refused.
+That trace is compatible with the transaction being *confirmed*. It is also compatible with eviction.
+From the announcement alone you cannot tell.
+
+Before concluding that a transaction was dropped, distinguish four different events:
+
+1. **It was included.** Check the chain, not the pool. The pool is the wrong instrument.
+2. **It was evicted.** Capacity bound and it was not competitive on price.
+3. **It expired.** Non-executable, waiting on a nonce gap, past the lifetime.
+4. **It was replaced.** Something else with the same nonce cleared the price bump.
+
+Only the first is terminal in the good sense, and none of the four are "the network rejected it" —
+that is not an event the network has.
+
+## Consequences for anything you build
+
+**"Pending" is a per-source observation.** When you query pending state through a provider, you learn
+what one of that provider's nodes currently holds. A second provider can legitimately answer
+differently. If your UI says "pending", the honest expansion is "one node we asked had it a moment
+ago".
+
+**Absence proves nothing.** Not finding a transaction in a pool tells you that this node does not
+have it. It does not tell you the transaction does not exist, and it does not tell you the
+transaction will not be included. Absence of evidence is the native condition of a peer-to-peer
+overlay.
+
+**The pool is a public surface.** Everything above assumes you *want* your transaction spread to
+peers, and the protocol obliges enthusiastically. Anyone running a node sees announcements for
+transactions that have not executed yet. Security research treats pool and peer-message traces as an
+observable data stream and builds monitoring on it.<Cite src="tikuna-monitoring" /> That visibility is
+a design property, not a leak — and it is the ground floor of the extractable-value material later in
+the curriculum.
+
+<Check type="spot-bug" concept="mempool-is-not-a-queue">
+A team ships this rule in their backend: after submitting a transaction, poll `eth_getTransactionByHash`
+against their RPC provider every 5 seconds. If three consecutive polls return `null`, mark the
+transaction **failed**, tell the user it did not go through, and re-submit with a fresh nonce.
+
+Name the ways this loses money, and give the rule that replaces it.
+
+<Answer>
+**Three independent failure modes, all of which occur routinely.**
+
+*It never entered that provider's node.* The provider you submitted through and the provider you are
+polling may not be the same node, and even one node's pool is a cache. A `null` means "the node I
+asked has no record of this hash", which is a statement about that node.
+
+*It is propagating.* Within the first seconds the transaction may be held by peers this node has not
+reconciled with. Fifteen seconds of `null` is a completely ordinary observation for a live
+transaction.
+
+*The re-submit is the expensive part.* "A fresh nonce" is the bug that costs money. The original
+transaction is still alive somewhere. If it lands, and the replacement also lands under a later
+nonce, both execute. For a payment, the user pays twice.
+
+**The replacement rule:** never treat pool absence as a terminal state. A transaction's outcome is
+determined on-chain and nowhere else — poll for a receipt, and consider the account nonce as the
+authority on whether that slot was consumed. If you must give up, do it by **replacing the same
+nonce** with a transaction that clears the client's price bump, not by issuing a new one. Replacing
+the nonce makes the two candidates mutually exclusive; issuing a new nonce makes them additive.
+</Answer>
+</Check>
+
+## Where this pays off
+
+The mempool's local, policy-driven nature is the hinge for several later topics.
+
+**Transaction lifecycle states.** "Submitted", "pending", "included" and "final" are four different
+claims with four different pieces of evidence behind them. This lesson supplies the evidence for the
+first two, and explains why neither is a promise.
+
+**Provider consistency hazards.** Once you accept that pending state is per-node, the rule for
+multi-provider architectures writes itself: never let a decision depend on two providers agreeing
+about anything that is not on-chain.
+
+**Extractable value.** Every mechanism in that literature starts from two facts you now have — the
+pool is public, and inclusion order is the builder's choice rather than the pool's. Nothing there is
+a new mechanism. It is this lesson, monetised.

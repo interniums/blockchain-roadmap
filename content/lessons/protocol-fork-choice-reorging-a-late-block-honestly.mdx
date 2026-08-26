@@ -1,0 +1,274 @@
+---
+id: protocol-fork-choice-reorging-a-late-block-honestly
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [fork-choice-spec, fc-config-mainnet-v161, fc-phase0-beacon-chain-v161, fc-phase0-validator-v161, monnot-reorg-post]
+stack: {}
+---
+
+The previous lesson ended with a proposer building on its grandparent to steal a block. This one is
+about a proposer building on its grandparent because the specification tells it to.
+
+Same action. Same shape on the chain. Same orphaned block. The difference is eight conditions, and
+learning them is worth more than the mechanism itself, because each one is a named answer to a
+specific way the manoeuvre could be abused — which makes `get_proposer_head` the best short catalogue
+of fork-choice attack surface anywhere in the spec.
+
+Start with the case for the rule at all. A block that arrives after its slot's attestation deadline
+gets few attestations, because attesters have already voted for its parent. It is a weak block sitting
+at the head, and the next proposer has two options: extend it and inherit a chain whose tip nobody
+supports, or build on the parent that the attesters actually voted for. The second is arguably what
+the votes already said. The rule makes that reading explicit and gates it heavily.
+
+## The eight conditions, and what each one forecloses
+
+```python
+def get_proposer_head(store: Store, head_root: Root, slot: Slot) -> Root:
+    head_block = store.blocks[head_root]
+    parent_root = head_block.parent_root
+    parent_block = store.blocks[parent_root]
+
+    head_late = is_head_late(store, head_root)
+    shuffling_stable = is_shuffling_stable(slot)
+    ffg_competitive = is_ffg_competitive(store, head_root, parent_root)
+    finalization_ok = is_finalization_ok(store, slot)
+    proposing_on_time = is_proposing_on_time(store)
+
+    parent_slot_ok = parent_block.slot + 1 == head_block.slot
+    current_time_ok = head_block.slot + 1 == slot
+    single_slot_reorg = parent_slot_ok and current_time_ok
+
+    assert store.proposer_boost_root != head_root  # ensure boost has worn off
+    head_weak = is_head_weak(store, head_root)
+    parent_strong = is_parent_strong(store, parent_root)
+
+    if all([head_late, shuffling_stable, ffg_competitive, finalization_ok,
+            proposing_on_time, single_slot_reorg, head_weak, parent_strong]):
+        return parent_root
+    else:
+        return head_root
+```
+
+<Cite src="fork-choice-spec" />
+
+Take them one at a time. Each is a door an attacker would otherwise walk through.
+
+**`head_late` — the block missed its own deadline.** `is_head_late` is simply
+`not store.block_timeliness[head_root]`,<Cite src="fork-choice-spec" /> and timeliness was recorded in
+`on_block` as "arrived during its own slot and before the attestation
+deadline".<Cite src="fork-choice-spec" /> Without this condition the rule would authorise reorging any
+block at all, which is the ex-post attack with a specification behind it.
+
+**`shuffling_stable` — not on an epoch boundary.** `slot % SLOTS_PER_EPOCH != 0`, with
+`SLOTS_PER_EPOCH` = 32.<Cite src="fork-choice-spec" /><Cite src="fc-phase0-beacon-chain-v161" /> The
+spec's stated reason is that the proposer shuffling could change at an epoch
+boundary.<Cite src="fork-choice-spec" /> Reorging across a boundary would let a proposer alter which
+validators get to propose next, which is a far larger prize than one block.
+
+**`ffg_competitive` — the switch does not cost justification.** The unrealized justification of the
+head must equal that of the parent.<Cite src="fork-choice-spec" /> Without it, an honest-looking reorg
+could drop a block whose branch was about to justify a checkpoint, converting a head-level tidy-up
+into a finality-level attack.
+
+**`finalization_ok` — the chain is healthy.** `epochs_since_finalization` must be at most
+`REORG_MAX_EPOCHS_SINCE_FINALIZATION` = 2.<Cite src="fork-choice-spec" /><Cite src="fc-config-mainnet-v161" />
+When finality is already struggling, the rule turns itself off. Deliberate reorgs are a luxury
+affordable only when the chain is otherwise settling.
+
+**`proposing_on_time` — the reorging proposer is not itself late.** `time_into_slot_ms` must be at most
+`get_proposer_reorg_cutoff_ms`, which is `PROPOSER_REORG_CUTOFF_BPS` = 1667 basis points of
+`SLOT_DURATION_MS` = 12000 — roughly 17% of the slot, about two
+seconds.<Cite src="fork-choice-spec" /><Cite src="fc-config-mainnet-v161" /> Note this is *tighter*
+than the four-second attestation deadline.<Cite src="fc-phase0-validator-v161" /> A proposer that wants
+to orphan someone else's late block must be conspicuously early with its own. A late block replacing a
+late block would just move the problem.
+
+**`single_slot_reorg` — exactly one block, no more.** Two equalities: the parent is one slot before the
+head, and the head is one slot before now.<Cite src="fork-choice-spec" /> The rule cannot be chained
+into depth, and it cannot be applied retroactively to a block from several slots ago.
+
+**`head_weak` — the block being dropped has almost no support.** `get_weight(head)` must be less than
+`calculate_committee_fraction(justified_state, REORG_HEAD_WEIGHT_THRESHOLD)` with the threshold at
+20.<Cite src="fork-choice-spec" /><Cite src="fc-config-mainnet-v161" /> Convert it: 20% of one slot's
+committee, and one committee is 1/32 of total active stake, so the head must hold **less than 0.625% of
+total stake**. That is a genuinely abandoned block, not a merely unlucky one.
+
+**`parent_strong` — and the votes really did go where they appear to have gone.** `get_weight(parent)`
+must exceed the same fraction computed with `REORG_PARENT_WEIGHT_THRESHOLD` =
+160.<Cite src="fork-choice-spec" /><Cite src="fc-config-mainnet-v161" /> That is 160% of a committee —
+more than one slot's entire attester weight — so **more than 5% of total stake**, which requires
+attesters from multiple slots to have converged on the parent.
+
+<Figure
+  caption="The parent-strength floor sits above a whole slot's committee, so one slot's attesters cannot meet it on their own. That is what separates votes that went to the parent from votes that are being hoarded."
+  alt="Four quantities as shares of total active stake: the head-weakness ceiling at 0.625 percent, the proposer boost at 1.25 percent, one slot's committee at 3.125 percent, and the parent-strength floor at 5 percent."
+>
+  <Bars
+    unit="% of total active stake"
+    axisLabel="share of the whole validator set"
+    items={[
+      { label: 'head_weak ceiling — 20% of a committee', value: 0.625, display: '0.625%', tone: 'danger' },
+      { label: 'proposer boost — 40% of a committee', value: 1.25, display: '1.25%', tone: 'warn' },
+      { label: 'one slot’s committee — 1/32 of the set', value: 3.125, display: '3.125%', tone: 'muted' },
+      { label: 'parent_strong floor — 160% of a committee', value: 5, display: '5%', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+The spec's comment on that last one is the most instructive line in the function: it is there to check
+that the missing votes are assigned to the parent **and not being hoarded**.<Cite src="fork-choice-spec" />
+Sit with that. A weak head is consistent with two stories: the block was late and the attesters
+honestly voted for its parent, or an adversary withheld attestations it intends to release. The first
+story implies a strong parent; the second does not, because the hoarded votes are not anywhere yet.
+`parent_strong` is a test that distinguishes the two, and it is precisely a defence against being
+tricked into performing the honest reorg on behalf of an ex-ante attacker.
+
+<Figure
+  caption="Two deadlines inside one slot, and the reorging proposer is held to the earlier one. A block only had to beat the 33% mark to count as timely; a proposer that wants to orphan it must beat the 17% mark itself."
+  alt="A twelve-second slot with two windows measured from its start: the proposer-reorg cutoff at 1667 basis points, about two seconds, and the attestation deadline at 3333 basis points, about four seconds. At the end of the slot the proposer boost is cleared."
+>
+  <Timeline
+    from={0}
+    to={12}
+    unit="seconds"
+    ticks={[0, 2, 4, 12]}
+    marks={[{ at: 12, label: 'slot ends; boost cleared', tone: 'muted' }]}
+    spans={[
+      { label: 'the reorging proposer must publish inside this', start: 0, end: 2, tone: 'good', note: 'PROPOSER_REORG_CUTOFF_BPS = 1667' },
+      { label: 'a block arriving after this is not timely', start: 0, end: 4, tone: 'warn', note: 'ATTESTATION_DUE_BPS = 3333' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="note">
+The `assert store.proposer_boost_root != head_root` sits outside the `all([...])` list, with the
+comment "ensure boost has worn off".<Cite src="fork-choice-spec" /> It guards against evaluating the
+head's weakness while the head still carries its own 1.25%-of-total-stake
+boost<Cite src="fork-choice-spec" /><Cite src="fc-config-mainnet-v161" /> — which would make
+`is_head_weak` compare against an inflated number. The spec also notes that the ordering of conditions
+is a suggestion only and implementations are free to reorder from least to most expensive and return
+early.<Cite src="fork-choice-spec" /> So the *order* you read is pedagogical, not normative; the
+*conjunction* is the rule.
+</Aside>
+
+## The word that changes how you should talk about this
+
+Directly above the helpers, the spec says: **_Implementing these helpers is
+optional_**.<Cite src="fork-choice-spec" />
+
+That single italicised line has consequences that outrun the mechanism.
+
+**There is no network-wide behaviour to describe.** Whether a late block gets reorged depends on which
+client the *next* proposer runs, which version it runs, and whether that client exposes the behaviour
+behind a flag and whether the operator turned it on. Two proposers in consecutive slots can behave
+differently and both be conformant.
+
+**The thresholds you just read are the spec's configuration, not a guarantee about any node.** A client
+is free to implement the rule with its own gating, or to implement part of it, or none. Reading
+`REORG_HEAD_WEIGHT_THRESHOLD` = 20 out of `configs/mainnet.yaml`<Cite src="fc-config-mainnet-v161" />
+tells you what the spec says; it does not tell you what the proposer in slot `n+1` will do.
+
+**Therefore: do not teach or assume a rate.** How often late blocks are reorged in practice is an
+empirical question about a heterogeneous deployed population, and it moves whenever a major client
+changes a default. That measurement is exactly what this module's counting exercise asks you to make
+against a beacon API rather than take from an article — including the base rate of *missed* slots,
+which dominates.
+
+**And there is precedent for the risk that optionality creates.** An uneven rollout of a fork-choice
+change across clients is not hypothetical harm: it is one of the three named causes of the seven-block
+mainnet reorg of 25 May 2022, where some validators applied proposer boost and some did not and the
+votes split roughly in half for seven consecutive slots.<Cite src="monnot-reorg-post" /> A rule that is
+optional by design is a rule whose adoption curve is part of its security analysis.
+
+<Misconception
+  belief="A proposer that builds on the grandparent instead of the parent is attacking the chain."
+  reality="It may be following an optional rule in the fork-choice specification that deliberately orphans a block which arrived after its own attestation deadline and gathered almost no weight, provided seven other conditions also hold."
+  why="Every reorg looks like an attack from a block explorer, and the on-chain artefact of an ex-post reorg and of the honest late-block rule is identical. What separates them is whether the gating conditions held — which is checkable, and is not what most observers check."
+  src="fork-choice-spec"
+/>
+
+<Misconception
+  belief="The reorg thresholds are protocol rules, so every client behaves the same way."
+  reality="The spec states outright that implementing these helpers is optional. Behaviour depends on the client the next proposer runs, its version, and its configuration."
+  why="Everything else in `fork-choice.md` is normative, and constants in a configuration file read as binding. This block is the exception, and the exception is one italicised line easily skipped."
+  src="fork-choice-spec"
+/>
+
+<Check type="spot-bug" concept="honest-reorg-of-late-blocks">
+A monitoring service you maintain raises an alert whenever a proposer builds on a grandparent. The
+alert text reads: "Possible ex-post reorg attack by proposer of slot N."
+
+Over a week it fires eleven times. A junior engineer proposes suppressing it entirely, on the grounds
+that it is always the honest late-block rule. Find the flaw in the alert as written, the flaw in the
+proposed fix, and say what the check should actually compare.
+
+<Answer>
+**The flaw in the alert is that its condition does not discriminate.** Building on a grandparent is the
+observable of both the attack and the specified honest rule — the rule's own return value is
+`parent_root` where `parent_root` is the *head's* parent, so the new block's parent is the orphaned
+block's parent.<Cite src="fork-choice-spec" /> A detector whose signal is present in both the benign
+and malicious case is not a detector; it is a counter with an accusatory label. And the label is the
+worse half: it names a proposer as an attacker on evidence that is consistent with correct software.
+
+**The flaw in the proposed fix is that it assumes the conclusion.** "It is always the honest rule" is
+the claim the alert was supposed to test. Suppress it and you lose the only place in your stack where a
+genuine ex-post reorg would have shown up at all — and an ex-post reorg needs no equivocation, no
+withholding and no unusual network position, so nothing else in your monitoring will see it either.
+
+**What the check should compare is the gating conditions, because they are the entire difference.**
+For each grandparent-build, evaluate whether the orphaned block satisfied what the rule requires:
+
+*Was the orphaned block late?* Timeliness is a per-node judgement recorded against the attestation
+deadline in the receiving node's own store,<Cite src="fork-choice-spec" /> so record *your* node's
+observation and label it as such. If your node saw it comfortably on time, that is the signal.
+
+*Was the orphaned block weak?* The rule requires head weight below 20% of a committee — under 0.625%
+of total active stake.<Cite src="fork-choice-spec" /><Cite src="fc-config-mainnet-v161" /> A block that
+was orphaned while holding substantially more than that was not eligible.
+
+*Was the parent strong?* The rule requires parent weight above 160% of a committee, more than 5% of
+total stake.<Cite src="fork-choice-spec" /><Cite src="fc-config-mainnet-v161" /> This is the condition
+that distinguishes "the votes went to the parent because the head was late" from "the votes are being
+hoarded",<Cite src="fork-choice-spec" /> and it is the most informative of the three.
+
+*Was it a single slot, off an epoch boundary, with finalization within two epochs, and was the new
+block itself published inside the ~17% cutoff?*<Cite src="fork-choice-spec" /><Cite src="fc-config-mainnet-v161" />
+Any of these failing means the rule as specified would not have fired.
+
+**Then fix the alert's wording, because it is making a claim it cannot support.** The honest text is
+mechanical: "Slot N built on grandparent. Orphaned block: timely per this node, weight X% of stake.
+Parent weight Y%. Conditions for the specified late-block reorg rule: not met — head was timely." That
+sentence is reviewable. "Attack by proposer" is not, and it is one screenshot away from a public
+accusation your data cannot back.
+
+**One caveat to keep the report honest.** Even a full condition match does not prove benign intent. The
+conditions are what an honest client checks; an adversary is free to wait for a genuinely late, genuinely
+weak block and reorg it for exactly the reasons the rule permits, taking the MEV as a bonus. And because
+implementing these helpers is optional,<Cite src="fork-choice-spec" /> a *failure* to reorg an eligible
+block is equally uninformative — it may simply be a client that never implemented it. What the check
+buys you is a clean separation between "consistent with the specified rule" and "not consistent with
+it", and only the second is worth anyone's attention.
+</Answer>
+</Check>
+
+## What this unlocks
+
+- **Eight conditions as a threat-model checklist.** `get_proposer_head` is the densest enumeration of
+  fork-choice abuse vectors in the spec, and each condition names one:<Cite src="fork-choice-spec" />
+  epoch-boundary shuffling manipulation, justification loss, chained depth, hoarded votes, boost
+  self-inflation. When you evaluate any proposed fork-choice change, walk this list and ask which
+  condition the change would need.
+- **Two numbers you can now compute for any validator set.** Head weakness is 0.625% of total stake and
+  parent strength is 5%, derived from 20 and 160 percent of a committee where a committee is 1/32 of
+  the set.<Cite src="fc-config-mainnet-v161" /><Cite src="fc-phase0-beacon-chain-v161" /> Both are
+  measurable against a live beacon API.
+- **"Optional" as a first-class property.** You now have a concrete case where the spec deliberately
+  declines to mandate behaviour, and where the resulting heterogeneity is itself a documented source of
+  a mainnet incident.<Cite src="monnot-reorg-post" /> Whenever a consensus rule is optional, adoption
+  is part of its analysis.
+- **Next: what would remove the need for all of this.** Every mechanism in this module so far exists
+  because there is a gap between a block being proposed and it being settled. The next lesson is about
+  designs that shrink that gap to almost nothing — and about how carefully their status has to be
+  stated, because none of them is scheduled.

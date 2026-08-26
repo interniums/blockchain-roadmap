@@ -1,0 +1,307 @@
+---
+id: evm-execution-a-call-is-a-new-machine
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    execution-specs,
+    execution-specs-osaka-interpreter,
+    execution-specs-osaka-system,
+    execution-specs-osaka-gas,
+    eip-150,
+    eip-2929,
+    solidity-layout-memory,
+    solidity-docs-contracts,
+    measured-gas-constants,
+  ]
+stack: {}
+---
+
+Two changes that look like refactors, both of which change behaviour.
+
+In the first, a team pulls a helper out of a large contract into a small one "for modularity". The
+signature is unchanged, the tests pass, and gas triples. Most of the increase lands in one function,
+the one that takes a `bytes memory` argument.
+
+In the second, an engineer changes `validate(order)` to `this.validate(order)` so it can be wrapped in
+a `try`/`catch`. The function body is untouched, and it now fails its own `onlyOwner` check — because
+the caller it sees is no longer the user who sent the transaction. It is the contract itself.
+
+Both are the same discovery arriving from different directions. In your language, moving a function
+across a file boundary is free and calling it through a reference is the same call. Here, the
+boundary between two contracts is not an organisational line. It is a machine boundary, and crossing
+it starts a second machine.
+
+## What a frame actually is
+
+The specification's `Evm` structure is the honest answer to "what is a call frame", because it is
+literally the state of one running machine.<Cite src="execution-specs-osaka-interpreter" /> Reduced to
+the fields that matter here, a frame holds:
+
+| field | what it is | lifetime |
+|---|---|---|
+| `pc` | the program counter | this frame |
+| `stack` | the operand stack, up to 1024 words | this frame |
+| `memory` | a byte array, freshly zeroed | this frame |
+| `code` | the bytes being executed | this frame |
+| `gas_left` | a budget carved out of the caller's | this frame |
+| `valid_jump_destinations` | the jump table computed at entry | this frame |
+| `return_data` | output of the most recent sub-call | this frame |
+| `message` | caller, target, value, calldata, depth | this frame |
+| `accessed_addresses`, `accessed_storage_keys` | the warm sets | copied in, merged out on success |
+| `logs`, `refund_counter`, `accounts_to_delete` | pending effects | merged out on success |
+
+Every entry in the first group is created when the frame opens and destroyed when it closes. Nothing
+in that group is shared with the caller, the callee, or anything else. When a `CALL` executes, a new
+`Evm` is constructed with `pc=Uint(0)`, `stack=[]`, `memory=bytearray()` — an empty machine, not a
+continuation of yours.<Cite src="execution-specs-osaka-interpreter" />
+
+<Misconception
+  belief="An external call is a function call, so it behaves like one — shared memory, shared locals, exceptions that propagate."
+  reality="It is closer to sending a message to a separate process. Nothing is shared implicitly. The only things that cross are bytes you explicitly copy in, bytes explicitly copied out, and effects on the world state."
+  why="Solidity deliberately makes `token.transfer(x)` and `_transfer(x)` look identical, because the alternative — a distinct syntax for a machine boundary — was judged worse for readability. The cost is that the single most consequential distinction in the language is invisible at the call site."
+  src="execution-specs"
+/>
+
+## What actually crosses the boundary
+
+Exactly three things, and it is worth being able to recite them.
+
+**Calldata goes in, by copying.** The caller names a region of *its own* memory; those bytes are read
+out and become the callee's `data`.<Cite src="execution-specs-osaka-system" /> The callee sees them
+as [read-only calldata](/c/calldata-is-read-only) starting at offset zero of its own address space.
+The caller's offsets mean nothing on the other side.
+
+**Return data comes out, by copying, and possibly truncated.** When the sub-call finishes, the
+caller's `CALL` also names a region of its memory to receive output. The specification writes
+`child_evm.output[:actual_output_size]` where `actual_output_size = min(memory_output_size, len(output))`.<Cite src="execution-specs-osaka-system" />
+Read that carefully: if the callee returns *fewer* bytes than the caller reserved, the remainder of
+the caller's buffer is not zeroed. It keeps whatever was there. This is a real source of bugs in
+hand-written assembly, and it is why the `RETURNDATASIZE` opcode exists rather than "the size you
+asked for".
+
+**Effects on the world state, journalled.** Storage writes, balance changes, logs, nonce increments
+and the accessed-address sets are made against a snapshot taken when the frame opened. On success
+they are incorporated into the caller; on failure `restore_tx_state` puts everything
+back.<Cite src="execution-specs-osaka-interpreter" />
+
+That last point has a consequence the gas lesson in the previous module already flagged from the
+other side. Because the child's warm sets are *copied in* and only merged back on success, a call
+that reverts also gives back the warmth it paid for. Retry the same call and every cold charge is
+paid again.<Cite src="eip-2929" />
+
+<Figure
+  caption="The callee's machine starts at zero in every field the caller cares about; the only continuity is bytes somebody paid to copy."
+  alt="A CALL copies a region of the caller's memory out as calldata, constructs a new frame with program counter zero, an empty stack and a freshly zeroed memory array, and on return copies the output back into a caller-named buffer truncated to the smaller of the size reserved and the size returned."
+>
+  <Flow
+    lanes={['caller', 'going in', 'callee', 'coming back']}
+    nodes={[
+      { id: 'a', label: 'caller frame', note: 'its memory, its pc', col: 0, tone: 'accent' },
+      { id: 'copy', label: 'copy calldata', note: 'out of caller memory', col: 1 },
+      { id: 'b', label: 'a new machine', note: 'pc 0, empty stack, zeroed memory', col: 2, tone: 'accent' },
+      { id: 'ret', label: 'copy output back', note: 'min(size asked, size returned)', col: 3, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+## Memory belongs to the frame, and dies with it
+
+Of everything in that table, memory is the field that most often breaks an intuition, because in
+every other environment you have worked in there is one heap.
+
+Here each frame allocates its own [flat byte array](/c/memory-is-a-flat-byte-array), zero-initialised,
+growing on demand and priced with a [quadratic term](/c/memory-expansion-quadratic) that never
+shrinks within the frame. A callee cannot read the caller's memory. The caller cannot read the
+callee's. When the frame ends, the array is gone — there is no free, and no need for one.
+
+<Misconception
+  belief="Contracts share a heap, so passing a large structure across a call is a pointer move."
+  reality="Each frame has private memory. Passing a large array means paying to copy the bytes out of one frame's memory into the calldata of the next, and paying expansion cost in the receiving frame to hold them."
+  why="Every mainstream runtime passes references across function boundaries and only copies when you ask. Solidity's `memory` keyword looks like a type qualifier rather than a location, so a `bytes memory` parameter reads as documentation instead of as an instruction to copy."
+  src="solidity-layout-memory"
+/>
+
+This is the whole of the first opening scene. The helper that moved into its own contract now takes
+its `bytes memory` argument across a machine boundary: the bytes are copied out, charged as calldata,
+copied in, and charged again as memory expansion on the far side. Nothing about the function got
+slower. The boundary got real.
+
+The same reasoning is why `calldata` rather than `memory` on an external function's array parameter
+is a machine decision and not a style one. A `calldata` parameter is read in place from the immutable
+input region; a `memory` parameter forces a copy of the whole array before the body
+runs.<Cite src="solidity-docs-contracts" /> Both compile. One of them allocates.
+
+### Which calls are actually calls
+
+Solidity's two kinds of call compile to two entirely different things, and the syntax barely
+distinguishes them.<Cite src="solidity-docs-contracts" />
+
+- **`internal` and `private` functions** are compiled into the same runtime code and reached with a
+  `JUMP`. Same frame, same memory, same storage, same `msg.sender`, same gas counter. There is no
+  boundary at all.
+- **`external` and `public` functions called from another contract** — or from your own contract via
+  `this.f()` — go through a `CALL`. New frame, new memory, `msg.sender` becomes your own address.
+
+The second opening scene is now legible. `this.validate(order)` opened a new frame, and in a new frame
+`caller` is set to the address that made the call — which is this contract. Every `msg.sender`-based
+check inside `validate` therefore evaluates against the contract's own address rather than the user's.
+
+Note carefully what *did* still cross. Storage writes made before the call are visible inside it,
+because storage lives in the world state and is applied as execution proceeds; the journal only comes
+back into play if the frame fails. What does not cross is the outer frame's memory, its locals, its
+program counter, and its identity. Getting these two halves the right way round — durable state
+crosses, machine state does not — is the whole content of the boundary.
+
+<Aside kind="note">
+`this.f()` is not a code smell on its own. It is the standard way to get a `try`/`catch` around your
+own logic, and it is sometimes the only way to make a group of state changes revertible in isolation.
+But it costs a full external call, it resets `msg.sender` to the contract itself, and any
+`onlyOwner`-style check inside `f` will now see the contract as the caller. Use it deliberately.
+</Aside>
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'internal / private', note: 'compiled to a JUMP' },
+    { title: 'external, or this.f()', note: 'compiled to a CALL', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'Whose memory does the body use?', cells: ['The frame you are already in', 'A fresh array, zeroed, starting at 0x80 again'] },
+    { label: 'What is msg.sender inside it?', cells: ['Unchanged — whoever called you', "This contract's own address"] },
+    { label: 'Whose gas counter is spent?', cells: ['The same one, with no ceiling', 'A budget carved out of it and handed over'] },
+    { label: 'What does a bytes memory argument cost?', cells: ['Nothing — the bytes are already there', 'A copy out, a copy in, and expansion on both sides'] },
+    { label: 'Can it be wrapped in try / catch?', cells: ['No', 'Yes — and that is usually why this.f() appears'] },
+    { label: 'Does a failure abort the caller?', cells: ['Yes — it is the same frame', 'No — the caller gets a boolean and continues'] },
+  ]}
+  caption="The two are indistinguishable at the call site and differ in every row that decides what the code does."
+  alt="Internal and private Solidity functions compile to a JUMP within the same frame, keeping memory, msg.sender, the gas counter and failure propagation, while external calls and this.f() compile to a CALL that creates a new frame with zeroed memory, resets msg.sender to the contract itself, forwards a carved-out gas budget and returns a boolean instead of aborting."
+/>
+
+## The depth limit, and the other 1024
+
+There is a cap on how deep frames can nest, and its failure mode is the interesting part.
+
+The specification refuses to open a frame whose depth would exceed 1024. Here is the branch, from the
+`CALL` family's shared implementation:<Cite src="execution-specs-osaka-system" />
+
+```python
+if evm.message.depth + Uint(1) > STACK_DEPTH_LIMIT:
+    evm.gas_left += params.gas
+    push(evm.stack, U256(0))
+    return
+```
+
+Three things happen, and none of them is an exception. The gas that would have been forwarded is
+handed straight back. Zero is pushed onto the caller's stack. Execution continues at the next
+instruction.
+
+From inside the calling contract, that is indistinguishable from a callee that reverted. It is the
+original reason "always check the return value of a low-level call" became a security rule, years
+before anybody was worried about reentrancy: a call could fail for reasons that had nothing to do
+with the callee, and a contract that ignored the boolean would carry on as though the call had
+worked.<Cite src="eip-150" />
+
+<Misconception
+  belief="The 1024 depth limit and the 1024 stack limit are the same limit."
+  reality="One counts nested frames; the other counts words on a single frame's operand stack. They are unrelated mechanisms that happen to share a number, and they fail differently — the depth limit pushes 0 and continues, a stack overflow is an exceptional halt."
+  why="Both are commonly called 'the stack limit', the specification's own constant for the depth cap is named `STACK_DEPTH_LIMIT`, and both are 1024. The compiler error 'stack too deep' refers to neither: that one is about DUP and SWAP reaching only 16 slots down."
+  src="execution-specs-osaka-interpreter"
+/>
+
+Do not build anything on the depth limit, in either direction. It is not a defence, because it is not
+reachable in practice — forwarded gas decays geometrically with depth and runs out long before frame
+1024, which is the subject of the lesson after next. And it is not a threat, because the attack that
+used to exploit it died in 2016 for the same reason.<Cite src="eip-150" /> What survives is the
+failure *shape*: a call that returns false without aborting you.
+
+## Where the boundary shows up in your bill
+
+Frames are not free, and the costs are in three places rather than one.
+
+**The access charge.** Touching the callee's account costs the cold or warm account-access price
+before anything else happens — 2,600 the first time an address is touched in a transaction, 100
+after.<Cite src="execution-specs-osaka-gas" /><Cite src="eip-2929" /> These are the same constants
+measured on this machine at 2,617 and 117 raw, with about 16 gas of harness
+overhead.<Cite src="measured-gas-constants" />
+
+**The copying.** Calldata out of your memory, return data back into it, plus any memory expansion
+either direction triggers.
+
+**The re-entry.** The callee starts with zeroed memory. Solidity's allocator begins at `0x80` in
+*every* frame, so a contract called a thousand times pays the same initial layout cost a thousand
+times.<Cite src="solidity-layout-memory" />
+
+None of these is large on its own. Together they are why a design that decomposes a hot path into six
+contracts and a design that keeps it in one are not equivalent, whatever the source looks like.
+
+<Check type="spot-bug" concept="memory-is-per-frame">
+A contract holds a scratch buffer and calls out to a hook it does not control:
+
+```solidity
+function settle(address hook, bytes calldata payload) external {
+    bytes memory scratch = new bytes(64);
+    _fill(scratch);                       // writes 64 bytes of state we need after the call
+    (bool ok, ) = hook.call(payload);     // hook is attacker-supplied
+    require(ok, "hook failed");
+    _commit(scratch);                     // reads those 64 bytes back
+}
+```
+
+A reviewer objects: "the hook can overwrite `scratch`, because it runs before `_commit`." A second
+reviewer objects: "the hook can read `scratch`, and it contains a value we do not want disclosed."
+
+Which reviewer is right, and what is the actual defect in this function?
+
+<Answer>
+**Neither reviewer is right, and both are wrong for the same reason.** `scratch` lives in this
+frame's memory. The hook executes in its own frame with its own freshly zeroed memory array and no
+mechanism whatsoever to address this one.<Cite src="execution-specs-osaka-interpreter" /> It cannot
+read `scratch` and cannot write it. Memory does not cross the boundary in either direction; only
+copied calldata, copied return data and world-state effects do.
+
+The second reviewer is wrong twice over, in fact: the value would not be private even if it were
+readable, because every byte of every transaction and every storage slot is public to anyone with a
+node. Memory isolation is a machine property, not a confidentiality one.
+
+**The actual defect is reentrancy, and it is about storage, not memory.** `hook.call(payload)` hands
+control to an attacker-supplied address in the middle of this function. That contract can call
+`settle` again — or any other function on this contract — while the first invocation is suspended
+between `_fill` and `_commit`. Whatever `_fill` and `_commit` do to *storage* is what is exposed,
+because storage is the thing that genuinely persists across the boundary and is genuinely shared with
+the re-entering call.
+
+The general form: when a call goes out, ask what is durable, not what is nearby. Locals and memory
+are safe because they are unreachable. Storage is at risk precisely because it is the one location
+built to survive.
+
+**A third problem, worth noticing.** `require(ok, "hook failed")` is correct here, but only because
+somebody wrote it. Had the boolean been ignored, a hook that reverted would have been treated as a
+hook that succeeded — the failure shape this lesson introduced with the depth limit and the next
+lessons develop in full.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Four calls, and whose storage each one writes** is next, and it is the payoff for everything above.
+Once "a call opens a new machine" is solid, the four call variants stop being four opcodes to
+memorise and become four answers to one question: which parts of the caller's context does the new
+machine inherit?
+
+**Forwarded gas is a ceiling** explains the one field in the frame table that is not simply created
+fresh. `gas_left` is carved out of the caller's, and the rule for carving is why the depth limit above
+is unreachable and why a caller always survives a callee.<Cite src="eip-150" />
+
+**Three ways out of a frame** picks up the `min(memory_output_size, len(output))` detail and the
+journalling, and turns them into the difference between a call that failed and a call that lied.
+
+**Delegatecall storage collisions**, later in the module and again in the security track, are what
+happens when the "nothing is shared" rule has a deliberate exception carved into it.
+
+And on the toolchain side, this lesson is why a gas measurement taken with Foundry's call isolation
+switched off is measuring something different from what your users pay: isolation controls whether
+each top-level call in a test is its own transaction, which controls which frames inherit which warm
+sets.<Cite src="eip-2929" />

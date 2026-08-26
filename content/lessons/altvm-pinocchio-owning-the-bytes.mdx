@@ -1,0 +1,371 @@
+---
+id: altvm-pinocchio-owning-the-bytes
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [p-token-account-layout-source, p-token-state-loading-source, p-token-entrypoint-source, pinocchio-repo, pinocchio-entrypoint-source, solana-docs-compute-budget, solana-docs-account-structure, anchor-docs-zero-copy, spl-token-repo]
+stack: {}
+---
+
+Open the token account struct that the most-invoked program on Solana casts onto raw account bytes,
+and the first thing you notice is that the balance is not a number.
+
+```rust
+#[repr(C)]
+pub struct Account {
+    pub mint: Pubkey,
+    pub owner: Pubkey,
+    amount: [u8; 8],
+    delegate: COption<Pubkey>,
+    state: u8,
+    is_native: [u8; 4],
+    native_amount: [u8; 8],
+    delegated_amount: [u8; 8],
+    close_authority: COption<Pubkey>,
+}
+```
+
+`amount` is a `u64` balance stored as `[u8; 8]`, read through an accessor that does
+`u64::from_le_bytes` and written through one that does
+`to_le_bytes`.<Cite src="p-token-account-layout-source" /> `is_native` is a four-byte array where only
+the first byte carries meaning.<Cite src="p-token-account-layout-source" />
+
+This is not stylistic. Every one of those choices is load-bearing, and reconstructing why is the
+fastest route to understanding what "own the bytes" actually obliges you to do.
+
+## The compile-time assertion that shapes the whole struct
+
+Follow the loading path. State is read through a small set of functions in the interface crate, and
+`load_unchecked` opens with this:<Cite src="p-token-state-loading-source" />
+
+```rust
+const {
+    assert!(
+        core::mem::align_of::<T>() == 1,
+        "<T> must have minimum alignment of 1"
+    );
+};
+
+if unlikely(bytes.len() != T::LEN) {
+    return Err(ProgramError::InvalidAccountData);
+}
+Ok(&*(bytes.as_ptr() as *const T))
+```
+
+Three lines, three obligations, and the first one is a compile-time refusal.
+
+**Why alignment of exactly 1?** Because Rust inserts padding. If `amount` were declared as `u64` — a
+type with alignment 8 — the compiler would be entitled to insert padding bytes before it so the field
+lands on an 8-byte boundary, and `size_of::<Account>()` would then exceed the sum of the field sizes.
+The on-chain format is a byte layout that other implementations, other languages and a decade of
+existing accounts already agree on. A compiler-inserted padding byte is a silent, invisible change to
+that format.
+
+The trait that marks a type as castable says exactly this. `Transmutable` is an `unsafe` marker trait
+whose safety contract is that the type's fields are well aligned and there are **no padding bytes**,
+and whose `LEN` constant must equal the size of each individual field in the
+type.<Cite src="p-token-state-loading-source" /> Declaring every multi-byte field as a byte array is
+how that contract is discharged: an array of `u8` has alignment 1, so the compiler has no reason to pad
+anywhere, and `size_of` becomes the exact sum of the fields.
+
+Confirm it arithmetically. `Pubkey` is 32 bytes; `COption<T>` is a 4-byte tag followed by
+`T`.<Cite src="p-token-state-loading-source" /> So: 32 + 32 + 8 + 36 + 1 + 4 + 8 + 8 + 36 = **165** —
+the SPL token account size that every Solana integration has hard-coded since 2020. The struct
+reproduces it because nothing was allowed to pad.
+
+<Figure
+  caption="Every offset here is a promise to every other implementation of the format: move one field and every account ever written is misread."
+  alt="The 165-byte SPL token account layout: a 32-byte mint, a 32-byte owner, an 8-byte amount, a 36-byte delegate COption, a 1-byte state, a 4-byte is_native, an 8-byte native amount, an 8-byte delegated amount and a 36-byte close authority COption."
+>
+  <ByteLayout
+    offsets
+    caption="p-token's Account, cast onto the account's data"
+    fields={[
+      { label: 'mint', size: 32 },
+      { label: 'owner', size: 32 },
+      { label: 'amount', size: 8, tone: 'accent', note: '[u8; 8]' },
+      { label: 'delegate', size: 36, note: 'COption: 4 + 32' },
+      { label: 'state', size: 1 },
+      { label: 'is_native', size: 4, note: 'one byte used' },
+      { label: 'native_amount', size: 8 },
+      { label: 'delegated_amount', size: 8 },
+      { label: 'close_authority', size: 36, note: 'COption: 4 + 32' },
+    ]}
+  />
+</Figure>
+
+**Why the length check?** Because with alignment satisfied, the only remaining question about a slice
+of bytes is whether there are enough of them. `bytes.len() != T::LEN` returns
+`InvalidAccountData`.<Cite src="p-token-state-loading-source" />
+
+And now look at what that length check *is*, in the security vocabulary you already have. It is the
+entire type discrimination. There is no [eight-byte discriminator](/c/eight-byte-discriminator) in SPL
+Token. A mint is 82 bytes — 36 + 8 + 1 + 1 + 36 — and a token account is 165, and the program tells
+them apart by counting.<Cite src="p-token-state-loading-source" /><Cite src="p-token-entrypoint-source" />
+That is why [account type confusion](/c/account-type-confusion) is a live class here rather than a
+historical one, and it is the direct reason Token-2022's variable-length accounts broke every
+integration that tested for `len() == 165`.
+
+**Why the third line is `unsafe`.** `&*(bytes.as_ptr() as *const T)` produces a reference with a
+lifetime the compiler cannot check against the buffer it points into. Every one of these functions is
+`unsafe`, and every call site in p-token carries a `// SAFETY:` comment explaining which invariant
+makes it sound.<Cite src="p-token-state-loading-source" />
+
+<Misconception
+  belief="repr(C) makes a struct safe to cast onto account bytes."
+  reality="repr(C) fixes field order and forbids reordering, but it does not remove padding — padding comes from field alignment. A struct with a u64 field can be repr(C) and still not match the on-chain byte layout."
+  why="repr(C) is described as 'C layout', and C layout is assumed to mean 'packed like the bytes on disk'."
+  src="p-token-state-loading-source"
+/>
+
+## Endianness stops being someone else's problem
+
+Once the fields are byte arrays, nothing in the type system knows they are integers. The accessor does:
+
+```rust
+pub fn amount(&self) -> u64 { u64::from_le_bytes(self.amount) }
+pub fn set_amount(&mut self, amount: u64) { self.amount = amount.to_le_bytes(); }
+```
+
+<Cite src="p-token-account-layout-source" />
+
+The byte order is a decision written in the accessor, not a property the serializer guarantees. It
+happens to be little-endian because that is the target's order and the input buffer's other integers
+are little-endian too.<Cite src="pinocchio-entrypoint-source" /> But the compiler will not complain if
+somebody writes `from_be_bytes` in a new accessor, and neither will any test that round-trips through
+the same accessor pair. The failure only appears when your program reads an account some other
+implementation wrote.
+
+Notice the defensive shape p-token uses: the byte-array fields are **private**, and every read and
+write goes through a method.<Cite src="p-token-account-layout-source" /> That is the one place the
+conversion exists, so it is the one place a review has to look. If those fields were public, the
+conversion would be scattered across every processor.
+
+## Padding you decided to ignore, written down
+
+`COption` is the most instructive thing in the file, because it is a documented decision not to
+validate.
+
+The type alias is `([u8; 4], T)`: a four-byte tag followed by the value. Only the first byte of that
+tag is used as the `Option` discriminant; the remaining three are padding to preserve alignment, and
+the program leaves them as zero.<Cite src="p-token-state-loading-source" /> Reading a value with
+nonzero trailing padding does not raise an error, because the implementation ignores those
+bytes.<Cite src="p-token-state-loading-source" />
+
+The struct's own doc comment states the consequence plainly: loading an `Account` does not check the
+validity of the `COption` fields, so it is possible to load an `Account` with invalid `COption`
+values.<Cite src="p-token-account-layout-source" />
+
+Sit with that for a moment, because it is the shape of every decision in this style of programming.
+Checking those three bytes would cost compute units on every load, on the hottest program on the
+network, to reject a state that the program itself can never produce. So it is not checked — and
+because it is not checked, it is *written down*, in the type alias and in the struct doc, where a
+reviewer will find it.
+
+That is the professional standard the rest of this module is measured against. Not "we validated
+everything", which is unaffordable, and not "we skipped some checks", which is negligence, but: here is
+the check we declined, here is why, and here is the scope of what could get past it.
+
+## Versioning: there isn't any
+
+A serializer gives you a place to put a version tag and a decoder that fails loudly on an unknown one.
+A cast gives you neither.
+
+Reorder two fields in that struct and every account ever written by the previous version is now
+misread, silently, with no error at any layer. Widen `amount` to 16 bytes and `T::LEN` changes, so the
+length check now rejects every existing account — which is at least loud, but is also a hard fork of
+your data format with no migration path. Add a field at the end and old accounts fail the length check
+while new ones pass, so your program has two incompatible populations and no way to tell them apart
+except by size.
+
+The technique is not new to you: this is [Anchor's `zero_copy` escape hatch](/c/anchor-zero-copy-escape-hatch),
+which exists precisely for accounts too large to Borsh-deserialize within the compute
+budget.<Cite src="anchor-docs-zero-copy" /> The difference is scope. Anchor applies it to one account
+type at a time, as an opt-in, while keeping its discriminator in front of the data. A Pinocchio program
+applies it to everything, and there is no discriminator unless you write one.
+
+<Aside kind="note">
+If you take one design rule from this lesson, take this: **put a version byte in the layout on day
+one**, even when you are certain the layout is final. It costs one byte of rent and one comparison per
+load, and it is the only thing standing between a future you and a silent reinterpretation of every
+account you have ever written. p-token does not have one because it is a reimplementation of a format
+fixed years ago by another program — that is a reason available to exactly one program on the network.
+</Aside>
+
+## Dropping the allocator
+
+The second half of the bill is the machinery the entrypoint installs before your handler runs.
+
+`entrypoint!` sets up a global bump allocator via `default_allocator!` and a panic hook via
+`default_panic_handler!`.<Cite src="pinocchio-repo" /> A program that never heap-allocates needs
+neither.
+
+`no_allocator!` replaces the first with a global allocator that **panics on any attempt to allocate
+memory**.<Cite src="pinocchio-repo" /> Read that as a design statement rather than an optimisation: it
+converts "we believe this program does not allocate" from a belief into a runtime assertion. Pull in a
+dependency that quietly builds a `Vec` in an error path and you find out at the first invocation that
+reaches it, not six months later in a compute-limit incident.
+
+There is a second, less obvious benefit. Solana reserves a heap region for the program, with
+`MIN_HEAP_FRAME_BYTES` at 32 KiB and `MAX_HEAP_FRAME_BYTES` at 256
+KiB.<Cite src="solana-docs-compute-budget" /> Requesting more than the minimum is itself metered, at
+`DEFAULT_HEAP_COST` of 8 CU per 32 KiB page.<Cite src="solana-docs-compute-budget" /> Under
+`no_allocator!` the 32 KiB region sits unused — so the macro also emits an `allocate_unchecked` helper
+that lets you reserve memory for a type at a compile-time offset within it, with the explicit warning
+that ensuring types do not overlap is the developer's
+responsibility.<Cite src="pinocchio-repo" /> A manual, unchecked, offset-addressed arena. Useful, and
+exactly as sharp as it sounds.
+
+The `alloc` feature is what makes the choice available at all: it is on by default and provides dynamic
+allocation for `String` and `Vec`, plus helpers that need to allocate, such as fetching sysvar data;
+turning it off removes `default_allocator` from the crate
+entirely.<Cite src="pinocchio-repo" /> That is the honest cost of the no-allocator path — it is not one
+macro, it is a constraint on every line of the program and every crate it depends on.
+
+### A feature flag that is the whole trade in miniature
+
+If you want the trade-off of this entire module compressed into one Cargo feature, look at how
+Pinocchio handles resizing an account's data.
+
+Two features do the same job. `account-resize` lets a program grow or shrink an account's data at
+runtime; at the start of execution the entrypoint stores the original data length so it can verify the
+resize stays within permitted bounds, and this adds a small setup cost **for each
+account**.<Cite src="pinocchio-repo" /> `unsafe-account-resize` allows the same operation but does not
+validate the new size, so it adds no entrypoint overhead — and the program must ensure the account
+stays within bounds itself.<Cite src="pinocchio-repo" />
+
+Where does that original length get stored? In the four reserved bytes at header offset 4 that the
+runtime documents as always zero.<Cite src="pinocchio-entrypoint-source" /> The library found unused
+space in the buffer and put its bookkeeping there.
+
+Two things to take from this. First, "overhead" here is not abstract: it is a named, per-account
+setup cost that exists only to make one operation checked. Second, the choice between the two features
+is a security decision wearing a performance costume, and it is presented as two lines in a manifest
+that no reviewer reading your processor code will ever see. Grep your `Cargo.toml` during review.
+
+## Dropping the panic handler
+
+The panic hook has the same character. `default_panic_handler!` only works in an `std`
+context.<Cite src="pinocchio-repo" /> A `no_std` program must instead use `nostd_panic_handler!`, which
+logs the file, line and column of the panic and calls the `abort()`
+syscall.<Cite src="pinocchio-repo" />
+
+p-token declares `#![no_std]` and uses `no_allocator!()` together with
+`nostd_panic_handler!()`.<Cite src="p-token-entrypoint-source" /><Cite src="spl-token-repo" /> The
+combination is coherent: a program whose failure mode is a numbered error code returned to the caller
+does not need Rust's panic machinery linked into its binary, and does not need a heap.
+
+Which leads to the effect people forget to count.
+
+## Binary size is rent
+
+Program bytecode lives in an account. Every account must hold a rent-exempt lamport balance
+proportional to its data size to stay on chain, and that balance is a refundable deposit recovered when
+the account is closed.<Cite src="solana-docs-account-structure" /> A smaller compiled artifact is
+therefore a smaller permanent deposit — capital, not a fee, but capital you cannot use for anything
+else.
+
+The order of magnitude is easy to feel from a published example: a token mint account holds 82 bytes of
+data and its rent-exempt balance is 1,461,600 lamports.<Cite src="solana-docs-account-structure" /> A
+program binary is measured in tens or hundreds of kilobytes, so run that ratio yourself against your
+own `.so` rather than trusting anyone's number, including a course's.
+
+That is the discipline for this whole area. **Do not publish a binary-size saving you have not
+measured on your own program**, because it depends on your dependency graph, your optimisation
+settings and your toolchain version, none of which are the library's. Build twice — once with
+`entrypoint!`, once with `program_entrypoint!` plus `no_allocator!` plus `nostd_panic_handler!` — and
+compare the artifacts. That measurement takes ten minutes and is worth more than every figure you will
+read.
+
+<Misconception
+  belief="no_allocator! is a performance flag you switch on to save compute units."
+  reality="It installs an allocator that panics on any allocation, turning a hidden heap dependency into a hard failure at the first invocation that hits it. The compute saving is a side effect of a constraint you are asserting."
+  why="It is grouped with optimisation macros and described in terms of saved compute units."
+  src="pinocchio-repo"
+/>
+
+<Check type="spot-bug" concept="repr-c-state-casting">
+A team writes their first Pinocchio program and defines their state like this, intending it to occupy
+exactly 49 bytes on chain:
+
+```rust
+#[repr(C)]
+pub struct Vault {
+    pub owner: Pubkey,   // 32 bytes
+    pub balance: u64,    // 8 bytes
+    pub bump: u8,        // 1 byte
+    pub deposits: u64,   // 8 bytes
+}
+```
+
+They allocate 49 bytes for the account and cast the struct onto the data slice. Name every problem, in
+the order the compiler and the runtime will encounter them.
+
+<Answer>
+**Problem 1 — it will not compile against a Pinocchio-style loader, and that is the good news.**
+`balance` and `deposits` are `u64`, so `align_of::<Vault>()` is 8, and the loader's
+`const { assert!(core::mem::align_of::<T>() == 1) }` fails at compile
+time.<Cite src="p-token-state-loading-source" /> The design error is caught before anything reaches a
+cluster. This is the single best argument for using an established loading helper rather than writing
+your own cast.
+
+**Problem 2 — the size is not 49.** Suppose the assertion were absent. `bump` sits at offset 40, and
+`deposits` has alignment 8, so the compiler inserts **7 padding bytes** after `bump` to place
+`deposits` at offset 48. `size_of::<Vault>()` is 56, not 49. Whatever length check the program performs
+will now reject the 49-byte accounts it just created, or — worse, if the team "fixes" it by allocating
+56 — will write a layout with a seven-byte hole that no other implementation of this format knows
+about.
+
+<Figure
+  caption="The seven bytes nobody declared are the ones that decide whether this account is 49 bytes or 56, and no other implementation of the format knows they are there."
+  alt="The Vault struct as the compiler would lay it out: a 32-byte owner, an 8-byte balance, a 1-byte bump, then seven bytes of compiler-inserted padding, then an 8-byte deposits field ending at offset 56."
+>
+  <ByteLayout
+    offsets
+    caption="what the compiler lays out for the 49 bytes they allocated"
+    fields={[
+      { label: 'owner', size: 32 },
+      { label: 'balance', size: 8, note: 'u64, align 8' },
+      { label: 'bump', size: 1 },
+      { label: 'padding', size: 7, tone: 'danger', note: 'inserted, never written' },
+      { label: 'deposits', size: 8, note: 'u64, align 8' },
+    ]}
+  />
+</Figure>
+
+**Problem 3 — the padding bytes are uninitialised and readable.** Those seven bytes are part of the
+account's data and are persisted on chain. Nothing zeroes them; nothing validates them. They are a
+covert channel and a source of non-determinism across compiler versions, since padding contents are not
+specified.
+
+**Problem 4 — endianness is unstated.** Even after fixing the layout, `u64` fields carry the target's
+byte order implicitly. The moment a client, an indexer or a second implementation reads this account,
+the byte order has to be agreed somewhere, and right now it is agreed nowhere.
+
+**Problem 5 — there is no version tag and no discriminator.** Length is the only type signal, so any
+other 49-byte account owned by this program is indistinguishable from a `Vault`, and any future change
+to the layout silently reinterprets every existing account.
+
+**The fix, in the shape p-token uses.** Make every multi-byte field a byte array — `balance: [u8; 8]`,
+`deposits: [u8; 8]` — make them private, and expose `u64` through accessors that call
+`from_le_bytes` and `to_le_bytes`.<Cite src="p-token-account-layout-source" /> Alignment becomes 1,
+`size_of` becomes exactly 49, padding disappears, and byte order is written down in one place. Then add
+the discriminator or version byte that p-token can do without and you cannot.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now write and review the data layer of a Pinocchio program: why the fields look the way they
+do, what the compile-time alignment assertion is protecting, where endianness lives, and what a length
+check is and is not capable of proving. You can also make the allocator and panic-handler decisions on
+evidence — as assertions about your program's behaviour, with a binary-size effect you measure rather
+than quote.
+
+Everything so far has been about performance and correctness of *representation*. The next lesson is
+about the other half of what the framework was doing for you, and it is not performance at all. Anchor
+generates code that proves the accounts you were handed are the accounts you meant. Pinocchio generates
+none of it. The next lesson walks the real hand-written validation in a production Pinocchio program,
+including one place where the owner check is deliberately conditional — a decision that is correct,
+saves compute units, and is one careless refactor away from a critical vulnerability.

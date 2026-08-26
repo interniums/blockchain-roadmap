@@ -1,0 +1,339 @@
+---
+id: evm-opcodes-memory-everything-is-32-bytes
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources:
+  [
+    yellow-paper,
+    execution-specs,
+    eip-3855,
+    solidity-variable-cleanup,
+    solidity-layout-storage,
+    solidity-layout-memory,
+    solidity-inline-assembly,
+    solidity-0836-release,
+    solidity-via-ir-closer-look,
+    argot-roadmap-2026,
+    measured-gas-constants,
+  ]
+stack:
+  solc: "0.8.36"
+  forge: "1.7.1"
+---
+
+Two things happen in the same week, on the same codebase, and they look unrelated.
+
+A developer replaces `uint256` with `uint8` in three local variables, because the values are counts
+that never exceed a hundred and smaller types should be cheaper. The gas report goes *up*.
+
+A different developer adds one line to a function — a single extra local variable, holding an
+intermediate result — and the build fails with `Stack too deep`. They look up the limit, find that
+the EVM's stack holds 1024 items, count seventeen locals in the function, and conclude that the
+compiler is broken.
+
+Neither developer is being careless. Both have run into the same fact from different directions: the
+EVM has exactly one operand width and exactly thirty-two instructions for reaching into its stack.
+This lesson is about what those two constraints cost, and why the second one is still costing
+working teams money in August 2026 despite a release note that appeared to close it.
+
+<Figure
+  caption="Every location this module covers is a different answer to one question: how long does the byte have to survive?"
+  alt="The EVM's data locations grouped by lifetime. Stack, memory, calldata and return data are discarded when the call frame ends. Transient storage is discarded when the transaction ends. Storage and code are kept by every node."
+>
+  <Tree
+    root={{
+      label: 'where a byte lives',
+      children: [
+        {
+          label: 'gone at RETURN',
+          tone: 'muted',
+          children: [
+            { label: 'stack', tone: 'accent', note: '32B items' },
+            { label: 'memory', note: 'byte-addressed' },
+            { label: 'calldata', note: 'read-only' },
+            { label: 'return data', note: 'read-only' },
+          ],
+        },
+        {
+          label: 'gone at end of tx',
+          tone: 'muted',
+          children: [{ label: 'transient storage' }],
+        },
+        {
+          label: 'kept by every node',
+          tone: 'muted',
+          children: [
+            { label: 'storage', tone: 'warn', note: 'trie-backed' },
+            { label: 'code', note: 'immutable' },
+          ],
+        },
+      ],
+    }}
+  />
+</Figure>
+
+## One width, no exceptions
+
+[Track 01 established that the word is 32 bytes](/c/byte-word-32) and why 256 bits was the right
+choice given keccak digests and secp256k1 field elements. What matters here is the machine-level
+consequence: **there is no narrower thing.**
+
+Every item the stack holds is 32 bytes. Every storage slot is 32 bytes. `MLOAD` and `MSTORE` move 32
+bytes. There is no 8-bit register, no 8-bit add, no 8-bit comparison.<Cite src="yellow-paper" />
+
+So `uint8` is not a machine type. It is a 32-byte value plus a *promise* that only the low eight bits
+carry meaning — and a promise is not free, because something has to keep the other 248 bits clean.
+
+### Who cleans, and when
+
+That job belongs to the compiler, and Solidity's documentation states the policy precisely: the
+compiler cleans the remaining bits before any operation that could be adversely affected by garbage
+in them.<Cite src="solidity-variable-cleanup" /> The two named cases are the ones you would guess —
+before writing a value to memory, because those bytes might be hashed or sent as call data, and
+before writing to storage, because a garbled value would then be observable.<Cite src="solidity-variable-cleanup" />
+
+Two riders on that policy are worth carrying, because both surprise people.
+
+**Cleaning is skipped when the next operation cannot care.** Any non-zero value is treated as true by
+`JUMPI`, so booleans are not cleaned before being used as a branch condition.<Cite src="solidity-variable-cleanup" />
+This is an optimisation, and it is also the reason a `bool` in memory is not guaranteed to be exactly
+`0` or `1` when you read it back through assembly.
+
+**Cleaning does not happen for you inside assembly.** Accessing a Solidity variable narrower than 256
+bits from inline assembly carries no guarantee that the value has been cleaned.<Cite src="solidity-variable-cleanup" />
+That is the whole of the [dirty-upper-bits](/c/dirty-upper-bits) hazard: an `address` compared in
+assembly without masking can fail to equal itself.
+
+The arithmetic follows. `uint256` addition is one `ADD`. `uint8` addition is an `ADD` plus whatever
+masking the compiler inserts to keep the promise. Strictly more instructions, for strictly more gas.
+
+<Misconception
+  belief="Using uint8 instead of uint256 saves gas."
+  reality="On the stack and in memory it costs more, because every narrow value carries masking instructions the wide one does not need. It saves only when several small values share one 32-byte storage slot."
+  why="A direct transfer of the C-family intuition that a smaller type occupies less memory. On a byte-addressable CPU that is true and free. On a machine with one operand width it is true only for the one location that is addressed in slots rather than words, and there the saving comes from slot sharing, not from the type."
+  src="solidity-layout-storage"
+/>
+
+The exception in that misconception is real and it is worth stating exactly, because it is the only
+place narrow types pay: Solidity packs contiguous state variables that fit into a single 32-byte
+storage slot,<Cite src="solidity-layout-storage" /> and one slot written instead of two is a saving
+measured in thousands of gas rather than tens.<Cite src="measured-gas-constants" /> Nothing analogous
+happens in memory, where array elements always occupy multiples of 32 bytes — the documentation
+notes this is true even for `bytes1[]`.<Cite src="solidity-layout-memory" /> The full packing trade,
+including the case where packing costs you more, gets its own treatment later in this module.
+
+## A stack of 1024, and why that number almost never matters
+
+Each call frame gets its own operand stack, and it holds at most 1024 items.<Cite src="yellow-paper" />
+
+EIP-3855's test cases state the limit about as concretely as a spec can. Executing the `PUSH0`
+opcode 1024 times succeeds and leaves a stack of 1024 zero items; executing it 1025 times aborts with
+an out-of-stack condition.<Cite src="eip-3855" />
+
+Note the word *aborts*. A stack overflow, or an underflow where an instruction needs operands the
+stack does not have, is an exceptional halt: the frame's state changes are undone and its gas is
+consumed. It is not an error the surrounding Solidity can catch, because there is no surrounding
+Solidity left — [the frame is gone](/c/three-failure-modes).
+
+Here is the useful part: **in ordinary compiled code you will never see this limit.** Solidity's
+codegen keeps a handful of values live at once. Hitting 1024 items requires deliberately writing
+assembly that pushes without popping, or a recursion pattern that the compiler would not produce.
+
+So the 1024 figure is mostly a trap in the curriculum rather than in production, and the trap is a
+naming collision. There are three separate limits with similar names:
+
+| limit | value | what exceeding it does |
+|---|---|---|
+| operand stack depth, per frame | 1024 items | exceptional halt of that frame |
+| [call depth](/c/depth-limit-1024) | 1024 frames | the `CALL` returns 0; the caller keeps running |
+| `DUP`/`SWAP` reach | 16 slots | a *compile-time* error; no runtime effect at all |
+
+Those three fail in three different ways and at three different times. The second one returns a
+boolean rather than throwing, which is why [checking a low-level call's return value](/c/call-returns-a-boolean)
+was ever a security rule. The third one never reaches runtime at all. Conflating them is the single
+most common confusion in this area, and the next section is about the one that will actually cost you
+an afternoon.
+
+## Thirty-two instructions for reaching into the stack
+
+The EVM has no random access to its stack. There is no "read the fourth item". There are exactly two
+families of instruction that address anything other than the top:
+
+- `DUP1` through `DUP16` copy one of the top sixteen items and push the copy.
+- `SWAP1` through `SWAP16` exchange the top item with one of the next sixteen.<Cite src="yellow-paper" />
+
+Sixteen plus sixteen is thirty-two instructions, and every one of them reaches at most sixteen slots
+down. An item at depth seventeen is **unreachable** — not expensive, not slow, unreachable — until
+enough of the items above it have been consumed or shuffled out of the way.<Cite src="execution-specs" />
+
+<Figure
+  caption="Two limits, one structure: the addressable window is sixteen words deep, and everything below it is out of reach long before the 1024-item capacity is in play."
+  alt="The operand stack drawn from the top down. The top sixteen words are the only ones DUP1 to DUP16 and SWAP1 to SWAP16 can address. Everything deeper, up to the 1024-item capacity, is unreachable until the values above it are consumed."
+>
+  <ByteLayout
+    unit="words"
+    caption="one call frame's operand stack, top first"
+    fields={[
+      { label: 'DUP1–16 / SWAP1–16', size: 16, tone: 'good', note: 'the addressable window' },
+      { label: 'unreachable', variable: true, tone: 'danger', note: 'down to item 1024' },
+    ]}
+  />
+</Figure>
+
+That single constraint shapes how every compiler targeting the EVM allocates local variables, and it
+is why compiled EVM bytecode is full of `SWAP` and `DUP` traffic that has no counterpart in the
+source. The compiler is not being wasteful; it is doing register allocation on a machine whose
+register file is a sixteen-deep sliding window over a stack.
+
+### Watching the window close
+
+Run this concretely, because the mechanism is easier to hold than the rule.
+
+**Subgoal — establish what the compiler is scheduling.** Take a function whose body needs several
+values alive at the same moment: four parameters, a few intermediate results, and a return value
+being assembled. Each of those is one stack slot. "Alive" means the value has been computed and has
+not yet had its last use.
+
+**Subgoal — watch the frontier move.** As the function computes, new intermediates are pushed on top.
+Every push moves every older value one slot further from the top. The values that go deep first are
+the ones computed earliest — typically the function's own parameters.
+
+**Subgoal — find the moment it breaks.** The compiler emits code for a statement that needs the
+second parameter. That parameter now sits at depth eighteen. There is no `DUP18`. The compiler could
+in principle shuffle the intervening seventeen items out of the way and back, but on the legacy code
+generator it does not attempt that: it reports `Stack too deep` and stops.
+
+**Subgoal — notice what did *not* happen.** The stack never came close to 1024 items. It held perhaps
+twenty. The failure is a *reach* failure, not a *capacity* failure, and it happened at compile time,
+so no gas was involved and no transaction ran.
+
+<Misconception
+  belief="Stack too deep means you exceeded the EVM's 1024-item stack."
+  reality="It means the compiler needed a value more than sixteen slots down and had no instruction that reaches it. The stack in question typically holds fewer than thirty items. 1024 is an unrelated limit that ordinary compiled code never approaches."
+  why="Both are called stack limits, and 1024 is the number that appears in every opcode reference. The 16 is buried in the DUP/SWAP entries, where it reads as an implementation detail of two instructions rather than as the constraint that governs how many local variables a function may have."
+  src="solidity-inline-assembly"
+/>
+
+## Is it fixed? The honest answer in August 2026
+
+Solidity 0.8.36 added stack-to-memory spilling to its SSA CFG code generator, which removes the
+error by moving values that cannot be reached into memory instead.<Cite src="solidity-0836-release" />
+Release-note summaries compressed this into "stack too deep is solved". For a default compile it is
+not, and the qualifiers are load-bearing.
+
+The spilling lives on the **SSA CFG code generator**, which is experimental and must be switched on
+explicitly with `--experimental --via-ssa-cfg`. That backend is not what `--via-ir` selects by
+default, and `--via-ir` is itself still not the default pipeline — legacy codegen remains the
+compiler's default as of 0.8.36, released 9 July 2026.<Cite src="solidity-0836-release" /> Stabilising
+the SSA CFG code generator is stated as the maintainers' near-term priority.<Cite src="argot-roadmap-2026" />
+
+<Misconception
+  belief="Stack-too-deep was fixed in Solidity 0.8.36, so the workarounds are historical."
+  reality="It is fixed only on an experimental backend behind --experimental --via-ssa-cfg, which is neither the via-IR default nor the compiler default. A default 0.8.36 compile still hits the error."
+  why="Release-note headlines drop qualifiers, and the qualifier here is three levels deep: experimental flag, not the via-IR default, and via-IR not the compiler default. Each level is individually easy to miss and the compression is what travels."
+  src="solidity-0836-release"
+/>
+
+<Aside kind="warn">
+Switching a production project to `--via-ir` to sidestep this is a bigger decision than it looks.
+The compiler maintains a dedicated page of observable behaviour differences between the legacy and
+IR pipelines, which is not something a purely gas-affecting change would need.<Cite src="solidity-via-ir-closer-look" />
+Re-run the full test suite, and treat the experimental SSA backend as unsuitable for deployed code
+until its maintainers say otherwise.<Cite src="argot-roadmap-2026" />
+</Aside>
+
+## The workarounds, and why each one works
+
+Every documented remedy does the same thing: reduce the number of values that are simultaneously
+live. Knowing that, you can invent the fix rather than look it up.
+
+**Introduce a block scope.** Wrapping part of a body in braces ends the lifetime of everything
+declared inside at the closing brace. The values stop being live, the compiler pops them, and the
+window slides back over the ones you still need. This is the cheapest fix and it costs nothing at
+runtime.
+
+**Group parameters into a struct.** Several stack slots become one — a pointer to a memory region.
+You have traded reach pressure for memory traffic, which is a real trade: reading a field is now an
+`MLOAD` rather than a `DUP`. For a function that touches each field once, that is a good deal. For a
+hot loop, measure it.
+
+**Split the function.** Two functions have two frames and two independent windows. The values that
+were fighting for reach in one body are now in two bodies. The cost is the internal call.
+
+**Move a value to memory or storage explicitly.** This is what the experimental spilling does
+automatically, done by hand.
+
+**Return fewer things at once.** A function returning six values holds six slots for the return
+tuple while still computing. Returning a struct collapses those to one.
+
+Notice what is *not* on the list: nothing about optimizer settings, and nothing about making types
+narrower. Narrower types do not help — every stack slot is a full word regardless of the declared
+type, so `uint8 a; uint8 b;` occupies exactly as many slots as `uint256 a; uint256 b;`. This is the
+first lesson and the third lesson colliding, and it is worth pausing on: **packing is a storage
+concept, and the stack has no packing.**
+
+<Check type="spot-bug" concept="stack-too-deep">
+A team hits `Stack too deep` in a function with eleven local variables. Someone proposes three fixes
+in a review thread:
+
+1. "Change the six `uint256` counters to `uint32`. Six values at 32 bits each fit in one word, so
+   that frees five slots."
+2. "Raise the optimizer runs. The optimizer will find a schedule that fits."
+3. "Wrap the validation block in braces so its four temporaries die before the settlement block
+   starts."
+
+Which of these can work, and what is each proposer assuming?
+
+<Answer>
+**Only the third works, and it works for the stated reason.** A block scope ends the lifetime of
+everything declared inside it at the closing brace. Four values stop being live, the compiler pops
+them, and the sliding window recovers four slots for the code that follows. No runtime cost, no
+behaviour change.
+
+**The first cannot work, and the assumption behind it is the one this lesson exists to remove.**
+Stack slots are not packed. Every item on the operand stack is a full 32-byte word whether it holds a
+`uint32` or a `uint256`,<Cite src="yellow-paper" /> so six `uint32` counters occupy six slots exactly
+as six `uint256` counters do. The change would also make the function marginally *more* expensive,
+because arithmetic on the narrow type now carries cleaning instructions that the wide type did not
+need.<Cite src="solidity-variable-cleanup" /> The proposer is applying a storage-layout rule — which
+is real, and which does pack contiguous state variables into shared slots<Cite src="solidity-layout-storage" /> —
+to a location that has no slots to share.
+
+**The second is a guess about the wrong stage.** The error is emitted by the code generator when it
+needs a value it cannot reach with `DUP1` through `DUP16`; it is a reach failure, not a
+scheduling-quality failure.<Cite src="solidity-inline-assembly" /> Optimizer runs tune a size-versus-gas
+trade in the emitted code, not the liveness structure that produced the error. The proposer is
+half-right about one thing, though: a *different code generator* does solve it, because 0.8.36's
+experimental SSA CFG backend spills unreachable values to memory. That is behind `--experimental
+--via-ssa-cfg`, is not the `--via-ir` default, and `--via-ir` is not the compiler
+default.<Cite src="solidity-0836-release" /> Switching pipelines to fix a compile error is a much
+larger change than the reviewer is proposing.
+
+The general habit worth taking away: when a stack error appears, count the *live* values, not the
+declared ones, and check whether the problem is reach or capacity. It is nearly always reach.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The memory model**, which the next three lessons cover, inherits the word rule directly. `MLOAD`
+and `MSTORE` move 32 bytes at an arbitrary byte offset, which is why writing a short value into the
+middle of a buffer is a read-modify-write rather than a store, and why byte-level manipulation in
+assembly looks the way it does.
+
+**Storage packing** is where narrow types finally earn their keep — and where they can also cost you,
+because updating one packed field means reading the slot, masking, and writing it back. The trade is
+tied to your access pattern, and the sixth lesson in this module prices both sides.
+
+**Inline assembly** is where the cleaning guarantee disappears. Once you know that a `uint8` on the
+stack is a word with a promise attached, [dirty upper bits](/c/dirty-upper-bits) stop being a
+mysterious class of bug and become the obvious consequence of stepping outside the code that was
+keeping the promise.<Cite src="solidity-variable-cleanup" />
+
+**The via-IR decision** in the toolchain track is the same question at project scale: which pipeline,
+which backend, and what does the [observable-behaviour difference](/c/via-ir-pipeline) cost you to
+verify.<Cite src="solidity-via-ir-closer-look" />
+
+The next lesson leaves the stack and starts on the location most engineers assume is free.

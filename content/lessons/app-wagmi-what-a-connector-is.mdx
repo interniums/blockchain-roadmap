@@ -1,0 +1,329 @@
+---
+id: app-wagmi-what-a-connector-is
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [wagmi-src-create-connector, wagmi-src-injected-connector, wagmi-src-create-config, wagmi-connector-injected, wagmi-connector-walletconnect, wagmi-connector-safe, wagmi-connector-metamask, wagmi-create-config, wagmi-use-connectors, wagmi-use-connection, wagmi-use-connect, wagmi-migrate-v2-v3, wagmi-viem-guide, mipd-repo, eip-6963, eip-1193]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+A Connector is a TypeScript type, and reading it is faster than reading any explanation of it. Here
+is the shape every wallet in your app must satisfy, at the `wagmi@3.7.6` tag, with the type
+parameters and JSDoc stripped:<Cite src="wagmi-src-create-connector" />
+
+```ts
+{
+  readonly id: string
+  readonly name: string
+  readonly type: string
+  readonly icon?: string
+  readonly rdns?: string | readonly string[]
+
+  setup?(): Promise<void>
+  connect(parameters?): Promise<{ accounts: readonly Address[]; chainId: number }>
+  disconnect(): Promise<void>
+  getAccounts(): Promise<readonly Address[]>
+  getChainId(): Promise<number>
+  getProvider(parameters?): Promise<provider>
+  isAuthorized(): Promise<boolean>
+  switchChain?(parameters): Promise<Chain>
+
+  onAccountsChanged(accounts: string[]): void
+  onChainChanged(chainId: string): void
+  onDisconnect(error?: Error): void
+}
+```
+
+Eight methods you call, three handlers the wallet calls back, five identity fields. That is the
+entire contract. A browser extension, a QR-code relay session, an iframe bridge to a multisig
+interface and a vendor SDK all reduce to it, which is why `useConnect` has one code path rather than
+four.<Cite src="wagmi-use-connect" />
+
+Two of the members deserve attention before anything else, because they are where the leaks are.
+`switchChain` is **optional** — a connector is allowed not to have one, and the hook that calls it
+has to cope. And every connector is constructed with an `emitter` typed over a `ConnectorEventMap`
+of `change`, `connect`, `disconnect`, `error` and `message`.<Cite src="wagmi-src-create-connector" />
+The connector is not a request/response client; it is a request/response client **plus a stream of
+things the wallet decided on its own**, and the second half is where the state bugs live.
+
+## The interface hides the wallet. It does not hide the failure modes
+
+Four connectors ship in wagmi's own package, and their sameness at the type level is exactly as deep
+as the type level. Underneath, each is a different network topology with a different way of
+disappearing.<Cite src="wagmi-viem-guide" />
+
+| Connector | Underlying transport | Characteristic failure |
+|---|---|---|
+| `injected` | An [EIP-1193](/c/viem-client-vs-transport) provider object in the page<Cite src="eip-1193" /> | The object is gone, or was never injected in time |
+| `walletConnect` | A relay session to a phone over a websocket<Cite src="wagmi-connector-walletconnect" /> | Session expires, phone sleeps, relay drops, chain was never pre-approved |
+| `safe` | A postMessage bridge to a Safe app iframe<Cite src="wagmi-connector-safe" /> | You are not in an iframe, or the parent origin is not allowed |
+| `coinbaseWallet` / `metaMask` / `baseAccount` | A vendor SDK that may itself open a popup or a mobile deeplink<Cite src="wagmi-migrate-v2-v3" /> | The SDK is not installed; the popup is blocked |
+
+Read the second column against the first. **An injected wallet is in-process**: `connect()` is a
+function call plus a user prompt, latency is a few milliseconds, and a failure is an object being
+absent. **A WalletConnect session is a network hop to a device on a mobile carrier**: `connect()` is
+a QR scan plus a round trip, latency is seconds, and a failure can be "the user's phone locked".
+Writing one loading spinner and one error toast for both is how you get a support queue.
+
+The two options most likely to surprise you are both about that difference.
+
+**`safe` defaults `shimDisconnect` to `false`, while `injected` defaults it to
+`true`.**<Cite src="wagmi-connector-safe" /><Cite src="wagmi-connector-injected" /> Same flag,
+opposite default, for a good reason covered below.
+
+**`walletConnect` defaults `isNewChainsStale` to `true`.** WalletConnect v2 requires the user to
+pre-approve a set of chains up front rather than switching dynamically, so a chain you added to your
+config after their session began is a chain their session has no relationship with. With the default,
+wagmi treats that chain as stale and **disconnects the user on auto-connect**, forcing a reconnect
+that re-approves. Set it to `false` and auto-connect succeeds — at the price of a throw when they
+later try to switch to the unapproved chain, which your code must then
+handle.<Cite src="wagmi-connector-walletconnect" /> There is no option that makes the problem go
+away; there is only a choice about where it surfaces.
+
+<Misconception
+  belief="The connector abstraction means I can write my connect flow once and every wallet behaves the same."
+  reality="The interface is uniform; the transports are not. An in-process extension, a relayed phone session, an iframe bridge and a vendor SDK have different latencies, different disconnect semantics, and errors that share no vocabulary."
+  why="Uniform types are usually a promise about uniform behaviour, and in most of TypeScript they are."
+  src="wagmi-viem-guide"
+/>
+
+## EIP-6963: the wallet list is an event protocol, not an object
+
+Before 2023, discovering a browser wallet meant reading `window.ethereum`. Every extension wrote to
+the same slot, browser extensions load in an unpredictable order, and the spec's own words for the
+result are that **the last wallet to load usually wins** — with some extensions deliberately delaying
+injection to overwrite the others.<Cite src="eip-6963" />
+
+[EIP-6963](/c/wagmi-eip6963-discovery), Final, replaces the slot with two window
+events:<Cite src="eip-6963" />
+
+- The page dispatches `eip6963:requestProvider`.
+- Each wallet answers by dispatching an `eip6963:announceProvider` `CustomEvent` whose `detail`
+  carries its EIP-1193 provider plus an info object.
+- Wallets also announce unprompted on load, and re-announce whenever they see a request — so the
+  ordering race disappears in both directions.
+
+<Figure
+  caption="Nothing here is a lookup — the wallet list is the accumulated result of an exchange your page starts and cannot finish."
+  alt="The page dispatches eip6963:requestProvider on the window. Each wallet replies with an eip6963:announceProvider CustomEvent, and wallets also announce unprompted on load. wagmi appends each announced provider to its connectors store and stays subscribed, so useConnectors returns a list that is longer after first paint."
+>
+  <Flow
+    lanes={['your page', 'each wallet', 'wagmi', 'your UI']}
+    nodes={[
+      { id: 'req', label: 'eip6963:requestProvider', note: 'dispatched on the window', col: 0, tone: 'accent' },
+      { id: 'ann', label: 'eip6963:announceProvider', note: 'one CustomEvent per wallet', col: 1 },
+      { id: 'late', label: 'an unprompted one', note: 'on load, or later', col: 1, dashed: true },
+      { id: 'store', label: 'connectors store', note: 'appended, and subscribed', col: 2 },
+      { id: 'ui', label: 'useConnectors()', note: 'longer after first paint', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'req', to: 'ann' },
+      { from: 'ann', to: 'store' },
+      { from: 'late', to: 'store' },
+      { from: 'store', to: 'ui' },
+    ]}
+  />
+</Figure>
+
+The info object is four fields: `uuid`, `name`, `icon`, `rdns`.<Cite src="eip-6963" /> The `uuid`
+must be UUIDv4 and identifies one provider session for the lifetime of the page. The `rdns` is a
+reverse-DNS identifier such as `com.example.wallet`, intended to be stable across sessions — and the
+spec is blunt that apps **SHOULD NOT** use it for feature detection, because it is self-attested and
+prone to impersonation.<Cite src="eip-6963" />
+
+wagmi implements this through the `mipd` library, wired in by `createConfig`'s
+`multiInjectedProviderDiscovery` flag, which defaults to
+`true`.<Cite src="wagmi-create-config" /><Cite src="mipd-repo" /> Discovered providers are converted
+into injected connectors and appended to the connectors store; because announcements can arrive at
+any time, the store is also subscribed, so a wallet that announces late still shows
+up.<Cite src="wagmi-src-create-config" />
+
+Three consequences for your UI, and the first two are the reason your wallet list looks wrong when it
+looks wrong.
+
+**The list is asynchronous and grows.** Render `useConnectors()` — the v3 replacement for
+`useConnect().connectors` — rather than a hard-coded array, and expect it to change after first
+paint.<Cite src="wagmi-use-connectors" /><Cite src="wagmi-migrate-v2-v3" />
+
+**Duplicates are prevented by `rdns`, not by name.** A connector you configured explicitly declares
+an `rdns`, and discovery skips any announced provider whose `rdns` is already claimed, so you do not
+get "MetaMask" twice.<Cite src="wagmi-src-create-config" /> A connector with no `rdns` cannot
+participate in that check.
+
+**`window.ethereum` is still there, and is still last-writer-wins.** The EIP does not supplant it and
+recommends wallets keep it for backwards compatibility.<Cite src="eip-6963" /> Reaching for it in
+2026 means asking for whichever extension happened to load last.
+
+<Aside kind="warn">
+The spec's security section names an attack worth designing against: a wallet extension can modify
+the page and other wallets' announcements, so **two announced providers with the same `uuid` is a
+tampering signal**, and icons are SVG, which can carry JavaScript that executes in your
+page.<Cite src="eip-6963" /> If you render announced icons, sanitise or sandbox them. The name and
+icon in your wallet picker are attacker-influenced strings, not trusted branding.
+</Aside>
+
+## The three callbacks are the wallet's half of the conversation
+
+`onAccountsChanged`, `onChainChanged` and `onDisconnect` are not optional, and they are not
+symmetrical with the methods above them.<Cite src="wagmi-src-create-connector" /> Nothing in your app
+calls them. The wallet does, whenever the user does something in the wallet's own interface, and the
+connector translates that into an emitter event — `change` carrying `accounts` and `chainId`,
+`connect`, `disconnect`, `error`, `message`.<Cite src="wagmi-src-create-connector" />
+
+That inverts the usual mental model for an integration. **The account your app is showing can change
+between two lines of your own code**, with no promise of yours resolving and no error thrown: the
+user picked a different account in MetaMask while your confirmation modal was open.
+
+Two rules fall out, and both are about not caching identity.
+
+**Read the address from `useConnection()` at the moment you need it**, rather than snapshotting it
+into component state at mount and using it for the rest of the session.<Cite src="wagmi-use-connection" />
+A snapshot is a bet that the wallet will not change under you, and it is a bet the callbacks exist
+precisely because you lose.
+
+**Treat an account change as a session boundary, not a re-render.** Anything scoped to the previous
+address — a cached balance, a pending signature request, a server session — is now about the wrong
+person. `useConnectionEffect` exists to hang that cleanup on, and it is one of the v3
+renames.<Cite src="wagmi-migrate-v2-v3" />
+
+## The disconnect that is not a disconnect
+
+`disconnect()` is in the interface, so it looks like the counterpart to `connect()`. For injected
+wallets it is not. wagmi's own documentation states the reason plainly: MetaMask and other injected
+providers do not support programmatic disconnect, and the `shimDisconnect` flag **simulates the
+disconnect behaviour by keeping track of connection status in
+storage**.<Cite src="wagmi-connector-injected" />
+
+The source shows exactly what that means. `disconnect()` writes a `${id}.disconnected` flag into the
+Config's storage; `isAuthorized()` reads it first and returns `false` if it is
+present.<Cite src="wagmi-src-injected-connector" /> The extension is not told anything. It still has
+the site's permission, still holds the account, and would still answer if asked.
+
+So "Disconnect" in your app means **your app agrees to stop asking**. Three things follow that
+regularly surprise a team at the worst moment:
+
+- Clearing site data, or a user opening the app in a fresh profile, resets the flag — and
+  auto-connect succeeds again without any prompt.
+- The user has not revoked anything. Revocation lives in the wallet's own permissions UI.
+- `safe` inverts the default to `false`, because inside a Safe app iframe there is no meaningful
+  "disconnected" state to shim — the app is the wallet's own container.<Cite src="wagmi-connector-safe" />
+
+If your product's copy says "Disconnect" beside a shield icon and your privacy page implies the site
+lost access, that is a claim the code does not support. "Sign out" is the honest word, and the
+[next lesson](/c/wagmi-connection-not-authentication) is about why even that one is doing more work
+than it can carry.
+
+<Misconception
+  belief="Calling disconnect() revokes my site's access to the wallet."
+  reality="For injected wallets there is no programmatic disconnect. wagmi writes a flag to its own storage and stops auto-connecting; the extension's permission grant is untouched."
+  why="Every other OAuth-shaped integration has a real revoke endpoint, and the method is named disconnect."
+  src="wagmi-connector-injected"
+/>
+
+## Debugging "my wallet is not in the list"
+
+This is the most common connector bug and it has four distinct causes that look identical. Work them
+in this order — each step is cheap and eliminates a whole class.
+
+**Subgoal — separate "not discovered" from "not rendered".** Log `useConnectors()` and compare its
+length to what you drew.<Cite src="wagmi-use-connectors" /> If the connector is in the array, this is
+a rendering bug: you memoised a list that grows, or you rendered before the late announcement. If it
+is absent, continue.
+
+**Subgoal — check whether discovery is even running.** `multiInjectedProviderDiscovery` defaults to
+true, but it is a common casualty of copy-pasted configs.<Cite src="wagmi-create-config" /> Also
+confirm you are in a browser context: the `mipd` store is only created when `window` is
+defined.<Cite src="wagmi-src-create-config" /> A server render has no wallets by construction, which
+is the subject of this module's SSR lesson.
+
+**Subgoal — ask whether the wallet announced at all.** Add a listener for
+`eip6963:announceProvider` and dispatch `eip6963:requestProvider` yourself, from the console, and
+count the events.<Cite src="eip-6963" /> Zero events means the extension is old, disabled for this
+origin, or injecting late. One event that never reaches wagmi is a wiring problem in your config.
+
+**Subgoal — check for an `rdns` collision.** If you configured a connector explicitly *and* the same
+wallet announces itself, discovery skips the announced one to avoid a
+duplicate.<Cite src="wagmi-src-create-config" /> The wallet is then present, but as your configured
+connector, possibly under a different `id` and a different display name than you were grepping for.
+
+**Subgoal — for a vendor connector, check the peer dependency before anything else.** In wagmi v3
+every connector's SDK is an optional peer dependency you install: `walletConnect` needs
+`@walletconnect/ethereum-provider`, `coinbaseWallet` needs `@coinbase/wallet-sdk`, `metaMask` needs
+`@metamask/connect-evm`, `safe` needs `@safe-global/safe-apps-provider` and
+`@safe-global/safe-apps-sdk`, `baseAccount` needs
+`@base-org/account`.<Cite src="wagmi-migrate-v2-v3" /><Cite src="wagmi-connector-metamask" /> A
+missing one builds fine and fails at connect time — the one path your smoke test most likely stubs.
+
+<Aside kind="note">
+`unstable_shimAsyncInject` exists for exactly the third subgoal's "injecting late" case: it watches
+for the `ethereum#initialized` event, defaulting to `1_000` milliseconds when set to
+`true`.<Cite src="wagmi-connector-injected" /> The `unstable_` prefix is a statement about its
+future, not about whether it works. Reach for EIP-6963 discovery first; this is for a specific wallet
+that does neither.
+</Aside>
+
+<Check type="spot-bug" concept="wagmi-connector-abstraction">
+A team ships a wallet picker. It renders a fixed array of three buttons — MetaMask, WalletConnect,
+Coinbase — each mapped to a configured connector. `createConfig` lists all three connectors and sets
+`multiInjectedProviderDiscovery: false` "for a cleaner list". A Disconnect button calls
+`disconnect()`. Four reports arrive.
+
+1. A user with Rabby installed cannot connect at all; the MetaMask button opens Rabby.
+2. A Coinbase user in production gets an error at connect time. It works locally.
+3. A user presses Disconnect, then reloads, and is connected again.
+4. A user in the Safe app interface sees the picker and none of the three buttons work.
+
+Diagnose each.
+
+<Answer>
+**1 — discovery is off, so `window.ethereum` decides.** With `multiInjectedProviderDiscovery: false`
+there is no EIP-6963 announcement handling, and an untargeted `injected` connector falls back to the
+single legacy slot — which the last extension to load owns.<Cite src="wagmi-create-config" /><Cite src="eip-6963" />
+The button is labelled MetaMask; the object is Rabby's. Turning discovery back on and rendering
+`useConnectors()` fixes both halves: Rabby appears as its own entry with its own name and icon, and
+the MetaMask entry addresses MetaMask because entries are matched by `rdns` rather than by
+hope.<Cite src="wagmi-use-connectors" />
+
+**2 — the peer dependency is missing in the deploy, not in the repo.** `coinbaseWallet` requires
+`@coinbase/wallet-sdk` as an optional peer dependency in v3.<Cite src="wagmi-migrate-v2-v3" /> It is
+almost certainly hoisted into the local `node_modules` by some other package, so the developer's
+machine resolves it and a clean production install does not. The failure is at connect time because
+that is when the SDK is first touched. Add it to `dependencies` explicitly and add a smoke test that
+actually calls `connect` against a mock, rather than asserting the button renders.
+
+**3 — the shim, working as designed, and probably a second bug.** `disconnect()` on an injected
+connector writes a flag to the Config's storage and stops auto-connecting; the extension keeps its
+grant.<Cite src="wagmi-connector-injected" /><Cite src="wagmi-src-injected-connector" /> If the flag
+survives, reload should stay disconnected — so a user who reconnects after reload is telling you the
+flag was not written or not read: most often two Configs, or storage that is a no-op because
+`window` was undefined when the Config was built.<Cite src="wagmi-src-create-config" /> Either way,
+the product copy is wrong regardless of which bug it is: nothing was revoked.
+
+**4 — the Safe context has no injected provider and no relay.** A Safe app runs in an iframe and
+talks to its parent over a bridge; the `safe` connector is that bridge, and it is not in the
+config.<Cite src="wagmi-connector-safe" /> None of the three configured connectors can see a wallet
+there. The fix is to include `safe()` and, because a Safe app should not present a picker at all,
+to auto-connect when the environment is a Safe iframe. Note this connector also defaults
+`shimDisconnect` to `false`, so the Disconnect button should not be rendered in that
+context.<Cite src="wagmi-connector-safe" />
+
+**The through-line.** Every one of the four is a place where the uniform interface stopped being
+uniform: discovery, dependency, disconnect semantics, and container. The interface earns its keep at
+the call site and costs you at the edges, and the edges are where users are.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**A wallet picker you can defend.** Render `useConnectors()`, expect it to grow, key on `rdns`,
+treat announced names and icons as untrusted input, and label the button "Sign out" rather than
+promising a revocation you cannot perform.
+
+**A per-connector error surface.** You now know that a WalletConnect timeout, a missing peer
+dependency and an absent iframe parent are three different events, and that the type system will not
+distinguish them for you.
+
+**The next lesson takes the ground out from under all of it.** A connector gives you an address the
+wallet says the user controls. That claim is worth exactly nothing to your server, and the gap
+between "connected" and "authenticated" is the most expensive misunderstanding in this module.

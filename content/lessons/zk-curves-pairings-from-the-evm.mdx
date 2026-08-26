@@ -1,0 +1,428 @@
+---
+id: zk-curves-pairings-from-the-evm
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-196, eip-197, eip-1108, eip-2537, eip-4844, eip-7951, execution-spec-tests-eip2537, iacr-groth16, orbiter-verifier-gas, zellic-bls-signatures, eth2book-bls-signatures, ethereum-org-history]
+stack: {}
+---
+
+Lay the EVM's cryptographic precompiles out as a number line and the history of the last decade
+becomes visible in a single column of addresses.
+
+<Matrix
+  corner="Address"
+  cols={['Curve', 'Operation', 'Introduced by']}
+  rows={[
+    { label: <code>0x06</code>, cells: ['BN254', 'point addition', 'EIP-196, 2017'] },
+    { label: <code>0x07</code>, cells: ['BN254', 'scalar multiplication', 'EIP-196, 2017'] },
+    { label: <code>0x08</code>, cells: ['BN254', 'pairing check', 'EIP-197, 2017'] },
+    { label: <code>0x0a</code>, cells: ['BLS12-381', { v: 'KZG point evaluation', tone: 'accent' }, 'EIP-4844, 2024'] },
+    { label: <code>0x0b</code>, cells: ['BLS12-381', 'G1ADD', 'EIP-2537, 2025'] },
+    { label: <code>0x0c</code>, cells: ['BLS12-381', 'G1MSM', ''] },
+    { label: <code>0x0d</code>, cells: ['BLS12-381', 'G2ADD', ''] },
+    { label: <code>0x0e</code>, cells: ['BLS12-381', 'G2MSM', ''] },
+    { label: <code>0x0f</code>, cells: ['BLS12-381', 'PAIRING_CHECK', ''] },
+    { label: <code>0x10</code>, cells: ['BLS12-381', 'MAP_FP_TO_G1', ''] },
+    { label: <code>0x11</code>, cells: ['BLS12-381', 'MAP_FP2_TO_G2', ''] },
+    { label: <code>0x100</code>, cells: ['secp256r1', 'signature verification', 'EIP-7951'] },
+  ]}
+  caption="Eleven of these twelve are general-purpose curve arithmetic. The highlighted one is a single protocol-specific check, and it is priced accordingly."
+  alt="The EVM's cryptographic precompiles by address: 0x06, 0x07 and 0x08 are BN254 point addition, scalar multiplication and pairing check from EIP-196 and EIP-197 in 2017; 0x0a is BLS12-381 KZG point evaluation from EIP-4844 in 2024; 0x0b through 0x11 are the BLS12-381 G1ADD, G1MSM, G2ADD, G2MSM, PAIRING_CHECK, MAP_FP_TO_G1 and MAP_FP2_TO_G2 calls from EIP-2537 in 2025; and 0x100 is secp256r1 signature verification from EIP-7951."
+/>
+
+<Cite src="eip-196" /><Cite src="eip-197" /><Cite src="eip-4844" /><Cite src="eip-2537" /><Cite src="eip-7951" />
+
+Three curves, three eras, three sets of encoding conventions that do not agree with each other. This
+lesson is the practical one: what each call takes, what it costs, and the specific places where a
+correct-looking integration fails. Two of those places have burned real teams, and one of them burns
+all your gas rather than reverting politely.
+
+## The BN254 precompiles, and the repricing that made them matter
+
+EIP-196 defined addition at `0x06` and scalar multiplication at `0x07` with a plain encoding: field
+elements are 32-byte big-endian numbers, a curve point is the pair `(x, y)`, and the point at infinity
+is encoded as `(0, 0)`.<Cite src="eip-196" /> EIP-197 added the pairing check at `0x08`, taking
+`192·k` bytes — a 64-byte `G₁` point and a 128-byte `G₂` point per pair — and returning 32 bytes that
+are one or zero.<Cite src="eip-197" />
+
+The original prices made them close to unusable: 500 gas for addition, 40,000 for multiplication, and
+`80,000·k + 100,000` for the pairing check.<Cite src="eip-196" /><Cite src="eip-197" /> EIP-1108 cut
+them to **150**, **6,000**, and **34,000·k + 45,000**.<Cite src="eip-1108" />
+
+The reason is a good corrective to the idea that gas prices encode intrinsic difficulty. Nothing about
+the mathematics changed. The Go reference implementation moved to a faster bn256 library and Parity's
+field arithmetic and pairing code were optimised, so the same operation started taking roughly an
+order of magnitude less time, and the schedule was brought into line.<Cite src="eip-1108" />
+
+The EIP shows its working, which is rare enough to be worth reading:
+
+```text
+ecrecover measured at 116 µs, priced at 3,000 gas
+  → 25.86 gas per microsecond of precompile runtime
+
+pairing precompile:  1 pairing  = 3,037 µs
+                    10 pairings = 14,663 µs
+  → fixed cost 1,745 µs, plus 1,292 µs per pairing
+  → ~35,000·k + 45,000 gas
+```
+
+<Cite src="eip-1108" />
+
+**Gas is a price for wall-clock on the slowest client of the day, calibrated against one reference
+operation.** That is the whole model. It explains why two curves priced years apart are not
+comparable as a statement about mathematics, and it explains why a repricing can arrive without any
+protocol change of substance.
+
+What the repricing bought is stated in the EIP itself as projections: an AZTEC confidential
+transaction's cryptography from 820,000 gas to 197,000, and a ZEther transaction from roughly
+6,000,000 to roughly 1,000,000.<Cite src="eip-1108" /> Those are the EIP's own forward-looking figures
+rather than post-deployment measurements, and they are the reason on-chain SNARK verification became
+economically ordinary.
+
+## What a Groth16 verifier actually pays, derived rather than recalled
+
+Groth16's proof is three group elements and its verification is a single pairing product equation
+using **three** pairings.<Cite src="iacr-groth16" /> On-chain, it pays for four. Working out why is
+the most useful five minutes in this lesson.
+
+**Subgoal: recall what the precompile refuses to accept.** EIP-197 specifies a *check*, not an
+evaluation, precisely because the pairing's codomain is a complex field that would raise encoding
+problems.<Cite src="eip-197" /> So there is no way to hand the precompile a target-group value.
+
+**Subgoal: see which term that strands.** One of Groth16's three pairings is over two fixed elements
+of the verification key. In the paper that term is a constant, computed once. On-chain it cannot be
+stored as a constant, because a target-group element has no encoding the precompile accepts — so the
+verifier passes the two source-group points and lets the precompile re-derive it inside the same call.
+Three pairings in the equation, four pairs in the calldata.
+
+**Subgoal: price it from the schedule.**
+
+```text
+pairing check, k = 4      34,000 × 4 + 45,000  =  181,000 gas
+per public input           6,000 (ECMUL) + 150 (ECADD)  =  6,150 gas
+```
+
+<Cite src="eip-1108" />
+
+So a two-input Groth16 verifier's precompile cost is 181,000 + 12,300 = **193,300 gas**, before a
+single line of the surrounding Solidity.
+
+**Subgoal: compare that with the figure you will see quoted.** A widely repeated model gives Groth16
+verification as roughly 207,000 gas plus about 7,160 per public input. It traces to a single community
+analysis rather than to a specification.<Cite src="orbiter-verifier-gas" /> Notice that it is close to
+the derivation above and slightly higher — consistent with the extra being calldata, memory expansion,
+input validation and dispatch in the verifier contract itself.
+
+The reason to derive rather than quote is not that the quoted number is wrong. It is that the derived
+one comes apart into terms you can act on: the 181,000 is fixed by the proof system, the 6,150 scales
+with a design decision you control, and the remainder is your contract's, which means it is the only
+part a gas-profiling pass can touch. A single number tells you none of that. Measure your own verifier
+and compare it against the floor above; the gap is yours.
+
+### Where the gas actually goes
+
+Put the two terms side by side for a two-input verifier and the optimisation strategy falls out of the
+ratio.
+
+<Matrix
+  numeric
+  corner="Term"
+  cols={['Gas', 'Share of the precompile cost']}
+  rows={[
+    {
+      label: <>Pairing check, <code>k = 4</code></>,
+      cells: [<>{'181,000'}<Cite src="eip-1108" /></>, { v: '94%', tone: 'warn' }],
+    },
+    {
+      label: 'Two public inputs',
+      cells: [<>{'12,300'}<Cite src="eip-1108" /></>, { v: '6%', tone: 'accent' }],
+    },
+  ]}
+  caption="The term you can shrink is the small one."
+  alt="For a two-input Groth16 verifier: the four-pair pairing check costs 181,000 gas, 94 percent of the precompile bill, and the two public inputs cost 12,300 gas, 6 percent."
+/>
+
+**The [pairing dominates](/c/pairings-dominate-gas), and it is a constant.** It does not shrink with a
+smaller circuit, a faster prover, or better Solidity — the proof is three group elements whether it
+attests to ten constraints or ten billion.<Cite src="iacr-groth16" /> That is succinctness working as
+advertised, and it is also a floor you cannot optimise below while verifying one proof per
+transaction.
+
+Which is why the two real levers are structural rather than local. **Reduce public inputs**: each one
+costs 6,150 gas, and a common move is to replace several with a single hash commitment to them,
+trading circuit constraints for calldata and gas. **Or verify fewer times**: fold many proofs into one
+before touching L1, so that a single pairing check settles a batch. The
+[cost of a verifier](/c/groth16-verifier-cost) and the existence of aggregation layers are the same
+fact seen from two directions — when 94% of the bill is a constant, the only way to shrink it per unit
+of work is to increase the work per call.
+
+<Misconception
+  belief="On-chain SNARK verification cost is a property of the proof system."
+  reality="It is the precompile schedule plus your public-input count plus your contract's own overhead. The proof system fixes the number of pairings; you fix everything else, and the schedule was set by benchmarking client implementations in a particular year."
+  why="Verifier contracts arrive generated, as an opaque artifact, so the cost reads as intrinsic rather than as a sum of line items."
+  src="eip-1108"
+/>
+
+## The operation BN254 does not give you
+
+EIP-196 exposes addition and multiplication for points encoded as *two* field elements — that is
+`G₁`.<Cite src="eip-196" /> There is no `G₂` addition and no `G₂` multiplication precompile on BN254 at
+all. The pairing check at `0x08` accepts `G₂` points as inputs, but nothing lets a contract *compute*
+with them.<Cite src="eip-197" /><Cite src="zellic-bls-signatures" />
+
+For a Groth16 verifier that is fine, because its `G₂` elements are fixed verification-key constants.
+For anything that aggregates on-chain it is a wall, and the workaround that grew up around it is
+instructive.
+
+EigenLayer's AVS contracts verify BLS signatures on BN254, which needs an aggregate public key. If
+public keys lived in `G₂`, aggregating them on-chain would need `G₂` additions that do not exist. So
+the aggregator submits the signers' individual public keys in `G₁` *and* a claimed aggregate key in
+`G₂`, and the contract checks in one pairing call both that the signature verifies and that the
+claimed `G₂` key is consistent with the `G₁` list — combining the two checks with a factor derived by
+hashing every public value, Fiat–Shamir style, so a malicious aggregator cannot forge the
+pairing.<Cite src="zellic-bls-signatures" />
+
+Read that as an architecture consequence of a missing precompile. A gap in the exposed operation set
+did not merely raise a gas cost; it changed who submits what, and added a soundness argument that
+would otherwise not exist. Zellic's own note is that with EIP-2537, which does expose `G₂` arithmetic,
+the trick is no longer needed on BLS12-381.<Cite src="zellic-bls-signatures" /><Cite src="eip-2537" />
+
+## EIP-2537, in the form you will call it
+
+Seven precompiles, shipped in the Prague execution upgrade — dated 7 May 2025 on ethereum.org's own
+upgrade table, and confirmed by the execution-spec tests filing them under
+`prague/`.<Cite src="eip-2537" /><Cite src="ethereum-org-history" /><Cite src="execution-spec-tests-eip2537" />
+
+<Matrix
+  corner="Address"
+  cols={['Operation', 'Input', 'Output', 'Gas']}
+  rows={[
+    { label: <code>0x0b</code>, cells: [<code>G1ADD</code>, <>256 bytes (two <code>G₁</code>)</>, '128 bytes', '375'] },
+    { label: <code>0x0c</code>, cells: [<code>G1MSM</code>, '160·k bytes', '128 bytes', 'see below'] },
+    { label: <code>0x0d</code>, cells: [<code>G2ADD</code>, <>512 bytes (two <code>G₂</code>)</>, '256 bytes', '600'] },
+    { label: <code>0x0e</code>, cells: [<code>G2MSM</code>, '288·k bytes', '256 bytes', 'see below'] },
+    { label: <code>0x0f</code>, cells: [<code>PAIRING_CHECK</code>, '384·k bytes', '32 bytes', { v: '32,600·k + 37,700', tone: 'accent' }] },
+    { label: <code>0x10</code>, cells: [<code>MAP_FP_TO_G1</code>, '64 bytes', '128 bytes', '5,500'] },
+    { label: <code>0x11</code>, cells: [<code>MAP_FP2_TO_G2</code>, '128 bytes', '256 bytes', '23,800'] },
+  ]}
+  caption="Address, shape and price — the three things a call has to get right before any cryptography is reached."
+  alt="The seven EIP-2537 precompiles: G1ADD at 0x0b takes 256 bytes and returns 128 for 375 gas; G1MSM at 0x0c takes 160k bytes and returns 128; G2ADD at 0x0d takes 512 bytes and returns 256 for 600 gas; G2MSM at 0x0e takes 288k bytes and returns 256; PAIRING_CHECK at 0x0f takes 384k bytes and returns 32 for 32,600k plus 37,700 gas; MAP_FP_TO_G1 at 0x10 takes 64 bytes and returns 128 for 5,500 gas; MAP_FP2_TO_G2 at 0x11 takes 128 bytes and returns 256 for 23,800 gas."
+/>
+
+<Cite src="eip-2537" />
+
+The encoding rules underneath those lengths:<Cite src="eip-2537" />
+
+- An `Fp` element is **64 bytes**, big-endian. The modulus is 381 bits, so the top 16 bytes are always
+  zero — and the EIP requires that this be checked, not assumed, even when only a sub-slice of the
+  input is decoded.
+- An `Fp2` element is **128 bytes**: the two coefficients concatenated.
+- A `G₁` point is **128 bytes**, a `G₂` point **256**. A scalar is **32**.
+- The point at infinity is a run of 128 or 256 zero bytes, by convention — because `(0, 0)` is not
+  actually on the curve for BLS12 curves and so the naive reading was free to be repurposed.
+
+<Misconception
+  belief="A BLS12-381 G₁ point is 48 bytes."
+  reality="48 bytes is the compressed serialisation used by KZG commitments and consensus signatures. The EIP-2537 precompiles take 128-byte zero-padded uncompressed points, and reject the compressed form."
+  why="The same curve appears with two different encodings in two different Ethereum subsystems, and both are correct in their own context. The consensus one is the one most readers meet first."
+  src="eip-2537"
+/>
+
+That misconception is not academic. A validator public key read from the beacon state is 48
+bytes;<Cite src="eth2book-bls-signatures" /> handing it to `0x0b` is a length error. The EIP notes why
+the padded uncompressed form was chosen: 64 bytes keeps the ABI 32-byte-aligned, representable as
+`bytes32[2]`, and decompression would cost more gas than supplying the decompressed point in
+calldata.<Cite src="eip-2537" />
+
+### Three behaviours that differ from what you would guess
+
+**Errors burn all the gas.** Following the convention of the other precompiles, an error in any
+EIP-2537 call burns all the gas supplied with the `CALL` or
+`STATICCALL`.<Cite src="eip-2537" /> This is not an ordinary revert that returns the remaining gas to
+the caller. A wrong encoding in a batch operation does not cost you an error path; it costs you the
+transaction's whole budget.
+
+**Empty input is an error — the opposite of BN254.** EIP-197 states that empty input to the pairing
+check is valid and returns one.<Cite src="eip-197" /> EIP-2537 discourages that use case explicitly:
+variable-length operations must return an error on empty input.<Cite src="eip-2537" /> Two pairing
+checks, two curves, opposite behaviour on the same degenerate input — and "returns one" versus "burns
+all gas" is a meaningful difference to a contract that builds its input list dynamically.
+
+**Subgroup checks are performed on five of the seven.** The multi-scalar multiplications and the
+pairing check must reject inputs that are on the curve but outside the correct subgroup. The two
+addition precompiles explicitly do not perform that check.<Cite src="eip-2537" /> Addition is safe
+without it, but a contract that treats "the precompile validated my point" as a uniform guarantee is
+generalising from five cases to seven.
+
+### Success is not the answer
+
+A precompile call has two independent results and they mean different things. `staticcall` returns a
+boolean saying whether the call itself succeeded. The pairing check *also* returns a value saying
+whether the pairing equation held.
+
+Both pairing precompiles return exactly 32 bytes: EIP-197's output is one or zero as a 32-byte
+big-endian number, and EIP-2537's is 31 zero bytes followed by `0x00` for false or `0x01` for
+true.<Cite src="eip-197" /><Cite src="eip-2537" /> So a call with a perfectly well-formed input over
+points that do not satisfy the equation is a **successful call returning false**.
+
+```solidity
+(bool ok, bytes memory out) = address(0x0f).staticcall(input);
+require(ok, "pairing call failed");          // says nothing about the proof
+require(abi.decode(out, (uint256)) == 1);    // this is the verification
+```
+
+Dropping the second line produces a verifier that accepts every proof whose calldata is
+well-encoded — which is every proof an attacker submits, because encoding correctly is free. It is the
+same shape of defect as the passkey precompile at `0x100`, which returns zero-length output on an
+invalid signature rather than reverting, so a bare `require(success)` there reads an invalid signature
+as a valid one.<Cite src="eip-7951" /> Two different precompiles, two different failure encodings, one
+identical mistake.
+
+<Aside kind="note">
+The fixed-price outlier on the list is `0x0a`, the KZG point-evaluation precompile. It takes exactly
+192 bytes, costs a flat 50,000 gas with no `k` term, and on success returns the number of field
+elements per blob and the BLS modulus as two padded 32-byte
+values.<Cite src="eip-4844" /> It is the one entry on the number line that is not a general-purpose
+curve operation but a single protocol-specific check —
+[the opening verification](/c/point-evaluation-precompile) for a blob commitment — which is why it
+prices as a constant rather than as a formula.
+</Aside>
+
+## Multi-scalar multiplication, and the table you must not interpolate
+
+EIP-2537 exposes no dedicated multiplication call at all. The rationale is that a dedicated
+multiplication would have exactly the same ABI as multi-scalar multiplication with `k` equal to one,
+so implementations are told to recognise that case and dispatch to a single-point
+routine.<Cite src="eip-2537" />
+
+**Multi-scalar multiplication** computes the sum of `[aᵢ]Pᵢ` over many pairs in one call. It is the
+dominant cost inside almost every prover, which is why prover performance work concentrates there and
+why [GPU acceleration pays off](/c/cpu-vs-gpu-proving). The reason it earns a discount is Pippenger's
+algorithm: batching the pairs shares work across them so that cost per pair falls as the batch
+grows.<Cite src="eip-2537" />
+
+The price is `(k · multiplication_cost · discount(k)) / 1000` with integer division, where the
+multiplication cost is 12,000 for `G₁` and 22,500 for `G₂`, and `discount(k)` is read from an explicit
+128-entry table per group, with a cap for `k` above 128 — 519 for `G₁`, 524 for
+`G₂`.<Cite src="eip-2537" />
+
+Evaluated at the sizes worth knowing:
+
+<Matrix
+  numeric
+  corner="k"
+  cols={['G1MSM', 'per pair', 'G2MSM', 'per pair']}
+  rows={[
+    { label: 'k = 1', cells: ['12,000', '12,000', '22,500', '22,500'] },
+    { label: 'k = 8', cells: ['69,888', '8,736', '143,280', '17,910'] },
+    { label: 'k = 64', cells: ['442,368', { v: '6,912', tone: 'good' }, '838,080', { v: '13,095', tone: 'good' }] },
+    { label: 'k = 128', cells: ['797,184', { v: '6,228', tone: 'good' }, '—', '—'] },
+  ]}
+  caption="These are table lookups, not points on a line: the discount has no formula behind it to interpolate."
+  alt="Multi-scalar multiplication cost in gas. G1MSM: 12,000 at k equals 1 and 12,000 per pair; 69,888 at 8 and 8,736 per pair; 442,368 at 64 and 6,912 per pair; 797,184 at 128 and 6,228 per pair. G2MSM: 22,500 at k equals 1 and 22,500 per pair; 143,280 at 8 and 17,910 per pair; 838,080 at 64 and 13,095 per pair."
+/>
+
+<Cite src="eip-2537" />
+
+Two readings. First, **the per-pair cost flattens rather than falling linearly** — from `k = 1` to
+`k = 64` in `G₁` it drops by about 42%, and from 64 to 128 by only a further 10%. Second, the `G₂`
+column stays close to 1.9× the `G₁` column throughout, which is the size asymmetry showing up as
+money rather than as bytes.
+
+<Aside kind="warn">
+**Do not fit a curve through two of those rows.** The discount is a lookup table, not a formula. It is
+not monotonic in its increments — successive entries repeat, for instance 92 and 93 both discount at
+547 in `G₁` — so an interpolation will look plausible and be wrong at points you did not sample. The
+practice exercise for this module measures `k` at 1, 8 and 64 and asks you to compare each against the
+table rather than against a fitted line, for exactly this reason.
+</Aside>
+
+There is also a gas-accounting subtlety with a security flavour. The EIP specifies that the gas
+function computes `k` by *floor division* of the input length and performs no length validation, so an
+input that is not a multiple of the per-pair length still produces a gas charge — and then the main
+routine returns an error. For `k = 0` the formal gas cost is zero, which the EIP notes is safe because
+the `CALL` itself is not free and a zero-cost precompile already exists in
+`blake2f`.<Cite src="eip-2537" />
+
+<Misconception
+  belief="Multi-scalar multiplication is a loop over scalar multiplications, so its cost is k times the single cost."
+  reality="Batching shares work across the pairs, and the schedule prices that with an explicit per-k discount: 64 pairs in G₁ cost 442,368 gas rather than 768,000, and the per-pair cost falls by about 42%."
+  why="The name describes the result, not the algorithm, and the naive implementation genuinely is a loop."
+  src="eip-2537"
+/>
+
+The EIP also puts a number on the other saving, which has nothing to do with cryptography: performing
+an MSM of 100 points by calling a multiplication precompile 100 times and an addition precompile 99
+times would waste roughly **138,600 gas** in `CALL` overhead
+alone.<Cite src="eip-2537" /> A batched interface is partly a cryptographic optimisation and partly a
+way of not paying the EVM's per-call toll two hundred times.
+
+<Check type="spot-bug" concept="bls-precompiles">
+A contract verifies an aggregated BLS signature using the new precompiles. The relevant fragment:
+
+```solidity
+// pubkeys[i] is a 48-byte compressed G1 point read from a registry.
+bytes memory input;
+for (uint256 i = 0; i < pubkeys.length; i++) {
+    input = bytes.concat(input, pubkeys[i], bytes32(weights[i]));
+}
+(bool ok, bytes memory apk) = address(0x0c).staticcall(input);
+require(ok, "aggregation failed");
+```
+
+Three separate defects. Name them, and say what the caller observes for each.
+
+<Answer>
+**Defect one: the points are in the wrong encoding.** `0x0c` is `G1MSM`, and it expects each pair as a
+128-byte uncompressed padded `G₁` point followed by a 32-byte scalar — 160 bytes per
+pair.<Cite src="eip-2537" /> The registry's 48-byte compressed form is the consensus and KZG
+serialisation, and the precompile does not accept it.<Cite src="eth2book-bls-signatures" /> The
+contract must decompress before the call, off-chain or in Solidity; the EIP's own rationale notes that
+supplying decompressed points in calldata is deliberately cheaper than making the precompile
+decompress.<Cite src="eip-2537" />
+
+**Defect two: what the caller observes is not a revert.** Each pair is 80 bytes instead of 160, so
+`k = floor(len / 160)` is half the intended count, the gas function charges for that smaller `k`
+without validating the length, and the main routine then errors — at which point **all gas supplied
+with the `STATICCALL` is burned**.<Cite src="eip-2537" /> The `require` never runs with a useful
+budget behind it. In a batch transaction this is the difference between one failed operation and a
+consumed block-gas allowance.
+
+**Defect three: the loop's cost model is wrong in the caller's favour and its correctness model is
+wrong in the caller's disfavour.** `bytes.concat` in a loop reallocates and copies the whole buffer on
+every iteration, so building the input is quadratic in the number of signers — for a large committee
+that alone can dominate the precompile cost the code is trying to optimise. Build the buffer once at
+the known size and write into it.
+
+**A fourth thing worth flagging even though it is not a bug here.** `G1MSM` performs a subgroup check
+on every input point, so a point that is on the curve but outside the prime-order subgroup is
+rejected.<Cite src="eip-2537" /> That is a real guarantee and it is worth knowing you have it — but
+had this code used `G1ADD` at `0x0b` in a loop instead, it would have had no such check, because the
+addition precompiles deliberately omit it.<Cite src="eip-2537" /> Whether your points are validated
+depends on which precompile you called, not on the curve.
+
+**The reviewable rule:** for every precompile call, write down the per-pair input length, whether the
+inputs are validated, and what happens to your gas on error. Three lines in a comment above the
+`staticcall`. All three differ between `0x08` and `0x0f`, on the same conceptual operation.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The module's practice exercise is this lesson with a compiler attached.** It asks you to call `0x0b`
+and `0x0f` with vectors from the execution-spec tests, then break the call twice — once by sending an
+`Fp` element as 48 bytes instead of 64, once by sending a compressed `G₁` point — and to measure
+`G1MSM` at three values of `k` against the EIP's own
+formula.<Cite src="execution-spec-tests-eip2537" /><Cite src="eip-2537" /> Taking the vectors from the
+spec tests rather than generating your own keeps "is this a valid point" and "is this the right
+encoding" as two problems instead of one.
+
+**The next lesson uses `0x10` and `0x11`.** Those two mapping precompiles exist because turning bytes
+into a curve point is a cryptographic operation with its own standard, and the alternative — everyone
+improvising — breaks the security proofs of the signature schemes built on top.
+
+**And in gas work generally**, the transferable habit is the derivation. When a cost arrives as a
+single quoted number, take it apart into the terms whose owners differ: the schedule's, the proof
+system's, and yours. Only the last one is negotiable, and you cannot find it without the first two.

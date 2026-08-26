@@ -1,0 +1,224 @@
+---
+id: solidity-abi-selectors-reading-your-own-calldata
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solidity-docs-global-vars, solidity-docs-contracts, solidity-abi-spec, solc-contractcompiler-source, philogy-selector-switches, eip-2771, solidity-0836-release]
+stack: { solidity: "0.8.36", forge: "1.7.1" }
+---
+
+Send this contract two bytes of calldata and ask it what it saw.
+
+```solidity
+contract Sig {
+    bytes4 public lastSig;
+    uint256 public lastLen;
+    fallback() external { lastSig = msg.sig; lastLen = msg.data.length; }
+}
+```
+
+```text
+call with 0xaabb   ->  lastSig = 0xaabb0000   lastLen = 2
+call with 0x       ->  lastSig = 0x00000000   lastLen = 0
+```
+
+Measured on solc 0.8.36.<Cite src="solidity-0836-release" /> `msg.sig` is four bytes even when the
+call is two bytes long, and it is four bytes even when there is no calldata at all. Whatever routing
+decision you make on it, you are making on a value that was partly invented.
+
+That asymmetry is the reason this short lesson exists. `msg.data` and `msg.sig` are the two windows
+onto the raw call from inside the contract, and everything generic — proxies, routers, forwarders,
+meta-transactions — is built by looking through them.
+
+## What the two members actually are
+
+The documentation is precise about their types, and the types carry more than they look like.
+
+`msg.data` is `bytes calldata` — the **complete** calldata. `msg.sig` is `bytes4` — the first four
+bytes of the calldata, that is, the function
+identifier.<Cite src="solidity-docs-global-vars" />
+
+Three consequences follow directly from those two lines.
+
+**`msg.data` is a view, not a copy.** Its declared location is `calldata`, so reading it costs
+nothing beyond the read and it inherits everything you already know about
+[calldata being immutable and non-relocatable](/c/sol-calldata-immutable). Assigning it to a
+`bytes memory` variable is a copy, with the memory expansion that implies; passing it straight into
+a low-level call is not.
+
+**"Complete" includes the selector.** `msg.data` is not the argument block; it is selector plus
+argument block — and the specification is explicit that the argument encoding starts from the fifth
+byte, with return values and event arguments using the identical encoding minus those four
+bytes.<Cite src="solidity-abi-spec" /> Anything you hand to `abi.decode` has to skip the first four bytes yourself, which is
+what the array-slice form is for: `abi.decode(input[4:], (uint256, uint256))`, on a slice rather
+than a copy.<Cite src="solidity-docs-contracts" />
+
+**`msg.sig` is derived, not stored.** There is no four-byte field in the call to read. The compiler
+produces it the same way the dispatcher does — load the first word of calldata and shift right by
+224 bits<Cite src="solc-contractcompiler-source" /> — and reading past the end of calldata yields
+zero bytes. Hence `0xaabb0000`.
+
+<Figure
+  caption="Two bytes arrived and four came back: the trailing zeroes are not padding the caller sent, they are a read past the end of calldata."
+  alt="The four bytes of msg.sig for a two-byte call: the first two bytes are what the caller actually sent, and the last two are zeroes produced by reading past the end of calldata."
+>
+  <Anatomy
+    value="0xaabb0000"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 6, label: 'sent', note: 'msg.data.length = 2', tone: 'accent' },
+      { from: 6, to: 10, label: 'invented', note: 'past the end', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="note">
+Both are readable from `pure` functions, which surprises people who expect `pure` to mean "reads
+nothing outside its arguments". The documentation's definition is narrower and deliberate: a `pure`
+function should be evaluable at compile time given only its inputs **and `msg.data`**, and the list
+of things that count as reading state names every member of `block`, `tx` and `msg` **with the
+exception of `msg.sig` and `msg.data`**.<Cite src="solidity-docs-contracts" /> They are inputs to
+the call, not state of the chain.
+</Aside>
+
+## The trap: four bytes that were not all sent
+
+Return to the opening measurement. The compiler's dispatcher never has this problem, because it
+tests `calldatasize` against 4 and branches to the not-found path *before* extracting a
+selector.<Cite src="solc-contractcompiler-source" /> Code you write in a `fallback` has no such
+guard unless you write one.
+
+So a router shaped like this is steerable:
+
+```solidity
+fallback() external {
+    address impl = implementationFor[msg.sig];   // no length check anywhere
+    ...
+}
+```
+
+A caller sending one, two or three bytes reaches the fallback, and `msg.sig` is those bytes
+zero-extended to four. If any registered selector happens to end in zero bytes — and mining a name
+for its selector is a practice with production examples, Seaport's `0x00000000` among
+them<Cite src="philogy-selector-switches" /> — a short call reaches a route the caller could not
+have named in full. A call with empty calldata produces `msg.sig == 0x00000000`, which is a perfectly valid key
+in that mapping.
+
+The fix is one line and it belongs in every generic entry point:
+
+```solidity
+require(msg.data.length >= 4, "no selector");
+```
+
+<Misconception
+  belief="If msg.sig has a value, the caller sent a selector."
+  reality="msg.sig is four bytes of a zero-extended read. Calldata of length 0 to 3 still produces a four-byte value, and empty calldata produces 0x00000000."
+  why="Every ordinary call carries at least four bytes, because the compiler's own dispatcher rejects anything shorter before your code runs. Inside a fallback that guard is behind you, and msg.sig has the same type and the same look as it did in a normal function."
+  src="solc-contractcompiler-source"
+/>
+
+### Two ways to reach the same bytes
+
+Solidity gives the fallback two declarations, and the difference is worth knowing before you pick
+one. `fallback() external [payable]` gives you nothing directly and leaves you to read `msg.data`.
+`fallback(bytes calldata input) external [payable] returns (bytes memory output)` binds the same
+bytes to a named parameter — the documentation states that `input` contains the full data sent to
+the contract, **equal to `msg.data`** — and gives you a return channel whose contents are sent back
+**without modifications, not even padding**.<Cite src="solidity-docs-contracts" />
+
+So the parameterised form is not sugar. It is the only way to return arbitrary bytes from a fallback
+without assembly, which is exactly what a forwarding contract needs: the callee's return value has
+already been encoded by the callee, and encoding it again would be wrong. Anything you return from
+the plain `fallback()` has to go out through inline assembly instead.
+
+## Reading a call that has been added to
+
+Once a contract routes on raw calldata, other people start appending to it, and ERC-2771 is the
+standard that formalised the practice.
+
+A trusted forwarder calls the recipient and **must append the address of the transaction signer — 20
+bytes of data — to the end of the call data**. The recipient extracts the signer from the last 20
+bytes and uses that instead of `msg.sender`; if `msg.sender` is not a trusted forwarder, **or if
+`msg.data` is shorter than 20 bytes**, it returns the original `msg.sender`
+unchanged.<Cite src="eip-2771" />
+
+<Figure
+  caption="The appended address sits in the same byte string as the arguments, distinguishable from them only by counting from the end."
+  alt="The calldata a trusted forwarder sends to an ERC-2771 recipient: four selector bytes, then the encoded argument block of unknown length, then twenty bytes carrying the claimed transaction signer."
+>
+  <ByteLayout
+    caption="msg.data inside an ERC-2771 recipient"
+    fields={[
+      { label: 'selector', size: 4, tone: 'accent', note: 'msg.sig' },
+      { label: 'argument block', variable: true, note: 'what the dispatcher decodes' },
+      { label: 'signer', size: 20, tone: 'warn', note: 'appended by the forwarder' },
+    ]}
+  />
+</Figure>
+
+Read that second condition next to the previous section and the pattern is the same one twice: every
+routine that slices calldata needs a length check, because calldata has no minimum length and every
+read past its end returns zeroes rather than failing.
+
+The standard is equally direct about what the mechanism does *not* buy. A malicious forwarder may
+forge the value of `_msgSender()` and effectively send transactions from any address, so recipient
+contracts must be very careful in trusting forwarders — and if a forwarder is upgradeable, that trust
+extends to it never performing a malicious upgrade.<Cite src="eip-2771" /> The 20 appended bytes
+carry no proof of anything. They are a claim by the caller, and the entire security of the scheme is
+the recipient's allow-list of forwarders.
+
+This is the same shape as the selector itself: a four-byte name is not authority, and a 20-byte
+suffix is not authentication. Both are data the caller chose.
+
+<Check type="explain" concept="abi-msg-data-msg-sig">
+A team is writing a proxy. Someone points out that the implementation, reached by `delegatecall`,
+also has `msg.data` and `msg.sig`, and asks what those hold inside it.
+
+Answer that, and then say what it means for a contract that wants to know whether it is being called
+directly or through a proxy.
+
+<Answer>
+**Inside the implementation, `msg.data` and `msg.sig` are the proxy's calldata, unchanged.**
+`delegatecall` runs the callee's code in the caller's context, and calldata is part of that context:
+the implementation sees the exact bytes the external caller sent to the proxy, including the
+selector that the proxy's own dispatcher failed to match. That is precisely why the pattern works —
+a proxy forwards `msg.data` verbatim and the implementation's dispatcher does the matching. See
+[whose context you are in](/c/sol-delegatecall-context).
+
+The documentation adds the general warning: all members of `msg`, including `msg.sender` and
+`msg.value`, can change for every external function call — including calls to library
+functions.<Cite src="solidity-docs-global-vars" /> `msg.*` describes the current frame, not the
+transaction. In a `delegatecall` the frame is inherited, which is exactly the case where the naive
+reading and the correct reading agree by accident.
+
+**What it means for "am I being proxied?"** Nothing in `msg.data` or `msg.sig` answers it. Both are
+identical whether the implementation was reached directly or through a proxy, because they describe
+what the caller sent, not who ran it. The values that differ are `address(this)` — which under
+`delegatecall` is the proxy's address, not the implementation's — and the storage the code is
+reading. The standard technique follows from that: a contract that must know records its own
+deployed address at construction time in an `immutable`, then compares it against `address(this)`
+at runtime — the two agree on a direct call and differ under `delegatecall`.
+
+The general lesson is worth more than the trick. `msg.data` and `msg.sig` tell you what was
+*requested*. They tell you nothing about who is executing it, in whose storage, or through how many
+frames. Every question of the form "where am I really?" is answered by `address(this)`, by storage,
+or by a value the deployer committed to — never by the calldata.
+</Answer>
+</Check>
+
+## Where this pays off
+
+You now have the whole byte string in view from both directions: how a caller builds it, and how a
+callee reads it back without decoding it.
+
+That is what the next module runs on. A proxy is a `fallback` that forwards `msg.data` and returns
+the result unmodified — which is why the parameterised fallback returns raw bytes with **no
+ABI-encoding and not even padding**.<Cite src="solidity-docs-contracts" /> A multicall router is a
+loop over an array of encoded sub-calls, each one a `bytes` argument you now know how to lay out. A
+meta-transaction relayer is the same call plus a suffix and an allow-list.
+
+Two habits to carry out of this module. Check `msg.data.length` before you slice it, every time.
+And when you route on four bytes, remember what those four bytes are: the front of a hash of a
+string somebody chose, zero-extended if they sent fewer, matched by compiled search code, and
+carrying no authority whatsoever.

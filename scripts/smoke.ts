@@ -1,0 +1,10 @@
+import { stats, allTracks, getConcept, getModulesOf, siblings, readingOrder, crumbsFor } from '../src/lib/content/load';
+const s = stats();
+console.log('stats', s);
+console.log('tracks', allTracks().map(t => `${t.number}:${t.id}@${t.layout.lane}/${t.layout.row}`).join('  '));
+const c = getConcept('delegation-designator');
+console.log('delegation-designator:', c ? { home: c.moduleId, track: c.trackId, requires: c.requires.length, requiredBy: c.requiredBy.length, related: c.related.length, lessons: c.lessons.length } : 'MISSING');
+console.log('evm modules:', getModulesOf('evm').map(m => m.id).slice(0,4).join(', '));
+const ro = readingOrder();
+console.log('reading order:', ro.length, '| first:', ro[0]?.lessonId, '| next:', siblings(ro[0].lessonId).next?.lessonId);
+console.log('crumbs:', crumbsFor({ trackId: ro[0].trackId, moduleId: ro[0].moduleId, lessonId: ro[0].lessonId }).map(x=>x.label).join(' > '));

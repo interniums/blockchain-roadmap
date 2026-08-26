@@ -1,0 +1,238 @@
+---
+id: evm-state-tries-log-of-edits-to-one-map
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [execution-specs, yellow-paper, eip-1186, eip-161, eip-7702, ethereum-docs-accounts, measured-gas-constants]
+stack: {}
+---
+
+Two teams are handed the same ticket: show a user their ETH balance as of a chosen block.
+
+The first team builds an indexer. It streams blocks from genesis, watches every value transfer, and
+keeps a running total per address. Four days of backfill later it works, mostly, and a handful of
+addresses are wrong by amounts nobody can account for. Reconciliation becomes a standing agenda item.
+
+The second team calls `eth_getBalance(address, blockNumber)`. It answers in milliseconds and it is
+exact.
+
+The second team is not better at engineering. They are working with the grain of the data model and
+the first team is working against it: the first team built a fold over history to recover a value the
+protocol stores as a field. This lesson is about what that field is, what sits next to it, and why
+the answer has consequences far past balance display.
+
+## The map is primary; the blocks are its changelog
+
+Ethereum's world state is one map. The key is a 20-byte address. The value is an account record. That
+is the entire top-level shape — the Yellow Paper defines the world state as exactly this mapping
+between addresses and account states, held in a structure no transaction ever
+serialises.<Cite src="yellow-paper" /><Cite src="execution-specs" />
+
+A block contains transactions and a 32-byte commitment to the map that results from executing them.
+It does not contain balances, and there is no place in a block where a balance is written down.
+Lesson 4 is about that commitment. What matters here is the direction of the dependency:
+
+**The map is the state. The chain is the log of edits to it.**
+
+That ordering is a design choice, not a fact about ledgers. On a UTXO chain there is no
+protocol-level balance at all — a wallet's "balance" is a client-side sum over outputs it can spend,
+and the first team's architecture is the *correct* architecture there. If
+you have met [the UTXO model](/c/utxo-model), this is the fork in the road: Ethereum chose a mutable
+addressable map precisely because long-lived contract state is painful to express over a set of
+one-shot outputs.
+
+<Misconception
+  belief="The blockchain stores balances in blocks; a node reads a balance by scanning the chain."
+  reality="Blocks store transactions and one 32-byte root. Balances live in a key-value map that every node maintains separately, and reading one is a lookup rather than a replay."
+  why="The word 'ledger' is imported from double-entry accounting and from Bitcoin, where the fold really is the model. Explainer diagrams reinforce it by drawing blocks as pages in a book."
+  src="execution-specs"
+/>
+
+<Figure
+  caption="Each block edits the map and commits to the result; no block anywhere records a total."
+  alt="The account map before a block, the block itself carrying transactions, the map after the block, and a balance read taken as a single lookup against the map at that block."
+>
+  <Flow
+    nodes={[
+      { id: 'm0', label: 'map @ N-1', note: 'every account record', col: 0, tone: 'accent' },
+      { id: 'b', label: 'block N', note: 'edits, never totals', col: 1 },
+      { id: 'm1', label: 'map @ N', note: 'edited in place', col: 2, tone: 'accent' },
+      { id: 'q', label: 'eth_getBalance', note: 'one lookup at block N', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'm0', to: 'b', label: 'apply' },
+      { from: 'b', to: 'm1' },
+      { from: 'm1', to: 'q', label: 'read' },
+    ]}
+  />
+</Figure>
+
+There is a sharp practical corollary that catches teams every quarter. **ETH balances are a protocol
+field; token balances are not.** An ERC-20 balance lives in that contract's storage, and the
+`Transfer` events an indexer folds over are a convention the contract's author chose to emit. Nothing
+in the protocol enforces that the events and the storage agree. Fold events and you get an answer as
+good as that convention; read storage and you get the answer the contract will act on. The first
+team's mistake is a reasonable design applied one layer too low.
+
+## The record is exactly four fields
+
+The value stored against an address is the RLP encoding of four items, in this
+order.<Cite src="execution-specs" /> `eth_getProof` returns exactly these four and nothing
+else.<Cite src="eip-1186" />
+
+| Field | What it holds |
+|---|---|
+| `nonce` | For a key-controlled account, how many transactions it has sent. For a code-bearing account, how many contracts it has created. |
+| `balance` | Wei. The only quantity the protocol itself treats as money. |
+| `storageRoot` | The root of *this account's own* storage trie — the subject of lesson 2. |
+| `codeHash` | keccak256 of the account's code. |
+
+Two details in that table are worth slowing down for.
+
+**The nonce is overloaded on purpose.** It is a replay counter for accounts that send transactions and
+a creation counter for accounts that deploy. Both readings serve the same invariant — the nonce must
+be unique per action — which is why [CREATE derives a new contract's address](/c/create-address-from-nonce)
+from the deployer's nonce, and why [one stuck transaction blocks everything behind it](/c/nonce-ordering).
+EIP-161 set a contract's nonce to begin at 1 rather than 0, so that a contract's own creations never
+collide with the address it was created at.<Cite src="eip-161" />
+
+**`storageRoot` is a reference, not data.** The account leaf holds a 32-byte hash. The storage it
+commits to is a whole separate structure. That single field is what makes the state a trie of tries,
+and lesson 2 is about what it costs.
+
+### There is no fifth field
+
+This is the part that reshapes how you read the chain. The record has no owner, no label, no type
+tag, no creation block, no deployer, no ABI, no token symbol, no "is this a proxy" flag. There is no
+extension point and no reserved space.<Cite src="execution-specs" />
+
+Everything a block explorer shows you beyond those four values is one of exactly two things: derived
+off-chain from transaction history, or read out of the contract's own storage. "When was this
+contract deployed" is an indexer answer. "What is this token called" is a storage answer, produced by
+a function the contract chose to expose. Neither is a property of the account.
+
+<Aside kind="note">
+This is a good filter for API design. If you are about to ask a node for a fact about an address, ask
+first which of the four fields it could possibly come from. If none of them, you are asking for an
+index — and indexes are somebody's infrastructure, with a backfill, a lag, and an outage
+history.<Cite src="ethereum-docs-accounts" />
+</Aside>
+
+## Empty and absent are the same state
+
+The map has no explicit deletions in the ordinary sense, but it does have a rule that removes
+entries, and the rule is older and stricter than most people expect.
+
+EIP-161 defines an account as **empty** when it has no code, zero nonce and zero balance, and as
+**dead** when it is either non-existent or empty. Any account touched during a transaction that is
+empty when the transaction ends becomes non-existent — deleted, not stored as
+zeroes.<Cite src="eip-161" /> The same EIP forbids an operation from creating an
+existent-but-empty account in the first place.<Cite src="eip-161" />
+
+So `eth_getBalance` returning `0` tells you nothing about whether the address has ever been used. An
+address that has never received a wei and an address that received funds and spent all of them down
+to zero are, after the sweep, the same entry in the map: none.
+
+Hold that shape. Lesson 3 shows the identical rule operating one level down, on individual storage
+slots, where it is much more likely to end up in your business logic.
+
+## One record shape, two ways to control an account
+
+Here is where a very common mental model quietly stops being true.
+
+An account with no code carries the hash of the empty string in `codeHash`. EIP-1186 prints the
+constant in its own specification of the `eth_getProof` response: a simple account without code
+returns `0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`.<Cite src="eip-1186" />
+You can regenerate it in one command — `cast keccak 0x` — and this project did, on the same toolchain
+that produced its gas figures, to avoid printing a constant it had only remembered.<Cite src="measured-gas-constants" />
+
+An account with code carries the hash of that code. Same four fields, same order, same encoding. The
+only difference is a value.
+
+**The state does not model account kinds.** There is no tag, no discriminated union, no separate
+table. "EOA" and "contract account" are names for two regions of one field's value space, and the
+protocol never asks which region an account is in — it asks what the code at that account does when
+called.
+
+That is what made EIP-7702 expressible without a state-format change. A set-code transaction writes a
+23-byte **delegation designator**, `0xef0100` followed by an address, into the account's code
+field.<Cite src="eip-7702" /> `codeHash` becomes the hash of those 23 bytes. Nothing structural moved.
+A key-controlled account now has code, and calls to it execute the delegate's code in that account's
+own storage and identity context. If you have met [the delegation designator](/c/delegation-designator),
+this is the state-level reason it could ship the way it did: the record had a field of the right shape
+already.
+
+<Misconception
+  belief="The account record can grow new fields as the protocol evolves — that is how EIP-7702 added delegation."
+  reality="Its shape is fixed at four RLP items. New capabilities are encoded into an existing field's value space, which is exactly what the 23-byte designator in the code field is."
+  why="Extensible records are the norm everywhere else — add a column, add a protobuf field, bump a version. Here every node's state format and every historical state root depend on the encoding, so widening the record is not a migration, it is a different chain."
+  src="eip-7702"
+/>
+
+<Misconception
+  belief="EOAs and contracts are stored differently, so the protocol can always tell them apart."
+  reality="Identical record shape; only the codeHash value differs. Since EIP-7702, a key-controlled account can carry code, so even the value no longer separates the two categories cleanly."
+  why="Every introductory diagram draws two boxes with different fields in them. The two-box picture was a teaching simplification before 2025 and is a source of live bugs after it."
+  src="eip-7702"
+/>
+
+The predicate that pre-2025 code reached for — treat an address as safe because its code length is
+zero — was already imperfect (an account under construction reports zero code), and it now fails in
+the other direction as well. The security track spends real time on this; what belongs here is the
+structural reason. **The check was reading a field, not a type**, and fields change.
+
+<Check type="explain" concept="eoa-vs-contract-same-record">
+You call `eth_getProof` on three addresses at the same block and get back these account records. No
+other information.
+
+```text
+A   nonce 41   balance 2.7e18   storageRoot 0x56e81f…b421   codeHash 0xc5d246…a470
+B   nonce 1    balance 0        storageRoot 0x3a1f9c…07dd   codeHash 0x9f2b41…c1e8
+C   nonce 12   balance 4.1e17   storageRoot 0x56e81f…b421   codeHash 0xa0bd80…e506
+```
+
+For each one, say what you can conclude and — more importantly — what you cannot. Then say what a
+fourth call would have to be to settle the open question about C.
+
+<Answer>
+**A — no code, has sent transactions, holds no storage.** `codeHash` is the empty-string hash, so
+there is no code at this account right now. `storageRoot` is the empty-trie root, so its storage trie
+has no entries. Nonce 41 means 41 transactions have been sent from it. What you cannot conclude: who
+controls it, whether it has *ever* had code (a delegation can be cleared), or that it is a
+"normal user" — an exchange hot wallet looks exactly like this.
+
+**B — has code and has deployed at least one contract.** A non-empty, non-designator `codeHash` plus a
+non-empty `storageRoot` says code and storage exist. Nonce 1 on a code-bearing account is the
+EIP-161 starting value, so it has created nothing yet.<Cite src="eip-161" /> What you cannot conclude:
+what the code *is*. You hold its hash. Fetching the bytes and checking they hash to this value is a
+separate call, and until you make it you know nothing about behaviour.
+
+**C — the interesting one.** It has a code hash that is neither the empty-code constant nor obviously
+a contract, and an empty storage root, and a transaction-sending nonce. The shape is consistent with a
+key-controlled account carrying a 23-byte delegation designator.<Cite src="eip-7702" /> It is also
+consistent with a contract whose code happens to hash to that value and whose storage is empty. The
+record cannot distinguish them, because the record has no type field.
+
+**The fourth call is `eth_getCode(C)`.** If it returns 23 bytes beginning `0xef0100`, this is a
+delegated account and the remaining 20 bytes name the delegate.<Cite src="eip-7702" /> Note what that
+means operationally: the classification you wanted required a second round trip and a byte-pattern
+match. Any system that needs to know "is this address controlled by a key" must do that work
+explicitly. There is no field to read.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Lesson 2** takes the `storageRoot` field seriously. One 32-byte reference inside a leaf turns the
+state into a nested structure, and that nesting explains why a single storage write costs what it
+costs and why [a storage proof is two proofs](/c/storage-proof).
+
+**Lesson 3** generalises the empty-is-absent rule from accounts to slots, where it becomes a design
+constraint on your data model rather than a curiosity.
+
+Further out, the fixed four-field record is the reason
+[proxies collide storage with their implementations](/c/delegate-storage-collision) — the storage
+belongs to the account, not to whichever code is currently running in it — and the reason
+[namespaced storage layouts](/c/erc-7201-namespaced-storage) exist at all. The protocol gave you one
+storage space per account and no way to partition it, so the partitioning had to be invented above.

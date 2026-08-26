@@ -1,0 +1,353 @@
+---
+id: scaling-sequencers-where-your-transaction-goes-first
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [arbitrum-read-sequencer-feed, arbitrum-sequencer, op-docs-subblocks, op-docs-transaction-finality, op-mainnet-transaction-finality, arbitrum-timeboost, l2beat-glossary]
+stack: {}
+---
+
+You call `eth_sendRawTransaction` against an L2 RPC endpoint. Trace where the bytes go.
+
+On Ethereum you know the answer precisely: the transaction enters a mempool, gets gossiped to
+thousands of independently operated nodes, and any of several hundred proposers might include it. The
+path is redundant by construction, and you have spent a whole track learning where in that path
+things go wrong.
+
+On every major L2 in 2026, the answer is: **one process, at one company.** Not one process per
+region, not a leader elected among peers. One. Arbitrum's documentation is explicit that only the
+sequencer can call the batch-submission methods on the `SequencerInbox` contract, and that this
+exclusivity ensures no other party can include messages directly.<Cite src="arbitrum-sequencer" />
+
+This lesson makes that process concrete, because it is unusually easy to observe directly, and the
+observation changes how the green tick in your wallet reads.
+
+<Figure
+  caption="Your wallet's confirmation is emitted at step three of four, before anything has reached Ethereum at all."
+  alt="A left-to-right flow: the transaction arrives at one RPC endpoint with no gossip network behind it; the sequencer orders it as received; the accepted ordering goes out on a real-time feed that wallets render as confirmed; and only then is a compressed batch posted to the SequencerInbox contract on L1."
+>
+  <Flow
+    lanes={['your client', 'one process, one company', 'the promise', 'Ethereum']}
+    nodes={[
+      { id: 'send', label: 'one endpoint', note: 'no gossip network to overhear', col: 0 },
+      { id: 'ord', label: 'ordered', note: 'as received, unless the chain overrides it', col: 1, tone: 'accent' },
+      { id: 'feed', label: 'broadcast', note: 'the feed your wallet renders as confirmed', col: 2, tone: 'warn' },
+      { id: 'post', label: 'batched to L1', note: 'only the sequencer may call SequencerInbox', col: 3 },
+    ]}
+  />
+</Figure>
+
+## Why there is a feed at all
+
+Before looking at it, derive why it has to exist. This takes thirty seconds and it makes the whole
+trust story inevitable rather than arbitrary.
+
+**Subgoal: work out when the L1 learns your transaction happened.** The sequencer collects
+transactions and posts them to L1 in batches. Arbitrum's docs give the two triggers for forming a
+batch: an accumulated size threshold, so that the fixed cost of posting is amortised over more
+transactions, and a maximum elapsed time since the last batch, so that a quiet period does not delay
+everyone indefinitely.<Cite src="arbitrum-sequencer" />
+
+**Subgoal: notice that both triggers are measured in minutes, not milliseconds.** Amortising a fixed
+L1 cost only works if you wait long enough to accumulate volume. So the earliest moment L1 could
+possibly know about your transaction is the next batch, and the earliest moment it is *irreversible*
+is after that batch's L1 block finalises.
+
+**Subgoal: ask what the user sees in the meantime.** Nothing, unless the sequencer tells them. There
+is no gossip network to overhear, because the ordering exists in exactly one place until it is
+posted.
+
+**Subgoal: conclude.** A feed is not a convenience feature bolted on for latency. It is the only
+mechanism by which anybody can learn the chain's state between batches, and it therefore *has* to be
+an announcement by the operator rather than an observation of a network. The trust assumption is
+structural. Any single-sequencer chain that gives sub-batch confirmations gives them this way, whether
+it calls the mechanism a feed, a stream, or a pre-confirmation.
+
+## The feed is a real endpoint with a real wire format
+
+Arbitrum publishes the sequencer's accepted ordering on a live broadcast before anything touches L1.
+Run a relay locally, connect to its websocket on port 9642, and you receive an uncompressed sequencer
+feed.<Cite src="arbitrum-read-sequencer-feed" /> The documentation prints what arrives:
+
+```json
+{
+  "version": 1,
+  "messages": [
+    {
+      "sequenceNumber": 25757171,
+      "message": {
+        "message": {
+          "header": {
+            "kind": 3,
+            "sender": "0xa4b000000000000000000073657175656e636572",
+            "blockNumber": 16238523,
+            "timestamp": 1671691403,
+            "requestId": null,
+            "baseFeeL1": null
+          },
+          "l2Msg": "BAL40oKksUiElQL5AISg7rsAgxb6o5SZbYNoIF2..."
+        },
+        "delayedMessagesRead": 354560
+      },
+      "signature": null
+    }
+  ]
+}
+```
+
+Three fields deserve a second look.
+
+**`sequenceNumber`.** A monotonically increasing counter assigned by the sequencer. Not a block
+number, not a consensus round — a position in one process's output queue.
+
+**`sender`.** Decode the last nine bytes of `0xa4b000000000000000000073657175656e636572` as ASCII:
+
+<Figure
+  caption="The last nine bytes of the sender field are ASCII, not entropy."
+  alt="The twenty-byte sender address 0xa4b0 followed by zero padding and then the nine bytes 73 65 71 75 65 6e 63 65 72, which decode as the ASCII text sequencer."
+>
+  <Anatomy
+    value="0xa4b000000000000000000073657175656e636572"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 24, label: 'system prefix and padding', note: 'no key behind it', tone: 'muted' },
+      { from: 24, to: 42, label: 'sequencer', note: 'nine bytes, read as ASCII', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+The address literally spells "sequencer". It is a system address, not an account anyone controls a
+key for, and its presence in the header is the protocol saying out loud which party authored this
+ordering.
+
+**`signature`: `null`.** The feed message carries no signature in this example. What authenticates
+the feed is the connection to the relay, not a per-message proof, which is a different and weaker
+thing than what you are used to from L1 gossip.
+
+The top-level structure is the `BroadcastMessage` struct, carrying a version, the messages array, and
+a `ConfirmedSequenceNumberMessage`.<Cite src="arbitrum-read-sequencer-feed" /> Wallets, RPC providers
+and explorers read this stream and render its contents as confirmed transactions. **Everything your
+users see as "done" originates here.**
+
+<Aside kind="note">
+The feed also carries transactions that arrived through L1 rather than through the sequencer —
+parent-chain-submitted messages and retryable tickets. Arbitrum's docs note that a Nitro node *can*
+be configured to add delayed-inbox transactions immediately after they are submitted to the parent
+chain, but that on Arbitrum One and Nova the sequencer includes them only after they finalise on
+Ethereum, because including them earlier risks an L2 reorg if the L1 transaction fails to
+finalise.<Cite src="arbitrum-sequencer" /> That is a deliberate trade of deposit latency against L2
+reorg risk, made per chain — worth knowing before you assume your L3's deposits behave like
+Arbitrum One's.
+</Aside>
+
+## What the operator promises, in its own words
+
+The trust model is not hidden. Arbitrum's own page lists soft finality's limitations: it depends on
+the sequencer's honesty and uptime, and in rare cases, if the sequencer acts maliciously or
+encounters issues, the provisional ordering could change.<Cite src="arbitrum-sequencer" />
+
+OP Stack's documentation says the same thing with more precision. Soft finality means the sequencer
+has processed your transaction and included it in a block; from that point the outcome is known and
+in practice the sequencer will not reorder it, because reorgs of the sequencer's own blocks are
+extremely rare. But it comes with a trust assumption you should understand: until the transaction's
+data lands on Ethereum, the sequencer is technically able to reorg the transaction
+away.<Cite src="op-docs-transaction-finality" />
+
+Read those two sentences as a single unit. *In practice it never happens* and *it is technically
+possible* are both true, and a product decision needs both. A soft confirmation is **a promise from
+one process, backed by that company's reputation and operational competence, and by nothing else.**
+No L1 contract has seen it. No proof covers it. No consensus has run.
+
+<Misconception
+  belief="When my wallet shows an L2 transaction as confirmed, it is final."
+  reality="That is a soft confirmation emitted from the sequencer's own feed, with no cryptographic backing. Hard finality arrives when the batch containing it finalises on L1, typically minutes later."
+  why="L2 wallet UX deliberately hides the difference, and it hides it successfully because sequencers have, so far, always behaved. The UI is calibrated to the observed record rather than to the guarantee."
+  src="op-docs-transaction-finality"
+/>
+
+### What happens between the feed and L1
+
+The gap the feed papers over is filled with real work, and knowing its shape tells you why the gap is
+the length it is.
+
+**Ordering.** Transactions are ordered by the order in which they are received — first come, first
+served — unless the chain overrides that default. Arbitrum names the override: Timeboost, which
+auctions an express lane.<Cite src="arbitrum-sequencer" />
+
+**Buffering and batch formation.** Received transactions sit in a buffer until a size or time
+threshold fires, at which point the sequencer aggregates them with their metadata into a
+batch.<Cite src="arbitrum-sequencer" />
+
+**Compression.** Batches are compressed with Brotli, whose compression level runs from 0 to 11,
+trading size reduction against processing time.<Cite src="arbitrum-sequencer" /> The interesting part
+is that the level is not fixed: it is adjusted dynamically against the backlog of batches waiting to
+be posted, and when the buffer is overloaded with overdue batches the level *decreases*, prioritising
+speed over compression so the backlog clears.<Cite src="arbitrum-sequencer" />
+
+Sit with that last mechanism for a moment, because it is a control loop with a cost consequence.
+Under load, the chain deliberately pays more per byte on L1 in order to reduce latency. Your
+transaction's share of the L1 bill is therefore a function of how busy the chain was when it was
+posted, which is not a variable most fee models contain.
+
+**Posting.** The batch poster — an externally owned account controlled by the sequencer — submits to
+the `SequencerInbox`. Two methods exist: `addSequencerL2BatchFromBlobs`, the default where the parent
+chain supports EIP-4844, and `addSequencerL2Batch`, which puts the compressed batch in calldata and
+is chosen when the blob base fee is high or blob space is
+constrained.<Cite src="arbitrum-sequencer" /> That choice is re-evaluated per batch against live
+prices.
+
+Four steps, one operator, and no point at which anyone else can intervene. The
+[glossary definition](/c/sequencer) — the party responsible for ordering and executing transactions on
+the rollup, compressing the data into a block, and submitting it to L1 — is describing all four as one
+role.<Cite src="l2beat-glossary" />
+
+## Subblocks: a projection, not a commitment
+
+OP Stack pushes the same idea one layer earlier. **Subblocks** are partial blocks that a sequencer
+streams while it is still building the full block; one arrives every 200 milliseconds, so an
+application can act on a transaction's outcome roughly ten times sooner than the two-second block
+time would allow.<Cite src="op-docs-subblocks" />
+
+Two properties follow, and the documentation states both plainly.
+
+**The sequence is append-only.** The final sealed block is the concatenation of every subblock in
+order, and transactions already emitted in a subblock are never reordered or dropped from the block
+that seals them.<Cite src="op-docs-subblocks" />
+
+**A subblock is a projection, not a commitment.** It reports the transactions executed so far. It
+does not prove the resulting state.<Cite src="op-docs-subblocks" />
+
+That second property has a concrete consequence that has already caught integrations. Four fields in
+the payload are present but zeroed: `state_root`, `block_hash`, `withdrawals_root` and
+`withdrawals`.<Cite src="op-docs-subblocks" />
+
+**Subgoal: derive why the state root cannot be there.** The state root is computed while execution
+continues and is only exact once the block is sealed. A subblock is emitted mid-execution. Therefore
+no correct value exists to put in the field.
+
+**Subgoal: propagate that to the block hash.** A block hash commits to the state root. If the state
+root is not final, neither is anything committing to it. So the block hash must be absent too, and
+this is a consequence rather than an independent design choice.
+
+**Subgoal: identify the trap.** The payload stayed wire-compatible with the format that preceded it,
+so nothing was removed — the fields are present and zero. Reading a zeroed field returns a zero value
+rather than raising an error, and an integration that treats the stream's `state_root` or
+`block_hash` as authoritative **will fail silently**.<Cite src="op-docs-subblocks" /> The correct
+handling is to treat both as absent and derive state by executing the transactions the subblock
+carries; a node consuming the stream does exactly that and serves the result under the `pending`
+block tag, so `eth_call` and `eth_getBalance` answer correctly with no root on the
+wire.<Cite src="op-docs-subblocks" />
+
+The 200-millisecond interval is a target rather than a guarantee — heavy execution in one interval
+leaves less time for the ones after it, so the number of subblocks per block
+varies.<Cite src="op-docs-subblocks" />
+
+## The four moments, and which one your UI is showing
+
+OP Mainnet's documentation puts numbers on the whole
+sequence.<Cite src="op-mainnet-transaction-finality" />
+
+<Matrix
+  corner="What happened"
+  cols={['RPC block tag', 'Typical time', 'What you are trusting']}
+  rows={[
+    {
+      label: 'Subblock pre-confirmation',
+      cells: [<code>pending</code>, '~200 ms', { v: 'The sequencer', tone: 'warn' }],
+    },
+    {
+      label: 'Transaction is in an L2 block',
+      cells: [<><code>latest</code> (unsafe)</>, '~2 s', { v: 'The sequencer', tone: 'warn' }],
+    },
+    {
+      label: 'The data is in an Ethereum block',
+      cells: [<code>safe</code>, 'A few minutes', 'Ethereum ordering; that block can still reorg'],
+    },
+    {
+      label: 'Ethereum finalises that block',
+      cells: [<code>finalized</code>, '~15 to 30 min', { v: "Ethereum's consensus", tone: 'good' }],
+    },
+  ]}
+  caption="One JSON-RPC surface exposes four different guarantees, and the two your users are shown rest on one company's word."
+  alt="Four moments in an OP Mainnet transaction against their RPC block tag, typical time and counterparty: a subblock pre-confirmation at pending after about 200 milliseconds, trusting the sequencer; inclusion in an L2 block at latest after about two seconds, trusting the sequencer; the data reaching an Ethereum block at safe after a few minutes, trusting Ethereum's ordering while that block can still reorg; and Ethereum finalising that block at finalized after about fifteen to thirty minutes, trusting Ethereum's consensus."
+/>
+
+Almost every wallet, explorer and application shows you row one or row two. Rows three and four exist,
+are exposed over standard JSON-RPC through block tags you already use, and are visible to nobody
+except the people who went looking.
+
+<Misconception
+  belief="An L2 has a mempool, so I can watch pending transactions the way I do on L1."
+  reality="On a single-sequencer L2 the pending pool is the operator's, and it is typically private. Arbitrum's Timeboost documentation states plainly that the transaction mempool continues to be private."
+  why="The JSON-RPC surface is identical to Ethereum's, so the same method names imply the same architecture underneath. They do not."
+  src="arbitrum-timeboost"
+/>
+
+That privacy is a genuine user protection — it is why Arbitrum's docs can claim users are protected
+from front-running and sandwich attacks.<Cite src="arbitrum-timeboost" /> It is also a statement about
+who has information asymmetry, and the answer is the party running the process. The lesson on hostile
+sequencers takes that up properly.
+
+<Check type="spot-bug" concept="soft-confirmation">
+A team ships an L2 payments integration. Their backend consumes the subblock stream for
+sub-second UX, and the relevant logic is:
+
+```ts
+onSubblock((sb) => {
+  for (const tx of sb.transactions) {
+    if (isOurPayment(tx)) {
+      db.credit(tx.from, tx.value, { blockHash: sb.block_hash, stateRoot: sb.state_root });
+      notifyMerchant(tx);
+    }
+  }
+});
+```
+
+Name every defect. There are three, and they are of three different kinds.
+
+<Answer>
+**Defect 1 — recording zeroed fields as if they were data.** `sb.block_hash` and `sb.state_root` are
+present in the payload and set to zero, and reading them returns a zero value rather than
+raising.<Cite src="op-docs-subblocks" /> Every credit row in this database will carry
+`0x0000...0000` for both. Nothing will error, no alert will fire, and the columns will look populated
+in every dashboard. The reconciliation job that eventually needs them — six months later, during an
+audit — is where this surfaces. **This is the silent-failure kind.**
+
+**Defect 2 — crediting at the wrong moment, without saying so.** Crediting on a subblock means
+crediting on a 200-millisecond pre-confirmation from one operator's process. That may well be the
+right business decision; it is not a decision this code makes explicitly. There is no policy, no
+threshold, no distinction between a five-dollar coffee and a fifty-thousand-dollar settlement. **This
+is the unexamined-trust kind**, and the next lesson is about pricing it.
+
+**Defect 3 — `notifyMerchant` is irreversible, and its input is not.** The database credit can be
+reversed. The email, push notification or webhook cannot. Side effects that leave your system should
+be gated on a durability level you would be willing to defend, and on OP Mainnet the `safe` tag —
+data on Ethereum, a few minutes — is available over standard JSON-RPC for exactly this
+purpose.<Cite src="op-mainnet-transaction-finality" /> **This is the irreversibility kind**, and it
+is the one that generates support tickets rather than accounting problems.
+
+**The fix in one line.** Consume the stream for optimistic UI, key durable state on
+`latest`, and gate anything irreversible on `safe` or `finalized` — three tiers, three different
+trust assumptions, one explicit policy per tier.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** is the other end of the timeline: what "hard finality" means precisely, why the
+gap between soft and hard is minutes rather than the seven days everybody quotes, and how to choose
+which of the four moments your product acts on.
+
+**The lesson after it** works out what the party at the other end of that feed can actually do to you
+if it stops behaving — a list that is shorter than the fear and longer than the marketing.
+
+**The infrastructure track's reorg work** now has a second application. Everything you learned about
+[reorg-safe indexing](/c/reorg-safe-indexing) applies to L2s with one change: on L1 the reorg risk
+comes from consensus, and on an L2 it comes from a company's process plus the L1 reorg risk
+underneath it. Two independent sources, one cursor.
+
+**Your own systems.** Connect to a feed. Arbitrum's relay is a documented local
+process,<Cite src="arbitrum-read-sequencer-feed" /> and thirty minutes watching your own transaction
+appear in a stream before it exists anywhere on Ethereum does more for your intuition than any
+amount of reading about trust models.

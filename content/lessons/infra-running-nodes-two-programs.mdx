@@ -1,0 +1,347 @@
+---
+id: infra-running-nodes-two-programs
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    eth-run-a-node,
+    ethereum-org-nodes-clients,
+    engine-api-authentication,
+    engine-api-paris,
+    engine-api-spec,
+    geth-dbpruning,
+    geth-hardware,
+    erigon-readme,
+    erigon-pruning-modes,
+    eth-docker-resource-usage,
+    ethereum-node-ssd-list,
+  ]
+stack: {}
+---
+
+You have brought up a node. Both containers are running. Neither has logged anything that reads like
+an error. `eth_chainId` answers instantly. `net_version` answers instantly. `eth_blockNumber` answers
+instantly, and returns the same number it returned forty minutes ago.
+
+`eth_syncing` returns `false`, which the documentation says means synced.
+
+Nothing is wrong with your network, your disk, your peers or your ports. What has happened is that
+the two programs you are running have stopped being able to talk to each other, and the failure mode
+of that particular conversation is silence on both sides. The execution client is waiting to be told
+what to do. The consensus client is asking and being refused. Neither of them thinks it is the one
+with the problem, so neither of them raises its voice.
+
+This lesson is about the shape that makes that possible: an Ethereum node is not one program, and the
+seam between its two halves is the single most operationally consequential interface you have not yet
+had to think about.
+
+## The two halves, and who is passive
+
+Everything you learned in the core tracks lives on one side of this seam.
+
+The **execution client** holds the EVM, the state trie, the transaction pool, the receipt and log
+databases, and the JSON-RPC surface on 8545 that every tool you have used — cast, viem, a fork test,
+an indexer — has been talking to. When you reasoned about [storage layout](/c/state-root), gas
+metering, a `delegatecall` frame or an `eth_call`, you were reasoning about this process.
+
+The **consensus client** holds none of that. It runs fork choice, tracks the validator set,
+propagates and validates beacon blocks and attestations, and decides which chain is canonical. It has
+no EVM. It cannot tell you an account balance.
+
+Ethereum.org states the requirement without hedging: after The Merge, "two clients are required to
+run an Ethereum node; an execution layer (EL) client and a consensus layer (CL)
+client."<Cite src="eth-run-a-node" />
+
+Here is the part that inverts most people's mental model, and it is worth sitting with because
+everything else in this module follows from it.
+
+**The execution client has no opinion about which chain is real.** It will happily execute any
+syntactically valid payload you hand it. It does not watch the network for a better head. It does not
+resolve forks. It is a state machine that advances when instructed and otherwise waits.
+
+The instruction comes from the consensus client, over the **Engine API**. Two method families carry
+almost all of the traffic. `engine_newPayload` hands the execution client a block to validate and
+execute; `engine_forkchoiceUpdated` tells it which block is now the head, which is safe and which is
+finalised.<Cite src="engine-api-paris" /><Cite src="engine-api-spec" /> The direction is always the
+same: the consensus client calls, the execution client answers.
+
+The answer is a small enumerated status —
+`"VALID" | "INVALID" | "SYNCING" | "ACCEPTED" | "INVALID_BLOCK_HASH"` — plus, on failure, an optional
+`validationError` string.<Cite src="engine-api-paris" /> That five-value enum is the entire vocabulary
+in which the execution half of your node tells the consensus half whether the chain is real.
+
+<Figure
+  caption="Everything your application talks to sits on the right of the seam; everything that decides what is true sits on the left."
+  alt="The consensus client drives the execution client over the authenticated Engine API on port 8551 and receives a status enum back; the execution client separately serves ordinary JSON-RPC on port 8545 to your tools."
+>
+  <Flow
+    lanes={['decides', 'the seam', 'executes', 'serves']}
+    nodes={[
+      { id: 'cl', label: 'consensus client', note: 'runs fork choice', col: 0, tone: 'accent' },
+      { id: 'eng', label: 'Engine API :8551', note: 'JWT, one caller', col: 1, tone: 'warn' },
+      { id: 'el', label: 'execution client', note: 'EVM, state, pool', col: 2 },
+      { id: 'rpc', label: 'JSON-RPC :8545', note: 'your tools', col: 3, tone: 'muted' },
+    ]}
+    edges={[
+      { from: 'cl', to: 'eng', label: 'newPayload' },
+      { from: 'eng', to: 'el', label: 'forkchoiceUpdated' },
+      { from: 'el', to: 'eng', label: 'VALID / INVALID' },
+      { from: 'el', to: 'rpc', label: 'eth_*' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="You run 'an Ethereum node', which is one program, and the consensus client is an extra you only need if you are staking."
+  reality="You run two processes. Without a consensus client, the execution client never advances — it has no way to learn which block is the head, because resolving that is not its job."
+  why="Every tutorial written before September 2022 describes one binary, and those tutorials still rank. The single-binary shape also matches every other database-like service you have operated."
+  src="eth-run-a-node"
+/>
+
+The staking confusion is worth killing separately, because it costs people days. A **validator
+client** is a *third* process, optional, that holds signing keys and asks the consensus client what
+duties it has. You do not need one to run a node. You do need the consensus client whether or not you
+ever stake a single wei, because it is the thing that knows what the chain is.
+
+## Four ports, two of which are not equivalent
+
+A running pair listens on roughly four things, and confusing two of them is a security incident
+rather than an inconvenience.
+
+<Matrix
+  corner="Port"
+  cols={['Process', 'Faces', 'What it can do']}
+  rows={[
+    { label: '30303', cells: ['execution', 'the internet', 'devp2p: blocks, transactions, state to and from peers'] },
+    { label: '9000', cells: ['consensus', 'the internet', 'beacon-chain p2p: blocks, attestations, blob columns'] },
+    { label: '8545', cells: ['execution', 'you', 'JSON-RPC: ask questions, submit transactions'] },
+    { label: '8551', cells: ['execution', { v: 'the consensus client only', tone: 'warn' }, { v: <>Engine API: <strong>tell the node what to believe</strong></>, tone: 'danger' }] },
+  ]}
+  caption="Two of these four are JSON-RPC on the same process, and only one of them can change what your node believes."
+  alt="A node listens on four ports: 30303 devp2p and 9000 beacon p2p face the internet, 8545 JSON-RPC faces you, and 8551 Engine API faces the consensus client alone and carries instructions about what is true."
+/>
+
+8545 and 8551 are both HTTP JSON-RPC on the same process, and they are not the same kind of thing at
+all. Everything on 8545 is a question or a submission — it can cost you money and leak your query
+pattern, but it cannot make your node follow a different chain. Everything on 8551 is an instruction
+about what is true. A caller on 8551 can hand your execution client a payload of their choosing and
+declare it the head.
+
+That asymmetry is exactly why one of them is authenticated and the other is not. The Engine API
+specification is explicit: "The default port for the authenticated Engine API is
+`8551`."<Cite src="engine-api-authentication" /> Ethereum.org describes the same arrangement from the
+operator's side — the execution client generates a JWT secret at a known path, and the consensus
+client connects to "the authenticated endpoint specified in Engine API" on port
+8551.<Cite src="eth-run-a-node" />
+
+<Aside kind="warn">
+The practical rule that follows: **8551 must never be reachable from outside the machine or the
+container network.** Publishing it is not "exposing an RPC endpoint". It is handing an anonymous
+caller the ability to drive your node's view of the chain, bounded only by whether they also hold the
+secret. Bind it to localhost or to a private container network, and treat any config that publishes
+it as a defect regardless of whether a firewall currently covers it.
+</Aside>
+
+## The secret, and why breaking it is silent
+
+Now the specific failure from the opening.
+
+The Engine API is authenticated with a JWT. The specification pins the parts that matter to an
+operator:
+
+- The execution client **must** support at least `HMAC + SHA256` (`HS256`) as the signing
+  algorithm.<Cite src="engine-api-authentication" />
+- Authentication uses "a hex-encoded 256 bit secret key ... for verifying/generating JWT
+  tokens".<Cite src="engine-api-authentication" /> Both processes read the same file. That is what
+  `openssl rand -hex 32` produces, and why every guide tells you to run exactly that.
+- The client "**SHOULD** only accept `iat` timestamps which are within +-60 seconds from the current
+  time".<Cite src="engine-api-authentication" />
+- The token travels in an HTTP header on each individual JSON-RPC
+  request.<Cite src="engine-api-authentication" />
+
+Three separate failure modes fall straight out of that list, and all three present identically.
+
+**Subgoal: rule out the obvious one — the two files differ.** Two processes, one file path each. If
+the compose file mounts the secret into the execution client and the consensus client generates its
+own, you have two valid 32-byte secrets that do not match. Every Engine API call is rejected. Neither
+process crashes, because from the execution client's point of view an unauthenticated caller is
+simply a caller it declines, and from the consensus client's point of view a rejected call is a peer
+that is not cooperating — a condition it is designed to survive and retry through.
+
+**Subgoal: rule out the second one — the file is not what you think it is.** The spec requires a
+hex-encoded key of 256 bits, and says that if the file "cannot be read, or does not contain a
+hex-encoded key of `256` bits, the client **SHOULD** treat this as an error: either abort the startup,
+or show error and continue without exposing the authenticated port."<Cite src="engine-api-authentication" />
+Read the second branch. A conforming client is permitted to *keep running with 8551 closed*. A
+trailing newline from an editor, a `0x` prefix a script added, a file written with the wrong
+permissions inside a container — any of these can land you there, and "continue without exposing the
+authenticated port" looks exactly like a healthy node whose peer is being rude.
+
+**Subgoal: rule out the third one — the clocks disagree.** The `iat` freshness window is ±60
+seconds.<Cite src="engine-api-authentication" /> Two containers on one host share a clock, so this is
+rare locally and common the moment the halves live on different machines, or on a VM whose clock
+drifted after a suspend. The secret is right; every token is stale on arrival.
+
+**Subgoal: name why the symptom is a stall rather than an error.** In all three cases both processes
+are doing their jobs correctly. The execution client is refusing unauthenticated instructions, which
+is the behaviour you want. The consensus client is following the chain, gossiping, and dutifully
+retrying an endpoint that keeps declining it. Neither has encountered a condition it considers fatal.
+The chain-level symptom — a head that stops moving — is emitted by *neither*, because neither one owns
+the concept.
+
+<Misconception
+  belief="If the node is broken, one of the two processes will have crashed or logged something obviously fatal."
+  reality="The most common bring-up failure leaves both processes running, both logging at their normal cadence, and the JSON-RPC surface answering every request correctly — with a block number that never changes."
+  why="Process liveness is the health signal every other service trains you to trust. Here, liveness of both halves is fully compatible with the node having stopped being a node."
+  src="engine-api-authentication"
+/>
+
+That misconception has a direct consequence for anything you build on top: **a health check that
+asserts "the process is up" or "`eth_chainId` responds" will pass through this failure indefinitely.**
+The check that catches it compares your node's head against something external — a second endpoint, a
+public one, an explorer — and alarms on the *gap*, not on the response. `eth_syncing` will not save
+you either; it reports `false` for a node that has finished syncing and for a node that has quietly
+stopped being driven, because the execution client cannot distinguish "nobody has given me a new head"
+from "there is no new head".
+
+## The execution clients
+
+Five execution clients are in production, and ethereum.org names them: Besu, Erigon, Geth,
+Nethermind, Reth.<Cite src="eth-run-a-node" /> Java, Go, Go, .NET and Rust respectively.
+
+They implement the same consensus rules and expose the same standard JSON-RPC methods, which is what
+makes them substitutable for ordinary application traffic. Where they genuinely differ is in two
+places you will meet.
+
+**How state is laid out on disk.** This is not a detail — it drives sync time, disk size and the
+practical feasibility of an archive node, and the next three lessons are largely about its
+consequences. Even within one client the layout is a versioned choice: geth's own pruning
+documentation distinguishes a "hash-based state scheme" from a "path-based state scheme" and notes
+that once the hash-based scheme is no longer supported, offline pruning will be
+deprecated.<Cite src="geth-dbpruning" /> Erigon 3 goes further and stores most data in immutable
+segment files, which lets an operator "symlink/mount latest state to fast drive and history to cheap
+drive" and leaves its mutable `chaindata` at "tens of gb (22gb on an archive mainnet
+node)".<Cite src="erigon-readme" /> Those are not the same database wearing different logos.
+
+**Which non-standard namespaces exist.** The `eth_` namespace is a network property. Tracing is not.
+`debug_`, `trace_` and client-specific namespaces vary in existence, in method names and in output
+shape, which means a tool built against one client's tracer may simply have no counterpart on
+another. If your indexer, your fork-test tooling or your incident runbook depends on a trace method,
+you have taken a dependency on a *client*, not on Ethereum, and swapping halves later is not free.
+
+<Misconception
+  belief="Execution clients are interchangeable, so pick whichever is easiest to install."
+  reality="They are interchangeable for standard JSON-RPC and for consensus. They are not interchangeable for disk footprint, sync strategy, pruning options, or any tracing namespace your tooling touches."
+  why="The interchangeability claim is true and is repeated everywhere, but it is a claim about the *standard* surface. Everything an operator actually chooses between lives outside it."
+  src="ethereum-org-nodes-clients"
+/>
+
+Retention is now an explicit dial too. Erigon exposes four pruning modes — `archive`, `full`, `blocks`
+and `minimal` — and states plainly that to switch between them "you must first delete the
+`/chaindata` folder in the chosen `--datadir` directory and re-sync from
+scratch."<Cite src="erigon-pruning-modes" /><Cite src="erigon-readme" /> That sentence is worth
+underlining now and will be underlined again in the sync-modes lesson: **retention is chosen at sync
+time, not adjusted afterwards.**
+
+## The consensus clients
+
+Five again: Lighthouse, Lodestar, Nimbus, Prysm, Teku<Cite src="eth-run-a-node" /> — Rust,
+TypeScript, Nim, Go and Java.
+
+The important structural fact is that **any consensus client pairs with any execution client**. There
+is no matched set and no vendor pairing, because the Engine API is the only contract between the two
+halves, and it is a specification rather than an integration.<Cite src="engine-api-spec" /> Twenty-five
+combinations, all valid.
+
+This is the thing that makes client diversity actionable rather than aspirational, which is the next
+lesson's subject. Replacing half your node is a configuration change plus a resync of that half. It is
+not a migration, it does not touch the other process, and the JSON-RPC surface your application talks
+to is unaffected when it is the consensus half you swap.
+
+It also means the two halves fail independently and must be observed independently. A consensus client
+that has fallen behind produces an execution client that has fallen behind — same symptom, wrong
+process. A useful habit from the start: whatever you build to watch the node should report both heads
+separately, so "which half" is never a question you have to reason your way to at three in the
+morning.
+
+<Check type="predict" concept="node-two-process-model">
+For each of the following, predict what an outside observer sees when they call `eth_blockNumber` and
+`eth_syncing` against your node's 8545 endpoint, and say which process is responsible.
+
+1. You stop the consensus client. The execution client keeps running.
+2. You stop the execution client. The consensus client keeps running.
+3. You point a *second* consensus client at the same execution client's 8551, with the correct
+   secret, while the first is still running.
+
+<Answer>
+**1 — The head freezes; `eth_syncing` returns `false`; the execution client is fine and is the wrong
+place to look.** Nothing calls `engine_forkchoiceUpdated` any more, so nothing tells the execution
+client that a newer block is the head, and it has no independent way to find out — resolving the
+canonical chain is not its job.<Cite src="engine-api-paris" /> It will still serve `eth_call`,
+`eth_getBalance` and `eth_getLogs` perfectly against the state it has, which is why this is
+indistinguishable from the JWT failure at the RPC surface. This is the same observable as the opening
+scene, reached a different way, and that is precisely the point: **the RPC surface cannot tell you
+which half stopped.**
+
+**2 — Requests fail at the transport layer, and the consensus client starts logging.** With the
+execution client gone there is nobody listening on 8545 or 8551, so your calls get a connection
+error rather than a stale answer. The consensus client cannot validate payloads it cannot execute, so
+it will report the head as unvalidated and, if it has validators attached, start missing duties. This
+failure is loud, which makes it the *easier* of the two — a useful thing to notice about which
+outages hurt.
+
+**3 — It works, and that is the hazard.** The Engine API has no session and no exclusivity; each
+request carries its own token in a header.<Cite src="engine-api-authentication" /> Two consensus
+clients both holding the secret can both issue `engine_forkchoiceUpdated`, and the execution client
+will obey whichever spoke most recently. If they ever disagree — one still syncing, one at head, or
+two on different forks during a reorg — the execution client oscillates between heads, and every
+`eth_getLogs` and `eth_call` your application makes lands on whichever view won the last
+millisecond. There is no error anywhere. This is the reason 8551 is a single-consumer port by
+convention rather than by enforcement, and the reason "I'll just point staging at the same execution
+client" is a worse idea than it looks.
+
+**The common thread.** In all three, the execution client is behaving correctly by its own lights. Its
+correctness condition is "execute what I am told and answer accurately"; it has no correctness
+condition about *being told the right thing*. Every health signal you design has to come from
+somewhere that knows what the right thing was.
+</Answer>
+</Check>
+
+## Where to read the numbers, rather than remember them
+
+You will want hardware figures. Resist memorising them, because they move and because the sources
+disagree in ways the next lessons will make explicit.
+
+The two places worth bookmarking are ethereum.org's node page, which gives a minimum and a recommended
+tier and is updated with the network,<Cite src="eth-run-a-node" /> and the eth-docker resource-usage
+table, which is practitioner-maintained per client. The second one carries the epistemics you want
+built into the page itself: "Please pay attention to the Version and Date. These are snapshots in time
+of client behavior. Initial database size increases over time, and execution clients are always
+working on improving their storage engines."<Cite src="eth-docker-resource-usage" />
+
+That warning generalises to every number in this module. A per-client disk figure is a measurement of
+one version on one date, and it decays. The structural facts — two processes, one authenticated seam,
+retention fixed at sync time — do not.
+
+## What this unlocks
+
+You now have the object the rest of the track assumes. Three things follow immediately.
+
+**Client choice stops being a taste question.** The next lesson shows why the popular execution client
+and the popular consensus client are, at the network level, the risky ones — and why the two published
+dashboards that would answer "which is popular" disagree with each other badly enough that quoting
+either is a mistake.
+
+**Sync mode becomes the decision it actually is.** Erigon's line about deleting `chaindata` to change
+retention<Cite src="erigon-pruning-modes" /> is the general case: you choose, at sync time, which
+questions your node will be able to answer for the rest of its life. Lesson three makes that choice
+precise, including the one it makes permanently unanswerable.
+
+**And you have the metric that ties this lesson to the last one in the module.** The community SSD
+guide that geth's own hardware page links to recommends watching "the `newPayloadVx` quantile on the
+execution layer client metrics during normal operation: You'd want the 95th percentile or even 99th
+percentile to be below 500ms."<Cite src="ethereum-node-ssd-list" /><Cite src="geth-hardware" /> That is
+an Engine API method — the one from this lesson — used as a disk benchmark. By the end of the module
+you will know exactly why those two things are the same measurement.

@@ -1,0 +1,423 @@
+---
+id: altvm-solana-security-accounts-that-come-back
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [sealevel-attacks, cantina-securing-solana, anchor-account-constraints, solana-docs-accounts, neodyme-token-2022, neodyme-workshop, helius-solana-hacks]
+stack: {}
+---
+
+Every lesson so far has asked whether you were handed the right account. This one asks a question the
+three questions cannot express at all.
+
+You were handed the right account. Owner correct, discriminator correct, `has_one` satisfied,
+derivation canonical. And it is not in the state you believe it is in — because it was initialised a
+second time and its authority is now somebody else's, or because it was closed and came back holding
+its old contents, or because it is also the *other* account in the same instruction and your two
+writes are fighting over one buffer.
+
+Three classes, one theme: **an account has a lifecycle, and the three questions are a snapshot.**
+
+## Class one: initialised twice
+
+Start with the framework's own constraint pair, because the distinction between them is the whole
+bug.
+
+`init` creates and funds an account, taking `payer` and `space`, and fails when the account already
+exists. `init_if_needed` is the same as `init` but only runs if the account does not exist yet, and
+requires the `init-if-needed` cargo feature to be
+enabled.<Cite src="anchor-account-constraints" />
+
+**Subgoal: read the feature gate as a warning rather than as friction.** A framework does not put a
+compile-time flag in front of a constraint because the constraint is complicated. It does it because
+the constraint's safety depends on something the framework cannot see: which of *your* fields must
+survive a second call. `init` fails loudly on a live account, so it cannot reset anything.
+`init_if_needed` proceeds silently, and what happens next is whatever your handler body does — which,
+in every initialiser ever written, is assign every field.
+
+```rust
+// The handler that runs under init_if_needed. Read it as an attacker.
+pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+    let v = &mut ctx.accounts.vault;
+    v.authority = ctx.accounts.payer.key();   // <- takes ownership
+    v.balance   = 0;                          // <- destroys the balance
+    v.bump      = ctx.bumps.vault;
+    Ok(())
+}
+```
+
+Called once, that is initialisation. Called again on a funded, live vault, it is a transfer of
+ownership to the caller and a write-off of whatever was inside. No check failed, because there was no
+check. The canonical taxonomy files this as class 4, `initialization`, and the audit-firm checklist
+covers the same ground as "account initialized check" at high
+severity.<Cite src="sealevel-attacks" /><Cite src="cantina-securing-solana" />
+
+**Subgoal: write the guard.** Since the framework cannot know which field is load-bearing, you name
+it:
+
+```rust
+#[account(
+    init_if_needed,
+    payer = payer,
+    space = 8 + Vault::LEN,
+    seeds = [b"vault", owner.key().as_ref()],
+    bump,
+    constraint = vault.authority == Pubkey::default() @ ErrorCode::AlreadyInitialized
+)]
+pub vault: Account<'info, Vault>,
+```
+
+`constraint = <expr>` expands into an ordinary runtime check that returns your named error on
+failure.<Cite src="anchor-account-constraints" /> The pattern is a sentinel: pick a field whose
+zero value cannot occur after a successful initialisation, and assert it. Better still, handle the
+branch explicitly in the handler and refuse to touch the fields that must survive.
+
+**Subgoal: prefer not needing it.** `init_if_needed` exists because clients frequently cannot tell
+whether an account exists before building a transaction, and the alternative is a failed transaction
+and a retry. That is a real ergonomics problem, and it has a cheaper answer than a re-initialisable
+instruction: two instructions, `create` and `update`, with the client attempting create-then-update
+and tolerating the create failing. The account never has a code path that resets it, so the class
+cannot occur.
+
+### How this compares to the EVM version you already know
+
+The Ethereum analogue is the uninitialised proxy: an implementation contract whose `initialize` was
+never called, or a proxy whose upgrade left storage in a state the new logic did not expect. You know
+the shape and you know the mitigations — an `initializer` modifier, a storage flag, disabling
+initialisers on the implementation.
+
+Two differences make the Solana version strictly broader.
+
+**Any account can be a target, not only a proxy.** On Ethereum the class attaches to a specific
+architectural pattern, and a project with no proxies is not exposed. Here, every account is created by
+some instruction of some program, so every account type has an initialisation path and every one of
+those paths is a candidate.
+
+**There is no constructor.** A Solidity contract's constructor runs exactly once, at deployment, as a
+property of the machine. A Solana account's "constructor" is an ordinary instruction anyone can call
+at any time, and its once-ness is entirely a matter of what checks it contains. The guarantee you are
+used to relying on is not weakened here; it does not exist.
+
+<Misconception
+  belief="init_if_needed is a convenience feature with a feature flag because it is experimental."
+  reality="The flag is there because the constraint hands you a live re-initialisation path and the framework has no way to know which of your fields must not be reset. It is gated on purpose, permanently, as a decision point rather than a maturity warning."
+  why="Cargo feature flags usually mean 'unstable'. This one means 'you are taking responsibility for something'."
+  src="anchor-account-constraints"
+/>
+
+## Class two: closed, and back again
+
+This is the class most likely to surprise, because the intuition it violates is a good intuition.
+
+An account's lamport balance goes to zero. Surely it is gone.
+
+It is not gone yet. The runtime collects a zero-lamport account at the end of the transaction, not at
+the moment the balance hits zero — and in the meantime the data is still sitting there, unchanged.
+Now recall the runtime's ownership rule and read its second half carefully: only the owner program can
+modify an account's data or debit its lamports, but **any program can credit lamports to any writable
+account**.<Cite src="solana-docs-accounts" />
+
+So an attacker, in a single transaction, can:
+
+1. call your `close` instruction, which drains the account's lamports to a destination;
+2. transfer lamports back into the same account from anywhere — no permission needed, because
+   crediting is unrestricted;<Cite src="solana-docs-accounts" />
+3. end the transaction with an account that is above zero, therefore not collected, still holding
+   every byte it held before.
+
+Your program believes that account is closed. It is not, and its old contents — a balance, a
+withdrawal authority, a "rewards already claimed" flag set to false — are live.
+
+### What a correct close looks like
+
+The audit-firm checklist states the requirement in two parts. After transferring an account's
+lamports, its data should be filled with a closed-account discriminator; and other functions in the
+program should check for that discriminator and refuse to operate on an account carrying
+it.<Cite src="cantina-securing-solana" />
+
+Both halves matter, and people implement only the first. Zeroing the data without a downstream check
+protects you against logic that reads meaningful fields, and leaves you exposed to logic that treats
+an all-zero account as freshly initialised — which is exactly the sentinel pattern from the previous
+section, now working against you.
+
+The checklist's secure version also adds a `force_defund` instruction so that anyone can push a
+revived-but-closed account back to zero lamports and finish the
+job.<Cite src="cantina-securing-solana" /> That is worth noticing as a design idea in its own right:
+when a cleanup step can be blocked by an adversary, make the cleanup permissionless.
+
+In the framework, all of this is one constraint. `close = target` closes the account by sending its
+lamports to the target and resetting its data.<Cite src="anchor-account-constraints" /> Resetting the
+data is the half that hand-rolled closes forget.
+
+```rust
+#[account(mut, close = receiver, has_one = authority)]
+pub position: Account<'info, Position>,
+pub authority: Signer<'info>,
+/// CHECK: rent destination
+#[account(mut)] pub receiver: AccountInfo<'info>,
+```
+
+<Misconception
+  belief="Draining an account's lamports deletes it, so a close instruction that transfers the balance out is a complete close."
+  reality="The runtime collects the account at the end of the transaction, not when the balance hits zero. Because any program may credit lamports to any writable account, an attacker can refund the rent in the same transaction and keep the stale data alive."
+  why="Zero balance means gone is a natural inference, and on every other system a developer has used, deletion is synchronous. Here it is deferred by exactly long enough to be exploitable."
+  src="sealevel-attacks"
+/>
+
+### The cost of an account is why closing exists at all
+
+A note on rent, because it explains why programs close accounts in the first place and therefore why
+this instruction exists to be attacked.
+
+Every account must hold a minimum lamport balance proportional to its data size in order to remain on
+chain; the documented formula for the rent-exempt minimum is the account size plus 128, multiplied by
+3,480 lamports per byte-year, multiplied by two
+years.<Cite src="solana-docs-accounts" /> That deposit is refundable, which is what makes closing
+worth doing: a protocol that creates one account per order or per position accumulates real,
+recoverable capital in [rent exemption](/c/rent-exemption), and returning it to users is a feature.
+
+The consequence for security is that close instructions are *common* — far more common than any
+Ethereum equivalent, since `SELFDESTRUCT` was never a routine part of an application's lifecycle. A
+class that only affects programs which delete things affects nearly every Solana program.
+
+<Aside kind="warn">
+The revival class has a token-flavoured relative worth knowing, because it defeats a check that looks
+permanent. A mint carrying a close authority can be closed and a **new mint initialised at the same
+address** with a different extension set, while token accounts created under the old rules continue to
+exist.<Cite src="neodyme-token-2022" /> So reading a mint's current extensions is necessary and not
+sufficient — you also need to know whether the mint can be replaced. That is
+[the reinitialisation hazard](/c/mint-close-and-reinit-hazard), and it is this lesson's two classes
+combined into one object.
+</Aside>
+
+### The state machine nobody draws
+
+Both of the first two classes come from the same omission: a program that has an implicit account
+lifecycle and no explicit representation of it. Draw the states and the transitions become checkable.
+
+<Figure
+  caption="Closing an account is a transition, not a deletion — and the transition can be reversed inside the same transaction."
+  alt="An account's lifecycle: nonexistent to live on create, which must fail if the account is already live; live to zeroed-with-a-closed-discriminator on close; zeroed to nonexistent when the runtime collects it at the end of the transaction. A dashed edge runs backwards from zeroed to live, labelled revival, when lamports are refunded in the same transaction."
+>
+  <Flow
+    nodes={[
+      { id: 'none', label: '(nonexistent)', col: 0, tone: 'muted' },
+      { id: 'live', label: 'LIVE', note: 'create must fail if this is already live', col: 1 },
+      { id: 'zero', label: 'ZEROED + closed-disc', note: 'lamports at zero, data reset', col: 2 },
+      { id: 'gone', label: '(nonexistent)', note: 'collected at end of transaction', col: 3, tone: 'muted' },
+    ]}
+    edges={[
+      { from: 'none', to: 'live', label: 'create' },
+      { from: 'live', to: 'zero', label: 'close' },
+      { from: 'zero', to: 'gone', label: 'collect' },
+      { from: 'zero', to: 'live', label: 'revival: lamports refunded', tone: 'danger', dashed: true },
+    ]}
+  />
+</Figure>
+
+Two invariants fall straight out of the picture. **Nothing may transition LIVE to LIVE** — that is
+re-initialisation, and the guard is a sentinel field or an `init` that refuses to run
+twice.<Cite src="anchor-account-constraints" /> **Nothing may read a ZEROED account as LIVE** — that is
+revival, and the guard is the closed-account discriminator, checked by every instruction rather than
+written by one.<Cite src="cantina-securing-solana" />
+
+The reason to draw it explicitly is that the dangerous edge — the dashed one back into LIVE — exists
+whether or not you drew it, because it is a property of the runtime's deferred collection and its
+unrestricted lamport crediting, not of your program.<Cite src="solana-docs-accounts" /> You are not
+choosing whether the edge exists. You are choosing whether anything checks for it.
+
+## Class three: the same account, twice
+
+The third class needs no lifecycle at all. It needs only that a caller can name one key in two
+positions.
+
+```rust
+#[derive(Accounts)]
+pub struct Transfer<'info> {
+    #[account(mut, has_one = authority)] pub from: Account<'info, Balance>,
+    #[account(mut)]                      pub to:   Account<'info, Balance>,
+    pub authority: Signer<'info>,
+}
+
+pub fn transfer(ctx: Context<Transfer>, amount: u64) -> Result<()> {
+    require!(ctx.accounts.from.amount >= amount, ErrorCode::Insufficient);
+    ctx.accounts.from.amount -= amount;
+    ctx.accounts.to.amount   += amount;
+    Ok(())
+}
+```
+
+Pass the same account key for `from` and `to`. Both wrappers construct successfully — it is a real
+`Balance`, owned by the program, and `has_one` binds it to the signer, who is its genuine owner. Two
+separate in-memory copies are deserialised from the same underlying account. The debit is applied to
+one copy, the credit to the other, and at the end of the instruction both are serialised back to the
+same account. **The last write wins**, and the last write is the credit.
+
+Balance goes up. The debit never persisted. Repeat until the number is as large as you like.
+
+The canonical taxonomy files this as class 6, `duplicate-mutable-accounts`, and the fix is one
+line:<Cite src="sealevel-attacks" />
+
+```rust
+#[account(mut, has_one = authority, constraint = from.key() != to.key() @ ErrorCode::SameAccount)]
+pub from: Account<'info, Balance>,
+```
+
+**Subgoal: understand why testing does not find this.** A test suite is written by someone who knows
+what the instruction means. They create Alice's balance and Bob's balance and transfer between them,
+because that is the operation. Nobody writes `transfer(alice, alice, 100)` unless they are
+specifically hunting for aliasing, and property-based testing only finds it if the generator is
+allowed to produce duplicate accounts — which most hand-written account generators are not, because
+they were written to produce *valid scenarios*. This is the argument for
+[invariant testing](/c/invariant-testing) restated on a new platform: assert conservation of total
+supply across arbitrary instruction sequences, and this bug fails the assertion the first time the
+generator repeats an account.
+
+**Subgoal: notice that you have seen this exact bug before.** The Solidity version is the classic
+`transfer(msg.sender, msg.sender, amount)` self-transfer bug in ERC-20 implementations that cache
+balances in local variables:
+
+```solidity
+uint256 fromBal = balances[from];   // cached
+uint256 toBal   = balances[to];     // cached: same slot when from == to
+balances[from] = fromBal - amount;
+balances[to]   = toBal + amount;    // overwrites the debit
+```
+
+Identical mechanism, identical fix, and it is one of the reasons a token implementation is expected to
+be inherited rather than written. The Solana difference is not the bug — it is that the aliasing is
+*routine* rather than exotic, because passing accounts is how every instruction receives its state, and
+nothing in the type system distinguishes two parameters from two accounts.
+
+### The neighbouring problem: stale copies after a CPI
+
+One more variant belongs here, because it produces the same symptom from the opposite direction. If
+your instruction holds a deserialised copy of an account, makes a cross-program invocation that
+modifies that account, and then keeps using its copy, the copy is stale — and writing it back
+overwrites whatever the callee did. The audit-firm checklist has an entry for exactly this, "Account
+Reloading".<Cite src="cantina-securing-solana" />
+
+The pattern to internalise:
+
+<Figure
+  caption="Skip the reload and the write-back overwrites whatever the callee did."
+  alt="A four-step sequence: deserialize an account into a local copy, make a cross-program invocation that mutates the same account, call reload, then read. Without the reload the local copy is stale."
+>
+  <Flow
+    nodes={[
+      { id: 'de', label: 'deserialize', note: 'you now hold a copy', col: 0 },
+      { id: 'cpi', label: 'CPI', note: 'the callee mutates the same account', col: 1, tone: 'warn' },
+      { id: 'rl', label: 'reload()', note: 'or your copy is a lie', col: 2, tone: 'accent' },
+      { id: 'rd', label: 'read', note: 'the value the callee actually wrote', col: 3 },
+    ]}
+  />
+</Figure>
+
+Class three and this variant are the same root fact: **a deserialised account is a copy, not a
+view.** Every time two things can hold copies of one account — two struct fields, or your handler and
+a callee — the last writer wins and you have to decide who that should be.
+
+<Check type="spot-bug" concept="account-revival-attack">
+A rewards program. The close path is hand-rolled because the team wanted to send the rent to a
+different destination than the framework's constraint made convenient. Find every one of this lesson's
+three classes, and say which one the attacker uses first.
+
+```rust
+pub fn close_position(ctx: Context<ClosePosition>) -> Result<()> {
+    let pos = ctx.accounts.position.to_account_info();
+    let dest = ctx.accounts.rent_receiver.to_account_info();
+
+    **dest.lamports.borrow_mut() = dest.lamports()
+        .checked_add(pos.lamports()).unwrap();
+    **pos.lamports.borrow_mut() = 0;
+    Ok(())
+}
+
+pub fn claim(ctx: Context<Claim>) -> Result<()> {
+    require!(!ctx.accounts.position.claimed, ErrorCode::AlreadyClaimed);
+    ctx.accounts.position.claimed = true;
+    // ... pay out ctx.accounts.position.reward ...
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct Migrate<'info> {
+    #[account(mut, has_one = authority)] pub old: Account<'info, Position>,
+    #[account(mut)]                      pub new: Account<'info, Position>,
+    pub authority: Signer<'info>,
+}
+```
+
+<Answer>
+**The attacker uses revival first, and it is unbounded.**
+
+**1 — `close_position` drains lamports and leaves the data intact. This is the revival class.** The
+account is not collected until the end of the transaction, and any program may credit lamports to any
+writable account.<Cite src="solana-docs-accounts" /> So in one transaction the attacker calls
+`close_position`, transfers rent-exempt lamports back into the position from their own wallet, and
+ends with a live account whose `claimed` flag is still whatever it was and whose `reward` is intact.
+Then they call `claim`. Then they close and revive and claim again. The payout is limited only by the
+rewards pool.
+
+Notice what makes this *unbounded* rather than a one-off: `claim` protects itself with a flag stored
+inside the very account that close was supposed to destroy. Any state whose integrity depends on the
+account ceasing to exist becomes replayable the moment closing is incomplete.
+
+**The fix, in order of preference.** Use the framework: `close = rent_receiver` closes the account by
+sending lamports to the target *and resetting its data*.<Cite src="anchor-account-constraints" /> The
+constraint takes an arbitrary destination, so the team's reason for hand-rolling was not a real
+constraint. If the close genuinely must be hand-written, do both halves the checklist requires: zero
+the data, write a closed-account discriminator, have every other instruction reject accounts carrying
+it, and add a permissionless `force_defund` so a revived account can be finished
+off.<Cite src="cantina-securing-solana" />
+
+**2 — `Migrate` has no `from.key() != to.key()` check. This is the duplicate-mutable class.** Passing
+the same position as both `old` and `new` gives two deserialised copies of one account. Whatever the
+migration does — copy the balance across, zero the source — the writes race and the last one persists,
+which for a "copy then clear" migration means the copy survives and the clear does not, or the reverse,
+depending on field order. Either way an invariant breaks. Class 6 in the canonical
+taxonomy;<Cite src="sealevel-attacks" /> fix with
+`constraint = old.key() != new.key()`.<Cite src="anchor-account-constraints" />
+
+**3 — `new` is unvalidated as an instance.** `old` is bound to the signer by `has_one`; `new` is bound
+to nothing. Right type, right owner, someone else's position — the third question, unasked, exactly as
+in lesson 3.<Cite src="sealevel-attacks" /> Fix with `has_one = authority` on `new` as well.
+
+**4 — and the initialisation class is here too, one inference away.** If `Migrate` creates `new` with
+`init_if_needed` anywhere in this program's flow, running it twice resets a live position. The
+constraint requires an explicit guard on an already-initialised field precisely because the framework
+cannot know which field that is.<Cite src="anchor-account-constraints" />
+
+**Why the attacker starts with revival.** It is the only one of the four that yields *repeatable*
+extraction rather than a single wrong outcome, and it needs no other user's account — the attacker
+loops on their own position. When ranking findings, that property matters more than severity labels:
+a bug that can be run in a loop against the attacker's own state has no natural ceiling and no
+dependency on anyone else's behaviour.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Three questions that live outside the three questions.** For every instruction, additionally ask:
+can this account be initialised again; can it be closed and brought back; can any two of these
+parameters be the same account? None of the three is answerable by inspecting a single account's
+fields, which is why the checklist from lesson 1 does not reach them.
+
+**A rule for close instructions specifically.** Any hand-rolled close is a finding until proven
+otherwise, because the correct implementation has two halves — zero the data and write a closed
+discriminator, then reject that discriminator everywhere downstream — and the half people write is
+the lamport transfer.<Cite src="cantina-securing-solana" /> The framework's `close` constraint does
+both.<Cite src="anchor-account-constraints" />
+
+**A test-design change you can make this week.** Add one property to your test suite: run every
+instruction with every pair of same-type accounts aliased, and assert conservation. It is a loop over
+the accounts struct, and it finds class three everywhere it exists. The workshop's vault levels are
+built to be attacked this way, and doing it by hand once is worth more than reading about
+it.<Cite src="neodyme-workshop" />
+
+**And the module's last technical lesson, then its turn.** Next is the shortest lesson here, on
+arithmetic — where a build profile, not a language decision, reintroduces the bug Solidity fixed in
+0.8. After that the module stops teaching the taxonomy and asks the harder question: given that
+everything in these six lessons is largely closed for programs built on the framework, where did the
+money in 2025 and 2026 actually go? It was not here.<Cite src="helius-solana-hacks" />

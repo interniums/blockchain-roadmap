@@ -1,0 +1,374 @@
+---
+id: defi-liquidations-llamma-bands
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [curve-llamma-explainer, curve-liquidation-bands, curve-crvusd-amm-docs, curve-crvusd-controller-docs, uniswap-v3-whitepaper, aave-v3-pool-docs, morpho-liquidation-docs, llamarisk-crvusd-incident]
+stack: {}
+---
+
+Everything so far has been an argument with a step function. Health factor crosses one and a
+discontinuity fires: a large market order appears, a borrower loses a fixed percentage of equity in a
+single transaction, and a keeper must be present at that exact instant or the position rots. Lesson
+five showed that the discontinuity is what gives the cascade its gain — a smooth price path arriving
+as a sudden block of forced selling.
+
+Curve's LLAMMA is a different answer to the same problem, and the difference is not a parameter
+change. There is no liquidation call. There is no close factor. There is no liquidation bonus. The
+position's composition is a continuous function of price, maintained by ordinary arbitrage, and the
+borrower's exposure to their collateral falls smoothly as the price does.
+
+Curve's own user documentation uses the right image: fixed-price liquidation is like a step, where
+crossing one price can close the loan immediately; LLAMMA is more like a ramp, exchanging collateral
+in stages across a range, with friction at every step in the form of conversion
+losses.<Cite src="curve-liquidation-bands" /> Hold on to the second half of that sentence. This lesson
+builds the ramp; the next one prices the friction.
+
+## The ladder
+
+LLAMMA — Lending-Liquidating AMM Algorithm — is the contract that rebalances a loan's collateral by
+creating arbitrage opportunities, offering better prices inside the AMM than external markets so that
+traders do the converting.<Cite src="curve-llamma-explainer" /> Each market deploys its own AMM
+holding the collateral and the borrowable asset — an ETH/crvUSD market's AMM contains ETH and
+crvUSD.<Cite src="curve-llamma-explainer" />
+
+Structurally it is a Uniswap-v3-style AMM using bands, and if you have
+[virtual reserves](/c/virtual-reserves) and [ticks](/c/tick) you have most of it
+already.<Cite src="curve-llamma-explainer" /><Cite src="uniswap-v3-whitepaper" /> A band is a price
+range into which liquidity is deposited; the bands form a fixed price grid; and when a loan is
+created, the collateral is distributed **equally** across the `N` bands the borrower
+chose.<Cite src="curve-llamma-explainer" /> `N` ranges from a minimum of 4 to a maximum of 50, and the
+contract enforces it with `MIN_TICKS` and `MAX_TICKS` constants of exactly those
+values.<Cite src="curve-llamma-explainer" /><Cite src="curve-crvusd-controller-docs" />
+
+The one structural difference from a Uniswap position matters for what follows: liquidity is spread
+across a range of bands rather than concentrated in one, and the collateral sitting in each band is
+idle until the price enters that band's range.<Cite src="curve-llamma-explainer" />
+
+### Where the band edges are, derived
+
+The grid is geometric, and the contract states the rule in a comment on the very function that decides
+which bands your loan lands in:
+
+```text
+p_oracle_up(n)  =  base_price · ((A − 1) / A)^n
+```
+
+with `A` documented as the band width factor and the relative band size given as
+`1/A`.<Cite src="curve-crvusd-amm-docs" />
+
+**Subgoal 1 — read what the exponent means.** Each band is a constant *ratio* below the one above it,
+not a constant number of dollars. Write `r = (A − 1)/A = 1 − 1/A`. Band `n`'s upper edge is
+`base_price · r^n`, so its lower edge is `base_price · r^(n+1)` — a fall of `1/A` in relative terms.
+For `A = 100`, each band is 1% wide.
+
+**Subgoal 2 — get the width of the whole ladder.** `N` bands span a price ratio of `r^N`, so the total
+range is
+
+```text
+range  =  1 − (1 − 1/A)^N   ≈   1 − e^{−N/A}
+```
+
+For `A = 100`: `N = 4` gives `1 − 0.99⁴ = 3.9%`; `N = 10` gives 9.6%; `N = 50` gives 39.5%. That single
+line is the leverage-versus-smoothness dial in geometric form, and the next lesson turns it into the
+LTV formula.
+
+**Subgoal 3 — distinguish two price pairs that look alike.** The glossary is precise and the
+distinction is load-bearing. `p_oracle_up` and `p_oracle_down` are the edges of band `n` in the steady
+state where the AMM price equals the oracle price, reached when `x = 0` or `y = 0` respectively.
+`p_current_up` and `p_current_down` are the value of the AMM's own price `p` at constant `p_oracle`
+when `y = 0` or `x = 0` for that band.<Cite src="curve-crvusd-amm-docs" /> The first pair describes
+where the ladder sits; the second describes what the AMM will quote *right now*. They coincide only at
+equilibrium, and the gap between them is the entire liquidation mechanism.
+
+<Misconception
+  belief="Bands are price alerts or trigger levels — thresholds at which something is scheduled to happen."
+  reality="Each band is a real liquidity range holding real assets. Crossing one is a trade that someone executed against your collateral, not a signal that fired. Your position's composition after the crossing is different because tokens moved."
+  why="The word band suggests a boundary on a chart rather than an inventory, and every other lending protocol's equivalent number genuinely is a threshold."
+  src="curve-llamma-explainer"
+/>
+
+## Three states a band can be in
+
+Because the collateral is real and the bands are real, a band's contents tell you where the price is
+relative to it. The documentation names exactly three cases.<Cite src="curve-llamma-explainer" />
+
+**Only the collateral token.** The band has not been soft-liquidated; the price is above its upper
+edge. These are the bands above the `active_band`.
+
+**Both tokens.** This is the band the price is currently inside, and it is by definition the
+`active_band`. Continuous liquidation is happening here.
+
+**Only the borrowable token.** The band has already been soft-liquidated; arbitrage has exchanged all
+of its collateral for crvUSD. These are the bands below the `active_band`.
+
+Two consequences fall out of this that no threshold-based design has.
+
+**The position's composition is a deterministic function of price.** Not of when you last checked, not
+of whether a keeper was awake, not of what order transactions arrived in. Where the price sits in the
+ladder determines what you hold. That is what makes progressive conversion possible with no discrete
+event to schedule.
+
+**Liquidation is per band, not per user.** The documentation is explicit: liquidation happens on a
+band basis, so if multiple users have liquidity in the same band being soft- or de-liquidated, it
+happens for all of them together rather than for one at a
+time.<Cite src="curve-llamma-explainer" /> This is what makes the design scale — a single arbitrage
+trade rebalances every position that shares that band, so cost per position falls as the market grows,
+where a discrete design pays `G` per position per liquidation.
+
+## How the conversion actually happens
+
+Nothing in LLAMMA is triggered by the contract. Soft- and de-liquidation are not automatically
+triggered by the smart contract; instead the AMM creates an arbitrage opportunity using two
+prices.<Cite src="curve-llamma-explainer" />
+
+**`price_oracle`** is the collateral price fetched from an external oracle contract. **`get_p`** is the
+AMM's own price.<Cite src="curve-llamma-explainer" /> The design deliberately makes `get_p` more
+sensitive than the oracle, so that any oracle movement opens a gap that pays somebody to
+close.<Cite src="curve-llamma-explainer" />
+
+**When the oracle price falls, `get_p` falls faster.** The documentation's example: `get_p` is 830
+while `price_oracle` is 850, so arbitrageurs buy ETH inside the LLAMMA for 830 and sell it elsewhere
+for 850. That decreases the ETH in the bands, because it is being bought, and increases the crvUSD,
+because it is being sold — which *is* soft liquidation.<Cite src="curve-llamma-explainer" />
+
+**When the oracle price rises, `get_p` rises faster.** `get_p` at 860 against a `price_oracle` of 850
+means arbitrageurs buy ETH outside and sell it into the AMM, depositing ETH and removing
+crvUSD — de-liquidation.<Cite src="curve-llamma-explainer" />
+
+**When they are equal there is no opportunity and nothing happens.**<Cite src="curve-llamma-explainer" />
+
+The arbitrageurs are incentivised to maintain `get_p = price_oracle`, and the AMM exposes
+`get_amount_for_price`, which returns how much needs to be exchanged to reach a given price plus a
+boolean for whether to pump or dump the collateral.<Cite src="curve-llamma-explainer" /> A helper
+function, published by the protocol, for the party extracting value from the borrower — which is the
+same relationship as `users_to_liquidate` in a discrete design, and the same reason it exists.
+
+The AMM charges a static exchange fee that governance can adjust with `set_fee`, and those fees go to
+the liquidity providers — who are the borrowers, since the borrowers' collateral is the
+liquidity.<Cite src="curve-llamma-explainer" /> So the borrower is paid a little, out of the same
+arbitrage that is costing them, and the documentation frames the fee as a counter to the losses from
+liquidation and to the interest rate.<Cite src="curve-llamma-explainer" />
+
+<Compare
+  axis="Which way the oracle moved"
+  columns={[
+    { title: 'Oracle price falls', note: 'soft liquidation', tone: 'accent' },
+    { title: 'Oracle price rises', note: 'de-liquidation' },
+  ]}
+  rows={[
+    {
+      label: 'What does the AMM quote?',
+      cells: [
+        <><code>get_p</code> 830, against a <code>price_oracle</code> of 850<Cite src="curve-llamma-explainer" /></>,
+        <><code>get_p</code> 860, against a <code>price_oracle</code> of 850<Cite src="curve-llamma-explainer" /></>,
+      ],
+    },
+    {
+      label: 'What does the arbitrageur do?',
+      cells: [
+        'Buys ETH inside the LLAMMA and sells it elsewhere',
+        'Buys ETH elsewhere and sells it into the LLAMMA',
+      ],
+    },
+    {
+      label: "What happens to the band's inventory?",
+      cells: ['Less ETH, more crvUSD', 'More ETH, less crvUSD'],
+    },
+    {
+      label: 'Who decided any of this?',
+      cells: ['Nobody. The gap paid someone to close it', 'Nobody. The same gap, opposite sign'],
+    },
+  ]}
+  caption="The position is rebalanced by people who are not liquidating anybody — they are closing a price gap the AMM opened on purpose."
+  alt="When the oracle falls, the AMM quotes 830 against an oracle price of 850, so arbitrageurs buy ETH inside the LLAMMA and sell it elsewhere, leaving the band with less ETH and more crvUSD — soft liquidation. When the oracle rises, the AMM quotes 860 against 850, arbitrageurs buy elsewhere and sell into the AMM, and the band gains ETH and loses crvUSD — de-liquidation. Neither direction is triggered by the protocol."
+/>
+
+<Aside kind="note">
+Compare the actors. Aave's `liquidationCall` needs a specialist who has integrated with Aave, holds or
+can flash-borrow the debt asset, and is watching health factors.<Cite src="aave-v3-pool-docs" />
+LLAMMA needs someone who noticed that one venue quotes ETH cheaper than another. The second population
+is orders of magnitude larger and requires no knowledge of lending at all. That is the strongest thing
+about the design, and it is a claim about the *keeper set* rather than about the mechanism.
+</Aside>
+
+## The worked example, and the ten dollars that are missing
+
+Curve's own numbers, because they contain the point of the next lesson hidden in a footnote.
+
+Take a loan backed by 2 ETH at an ETH price of $1,000, with a total debt of 1,750 crvUSD, using 4
+bands.<Cite src="curve-llamma-explainer" /> Equal distribution puts 0.5 ETH in each band.
+
+<Figure
+  caption="A band is an inventory, not a trigger. Where the price sits decides what the position is made of, with no event in between."
+  alt="Curve's worked LLAMMA loan: 2 ETH spread equally across four bands, half an ETH each, drawn with price descending from left to right. With the price at the lower edge of the first band, that band holds 490 crvUSD instead of its original half an ETH, and the remaining three bands still hold half an ETH each."
+>
+  <ByteLayout
+    proportional
+    caption="2 ETH · 4 bands · price descending →"
+    fields={[
+      { label: 'band 1', note: '0.5 ETH → 490 crvUSD', tone: 'warn' },
+      { label: 'band 2', note: '0.5 ETH' },
+      { label: 'band 3', note: '0.5 ETH' },
+      { label: 'band 4', note: '0.5 ETH' },
+    ]}
+  />
+</Figure>
+
+**Above the range.** All four bands are 100% ETH. There is nothing to liquidate, so nothing
+happens.<Cite src="curve-llamma-explainer" />
+
+**Price enters the first band.** LLAMMA starts selling ETH into crvUSD. With the price roughly in the
+middle of the band, about 0.25 of that band's 0.5 ETH has been
+converted.<Cite src="curve-llamma-explainer" />
+
+**Price reaches the band's lower edge.** The whole 0.5 ETH of that band has been soft-liquidated —
+into, in the documentation's words, "let's say, 490 crvUSD".<Cite src="curve-llamma-explainer" />
+
+Stop there. The band's price range was around $1,000 per ETH, and 0.5 ETH sold for 490 crvUSD rather
+than 500. Curve's own footnote answers the obvious question directly: the shortfall is because losses
+occur during soft liquidation.<Cite src="curve-llamma-explainer" /> Ten crvUSD, or 2% of the amount
+converted, in one band, on one pass down.
+
+That is the liquidation bonus. It has not been abolished; it has been atomised into a per-band, per-
+crossing charge and paid to arbitrageurs instead of to a designated liquidator. Lesson seven works out
+what it costs over a path rather than over a single crossing, and the answer is not obviously smaller
+than a one-time penalty.
+
+**Below the entire range.** The price can walk all the way through the ladder, at which point the
+entire collateral has been converted and the loan is fully backed by
+crvUSD.<Cite src="curve-llamma-explainer" /> The documentation attaches a condition to this that is
+easy to skim past and belongs in lesson eight: this is only possible if the health of the loan is
+still above 0%.<Cite src="curve-llamma-explainer" />
+
+<Check type="predict" concept="llamma-bands">
+A borrower opens an ETH/crvUSD LLAMMA loan with 10 ETH and `N = 10` bands, in a market with `A = 100`,
+at an oracle price of $3,000. The price falls to the bottom edge of the fourth band and then stops.
+
+Work out approximately where the bottom of the whole liquidation range sits, how much of the borrower's
+ETH has been converted, and what happens to the remaining six bands if the price sits still for a week.
+
+<Answer>
+**Where the range ends.** Bands are `1/A = 1%` wide, so ten bands span
+`1 − 0.99¹⁰ = 1 − 0.9044 = 9.6%`. If the top of the ladder is near $3,000, the bottom is around
+`3,000 × 0.9044 ≈ $2,713`. The whole protection range is about $287 wide on a $3,000 asset — narrow,
+because ten bands at `A = 100` is a narrow ladder.
+
+**How much has converted.** Collateral is distributed equally, so each band holds 1 ETH. At the bottom
+edge of band four, bands one through four are fully soft-liquidated and bands five through ten are
+untouched. **About 4 ETH has become crvUSD; about 6 ETH remains as ETH.** The position is now roughly
+40% stable and 60% volatile, and that composition is a fact about where the price is, not about who
+did what.
+
+**Sanity-check the conversion price.** Band four's edges are around
+`3,000 × 0.99³ = $2,911` down to `3,000 × 0.99⁴ = $2,882`. The 4 ETH did not all sell at $2,882; each
+band sold across its own range, so the blended proceeds are roughly the average of the ladder from
+$3,000 down to $2,882 — minus the conversion losses on every crossing.
+
+**What happens over a still week.** Two different things, and separating them is the point of the
+question.
+
+*Nothing more converts.* The price is not moving, so `get_p` and `price_oracle` are in equilibrium and
+there is no arbitrage opportunity, so bands five through ten sit
+untouched.<Cite src="curve-llamma-explainer" /> Curve's user documentation says the same thing from
+the borrower's side: losses in liquidation protection only occur while inside the protection
+range and while conversions are happening.<Cite src="curve-liquidation-bands" />
+
+*Health still falls.* Interest accrues per block regardless of whether the loan is being liquidated,
+and the documentation lists interest as one of the two factors that decrease loan health, alongside
+soft- and de-liquidation losses.<Cite src="curve-llamma-explainer" /> A week of stillness inside the
+range is a week of health decay with no offsetting conversion.
+
+*And the borrower is restricted.* While in liquidation protection they cannot add collateral, remove
+collateral, or borrow more; they can repay, and only a *full* repayment exits the range — repaying 99%
+does not.<Cite src="curve-liquidation-bands" /> So the obvious defensive move, topping up collateral,
+is unavailable precisely when it is wanted.
+</Answer>
+</Check>
+
+## What the design removed, precisely
+
+Line the two mechanisms up and the differences are all structural rather than parametric.
+
+**No discrete event.** A discrete design has a moment: a transaction, a `LiquidationCall` log, a step
+in the borrower's balance. LLAMMA has a continuous function of price and a stream of ordinary swaps.
+
+**No close factor.** There is nothing to cap, because no single call retires a fraction of the debt.
+The equivalent question — how fast can conversion happen — is answered by `A` and by how fast the
+price moves, not by a parameter with branches.<Cite src="aave-v3-pool-docs" />
+
+**No liquidation bonus.** No governance-set discount, no per-asset bitmap field, no incentive factor
+formula.<Cite src="morpho-liquidation-docs" /> The compensation to whoever does the converting is the
+gap between `get_p` and `price_oracle`, which is set by how sensitive the AMM is rather than by a
+vote.
+
+**No privileged caller.** Anyone arbitraging two venues participates without knowing they are
+liquidating anybody.
+
+**And it reverses.** De-liquidation is the same mechanism running the other way: if the price recovers,
+the crvUSD is converted back into collateral, and this can continue until all the assets backing the
+loan are the original asset again.<Cite src="curve-llamma-explainer" /> A discrete liquidation is
+final; a soft one is a position on a spectrum that can walk back up.
+
+<Misconception
+  belief="Soft liquidation means you cannot be liquidated."
+  reality="It means the conversion is continuous rather than discrete. A hard liquidation path exists and is used: a loan becomes eligible for it when health falls below zero, which depends on accrued interest and accumulated conversion losses rather than on the price being inside or outside the band range."
+  why="'No liquidation event' is marketed as 'no liquidation', and the band range is mistaken for the thing that determines hard liquidation when the documentation says the range explicitly does not."
+  src="curve-llamma-explainer"
+/>
+
+That misconception is worth pausing on because Curve's own documentation goes out of its way to
+correct it: hard liquidation is when other users repay the debt and receive the collateral, a loan is
+only eligible when health is below 0%, and it is very important to understand that the liquidation
+range does not reflect prices at which a loan is hard-liquidated — it depends only on the health of
+the loan.<Cite src="curve-llamma-explainer" /> Two independent quantities that both use the word
+liquidation.
+
+<Aside kind="warn">
+Being below the entire range is not safety. Curve's user documentation spells out the case: with the
+whole position converted to crvUSD you are protected from further collateral declines and no longer
+taking conversion losses, but health now decreases from interest alone, and if the price stays far
+below the range for a long time interest alone can eventually push health to
+zero.<Cite src="curve-liquidation-bands" /> A fully de-risked position that is still a loan is still a
+loan.
+</Aside>
+
+## What this design inherits
+
+Two dependencies carry straight through from the discrete world, and neither is softened.
+
+**It depends on arbitrageurs.** The conversion is not performed by the protocol; it is performed by
+people responding to a price gap. That is a keeper assumption with a much larger population and a much
+lower barrier to entry — but it is still a keeper assumption, and its quality shows up directly in the
+borrower's losses. Curve names three factors that reduce those losses, and one of them is more
+efficient arbitrage.<Cite src="curve-llamma-explainer" />
+
+**It depends on an oracle.** `price_oracle` is fetched from an external contract, and the whole ladder
+is indexed to it.<Cite src="curve-llamma-explainer" /> A discrete design has one oracle-sensitive
+price per position. LLAMMA has a range. Lesson eight is about what an attacker does with that.
+
+And one dependency is new. Because the borrower's collateral *is* the AMM's liquidity, the quality of
+the conversion depends on how much liquidity is in the market — the second of Curve's three factors is
+simply more liquidity.<Cite src="curve-llamma-explainer" /> The June 2024 incident report makes the
+same observation from the failure side, attributing inefficient liquidation of a large CRV position to
+the relatively poor on-chain liquidity profile of CRV.<Cite src="llamarisk-crvusd-incident" /> Thin
+markets are punished here exactly as they are punished in a discrete design; the punishment is just
+spread out.
+
+## What this unlocks
+
+**The next lesson** turns `A` and `N` into the maximum-LTV formula, derives it from the geometric sum
+rather than accepting it, and then prices the friction — because a mechanism that charges 2% per band
+crossing charges it every time the price crosses, and prices cross back and forth.
+
+**The mental model to carry.** A LLAMMA borrower is a concentrated-liquidity provider who did not
+choose to be one. Their collateral is the inventory, the price range is their position, and the
+arbitrageurs' profit is their loss. Everything you know about
+[impermanent loss](/c/impermanent-loss) applies, with one asymmetry: an ordinary LP earns fees
+proportional to the volume they facilitate, while this LP is holding a loan against the same
+inventory.
+
+**A question to ask about any continuous-liquidation design.** Where did the discrete cost go? It never
+disappears — it becomes a rate, and a rate multiplied by an amount of time or an amount of volatility
+is still a number. The next lesson computes it.

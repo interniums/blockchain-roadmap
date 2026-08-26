@@ -1,0 +1,419 @@
+---
+id: evm-yul-assembly-the-net-you-just-removed
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    solidity-inline-assembly,
+    solidity-yul,
+    solidity-variable-cleanup,
+    solidity-external-calls,
+    solidity-global-variables,
+    solidity-error-handling,
+    eip-140,
+    eip-211,
+    eip-2929,
+    measured-gas-constants,
+  ]
+stack:
+  solc: "0.8.36"
+---
+
+Three statements that are true inside an `assembly` block and false three lines above it, in the
+same function, in a file whose first line reads `pragma solidity ^0.8.36`.
+
+`add(x, y)` where the true sum exceeds the largest 256-bit value produces the wrapped result and
+keeps going.<Cite src="solidity-yul" />
+
+`eq(a, b)` on two words that Solidity would consider the same `address` can produce
+zero.<Cite src="solidity-inline-assembly" />
+
+`call(...)` to an address holding no code produces one — success — having executed
+nothing.<Cite src="solidity-external-calls" />
+
+None of these is a compiler bug, an edge case, or a thing that happens only under an exotic
+optimizer setting. They are the normal behaviour of the machine, visible because the layer that was
+hiding it is gone. The Solidity documentation states the position in one sentence: inline assembly
+bypasses several important safety features and checks of Solidity.<Cite src="solidity-inline-assembly" />
+This lesson enumerates which ones, because "several" is doing a lot of work in that sentence.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'In Solidity', note: 'pragma ^0.8.36' },
+    { title: 'Inside the assembly block', note: 'same file, same function', tone: 'warn' },
+  ]}
+  rows={[
+    {
+      label: 'What happens when a + b overflows?',
+      cells: [
+        'A comparison and a conditional revert the code generator wrapped around the opcode, raising Panic(uint256)',
+        'add is the opcode. It wraps modulo 2**256 and execution continues',
+      ],
+    },
+    {
+      label: 'What happens on a division by zero?',
+      cells: ['Panic', 'div(x, y) is documented as x / y or 0 if y is 0. Nothing reverts'],
+    },
+    {
+      label: 'What checks that the callee has code?',
+      cells: [
+        'An EXTCODESIZE the compiler emits before a call on a contract instance, or the ABI decoder when return data is expected',
+        'Nothing. A call to a codeless address returns one, having executed nothing',
+      ],
+    },
+    {
+      label: 'What decodes the return data?',
+      cells: [
+        'The ABI decoder, which reverts on an empty or short return',
+        'Nothing. returndatasize() is a number you have to go and read',
+      ],
+    },
+    {
+      label: 'What happens to the callee reverting?',
+      cells: [
+        'It propagates',
+        'It sets a flag to zero. REVERT hands control and data back to the caller and stops there',
+      ],
+    },
+    {
+      label: 'What cleans the bits above a narrow type?',
+      cells: [
+        'The compiler cleans before any operation that would be adversely affected',
+        'Nothing. Access via inline assembly is explicitly not such an operation',
+      ],
+    },
+  ]}
+  caption="Solidity turns most of these mistakes into a revert; the same mistakes on the right produce a plausible wrong answer instead."
+  alt="Solidity and inline assembly compared on overflow, division by zero, callee code-existence checks, return-data decoding, revert propagation, and cleaning the bits above a narrow type."
+/>
+
+## The checks were never in the machine
+
+The mental model that causes the most damage is that Solidity 0.8's arithmetic safety is a property
+of the runtime — a mode the contract is in. It is not. Checked arithmetic is code the compiler
+*emits*: a comparison and a conditional revert wrapped around the opcode, generating a
+`Panic(uint256)` error when the condition fails.<Cite src="solidity-error-handling" /> Inside an
+assembly block the compiler emits what you wrote, so there is nothing to wrap.
+
+The same applies to every other guarantee, and the list is longer than most people can produce from
+memory:
+
+- **Overflow and underflow.** `add`, `sub` and `mul` are the EVM opcodes, which wrap modulo
+  2<sup>256</sup>.<Cite src="solidity-yul" />
+- **Division by zero.** In Solidity this is a `Panic`.<Cite src="solidity-error-handling" /> In Yul,
+  `div(x, y)` is documented as "x / y or 0 if y == 0", and `mod` and their signed variants behave
+  the same way.<Cite src="solidity-yul" /> A denominator bug does not revert; it silently produces
+  zero, which then flows into whatever you do next.
+- **Array bounds.** There are no arrays. There are offsets, and an offset past the end of a memory
+  buffer is a perfectly legal memory access to the zero-initialised region beyond it.
+- **Types.** There is one type, `u256`, supplied by the dialect.<Cite src="solidity-yul" /> A
+  `bool`, an `address`, a `uint8` and a token amount are the same thing to every instruction.
+- **Return-data decoding.** No ABI decoder runs. Nothing checks that a call returned as many bytes
+  as your interface said it would.
+- **Revert bubbling.** A failing sub-call sets a flag; it does not propagate.<Cite src="eip-140" />
+- **Existence of the callee.** Covered below, and the most surprising of the set.
+
+<Misconception
+  belief="Arithmetic inside my assembly block is checked, because the file declares pragma solidity ^0.8."
+  reality="0.8's overflow checks are instructions the code generator inserts around your arithmetic. Inside an assembly block the compiler emits your instructions, so add wraps and div by zero yields zero."
+  why="The pragma sits at the top of the file and reads like a global mode — the same way a strict-mode directive or a compiler flag would. Nothing in the syntax marks the assembly block as being outside its reach."
+  src="solidity-inline-assembly"
+/>
+
+The correct model is not "assembly is dangerous". It is that an assembly block is a **hole in the
+language**, and everything the language was doing inside that region has to be re-done by hand or
+consciously given up. [The three failure modes](/c/three-failure-modes) you already know — revert,
+out-of-gas, and returning a wrong answer — are not equally likely on both sides of the boundary.
+Solidity converts most classes of mistake into the first. Assembly converts many of the same
+mistakes into the third.
+
+## The bits above the type
+
+Start with the one that surprises people who have written a decade of systems code.
+
+An `address` is 20 bytes and lives in a 32-byte word. A `uint32` is four bytes in a 32-byte word.
+The high bits are not part of the value. The question is what is in them, and the answer is: it
+depends, and the compiler is explicit that it will not tell you.
+
+Solidity's rule is a design principle, not a guarantee of zeroes. The compiler cleans the remaining
+bits before any operation that might be adversely affected by garbage in them — before writing to
+memory, because memory contents may be hashed or sent as call data; before writing to storage,
+because the garbled value would otherwise be observable.<Cite src="solidity-variable-cleanup" /> It
+deliberately skips cleanup when the next operation does not care: a `bool` used as the condition of
+`JUMPI` is not cleaned, because `JUMPI` treats any non-zero value as true.<Cite src="solidity-variable-cleanup" />
+
+And then the sentence that matters here: **access via inline assembly is not considered such an
+operation.** If you use inline assembly to access Solidity variables shorter than 256 bits, the
+compiler does not guarantee that the value is properly cleaned.<Cite src="solidity-variable-cleanup" />
+The inline assembly documentation states the same rule as an instruction to you: for a type spanning
+fewer than 256 bits, you cannot make any assumptions about the bits outside the encoding, and in
+particular must not assume them to be zero.<Cite src="solidity-inline-assembly" />
+
+### Where the garbage actually comes from
+
+"Undefined" is hard to reason about. Two concrete sources make it concrete.
+
+**Subgoal: read a packed variable and see what you got.** Two `address` values and a `uint96` share
+one storage slot. Your assembly does `sload(owner.slot)`. You receive all 32 bytes — the whole slot,
+including the neighbours. The bits above bit 159 are not garbage in the sense of noise; they are
+another state variable, with a value an attacker can often read from chain and sometimes influence.
+
+<Figure
+  caption="The high twelve bytes are not noise — they are another state variable, which an attacker can often read and sometimes choose."
+  alt="A 32-byte word drawn proportionally: the top 12 bytes hold whatever else was packed into the storage slot, and the bottom 20 bytes hold the address that was wanted."
+>
+  <ByteLayout
+    proportional
+    caption="one word out of sload(owner.slot)"
+    fields={[
+      { label: 'the packed neighbour', size: 12, tone: 'danger', note: 'whatever else shares the slot' },
+      { label: 'address', size: 20, tone: 'accent', note: 'the 160 bits you asked for' },
+    ]}
+  />
+</Figure>
+
+**Subgoal: take a narrow value straight off an operation.** Because most arithmetic ignores the fact
+that types can be shorter than 256 bits, and cleanup happens only shortly before it is needed, a
+`uint32` local arriving in your block may still be carrying the high bits of the intermediate that
+produced it.<Cite src="solidity-inline-assembly" />
+
+Now run each of the three failures that follow.
+
+**Comparison.** `eq` compares 256 bits. Two words encoding the same address, one clean and one not,
+are not equal. In an allowlist check this is a lockout: the legitimate caller is refused, forever,
+by code that passed its tests because the test's value happened to arrive clean.
+
+**Hashing.** `keccak256(p, n)` hashes the bytes in memory.<Cite src="solidity-yul" /> An uncleaned
+word stored to memory and hashed produces a different digest — so a mapping slot derived in assembly
+lands somewhere a Solidity write never touched, and the balance you look up is a genuine, correct
+read of an empty slot. Nothing reverts.
+
+**Encoding.** The same word written into a call's argument area is sent as-is. The callee's ABI
+decoder may reject it, may mask it, or may not look — three different behaviours from three
+different callees, which is why this class of bug reproduces on one integration and not another.
+
+### The fix, and why it should be derived
+
+Mask explicitly. The documentation's own example is `and(x, 0xffffffff)` for a `uint32`, and it
+directs you to `signextend` for signed types.<Cite src="solidity-inline-assembly" /> For a 160-bit
+address the constant is twenty `ff` bytes, which is exactly the sort of literal that gets pasted one
+character short.
+
+Derive it instead, so the width is visible in the code rather than in the number of characters:
+
+```solidity
+// mask = 2**160 - 1, written so the 160 is readable and checkable
+let mask := sub(shl(160, 1), 1)
+let cleanOwner := and(sload(ownerSlot), mask)
+
+// signed values are extended, not masked: 3 == 4 bytes minus one, for an int32
+let cleanDelta := signextend(3, rawDelta)
+```
+
+A reviewer can check `160` against the type. A reviewer cannot check forty hex characters, and
+neither can you.
+
+<Misconception
+  belief="An address stored in a word is always zero-padded on the left."
+  reality="Only where the compiler has cleaned it, which it does before operations that would be affected — not on the path into an assembly block. A value read out of a packed slot carries its neighbours in the high bits."
+  why="The type declares 20 bytes and every block explorer renders 20 bytes, so the 12 leading zero bytes feel like part of the representation rather than a thing the compiler arranges at particular moments."
+  src="solidity-variable-cleanup"
+/>
+
+## Signedness is a property of the instruction
+
+The EVM stores no type information, so the same 32 bytes are a positive number or a negative one
+depending entirely on which opcode you hand them to. Yul therefore exposes both variants as separate
+built-ins: `div` and `sdiv`, `mod` and `smod`, `lt` and `slt`, `gt` and `sgt`, and `shr` (logical)
+alongside `sar` (signed arithmetic).<Cite src="solidity-yul" />
+
+Take the two's-complement encoding of −1: all 256 bits set. As an unsigned value that is the largest
+number the machine can represent. So `lt(minusOne, 5)` is 0 and `slt(minusOne, 5)` is 1, from
+identical inputs.<Cite src="solidity-yul" /> A collateral check written with the unsigned comparison
+treats the most negative position on your books as the largest positive one.
+
+Nothing warns you. There is no declared type for the compiler to check the instruction against, no
+lint that can infer intent from a word, and no runtime behaviour that differs — the wrong instruction
+is a valid instruction. The bug is invisible until an input crosses zero, which in a lot of
+financial logic means it is invisible until the first bad day.
+
+<Misconception
+  belief="The compiler picks the right comparison based on the variable's declared type."
+  reality="Inside assembly there are no declared types. You choose between lt and slt yourself, and neither the compiler nor any static analyser has the information needed to tell you the choice was wrong."
+  why="In Solidity proper the type genuinely does drive the operator, so the habit of letting the type decide is correct everywhere else in the file."
+  src="solidity-yul"
+/>
+
+The defensible rule that follows: keep signed arithmetic out of assembly. If a value can be negative
+and the reason you are in assembly is gas, the gas is not worth it.
+
+## A raw call does not check that anyone is home
+
+This is the one with the widest blast radius, because it changes what "the call succeeded" means.
+
+At the machine level, calling an address with no code succeeds. There is nothing to execute, so the
+frame returns immediately with success and empty return data. The Solidity documentation states this
+as a property of the EVM design and warns that account existence must be checked before calling if
+it matters.<Cite src="solidity-global-variables" />
+
+High-level Solidity therefore inserts a check. Because the EVM considers a call to a non-existing
+contract to always succeed, the compiler emits `EXTCODESIZE` before a call on a contract instance and
+raises an exception when the target has no code.<Cite src="solidity-external-calls" /> Two
+qualifications on that, both worth knowing precisely:
+
+- Since 0.8.10, the check is **skipped when return data is expected**, on the reasoning that empty
+  code cannot return data, so the ABI decoder will revert instead.<Cite src="solidity-external-calls" />
+  You still get a loud failure; it arrives from the decoder rather than from a size check.
+- The check is **not performed at all for low-level calls** that operate on addresses rather than
+  contract instances.<Cite src="solidity-external-calls" /> That covers `.call`, `.delegatecall` and
+  `.staticcall` as well as assembly.
+
+So the guarantee that a call to a codeless address fails loudly is assembled from two separate
+mechanisms, and dropping into assembly removes both. What you are left with is
+[the raw boolean](/c/call-returns-a-boolean): one, meaning the frame did not revert.
+
+<Figure
+  caption="Nothing in this sequence is an error, and the number that reaches the caller is a price of zero."
+  alt="A stack trace of an assembly staticcall to an address holding no code: six arguments are pushed with gas on top, STATICCALL returns one having executed nothing, the success guard passes, and loading the untouched output word yields zero."
+>
+  <StackTrace
+    steps={[
+      { op: 'MSTORE', note: 'selector into scratch at 0x00' },
+      {
+        op: 'PUSH the six args',
+        stack: ['gas()', 'oracle', '0x00', '0x04', '0x20', '0x20'],
+        changed: [0, 1, 2, 3, 4, 5],
+        note: 'STATICCALL pops gas first, retSize last',
+      },
+      {
+        op: 'STATICCALL',
+        stack: ['0x01'],
+        changed: [0],
+        tone: 'danger',
+        note: 'no code at oracle: succeeds, returns nothing',
+      },
+      { op: 'ISZERO, JUMPI', stack: [], note: 'the guard passes' },
+      {
+        op: 'MLOAD 0x20',
+        stack: ['0x00'],
+        changed: [0],
+        tone: 'danger',
+        note: 'never written; memory is zero-initialised',
+      },
+    ]}
+  />
+</Figure>
+
+### The full list of what you now owe
+
+An assembly `call` obliges you to write four things the language wrote for you:
+
+**Check that the target has code**, with `extcodesize`, when a codeless target must not be treated as
+success. That read costs 2,600 gas cold and 100 warm on this project's toolchain, priced by the same
+warm/cold access set as everything else.<Cite src="measured-gas-constants" /><Cite src="eip-2929" />
+People skip it for that 2,600 and it is almost never the right trade.
+
+**Check the returned flag**, because a reverting callee sets it to zero rather than propagating.
+REVERT was specified precisely to return control plus data to the caller instead of
+aborting.<Cite src="eip-140" />
+
+**Bubble the revert yourself**, if the caller should see the callee's error. That means
+`returndatacopy` into memory and `revert` with the same bytes. Two asymmetries make this fiddly:
+reading past the end of *calldata* returns zeros, while `RETURNDATACOPY` reverts if you ask for more
+bytes than `RETURNDATASIZE` reports.<Cite src="eip-211" /> The two opcodes look symmetric and are
+not.
+
+**Decode, or decide not to.** If you skip the existence check and the target has no code, the call
+returns zero bytes and `returndatasize()` is zero. If your output buffer was memory you allocated
+and never wrote — and EVM memory is zero-initialised — then reading it back yields a well-formed
+zero. A price of zero. A balance of zero. An "is this allowed" of false, or of true, depending on
+which way your predicate points.
+
+<Misconception
+  belief="call in assembly behaves like a Solidity external call, just without the type checking."
+  reality="It performs no code-existence check, does not decode return data, and does not bubble reverts. All three are code the compiler emits around a high-level call, and none of it survives the move into assembly."
+  why="The name is identical and the arguments look like a superset, so it reads as the same operation with more control rather than a different, thinner operation."
+  src="solidity-external-calls"
+/>
+
+<Aside kind="warn">
+The same holds for `delegatecall`, with the consequence upgraded from wrong answer to silent
+no-op: a proxy whose implementation slot holds an address with no code will accept every call,
+execute nothing, and report success. That is [the delegatecall-to-empty-code case](/c/delegatecall-no-code-succeeds),
+and it is the reason a proxy fallback written in assembly needs an implementation check that a
+Solidity call would have supplied for free.
+</Aside>
+
+<Check type="spot-bug" concept="assembly-removes-the-safety-net">
+This helper is meant to read a spot price from a registered oracle and revert if the oracle is
+missing or fails. It compiles, and it passes a test suite that uses a mock oracle deployed by the
+test.
+
+```solidity
+function spot(address oracle) internal view returns (uint256 price) {
+    assembly {
+        mstore(0x00, 0x50d25bcd00000000000000000000000000000000000000000000000000000000)
+        let ok := staticcall(gas(), oracle, 0x00, 0x04, 0x20, 0x20)
+        if iszero(ok) { revert(0, 0) }
+        price := mload(0x20)
+    }
+}
+```
+
+Name every way this returns a wrong answer rather than reverting, and say which one the test suite
+could not have caught.
+
+<Answer>
+**One — a codeless `oracle` returns a price of zero.** `staticcall` to an address with no code
+succeeds with empty return data.<Cite src="solidity-external-calls" /> `ok` is 1, the guard passes,
+and `mload(0x20)` reads scratch space that this function never wrote. EVM memory is zero-initialised,
+so `price` is 0. If `oracle` was read from a registry and the registry entry is unset, the address is
+the zero address and this path is reached with an attacker-supplied or simply stale configuration.
+
+**Two — a short return is not detected.** Nothing consults `returndatasize()`. A callee returning 8
+bytes leaves the remaining 24 bytes of the output word as whatever was there before — here, zeros —
+so a truncated response decodes as a small number rather than failing.
+
+**Three — the caller loses the reason.** `revert(0, 0)` discards the callee's revert data, so an
+oracle that reverts with a custom error surfaces as [an empty revert](/c/empty-revert-data) at the
+top level. Not a wrong answer, but it converts a diagnosable failure into an undiagnosable one.
+
+**Four — `oracle` is used unmasked.** If it arrived from a packed storage slot rather than as a clean
+parameter, the high bits may carry a neighbour and the call goes to a different address
+entirely.<Cite src="solidity-variable-cleanup" /> Here the parameter is a function argument, so it is
+clean on entry; the same three lines pasted into a function that reads the address from packed
+storage are not.
+
+**Which the tests could not catch:** the first, and it is the one that loses money. A test suite
+deploys its mock, so `oracle` always has code, and no ordinary unit test exercises the "registered
+address points at nothing" path — that state arises from a deployment mistake, a migration, or a
+registry entry cleared on another chain. The fix is one `extcodesize` check, costing 2,600 gas cold
+and 100 warm.<Cite src="measured-gas-constants" />
+
+**What Solidity would have done instead:** with a typed interface and a `uint256` return, the
+compiler either emits the existence check or relies on the ABI decoder to revert on empty return
+data, and the short-return case fails in the decoder as well.<Cite src="solidity-external-calls" />
+All four defects are things the code generator was handling.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The memory map** is the next lesson, and it is the fifth item on the list of things the compiler
+was maintaining for you. The difference is that the failures in this lesson are local — a wrong
+comparison produces a wrong answer *here*. Memory violations produce wrong answers somewhere else.
+
+**The memory-safe annotation** asks you to assert something about a block whose semantics you now
+understand well enough to reason about. That reasoning is the prerequisite; an annotation added
+without it is a guess with a keyword attached.
+
+**Proxy patterns** on the Solidity track are the place where a raw `delegatecall` with no existence
+check is not a bug but the entire design, which is exactly why the implementation-slot check has to
+be explicit and reviewed rather than assumed.
+
+**Security review** inherits the classification: a Solidity codebase fails mostly by reverting, and
+an assembly-heavy one gains a second failure mode that produces plausible numbers. Tests are good at
+catching the first. Only invariants and property tests catch the second.

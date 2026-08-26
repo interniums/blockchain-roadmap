@@ -1,0 +1,411 @@
+---
+id: app-session-keys-policy-dimensions
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [erc-7715, erc-7710, erc-7579, erc-7562, eip-4337, erc-4337-session-keys-docs, metamask-caveat-enforcers, metamask-caveats-reference, metamask-permission-rules-reference, metamask-permissions-reference, openfort-smart-wallet-security]
+stack: { viem: "2.x" }
+---
+
+Here is the sentence a product manager writes, and it is a good sentence:
+
+> *Let the player make moves in our game for the next hour without signing every one.*
+
+Here is what happens when an engineer implements it and stops at the first thing that works: the
+session key is registered, the moves go through, the demo is great. Every dimension the sentence did
+not mention is unconstrained, and every unconstrained dimension is a choice the attacker gets to
+make instead of you.
+
+MetaMask's documentation states the default without any softening: **without caveat enforcers, a
+delegation has infinite and unbounded authority to make any execution the original account can
+make.**<Cite src="metamask-caveat-enforcers" /> That is the correct mental starting point for every
+implementation in this space. You do not start from "locked down" and open holes. You start from a
+copy of the user's account and add walls, and the number of walls you get is the number you wrote.
+
+This lesson does two things: enumerate the walls that exist, and establish where they have to be
+built.
+
+## The dimensions, as they actually appear in shipping code
+
+Abstract lists of "you should restrict scope" are useless. Here is the concrete catalogue from one
+production delegation framework — MetaMask's caveat enforcers, each a deployed contract that gates a
+redemption — because a real catalogue tells you what is possible and what is
+awkward.<Cite src="metamask-caveats-reference" />
+
+<Matrix
+  corner="Dimension"
+  cols={['Enforcer', 'What an omission gives away']}
+  rows={[
+    {
+      label: 'Target address',
+      cells: [
+        <code>allowedTargets</code>,
+        'The key may call any contract on the chain, including token contracts directly.',
+      ],
+    },
+    {
+      label: 'Function selector',
+      cells: [
+        <><code>allowedMethods</code> (list of 4-byte selectors)</>,
+        <>Every function on the allowed target, including <code>approve</code>, <code>setOwner</code>, <code>upgradeTo</code>.</>,
+      ],
+    },
+    {
+      label: 'Argument values',
+      cells: [
+        <><code>allowedCalldata</code> (<code>startIndex</code>, expected <code>value</code>)</>,
+        'The recipient, the amount and the token are all attacker-chosen.',
+      ],
+    },
+    {
+      label: 'Native value per call',
+      cells: [
+        <><code>valueLte</code> (<code>maxValue</code>)</>,
+        "Each call can carry the account's entire ETH balance.",
+      ],
+    },
+    {
+      label: 'Token amount, cumulative',
+      cells: [
+        <code>erc20TransferAmount</code>,
+        "No ceiling on the total moved over the key's life.",
+      ],
+    },
+    {
+      label: 'Token amount, per period',
+      cells: [
+        <><code>erc20PeriodTransfer</code> (<code>periodAmount</code>, <code>periodDuration</code>)</>,
+        'The whole allowance is spendable in one block.',
+      ],
+    },
+    {
+      label: 'Token amount, streamed',
+      cells: [
+        <><code>erc20Streaming</code> (<code>initialAmount</code>, <code>amountPerSecond</code>, <code>maxAmount</code>)</>,
+        'No relationship between elapsed time and spend.',
+      ],
+    },
+    {
+      label: 'Call count',
+      cells: [
+        <><code>limitedCalls</code> (<code>limit</code>)</>,
+        'Unlimited redemptions within every other bound.',
+      ],
+    },
+    {
+      label: 'Validity window',
+      cells: [
+        <><code>timestamp</code> (<code>afterThreshold</code>, <code>beforeThreshold</code>, 0 disables either)</>,
+        'The authority never starts late and never ends.',
+      ],
+    },
+    {
+      label: 'Who may redeem',
+      cells: [
+        <><code>redeemer</code> (address list)</>,
+        'Anyone who obtains the delegation may use it, not only your session account.',
+      ],
+    },
+    {
+      label: 'Bulk revocation handle',
+      cells: [
+        <><code>nonce</code> (plus <code>incrementNonce</code>)</>,
+        'No way to retire a whole generation of grants at once.',
+      ],
+    },
+    {
+      label: 'Resulting balance',
+      cells: [
+        <><code>erc20BalanceChange</code>, <code>nativeBalanceChange</code></>,
+        <>No check on the <em>outcome</em>, only on the call.</>,
+      ],
+    },
+  ]}
+  caption="The third column is the default. Every bound in the second column exists only because somebody wrote it down."
+  alt="Twelve policy dimensions with the enforcer that implements each and what leaving it out gives away: target address, function selector, argument values, native value per call, cumulative token amount, per-period token amount, streamed token amount, call count, validity window, who may redeem, a bulk revocation nonce, and resulting balance."
+/>
+
+Two things about this table are worth more than the table itself.
+
+**First, the dimensions are independent, and the security is the intersection.** `allowedTargets`
+alone bounds *where*, not *what* or *how much*. `valueLte` alone bounds native value and says nothing
+about ERC-20 transfers, which move no native value at all. A policy is only as tight as the
+conjunction of what you set, and the common failure is setting two dimensions confidently and
+believing the other seven are implied.
+
+**Second, some dimensions are cheap and some are genuinely hard.** Target and selector are equality
+checks on bytes you already have. A cumulative cap needs *state* — the enforcer has to remember what
+was spent, which turns a pure check into a storage write and drags in every constraint the next
+lesson is about. And argument matching is the hardest of the three.
+
+## Argument matching is positional, and that is a trap
+
+`allowedCalldata` takes a `startIndex` — the index in the calldata byte array, including the 4-byte
+selector — and the exact bytes expected at that index.<Cite src="metamask-caveats-reference" /> It is
+a memcmp at an offset. Nothing about it understands types.
+
+The documentation carries its own warning: use this caveat to validate **static** types and not
+dynamic types, and while you can validate dynamic types through a series of `allowedCalldata` terms,
+it is tedious and error-prone.<Cite src="metamask-caveats-reference" />
+
+You know exactly why from [ABI head–tail encoding](/c/abi-head-tail). A static argument sits at a
+fixed offset forever. A dynamic argument — `bytes`, `string`, any array — puts an *offset* in the
+head and the payload somewhere in the tail, and the position of that payload moves when any earlier
+dynamic argument changes length. A byte-offset check against a dynamic argument is checking a
+pointer, or checking a payload at a position the attacker controls.
+
+The practical rule: **pin dynamic arguments by pinning the whole calldata** (an exact-calldata check)
+or do not pin them at all and bound the damage some other way. A partial positional check on a
+dynamic parameter is the kind of control that passes review and fails in production.
+
+<Misconception
+  belief="Restricting the function selector bounds what the key can do."
+  reality="A selector is a name, not a semantic. `transfer(address,uint256)` restricted to one token contract still lets the holder send the entire balance to themselves, because the recipient and the amount are arguments and arguments are a separate dimension."
+  why="Selector allowlists are the easiest dimension to implement and the one every tutorial shows, so they carry an unearned feeling of completeness."
+  src="metamask-caveats-reference"
+/>
+
+<Aside kind="note">
+One more reason a selector allowlist is weaker than it looks: a selector is the first four bytes of a
+Keccak hash, so it is a lossy name. You met the consequence in
+[selector collisions](/c/abi-selector-collision-risk) — two differently named functions can share
+four bytes, and finding a colliding pair is cheap. If the same address exposes a colliding function,
+your allowlist admits both. The defence is not longer selectors; it is that the target allowlist and
+the selector allowlist are checked together, so the collision has to exist on a contract you already
+trusted.
+</Aside>
+
+## The two dimensions nobody writes down
+
+Beyond the enforcer catalogue there are two constraints that live outside the policy object and are
+omitted more often than any item in the table.
+
+**Chain id.** A signature that authorises an action is a signature over some bytes. If those bytes do
+not commit to a chain id, the same authorisation is valid on every chain where the account exists at
+the same address — which, after EIP-7702, is a larger set than it used to be. ERC-7715's
+`PermissionRequest` carries `chainId` as a required field precisely because the grant is
+chain-scoped.<Cite src="erc-7715" /> This is the same failure you studied as
+[cross-chain replay](/c/eip-155-chain-id-replay), arriving through a new door.
+
+**Gas budget.** A key that may only call one harmless function can still burn the account's native
+balance by calling it thousands of times, or by causing operations that pay a bundler. If the account
+sponsors its own gas, "the actions are harmless" is not the same as "the loss is bounded". If a
+[paymaster](/c/paymaster) sponsors it, the loss lands on you instead of the user, which is a
+[different budget with the same hole in it](/c/paymaster-risk).
+
+A third one is worth separating out because it is usually collapsed into the amount cap and should
+not be. **Rate and total are different bounds and they fail differently.** A cumulative cap of 500
+USDC over an hour permits all 500 in one block; a per-period cap of 50 USDC per five minutes permits
+600 over that hour but never more than 50 while you are reacting. The first bounds the *loss*, the
+second bounds the *loss before you can intervene*, and the lesson on revocation is entirely about why
+the second number is the one that decides whether your revoke button is worth building. The framework
+offers both shapes — `erc20TransferAmount` for a lifetime total and `erc20PeriodTransfer` with an
+explicit `periodAmount` and `periodDuration` for the rate — and using one is not using the
+other.<Cite src="metamask-caveats-reference" />
+
+Openfort's builder checklist reaches the same conclusions from the vendor side — always set
+`validUntil` with no eternal keys, set native and token spending caps sized to the session's maximum
+expected value, allowlist target contracts rather than issuing keys with any target, and constrain
+selectors.<Cite src="openfort-smart-wallet-security" /> Treat a vendor checklist as a prompt list
+rather than as a specification: it tells you which questions someone else found worth asking, and it
+has an interest in the answer being "use our SDK".
+
+## A policy is only real if the account enforces it
+
+Now the half of this lesson that changes how you build.
+
+Every dimension above can be checked in two places: in your application code before you sign, or in
+the account's on-chain validation. Both are worth doing. **They are not the same kind of thing, and
+conflating them is the most consequential mistake in this module.**
+
+The check in your application code is a **bug-prevention measure**. It catches a mis-built call, a
+unit error, a UI that let the user pick a target you did not intend. That is real value and you should
+do it.
+
+The check in the account is a **security control**. It is the only one, because of a fact about who
+holds what: **the session key is in your application's custody, and whoever obtains it does not have
+to use your application.**
+
+Sit with the mechanics of that, because "bypassing the client" is often said and rarely pictured.
+Your React app is not a component in the authorisation path. It is one possible producer of signed
+bytes. An attacker with the private key opens a terminal, builds the call by hand, signs it, and
+submits it — to a bundler as a UserOperation, or as an ordinary transaction to a delegation manager.
+Your spending counter in a Zustand store, your rate limit in the API gateway, your "we only ever call
+`move()`" convention in the codebase: none of them are executed. They were never on the path. They
+were on *a* path, the one your honest users take.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Checked in your app', note: 'before you sign', tone: 'muted' },
+    { title: 'Checked in the account', note: 'when the operation arrives', tone: 'good' },
+  ]}
+  rows={[
+    {
+      label: 'What kind of thing is it?',
+      cells: ['A bug-prevention measure', 'A security control'],
+    },
+    {
+      label: 'What does it catch?',
+      cells: [
+        'A mis-built call, a unit error, a UI that offered the wrong target',
+        'Every call the policy does not permit, whoever built it',
+      ],
+    },
+    {
+      label: 'Does it run when the key is used outside your app?',
+      cells: ['No — your code was never on that path', 'Yes — every path ends at the account'],
+    },
+    {
+      label: 'What does skipping it take?',
+      cells: ['A terminal, the key, and somewhere to submit', 'Nothing skips it; it is the authorisation'],
+    },
+  ]}
+  caption="Both checks are worth writing. Only one of them is on the path the party it exists to constrain will use."
+  alt="A check written in the application compared with the same check enforced by the account, across what kind of control it is, what it catches, whether it runs when the key is used outside the app, and what skipping it takes."
+/>
+
+<Misconception
+  belief="The app can enforce the spending limit, because the app is the only thing that signs with the session key."
+  reality="The app is the only thing that signs with it today. The party the limit exists to constrain is precisely the party that has taken the key and no longer runs your code."
+  why="Engineers map this onto API rate limiting, where the server really is the sole authority and the client really cannot go around it. Here the relationship is inverted: the client holds the credential and the 'server' is a contract that only sees the request."
+  src="erc-7710"
+/>
+
+This is a boundary you already have a name for. In [threat modelling](/c/trust-boundary), the line
+is drawn where control changes hands, and everything on the far side is attacker-controlled by
+assumption. The session key sits on the far side from the moment you generate it. Draw the line
+there and the design question answers itself: **anything that must hold when the app is hostile has
+to be in the account.**
+
+<Aside kind="warn">
+There is a seductive middle option — put the policy in your backend and have the backend co-sign, so
+the session key alone is not sufficient. That is a real design and it does bound some failures. But
+be precise about what you have built: you have added yourself as a required signer, which means your
+backend's availability is now the user's liveness dependency, your backend's compromise is a full
+policy bypass, and the user's on-chain account still cannot tell the difference. It is a control, and
+it is not the account enforcing the policy. Write it in the
+[trust assumption inventory](/c/trust-assumption-inventory) as its own row.
+</Aside>
+
+## Worked example: converting a sentence into a policy
+
+Take the product manager's sentence from the top and turn it out properly.
+
+**Subgoal — write the English claim you want to be able to make after the leak.** Not the feature
+description; the incident sentence. *"If this key leaks, an attacker can submit moves in our game as
+this user, and nothing else, until the hour is up."* Everything below exists to make that sentence
+true.
+
+**Subgoal — extract the dimensions the sentence already names.** "In our game" is a target: the game
+contract's address. "Submit moves" is a selector: `move(uint8)`. "Until the hour is up" is a validity
+window: `beforeThreshold = now + 3600`. Three dimensions, from one sentence, for free.
+
+**Subgoal — enumerate what the sentence does not name, and decide each explicitly.** This is the step
+teams skip, and it is the whole exercise.
+
+- *Native value per call.* Does `move` need ETH? No. Set `maxValue = 0`. An unconstrained value field
+  on a function that takes no value is a pure gift.
+- *Token spend.* Does the game move tokens on the player's behalf? If yes, that is a second target
+  and needs its own cap; if no, the target allowlist already excludes the token contract, and you
+  should confirm that rather than assume it.
+- *Call count.* A move costs gas. Six hundred moves in forty minutes is the honest ceiling; set
+  `limit` to something like 1,000 and you have bounded gas burn without touching the happy path.
+- *Argument values.* `move(uint8)` has one static argument with 256 possible values, all of which are
+  legal game moves. This dimension does not need constraining, and saying so in a comment is worth
+  more than leaving it silent.
+- *Chain id.* One chain. State it in the grant.
+- *Who may redeem.* Your session account's address, not "whoever holds this".
+- *Start time.* `afterThreshold = 0` — valid immediately. Deliberate, not accidental.
+
+**Subgoal — check each decision against the sentence, and notice the one that fails.** Re-read the
+incident sentence with the policy in hand. "An attacker can submit moves in our game as this user"
+— true. "And nothing else" — true, *if* the game contract itself does not expose a function reachable
+via `move` that does something else. That is now a property of the game contract's code, not of your
+policy, and it belongs in the same inventory. A session key inherits every capability of the
+contracts it is allowed to call.
+
+**Subgoal — decide which dimensions the account can actually enforce, and which move to execution.**
+Target, selector, value cap, window, redeemer and call count are all checks on the request itself.
+The balance-change enforcers are checks on the *outcome* and therefore run after the call. That
+distinction is not a detail — it is the subject of the next lesson, and it changes what a failure
+costs.
+
+<Check type="spot-bug" concept="session-key-enforced-on-chain">
+A team ships this for a trading interface. The session key is registered on the user's account with
+a validator that constrains the target to their router contract and the selector to
+`swapExactTokensForTokens`. Everything else is handled here:
+
+```ts
+// lib/sessionSigner.ts
+const DAILY_CAP = parseUnits('500', 6) // 500 USDC
+
+export async function signSwap(params: SwapParams) {
+  const spentToday = await db.getSpend(params.user, todayKey())
+  if (spentToday + params.amountIn > DAILY_CAP) {
+    throw new Error('Daily session limit reached')
+  }
+  if (params.recipient !== params.user) {
+    throw new Error('Recipient must be the user')
+  }
+  const signed = await sessionAccount.signUserOperation(buildOp(params))
+  await db.addSpend(params.user, todayKey(), params.amountIn)
+  return signed
+}
+```
+
+Name every problem, and say which single change matters most.
+
+<Answer>
+**Problem one: the daily cap is not a cap.** It lives in your database, checked by code the attacker
+does not run. Someone holding the session key builds their own operation and never touches
+`signSwap`. The correct statement of what this code provides is "our own UI cannot exceed 500 USDC
+per day by accident", which is worth having and is not a spending limit.
+
+**Problem two: the recipient check has the same defect and a worse consequence.** It is the only
+thing stopping the swap output from going to an attacker-chosen address, and it is enforced in
+TypeScript. On-chain, the validator constrains the target and the selector — and
+`swapExactTokensForTokens` takes the recipient as an *argument*. So the on-chain policy permits a
+swap that sends its entire output to any address. The dimension that mattered most was the argument
+value, and it was the one dimension not enforced where it counts.
+
+**Problem three: the counter is written after signing, and never reconciled.** Even as a
+bug-prevention measure it is wrong: an operation that is signed but never included still consumes
+budget, and an operation that reverts on-chain consumes budget for a swap that did not happen. The
+database is tracking *intent to spend*, and it is drifting from reality in both directions.
+
+**Problem four: nothing bounds the input token or the total.** `swapExactTokensForTokens` names the
+input token in its path argument. Without an argument constraint or a per-token cap enforced by the
+account, "500 USDC per day" does not even describe the intended behaviour — the same selector moves
+any token the router is approved to move, and an old
+[unlimited approval](/c/erc20-allowance-model) to that router is exactly the kind of thing a
+long-lived account has lying around.
+
+**The single change that matters most: move the recipient constraint on-chain.** Pin the recipient
+argument in the validator — with an exact-calldata or argument-equality check at the recipient's
+static offset — so that the output can only land in the user's own account. Once the funds cannot
+leave the user, every other omission degrades from "theft" to "unwanted trades", which is a
+recoverable class of harm. Then add the per-period token cap in the account, and keep the TypeScript
+checks as the bug filter they always were.
+
+**The general form of the lesson.** For each rule in your client, ask: *what happens if this line is
+deleted and the key is used from a laptop I have never seen?* If the answer is "loss", the rule is in
+the wrong place.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The next lesson** answers the question this one keeps deferring: why is a cumulative cap harder
+than a target allowlist, and why can a validator not just read the clock? The answer is ERC-7562's
+validation rules, and it explains the otherwise-arbitrary shape of every session-key module you will
+read.
+
+**The wallet-facing lessons** show what happens to this dimension list when you stop building the
+policy and start requesting one — including the discovery that the shipping permission types cover
+token movement and not "call this function".
+
+**And the blast-radius lesson** turns the table into a budget. Enumerating dimensions tells you what
+is possible; sizing them requires deciding what you are willing to lose in one window, which is a
+product decision wearing a security costume.

@@ -1,0 +1,323 @@
+---
+id: solidity-token-standards-one-contract-many-ids
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-1155, eip-165, eip-721, oz-erc1155-source, oz-changelog, measured-gas-constants, eip-7702]
+stack: { solidity: "0.8.36" }
+---
+
+An indexer has been running for a year against a game's item contract. Balances reconciled every day
+until one week in March, when a handful of wallets started showing items the indexer had never seen
+arrive.
+
+Nothing was wrong with the indexer's logic. It handled `TransferSingle` correctly, retried on reorgs,
+and had a test suite. What it did not handle was `TransferBatch`, and in March the game shipped a
+crafting feature that moved several item types at once.
+
+ERC-1155 is ERC-721 with a second dimension, two receiver hooks, and a batch path that emits a
+different event. Each of those three is a place an integration quietly loses data or control.
+
+## The shape
+
+One contract, many token ids, and a two-dimensional balance:<Cite src="eip-1155" />
+
+```solidity
+function balanceOf(address _owner, uint256 _id) external view returns (uint256);
+function balanceOfBatch(address[] calldata _owners, uint256[] calldata _ids)
+    external view returns (uint256[] memory);
+```
+
+That is the whole conceptual difference from lesson one. `balanceOf` takes a second key, so the
+storage derivation you did there gains one nesting level, and the same contract can now express
+fungible items (id 1, balance 5,000), semi-fungible items (id 2, balance 3) and non-fungible items
+(id 3, balance 1) with no change of interface.
+
+Compliance is detectable through ERC-165: a compliant contract MUST return true for
+`0xd9b67a26`, and the receiver interface identifier is `0x4e2312e0`.<Cite src="eip-1155" /><Cite src="eip-165" />
+
+The authority model is the one thing that got *smaller*. ERC-721 has a per-token approval and a
+blanket operator;<Cite src="eip-721" /> ERC-1155 has only the blanket operator — `setApprovalForAll(operator, approved)`
+and `isApprovedForAll(owner, operator)`, and nothing per id.<Cite src="eip-1155" /> A contract
+holding a hundred item types cannot authorise a marketplace for one of them. It is all ids or
+nothing.
+
+Hold that. It is the single design decision ERC-6909 exists to undo, two lessons from now.
+
+## Batch means atomic, and the spec says so four times
+
+```solidity
+function safeBatchTransferFrom(address _from, address _to, uint256[] calldata _ids,
+                               uint256[] calldata _values, bytes calldata _data) external;
+```
+
+The rules are normative and they are absolute:<Cite src="eip-1155" />
+
+- MUST revert if `_to` is the zero address.
+- MUST revert if the length of `_ids` is not the same as the length of `_values`.
+- MUST revert if any of the balances of the holder for tokens in `_ids` is lower than the respective
+  amount in `_values`.
+- MUST revert on any other error.
+
+There is no partial success and no per-leg result. One failure anywhere and the whole call reverts,
+which is the opposite of what "batch" means in almost every non-blockchain API a product engineer has
+used — where a batch endpoint returns per-item statuses and you retry the failures.
+
+The parallel arrays are the other trap. `_ids[i]` pairs with `_values[i]` positionally; nothing in
+the type system enforces that they were built together. A function that filters one array and
+forgets to filter the other produces a call that either reverts on the length check or — worse, if
+the lengths happen to match — transfers the right amounts of the wrong items.
+
+<Misconception
+  belief="ERC-1155 batch transfers can partially succeed, like a batch HTTP endpoint."
+  reality="Any failing leg reverts the entire call, and mismatched array lengths revert before anything moves."
+  why="'Batch' in most APIs means independent items with independent outcomes. Here it means one transaction, and a transaction is all or nothing."
+  src="eip-1155"
+/>
+
+## The event that a single-event indexer never sees
+
+The standard defines two events, and which one fires is an implementation choice within
+rules:<Cite src="eip-1155" />
+
+```solidity
+event TransferSingle(address indexed _operator, address indexed _from, address indexed _to,
+                     uint256 _id, uint256 _value);
+event TransferBatch(address indexed _operator, address indexed _from, address indexed _to,
+                    uint256[] _ids, uint256[] _values);
+```
+
+Either MUST be emitted when tokens are transferred, including zero-value transfers and mints and
+burns; `TransferBatch` SHOULD be used to indicate multiple balance transfers between one `_from` and
+`_to` pair, and the spec says outright that it is designed to reduce gas
+consumption.<Cite src="eip-1155" />
+
+Both carry three [indexed topics](/c/sol-event-topics) — operator, from, to — so the per-log topic
+cost is the same either way. On forge 1.7.1 with solc 0.8.36 each topic prices at 375
+gas.<Cite src="measured-gas-constants" /> The saving from batching is therefore not in topics per
+log; it is in emitting one log instead of N, so you avoid N-1 log bases and N-1 sets of three topics
+along with them. (The log base cost and the per-byte data cost were not measured in this repository,
+so treat the topic figure as the only one that is settled here.)<Cite src="measured-gas-constants" />
+
+Now the part that broke the indexer in the opening scene. A consumer subscribed only to
+`TransferSingle` sees nothing at all when a batch transfer happens — not a partial record, not an
+error. The balances it computes drift permanently, and the drift is silent because there is no
+missing-data signal to alert on.
+
+The standard does give you a way to notice: it requires that an external viewer MUST be able to
+query the balance through a standard function and that it MUST be identical to the balance
+determined by the `TransferSingle` and `TransferBatch` events alone.<Cite src="eip-1155" /> That is a
+stronger guarantee than ERC-20 makes, and it is directly actionable — a reconciliation job that
+compares your log-derived balance against `balanceOfBatch` for a sample of holders will catch a
+missing event handler on the first run.
+
+<Misconception
+  belief="An indexer that handles TransferSingle covers ERC-1155."
+  reality="Batch transfers may emit only TransferBatch, so a single-event consumer silently loses every batched movement, with no error to alert on."
+  why="The single-transfer path is what tutorials demonstrate and what a first integration exercises. Batching arrives later, from a feature the indexer team was not told about."
+  src="eip-1155"
+/>
+
+### Supply is an event-derived quantity here
+
+There is no `totalSupply` in the core ERC-1155 interface, and there is no per-id supply either. What
+the standard offers instead is a convention: the total value transferred *from* the zero address
+minus the total value transferred *to* the zero address, observed via `TransferSingle` and
+`TransferBatch`, MAY be used by clients and exchanges to determine the circulating supply for a
+given token id.<Cite src="eip-1155" />
+
+Read that as an architectural statement. In ERC-20, supply is a storage word you can `SLOAD`. In
+ERC-1155, supply is something you compute by replaying logs — which means the indexer trap above is
+not only a balance problem. A consumer that misses `TransferBatch` computes a wrong supply for every
+id that has ever been minted in a batch, and mints are exactly the operation most likely to be
+batched.
+
+If you need supply on chain, OpenZeppelin's `ERC1155Supply` extension tracks it in
+storage.<Cite src="oz-changelog" /> If you need it off chain, reconcile against a view function
+rather than trusting the replay.
+
+## The id space is yours, and the URI knows it
+
+`_id` is a `uint256` and the standard imposes no structure on it, which is what makes one deployment
+able to hold a game's entire item catalogue. The metadata rule is the part with a real requirement
+attached.
+
+The optional `ERC1155Metadata_URI` extension exposes `uri(uint256 _id)`, and the returned string
+supports client-side substitution: if the string `{id}` appears in any URI, clients MUST replace it
+with the actual token id in **hexadecimal** form.<Cite src="eip-1155" /> The specification's own
+example shows what that means in practice — `https://token-cdn-domain/{id}.json` becomes
+`https://token-cdn-domain/000000000000000000000000000000000000000000000000000000000004cce0.json`
+for token id 314592, so 64 lowercase hex characters with no `0x`
+prefix.<Cite src="eip-1155" /> The same substitution rule applies inside the metadata JSON itself,
+so an `image` field can carry the placeholder too.<Cite src="eip-1155" />
+
+<Figure
+  caption="A token id worth five hex digits is still sixty-four characters on the wire."
+  alt="The expanded form of token id 314592: fifty-nine leading zeros followed by the five significant hex digits 4cce0, sixty-four lowercase characters with no 0x prefix."
+>
+  <Anatomy
+    value="000000000000000000000000000000000000000000000000000000000004cce0"
+    parts={[
+      { from: 0, to: 59, label: 'left-padded zeros', note: 'no 0x prefix', tone: 'muted' },
+      { from: 59, to: 64, label: '4cce0', note: 'token id 314592', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+Two integration notes fall out. The substitution is the *client's* job, not the contract's — a front
+end that renders `uri()` verbatim shows a broken link for every token. And the padding is
+non-obvious: 64 hex characters, lowercase, no `0x` prefix. Getting either wrong produces a 404 that
+looks like a missing asset rather than a formatting bug.
+
+## Two hooks, and a rule that only fixes half the problem
+
+The receiver interface has two entry points and two magic values:<Cite src="eip-1155" />
+
+```solidity
+function onERC1155Received(address _operator, address _from, uint256 _id, uint256 _value,
+                           bytes calldata _data) external returns (bytes4);   // 0xf23a6e61
+function onERC1155BatchReceived(address _operator, address _from, uint256[] calldata _ids,
+                                uint256[] calldata _values, bytes calldata _data)
+                                external returns (bytes4);                     // 0xbc197c81
+```
+
+The scenario rules are worth reading rather than summarising, because they are where the standard
+does something unusual. For a recipient of a single balance change, the spec requires that **the
+balances MUST have been updated before the hook is called**, and that **the transfer event MUST have
+been emitted to reflect the balance changes before the hook is called**.<Cite src="eip-1155" /> For a
+recipient of multiple balance changes, the same two rules apply to all of
+them.<Cite src="eip-1155" /> And there is a global version: all `TransferSingle` and `TransferBatch`
+events MUST be emitted to reflect all the balance changes that have occurred before any call to
+either hook.<Cite src="eip-1155" />
+
+That is Checks-Effects-Interactions, written into a token standard as a MUST. ERC-777 — two lessons
+from now — did the exact opposite, and it is the reason ERC-777 is dead.
+
+And it is still not enough, which is the point of this section. What the standard guarantees is that
+**the token's own state is consistent when your hook runs**. It says nothing about *your* state. The
+attacker re-entering through `onERC1155Received` is not trying to confuse the token about who owns
+what; they are trying to reach your contract while your contract is mid-update. A standard cannot
+order your statements for you.
+
+OpenZeppelin's implementation makes the same point in a comment, warning that overriding the
+acceptance-check function is discouraged because it poses a reentrancy risk from the receiver, and
+that any update to contract state after that function breaks
+Checks-Effects-Interactions.<Cite src="oz-erc1155-source" />
+
+### Which hook fires is not obvious, and it changed
+
+Read scenario 6 carefully. For a recipient of exactly one balance change, one of the two hooks MUST
+be called; `onERC1155Received` SHOULD be called and `onERC1155BatchReceived` **MAY** be
+called.<Cite src="eip-1155" /> Both are conformant. The standard also says smart contracts MUST
+implement **all** of the functions in the receiver interface to accept
+transfers.<Cite src="eip-1155" /> Implementing only one was never compliant; it merely worked.
+
+OpenZeppelin 5.6.0, released 25 February 2026, exercised that freedom as a documented breaking
+change: performing a batch transfer with exactly one id and value no longer calls
+`onERC1155Received`, and calls `onERC1155BatchReceived` instead, with arrays of length
+one.<Cite src="oz-changelog" />
+
+Read the current source and you find something sharper still. The event choice and the hook choice
+are made by different rules. `_update` emits `TransferSingle` when `ids.length == 1` and
+`TransferBatch` otherwise, while `_updateWithAcceptanceCheck` takes an explicit `batch` flag —
+`false` from the `safeTransferFrom` path, `true` from the `safeBatchTransferFrom`
+path.<Cite src="oz-erc1155-source" />
+
+<Matrix
+  corner="Call path"
+  cols={['ids.length', 'Event emitted', 'Hook called']}
+  rows={[
+    { label: 'safeTransferFrom', cells: ['1', 'TransferSingle', 'onERC1155Received'] },
+    { label: 'safeBatchTransferFrom', cells: ['1', { v: 'TransferSingle', tone: 'warn' }, { v: 'onERC1155BatchReceived', tone: 'warn' }] },
+    { label: 'safeBatchTransferFrom', cells: ['3', 'TransferBatch', 'onERC1155BatchReceived'] },
+  ]}
+  caption="All three rows are conformant, and a receiver that implements only onERC1155Received rejects two of them."
+  alt="Three call paths through OpenZeppelin's ERC-1155: safeTransferFrom with one id emits TransferSingle and calls onERC1155Received; safeBatchTransferFrom with one id emits TransferSingle but calls onERC1155BatchReceived; safeBatchTransferFrom with three ids emits TransferBatch and calls onERC1155BatchReceived."
+/>
+
+The middle row is the one to stare at. One movement, a `TransferSingle` in the logs, and the *batch*
+hook on the receiver. A receiver written against the log shape — "we saw a single transfer, so the
+single hook ran" — is wrong, and a receiver that implemented only `onERC1155Received` because that
+is all it ever observed now rejects the transfer entirely.
+
+If your contract accepts ERC-1155 tokens, implement both hooks or inherit `ERC1155Holder`. Since
+5.5.0 that contract is flagged as stateless and is no longer transpiled into the upgradeable
+package, so import it from the main package even in an upgradeable
+project.<Cite src="oz-changelog" />
+
+### The receiver-hook rules in one place
+
+Worth having as a checklist, all from the standard:<Cite src="eip-1155" />
+
+- The hooks MUST NOT be called on an externally owned account.
+- The hooks MUST NOT be called outside a mint or transfer process.
+- If the receiver does not implement the required function, the transfer MUST revert.
+- If it returns an unknown value, the transfer MUST revert.
+- If it throws, the transfer MUST revert.
+- A receiver that forwards the tokens onward should treat forwarding as acceptance and return the
+  magic value after forwarding succeeds; the `_data` argument may be repurposed for the new context.
+
+The first of those has drifted under the standard in the same way ERC-721's check did. "Is this an
+EOA" is decided in practice by code size, and a delegated account carries 23 bytes of code while
+remaining externally owned.<Cite src="eip-7702" /> The rule still reads the same; the population it
+selects does not.
+
+<Check type="predict" concept="erc1155-batch-atomicity">
+A rewards contract distributes a mixed bundle to a claimant in one call:
+
+```solidity
+function claim(uint256[] calldata ids, uint256[] calldata amounts) external {
+    require(!claimed[msg.sender], "claimed");
+    items.safeBatchTransferFrom(treasury, msg.sender, ids, amounts, "");
+    claimed[msg.sender] = true;
+    emit Claimed(msg.sender, ids, amounts);
+}
+```
+
+An off-chain service reads `Claimed` for user support and a separate indexer reconstructs balances
+from `TransferSingle`. Predict what happens when (a) one id in the bundle has an insufficient
+treasury balance, (b) the bundle contains exactly one id, and (c) the claimant is a contract.
+
+<Answer>
+**(a) The entire claim reverts and `claimed` stays false.** The standard requires a revert if any
+balance is insufficient, and requires a revert on any other error — there is no partial
+delivery.<Cite src="eip-1155" /> That is actually the good outcome here: the user can retry once the
+treasury is topped up. The bad version of this contract would be one that set `claimed = true`
+first and swallowed a failure.
+
+**(b) The indexer misses it, and the receiver may reject it.** With one id, OpenZeppelin's `_update`
+emits `TransferSingle`, so the `TransferSingle` indexer does see this
+one.<Cite src="oz-erc1155-source" /> With two or more ids it emits only `TransferBatch` and the
+indexer silently loses the whole bundle. Meanwhile, since 5.6.0, the single-id case calls
+`onERC1155BatchReceived` on the recipient, because the call arrived through the batch
+path.<Cite src="oz-changelog" /><Cite src="oz-erc1155-source" /> So the one-id case is the one where
+the event says "single" and the hook says "batch".
+
+**(c) The claimant's code runs before `claimed` is written.** `safeBatchTransferFrom` calls the
+recipient's hook, and the next statement in `claim` has not executed. A contract claimant can
+re-enter `claim` with `claimed[msg.sender]` still false and take the bundle repeatedly, bounded only
+by the treasury's balance and the gas limit. The token's own state is consistent throughout —
+the standard guarantees that — and it does not help, because the invariant being violated is this
+contract's.<Cite src="eip-1155" />
+
+**The fixes are independent.** Move `claimed[msg.sender] = true` above the transfer, and add a guard
+for the invariants you have not thought of. Handle both events in the indexer, and add a
+reconciliation job against `balanceOfBatch`, which the standard guarantees will
+agree.<Cite src="eip-1155" /> Emit `Claimed` before the transfer or accept that it is a
+post-interaction log.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** asks what is left if you delete the callbacks and the batching from this design.
+ERC-6909's rationale answers it directly, and its section headings read as a critique of this
+lesson's subject.
+
+**Gaming and marketplace integrations** live on the all-ids-or-nothing operator model. Knowing that
+per-id approval does not exist here changes what you can promise a user about scoped permissions.
+
+**The indexing track** returns to the event-shape problem generally: a contract's log surface is an
+API, batching changes its shape without changing its version, and reconciliation against a view
+function is the only thing that catches the difference.

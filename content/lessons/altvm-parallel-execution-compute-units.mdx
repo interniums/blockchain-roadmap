@@ -1,0 +1,405 @@
+---
+id: altvm-parallel-execution-compute-units
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [anza-compute-units, solana-docs-compute-budget, solana-docs-fee-structure, measured-forge-1-7-1, solana-docs-transactions, solana-cookbook-retry, simd-0296, helius-local-fee-markets, agave-greedy-scheduler]
+stack: {}
+---
+
+Two transactions do the same thing: move one token from A to B. Same program, same accounts, same
+compute-unit price. One pays about seven times the other's priority fee, and lands *later*.
+
+Nothing is wrong with either. The expensive one left its compute budget at the default. That is the
+entire difference, and it is not a rounding error — it is a factor of seven on price and a factor of
+several on scheduling position, both in the same direction, both derivable from published formulas.
+
+If you arrive from the EVM this reads as absurd, because there setting a generous gas limit is
+*free*: unused gas is refunded, so the limit is a safety margin with no economic content and everyone
+over-sets it deliberately. Import that habit here and you overpay on every transaction you ever send.
+
+This lesson makes the arithmetic explicit, and then shows why the mistake costs twice.
+
+## Three quantities that all sound like "gas"
+
+The first job is to stop using one word for three things. Anza's own framing separates
+them:<Cite src="anza-compute-units" />
+
+**Compute units consumed.** What the runtime meters during execution. The smallest runtime operation
+consumes 1 CU.<Cite src="anza-compute-units" /> This is the quantity closest to gas as a
+[countdown](/c/gas-is-a-countdown): exhaust your budget mid-execution and the transaction
+fails.<Cite src="solana-docs-compute-budget" />
+
+**Transaction cost.** A pre-execution *estimate*, also denominated in compute units, that the leader
+uses to schedule and to enforce block limits. It is the sum of five components — signature cost, write
+lock cost, instruction data cost, program execution cost, and loaded-accounts-data-size
+cost.<Cite src="solana-docs-compute-budget" /> Note the fourth: "program execution cost" is not what
+your program used, it is *the CU limit you requested*.<Cite src="anza-compute-units" />
+
+**Transaction fee.** Lamports, and mostly independent of how many CU you actually
+used.<Cite src="anza-compute-units" />
+
+Keeping these apart is the whole lesson. The EVM collapses all three: gas used drives gas paid drives
+block-space accounting. Here they are three different numbers with three different formulas, and the
+one you control most directly is the *estimate*.
+
+## The budget
+
+Without any explicit instruction, a transaction's CU limit is computed from its instruction mix rather
+than being a single default:<Cite src="solana-docs-compute-budget" />
+
+```text
+default_cu_limit = (non-builtin instructions      × 200,000)
+                 + (builtin instructions          ×   3,000)
+                 + (migrated-builtin instructions × 200,000)
+clamped to MAX_COMPUTE_UNIT_LIMIT = 1,400,000
+```
+
+`DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT` is 200,000 CU per user-deployed SBF instruction;
+`MAX_BUILTIN_ALLOCATION_COMPUTE_UNIT_LIMIT` is 3,000 CU for builtins that have not migrated to SBF,
+per SIMD-0170; the result is clamped to 1,400,000.<Cite src="solana-docs-compute-budget" />
+
+To override it you include a `SetComputeUnitLimit` instruction from the Compute Budget program, which
+has four variants in
+total — `RequestHeapFrame`, `SetComputeUnitLimit`, `SetComputeUnitPrice`,
+`SetLoadedAccountsDataSizeLimit`.<Cite src="solana-docs-compute-budget" /> Three rules bite in
+practice: only one of each variant is allowed per transaction, and a duplicate fails the *whole
+transaction* with `DuplicateInstruction`; any `u32` is accepted for the limit but the effective value
+is clamped to 1,400,000; and an unrecognised Compute Budget instruction fails with
+`InvalidInstructionData`.<Cite src="solana-docs-compute-budget" />
+
+The documented method for choosing the number is not folklore: simulate the transaction to measure CU
+consumption, then add a 10% safety margin.<Cite src="solana-docs-compute-budget" />
+
+## The fee, exactly
+
+Total fee is base fee plus prioritization fee, deducted from the fee payer *before execution
+begins*.<Cite src="solana-docs-fee-structure" />
+
+**Base fee.** `signature_count × lamports_per_signature`, where `lamports_per_signature` is currently
+5,000 and the count includes the transaction's own Ed25519 signatures plus any verified by the
+Ed25519, Secp256k1 and Secp256r1 precompile programs.<Cite src="solana-docs-fee-structure" /> Of the
+base fee, 50% is burned and 50% goes to the block-producing validator — `DEFAULT_BURN_PERCENT` is
+50.<Cite src="solana-docs-fee-structure" />
+
+**Prioritization fee.**
+
+```text
+micro_lamport_fee  = compute_unit_price × compute_unit_limit
+prioritization_fee = ceil(micro_lamport_fee / 1,000,000)
+```
+
+<Cite src="solana-docs-fee-structure" /> The price is in micro-lamports per CU and defaults to 0, so
+the default prioritization fee is 0.<Cite src="solana-docs-fee-structure" /> All of it goes to the
+validator; none is burned, per SIMD-0096.<Cite src="solana-docs-fee-structure" />
+
+Now read the second factor in that multiplication. It is `compute_unit_limit` — the requested
+maximum — not consumed CU, and if you set no limit the *default* computed above is what gets
+multiplied.<Cite src="solana-docs-fee-structure" /> There is no refund path anywhere in the formula.
+
+**So the seven-times claim is one division.** A transaction that lazily rides the 1,400,000 ceiling
+pays `1,400,000 / 200,000 = 7×` what a tuned 200,000 request pays at the same
+price.<Cite src="solana-docs-compute-budget" /><Cite src="solana-docs-fee-structure" /> At a price of
+10,000 micro-lamports per CU that is 14,000 lamports against 2,000 — a 12,000-lamport gap on a
+transaction whose base fee is 5,000.
+
+<Misconception
+  belief="The priority fee is charged on the compute units the transaction actually consumed, so an over-generous limit is harmless."
+  reality="The formula multiplies the requested limit by the price. Unused compute units are not refunded, and the documentation states plainly that setting a limit higher than needed means paying for compute units you did not use."
+  why="On the EVM the refund of unused gas makes the limit economically free, so every EVM developer has years of trained habit telling them to over-set it. The habit is correct there and expensive here."
+  src="solana-docs-compute-budget"
+/>
+
+## Why over-requesting costs you twice
+
+The fee is the obvious half. The scheduling half is larger and almost nobody mentions it.
+
+The leader ranks buffered transactions with a published formula:<Cite src="solana-docs-fee-structure" />
+
+```text
+Priority = reward × 1,000,000 / (cost + 1)
+```
+
+where `reward` is the validator's fee income — prioritization fee plus the non-burned half of the base
+fee — and `cost` is the scheduler's five-component estimate.<Cite src="solana-docs-fee-structure" />
+The multiplier preserves precision because cost usually exceeds reward in raw lamports; the `+1`
+prevents division by zero.<Cite src="solana-docs-fee-structure" /> That priority determines the order
+in which transactions are dequeued from the scheduler's buffer.<Cite src="solana-docs-fee-structure" />
+
+Your requested CU limit appears in **both** terms. It multiplies the numerator through the
+prioritization fee, and it is the program-execution component of the denominator. Raising it scales
+the numerator linearly — and scales the denominator by the same absolute amount while the rest of the
+denominator stays fixed. Which means past a certain point you are buying denominator faster than
+numerator.
+
+### Working it
+
+A token transfer. One signature, two writable accounts, and — from Anza's example — roughly 6,000 CU
+of actual execution.<Cite src="anza-compute-units" />
+
+**Subgoal 1 — assemble the fixed part of the cost.** Signature cost is 720 CU; write locks are 300 CU
+each, so two writable accounts contribute 600 CU.<Cite src="solana-docs-compute-budget" /> If you set
+no loaded-accounts-data limit, the transaction is assumed to load the 64 MiB maximum, and at 8 CU per
+32 KiB that is about 16,000 CU of overhead.<Cite src="anza-compute-units" /> Fixed overhead: roughly
+17,300 CU before a single instruction executes.
+
+**Subgoal 2 — price the lazy version.** Leave the CU limit at the default 200,000 for one non-builtin
+instruction, set a price of 10,000 micro-lamports per CU.<Cite src="solana-docs-compute-budget" />
+Prioritization fee = `10,000 × 200,000 / 1,000,000` = **2,000 lamports**.<Cite src="solana-docs-fee-structure" />
+Reward = 2,000 + 2,500 (the non-burned half of the 5,000-lamport base fee) = 4,500. Cost ≈ 200,000 +
+17,300 = 217,300. Priority ≈ `4,500 × 1,000,000 / 217,301` ≈ **20,709**.
+
+**Subgoal 3 — price the maximally lazy version.** Request the 1,400,000 ceiling at the same price.
+Prioritization fee = **14,000 lamports**. Reward = 16,500. Cost ≈ 1,417,300. Priority ≈
+`16,500 × 1,000,000 / 1,417,301` ≈ **11,642**. You paid seven times as much and your priority
+*halved*.
+
+**Subgoal 4 — price the tuned version.** Simulate, read about 6,000 CU consumed, add the recommended
+10% margin, request 6,600.<Cite src="solana-docs-compute-budget" /> Prioritization fee =
+`ceil(10,000 × 6,600 / 1,000,000)` = **66 lamports**. Reward = 2,566. Cost ≈ 6,600 + 17,300 = 23,900.
+Priority ≈ `2,566 × 1,000,000 / 23,901` ≈ **107,359**.
+
+**Subgoal 5 — read the table.**
+
+<Matrix
+  numeric
+  corner="Requested limit (compute units)"
+  cols={['Priority fee (lamports)', 'Scheduler priority']}
+  rows={[
+    { label: '1,400,000', cells: [{ v: '14,000', tone: 'danger' }, { v: '~11,600', tone: 'danger' }] },
+    { label: '200,000 (default)', cells: ['2,000', '~20,700'] },
+    { label: '6,600 (tuned)', cells: [{ v: '66', tone: 'good' }, { v: '~107,400', tone: 'good' }] },
+  ]}
+  caption="Nothing here is a tradeoff. The tuned row wins on both columns at once."
+  alt="Three requested compute-unit limits against what each costs and how each ranks: 1,400,000 compute units costs 14,000 lamports of priority fee for a scheduler priority of about 11,600; the 200,000 compute-unit default costs 2,000 lamports for about 20,700; and a tuned 6,600 compute units costs 66 lamports for about 107,400."
+/>
+
+Tuning cut the priority fee by a factor of over two hundred against the lazy ceiling *and* raised
+scheduling priority by roughly nine times. Both, from one instruction.
+
+**Subgoal 6 — take the last free win.** Add `SetLoadedAccountsDataSizeLimit` sized to what you
+actually load and the 16,000 CU of default overhead mostly evaporates, shrinking the denominator
+again.<Cite src="anza-compute-units" /><Cite src="solana-docs-compute-budget" /> Anza recommends it
+explicitly, both for priority today and against rejection risk as block limits
+rise.<Cite src="anza-compute-units" />
+
+<Aside kind="note">
+Do not read the absolute priority numbers as portable. They depend on the base fee, the burn split and
+the cost constants, all of which can change, and the leader's ranking is against whatever else is in
+its buffer. What *is* portable is the shape: **your requested limit sits in the numerator once and the
+denominator once, and the denominator has a floor you cannot go below.** That is why the curve turns
+over.
+</Aside>
+
+## Where the compute actually goes
+
+Two more things worth knowing about the runtime's meter, because they explain why tuned CU limits
+are so much smaller than EVM instincts predict.
+
+**The floor is one.** The smallest runtime operation costs 1 CU.<Cite src="anza-compute-units" /> Not
+three, not five. Arithmetic and memory access on Solana are close to free by design, and the budget
+gets spent on the things that are genuinely expensive: cross-program invocations, syscalls,
+serialization and account handling.
+
+**Structural work has published constants.** Agave's execution budget lists them: one CPI invocation
+costs `DEFAULT_INVOCATION_COST` = 1,000 CU, dropping to 946 CU under SIMD-0339; heap costs
+`DEFAULT_HEAP_COST` = 8 CU per 32 KiB page, with the heap frame settable between 32 KiB and 256 KiB in
+1,024-byte multiples; the instruction stack depth is 5 (top level plus CPIs), raised to 9 under
+SIMD-0268; and SBF-to-SBF call depth within a program is capped at 64 with a 4,096-byte stack
+frame.<Cite src="solana-docs-compute-budget" />
+
+<Figure
+  caption="Measured execution sits two orders of magnitude below the ceiling, and on Solana that whole gap is something you pay for."
+  alt="Compute units on a logarithmic scale: the smallest runtime operation costs 1 compute unit; one cross-program invocation costs 1,000; a measured token transfer about 6,000; the default limit for one non-builtin instruction is 200,000; and MAX_COMPUTE_UNIT_LIMIT is 1,400,000."
+>
+  <Bars
+    scale="log" unit="compute units" axisLabel="what one thing costs the runtime"
+    items={[
+      { label: 'smallest runtime operation', value: 1, tone: 'good', note: 'arithmetic, memory' },
+      { label: 'one CPI invocation', value: 1000, tone: 'warn', note: '946 under SIMD-0339' },
+      { label: 'a token transfer, measured', value: 6000, tone: 'accent', note: "Anza's worked example" },
+      { label: 'per-instruction default', value: 200000, note: 'one non-builtin instruction' },
+      { label: 'MAX_COMPUTE_UNIT_LIMIT', value: 1400000, tone: 'danger', note: 'clamped, whatever you ask' },
+    ]}
+  />
+</Figure>
+
+Read the CPI number against the arithmetic floor. **One cross-program call costs about as much as a
+thousand arithmetic operations.** On Solana, composition is the expensive thing and computation is
+nearly free — which is close to the inverse of the shape you internalised optimising Solidity, where a
+single storage read outweighs a great deal of arithmetic and an external call is comparatively
+unremarkable.
+
+### There is no cold and warm here
+
+The absence is the interesting part.
+
+The EVM prices the *first* access to an account or storage slot far above subsequent ones — the
+[cold versus warm](/c/cold-vs-warm-access) distinction you measured yourself, where a cold `SLOAD`
+came in at 2,100 gas against 100 warm.<Cite src="measured-forge-1-7-1" /> That mechanism exists
+because the EVM discovers what it touches during execution: the first touch may require fetching state
+the node did not have loaded, so it is charged for, and the warm price reflects that the work is
+already done.
+
+Solana has no equivalent, and could not have one. Every account the transaction will touch is named
+before execution starts, so the loading is bulk work done up front and priced by *size* rather than by
+order of first use: 8 CU per 32 KiB of loaded account data, defaulting to an assertion of the 64 MiB
+maximum unless you say otherwise.<Cite src="anza-compute-units" /> There is no "first" access to price
+differently, because there is no discovery.
+
+That is the same trade this whole track keeps circling. **Declared access removes an entire pricing
+mechanism from the runtime and replaces it with a size declaration you are responsible for making.**
+The EVM's cold/warm rule is a clever way to price a problem Solana does not have; Solana's
+loaded-data limit is a chore the EVM does not impose. Neither machine is being sloppy — they are
+charging for different things because they learn about state at different times.
+
+## Included means paid
+
+Now the failure semantics, which are two-thirds familiar and one-third completely new.
+
+The fee is deducted from the fee payer before execution, and if the transaction fails it is still
+charged.<Cite src="solana-docs-fee-structure" /> Instructions are atomic — if any instruction fails,
+the entire transaction fails and all state changes are reverted — but the fee is not
+reverted.<Cite src="solana-docs-transactions" /> So far this is exactly the EVM's "a revert still
+burns gas", with one refinement: the amount charged does not depend on how far execution got, because
+the fee was computed from the requested limit before anything ran.
+
+The third case is the one the EVM barely has. **A transaction that never gets included costs
+nothing** — and produces no receipt, no logs, no on-chain record of any kind. It is not a cheaper
+failure. It is an *invisible* one. Under load it is also the common one, and the entire final lesson
+of this module is about it.
+
+Three outcomes, then, where your EVM instincts have two:
+
+<Matrix
+  corner="Outcome"
+  cols={['Fee charged', 'On-chain record']}
+  rows={[
+    { label: 'Executed successfully', cells: ['yes', { v: 'full', tone: 'good' }] },
+    { label: 'Executed and failed', cells: ['yes', { v: 'full, with the error', tone: 'warn' }] },
+    { label: 'Never included', cells: ['no', { v: 'none', tone: 'danger' }] },
+  ]}
+  caption="The EVM has the top two rows. The third is the one you have to build a client around."
+  alt="Three outcomes for a Solana transaction: executed successfully, which charges a fee and leaves a full record; executed and failed, which charges a fee and leaves a full record carrying the error; and never included, which charges no fee and leaves no record at all."
+/>
+
+<Misconception
+  belief="If my transaction failed, I can look up why."
+  reality="Only if it was included. A transaction the leader never scheduled has no signature status, no logs and no error — the query returns nothing, which is indistinguishable from a transaction you never sent."
+  why="On Ethereum a transaction that reaches the mempool and has a valid nonce will almost always eventually land somewhere and produce a receipt, so 'failed' and 'has a receipt explaining the failure' became the same idea."
+  src="solana-cookbook-retry"
+/>
+
+### Reading your own numbers back
+
+None of this needs to be taken on trust, because both quantities are published per transaction. The
+documented profiling route is `getBlock`, whose transaction metadata carries **`computeUnitsConsumed`**
+— what the runtime actually metered — alongside **`costUnits`**, the scheduler's cost
+estimate.<Cite src="anza-compute-units" />
+
+Pull both for a day of your own traffic and three questions answer themselves:
+
+- **How much headroom am I paying for?** `requested limit − computeUnitsConsumed`, multiplied by your
+  CU price, is money spent on compute nobody used.<Cite src="solana-docs-fee-structure" />
+- **How much of my cost is not execution at all?** `costUnits − requested limit` is the signature,
+  write-lock, instruction-data and loaded-data overhead.<Cite src="solana-docs-compute-budget" /> If
+  that difference is large relative to your execution budget, the cheapest available optimisation is
+  the account list, not the program.
+- **How stable is my consumption?** The spread of `computeUnitsConsumed` for one instruction shape is
+  what sizes your margin. A tight distribution justifies the documented 10%; a long tail says the
+  margin belongs at a percentile of the observed distribution rather than at a round
+  number.<Cite src="solana-docs-compute-budget" />
+
+That last one is the difference between tuning and guessing, and it is the kind of measurement that
+does not exist as a habit in EVM work — because there, over-setting the limit was free and nobody ever
+had to know.
+
+## A change worth watching
+
+Everything above describes legacy and v0 transactions. The documentation carries a standing warning
+that the upcoming v1 format works differently, and the differences invert the advice in this lesson
+rather than refining it.<Cite src="solana-docs-fee-structure" />
+
+Under v1 as documented: Compute Budget instructions are ignored for configuration — they execute as
+no-ops that still cost 150 CU and still occupy an instruction slot — and the limits plus the priority
+fee are set directly in the message config instead.<Cite src="solana-docs-compute-budget" /> The
+priority fee becomes an absolute lamport total with no per-CU price, no multiplication and no
+rounding.<Cite src="solana-docs-fee-structure" /> And the trap: **unset limits default to zero, not to
+the values above**.<Cite src="solana-docs-compute-budget" />
+
+That last clause deserves alarm. Today an omitted limit means "generous default"; under v1 it means
+"no compute at all". The same code that merely overpays now would fail outright. SIMD-0296 is the
+proposal behind the larger v1 payload, and its own status line reads Review with the feature key
+unfilled — so treat the whole of this section as direction, verify activation yourself, and make sure
+any transaction-building code you write has one place where limits are set rather than
+five.<Cite src="simd-0296" />
+
+<Check type="predict" concept="priority-fee-formula">
+A trading bot sends bursts of transactions. Its builder sets `SetComputeUnitLimit` to 1,400,000 on
+everything "so nothing ever runs out of compute", and sets the CU price from a provider's fee API.
+Under load, the team observes that its landing rate falls even after doubling the CU price, while a
+competitor lands consistently at what appears to be a lower price.
+
+Diagnose it, and say what you would change first and how you would prove the change worked.
+
+<Answer>
+**The diagnosis: they are bidding against their own denominator.**
+
+Priority is `reward × 1,000,000 / (cost + 1)`, and the requested CU limit appears in both
+terms.<Cite src="solana-docs-fee-structure" /> At a 1,400,000 limit the cost is dominated by the
+requested compute — roughly 1.4M against maybe 20,000 of everything else — so doubling the price
+doubles the numerator against a denominator that is already 70 times larger than a tuned
+transaction's. The competitor with a 30,000 limit gets a comparable priority from a fraction of the
+fee, because their denominator is two orders of magnitude smaller.
+
+Worse, they are paying for it. The prioritization fee is price × requested limit, and at 1,400,000 it
+is seven times what a 200,000 request costs at the same price and over two hundred times a tuned
+6,600.<Cite src="solana-docs-fee-structure" /><Cite src="solana-docs-compute-budget" /> Doubling the
+price doubled a bill that was already inflated sevenfold.
+
+**Change first: set the limit from simulation, not from the ceiling.** Simulate each transaction
+shape, read the consumed CU, add the documented 10% margin, and set that.<Cite src="solana-docs-compute-budget" />
+Do it per shape, not globally — a swap and a cancel have different profiles and one number for both
+reintroduces the problem in miniature.
+
+**Change second: set `SetLoadedAccountsDataSizeLimit`.** Leaving it unset asserts the 64 MiB maximum
+and adds roughly 16,000 CU to cost for free.<Cite src="anza-compute-units" /> On a tuned transaction
+that overhead can exceed the execution budget itself.
+
+**How to prove it.** Instrument three numbers per transaction and compare distributions before and
+after, on the same market conditions:
+
+1. `computeUnitsConsumed` and `costUnits` from the transaction metadata in `getBlock`, which is the
+   documented way to profile this.<Cite src="anza-compute-units" />
+2. Lamports paid — priority fee is a formula you can recompute exactly from the limit and price you
+   set, so any divergence means your builder is not sending what you think.
+3. Landing rate: signatures submitted versus confirmed inside the blockhash lifetime.
+
+**The trap in the fix.** A tuned limit is a real limit. Simulation runs against a recent bank, and a
+program whose CU consumption depends on state — how many order book levels it walks, whether an
+account needs initialising — can consume more when it lands than when it simulated. The 10% margin is
+a margin, not a guarantee, and the correct response is to size the margin per instruction shape from
+its observed distribution rather than to retreat to 1,400,000. This is the same lesson as
+[simulation is not a guarantee](/c/simulation-is-not-a-guarantee), arriving with a price attached.
+
+**One thing to be suspicious of.** The provider fee API is itself a vendor artifact rather than a
+protocol quantity: every major RPC offers its own, they disagree, and practitioner analysis has
+flagged both the divergence and the lock-in risk.<Cite src="helius-local-fee-markets" /> Recompute the
+fee you are being advised to pay against the published formula before trusting it.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next**, the ceiling that all this competes under. Compute is limited per block, and — separately,
+and much lower — per writable account. That second limit is the mechanical basis of local fee markets,
+and its current value is not what most published material says it is.
+
+**Two lessons out**, the reason a fee war on one account does not stay on that account: the scheduler
+you now know ranks a single global queue with the formula above, so a big numerator anywhere reorders
+everything.<Cite src="agave-greedy-scheduler" />
+
+**And carry the two-sided rule.** *On Solana, asking for less makes you cheaper and faster at the same
+time.* There is no equivalent statement about the EVM, and if you find yourself reaching for a
+generous limit for safety margin alone, that is the EVM's refund rule talking through you.

@@ -1,0 +1,437 @@
+---
+id: infra-simulation-governance-rehearsal
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [recon-safe-utils, oz-governance-docs, foundry-fork-testing, measured-simulation-2026-08-26, eip-7825, tenderly-virtual-environments, cast-run-reference]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+The vote closed nine days ago. The forum thread ran to two hundred replies and the outcome was
+never in doubt. The timelock elapsed at 14:00. Someone calls `execute`, in public, with the treasury
+watching.
+
+It reverts.
+
+Not because the community was wrong about the parameter. Because the payload targets the proxy
+instead of the timelock's own admin, or encodes `setReserveFactor(uint256)` where the deployed
+contract exposes `setReserveFactor(address,uint256)`, or asks the executor to call a function it was
+never granted the role for, or forgets that the call needs 3 ETH forwarded with it and the timelock
+holds none.
+
+Every one of those is a mechanical defect, findable in a minute of execution, that instead surfaced
+nine days later in front of everyone — and that now costs another nine days to fix, because there is
+no patch for a proposal. There is only a new one.
+
+**Governance failures cluster in the encoding of the payload and the permissions of the executor, not
+in the substance of the decision.** Voters read the description. Nobody reads the calldata. This
+lesson is about the two artifacts that fix that: a rehearsal of the entire flow, and a published
+account of what the calldata actually does.
+
+## Rehearse the process, not the moment
+
+The instinct is to simulate `execute`. That is the step that failed, so that is the step to test.
+It is the wrong scope, for a reason that is easy to state: **the object that gets executed is created
+at `propose`, and most of the ways it can be wrong are already baked in by then.**
+
+OpenZeppelin's Governor computes the proposal id as the hash of the proposal parameters — the
+targets, the values, the calldatas and the description hash — specifically so that the data can be
+kept off chain and recovered by event indexing, in contrast with the original Bravo implementation's
+sequential ids.<Cite src="oz-governance-docs" /> That design has a consequence people learn the hard
+way: `queue` and `execute` must be called with **byte-identical** arrays and description hash. Fix a
+typo in the description between proposing and queueing and you are addressing a different proposal —
+one that does not exist.
+
+So the rehearsal runs the whole path, in one fork test, in seconds:
+
+**propose → advance past the voting delay → vote → advance past the voting period → queue → advance
+past the timelock → execute → assert the thing you wanted actually changed.**
+
+<Figure
+  caption="Three clock advances stand in for two weeks of real time, and only the last step proves anything."
+  alt="A vertical governance rehearsal: propose with the targets, values, calldatas and description; advance past the voting delay; vote, either by impersonating real delegates or by writing the historical checkpoint; advance past the voting period; queue with byte-identical arrays and description hash; advance past the timelock; execute, where msg.sender is the timelock rather than the Governor; and finally assert by reading the new value back from the chain."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'prop', label: 'propose', note: 'targets, values, calldatas, description', col: 0, tone: 'accent' },
+      { id: 'a1', label: 'advance the clock', note: 'past votingDelay', col: 1, dashed: true },
+      { id: 'vote', label: 'vote', note: 'impersonate, or write the checkpoint', col: 2 },
+      { id: 'a2', label: 'advance the clock', note: 'past votingPeriod', col: 3, dashed: true },
+      { id: 'queue', label: 'queue', note: 'byte-identical arrays and description hash', col: 4 },
+      { id: 'a3', label: 'advance the clock', note: 'past the timelock delay', col: 5, dashed: true },
+      { id: 'exec', label: 'execute', note: 'msg.sender is the timelock', col: 6, tone: 'warn' },
+      { id: 'ass', label: 'assert', note: 'read the new value back from the chain', col: 7, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+The parameters that make those "advance" steps necessary are ordinary Governor configuration.
+`votingDelay` is how long after a proposal is created voting power gets fixed — a large delay gives
+holders time to unstake if they want to. `votingPeriod` is how long the proposal remains open. Both
+are expressed in the unit of the token's clock, and OpenZeppelin's own walkthrough uses a one-day
+delay of 7,200 blocks and a one-week period of 50,400 blocks at roughly twelve-second
+blocks.<Cite src="oz-governance-docs" /> Two weeks of real time; two `vm.roll` calls in a rehearsal.
+
+<Aside kind="note">
+Check which clock the token uses before you write those advances. The internal clock the token uses
+to store voting balances dictates the Governor's operating mode: block numbers by default, with the
+option since v4.9 to override the ERC-6372 clock to use timestamps
+instead.<Cite src="oz-governance-docs" /> A rehearsal that `vm.warp`s a block-number-clocked Governor
+advances nothing at all, and the proposal sits in the same state while your test happily asserts its
+way past the problem. Match the cheatcode to the clock: `vm.roll` for blocks,
+[`vm.warp` for timestamps](/c/warp-and-roll), and usually both, because the contracts the proposal
+touches may be on the other one.
+</Aside>
+
+## Getting the votes without the voters
+
+You need the proposal to pass, and you do not have the electorate. Three techniques, in increasing
+order of fidelity.
+
+**Impersonate real large holders.** [`vm.prank`](/c/prank-scope) a real delegate address read from
+the chain and cast their vote. This is the highest-fidelity option because the voting weight is
+genuinely theirs, and it is limited by how many you have to impersonate to reach quorum — most
+Governors use a 4% quorum,<Cite src="oz-governance-docs" /> which on a well-distributed token is a
+lot of addresses.
+
+**Write the voting power into storage.** `vm.store` the checkpoint that the vote will read. Fast,
+and the place where rehearsals most often go quietly wrong — see below.
+
+**Override the quorum or the counting module's storage directly.** Crude, and it changes the thing
+you are testing. Acceptable when the object of the rehearsal is unambiguously the payload rather than
+the vote.
+
+The subtlety that catches people is *when* voting power is read. The `ERC20Votes` extension keeps
+track of historical balances so that voting power is retrieved from past snapshots rather than
+current balance, which OpenZeppelin describes as an important protection that prevents double
+voting.<Cite src="oz-governance-docs" /> The `GovernorVotes` module determines voting power from the
+token balance held when the proposal becomes active.<Cite src="oz-governance-docs" />
+
+So writing a balance into storage *after* proposing changes nothing: the snapshot the vote consults
+was taken at a past block, and your write is in the present. The rehearsal must either give the
+address its power before proposing and then advance past the voting delay, or write the historical
+checkpoint rather than the balance. A rehearsal where the vote silently counts zero and the proposal
+fails quorum is the good outcome; the bad one is a test that concludes the payload is broken when the
+payload was never reached.
+
+## Where the defects actually are
+
+Four failure classes account for most of it. Each one is invisible in a description and obvious in an
+execution.
+
+**Wrong target.** The proposal calls the implementation directly instead of the proxy, or the old
+deployment of a contract that was migrated, or the token instead of the vault that holds it. The call
+often *succeeds* against the wrong target and changes nothing anyone can observe — which is worse
+than reverting.
+
+**Wrong selector.** An overload, a renamed function, a parameter added in the version that is
+actually deployed. Four bytes. A revert with no data, or worse, a call to a fallback.
+
+**Missing role.** The proposal is correct and the executor — the timelock, not the Governor — has not
+been granted the role on the target. This is the single most common one in practice, because the
+role was granted to whoever deployed the system and never moved to the timelock. Note who the
+`msg.sender` will be at execution time: with `GovernorTimelockControl`, operations are executed *by
+the timelock*,<Cite src="oz-governance-docs" /> so a role granted to the Governor is a role granted to
+the wrong address.
+
+**Value not forwarded.** The `values` array is parallel to `targets` and `calldatas`, and a payable
+call with `0` in that slot reverts or, on a lenient target, does something other than what was
+intended. Whether the executor even holds the ETH is a separate question the rehearsal answers for
+free.
+
+<Matrix
+  corner="Defect"
+  cols={['What is wrong', 'How it presents']}
+  rows={[
+    {
+      label: 'Wrong target',
+      cells: [
+        'the implementation instead of the proxy, an old deployment, the token instead of the vault',
+        { v: 'often succeeds against the wrong target and changes nothing anyone can observe', tone: 'danger' },
+      ],
+    },
+    {
+      label: 'Wrong selector',
+      cells: [
+        'an overload, a renamed function, a parameter added in the deployed version',
+        'a revert with no data, or a call to the fallback',
+      ],
+    },
+    {
+      label: 'Missing role',
+      cells: [
+        <>the executor is the timelock, and the role was granted to the deployer or to the Governor</>,
+        { v: 'reverts at execute, days after the vote', tone: 'warn' },
+      ],
+    },
+    {
+      label: 'Value not forwarded',
+      cells: [
+        <>a payable call with <code>0</code> in the parallel <code>values</code> array</>,
+        'reverts, or on a lenient target does something other than what was intended',
+      ],
+    },
+  ]}
+  caption="Not one of these is a disagreement about what the proposal should do."
+  alt="Four governance defect classes. Wrong target: the implementation instead of the proxy, an old deployment, or the token instead of the vault, which often succeeds and changes nothing observable. Wrong selector: an overload, a rename, or a parameter added in the deployed version, presenting as a revert with no data or a call to the fallback. Missing role: the executor is the timelock and the role was granted to the deployer or the Governor, presenting as a revert at execute days after the vote. Value not forwarded: a payable call with zero in the parallel values array, which reverts or does something unintended."
+/>
+
+The rehearsal catches all four the same way, and the assertion is not "execute did not revert" — it
+is **"the parameter now has the new value"**, read from the chain after execution. That is the only
+assertion that distinguishes a call that worked from a call that landed somewhere harmless.
+
+<Misconception
+  belief="If the proposal's intent is right, the proposal is right."
+  reality="Most governance failures are encoding and permission failures in the payload: wrong target, wrong selector, executor lacking the role, value not forwarded. All four survive any amount of discussion about the intent, and all four surface at execute, days after the vote."
+  why="Voters and authors read the description, which is prose written by a human. The thing that executes is calldata, which nobody reads and which no part of the voting process compares against the description."
+  src="recon-safe-utils"
+/>
+
+## When the executor is a multisig
+
+A large share of protocol changes do not go through a Governor at all. They go through a Safe, often
+behind a timelock or a Governor, and the same reasoning applies with different mechanics.
+
+Recon's write-up of `safe-utils` and `tenderly-utils`, published in April 2025, describes the workflow
+concretely, and it is worth reading as a design rather than as a
+product.<Cite src="recon-safe-utils" /> Four points from it generalise regardless of which libraries
+you use.
+
+**Propose from a script, not from a UI.** The library exposes
+`safe.proposeTransaction(target, abi.encodeCall(Contract.functionName, (args)), signer)`, which signs
+the operation and submits it to the Safe API backend for the other owners to
+approve.<Cite src="recon-safe-utils" /> The point made is that having the proposal implemented as a
+Foundry script lets security researchers review it, find issues and mitigate
+them<Cite src="recon-safe-utils" /> — a reviewable artifact instead of a sequence of clicks.
+
+**Batches built by hand are where the errors are.** The article describes the previous process
+bluntly: building batch transactions through the Safe frontend meant copying the contract address,
+the ABI and the parameter, checking the formatting, and repeating for every change — extremely error
+prone and time consuming, with failures such as forgetting to update one market or submitting to an
+invalid address having already happened in production.<Cite src="recon-safe-utils" /> Programmatic
+construction removes an entire class of defect that no amount of review reliably catches.
+
+**One low-level detail decides whether a batch works at all.** The `execTransaction` operation
+parameter must be a `DelegateCall`, so that the transaction context — including `msg.sender` —
+remains the Safe account across every sub-call in the chain.<Cite src="recon-safe-utils" /> Get this
+wrong and every permissioned call in the batch is made by the aggregator contract instead of the
+Safe, and the whole batch fails on authorisation. The library uses the same `MultiSendCallOnly` batch
+aggregator as the Safe SDK underneath.<Cite src="recon-safe-utils" />
+
+**Make the proposal instantly applicable on a fork.** The described technique is to use a cheatcode
+such as `setStorageAt` to change the Safe threshold to 1, which makes the governance proposal pass
+immediately — and the article notes this is exactly what happens when you click "Simulate
+transaction" in the Safe UI.<Cite src="recon-safe-utils" /> The stated purpose is that frontend and
+backend teams can test governance updates before they take
+effect.<Cite src="recon-safe-utils" /> That is the rehearsal-environment argument from the previous
+lesson, arriving from the governance side — and it is the documented purpose of a hosted forked
+network, whose stated uses include staging environments for manual QA, community testing and
+audits.<Cite src="tenderly-virtual-environments" />
+
+<Aside kind="warn">
+Setting the threshold to 1 is a substitution, and it removes the exact property the multisig exists
+to provide. Your rehearsal now proves the payload executes correctly *if* the signers sign. It proves
+nothing about whether they will, whether the right people hold the keys, or whether the signing flow
+works on their hardware. Rehearse that separately, with the real threshold, on a shared environment
+the signers can actually reach — it is a different exercise, and it is the one that finds out a
+signer left the company.
+</Aside>
+
+## The artifact voters need
+
+A proposal description is a claim by the author. The verifiable object is a simulated execution of
+the actual calldata against current state, rendered so that someone who does not read Solidity can
+evaluate it.
+
+Six things belong in it. Producing them is mechanical once the rehearsal exists.
+
+**Every target, named and linked.** Not just the address — what the address is, and whether it is a
+proxy and what it currently delegates to.
+
+**Every call, decoded.** Function name, parameter names, parameter values in human units. `cast run`
+on a real mainnet transaction produced a decoded trace, including the proxy's delegatecall into its
+implementation, in 1.3 seconds.<Cite src="measured-simulation-2026-08-26" /><Cite src="cast-run-reference" />
+The same tooling produces this for a rehearsed execution.
+
+**Every storage value that changes, from what to what.** This is the part nobody can fake and the
+part that catches a description-payload mismatch.
+
+**The `msg.sender` at execution and the role it needs.** Stated explicitly, because "the timelock
+does not have this role" is the most common defect and the least visible one.
+
+**The block the rehearsal ran against, and every override applied.** Everything lesson three said
+about conditions applies with more force here, because the audience is not engineers.
+
+**One risk you would flag.** Not a disclaimer — a specific thing that could go wrong, from someone
+who executed the payload and watched what it did.
+
+Publishing this alongside a serious proposal has become an expectation rather than a courtesy, and
+the reason is the cheapest possible one: it is the only defence against a proposal whose description
+and payload do not match, which is a real attack pattern and not a hypothetical. You met the
+consequences in the security track — the reason
+[a timelock queue is an alert, not a formality](/c/timelock-queue-is-the-alert) is that the queue
+window is the only period in which a mismatch can be found and acted on.
+
+## A constraint that did not exist before: the payload has to fit
+
+One more check belongs in the rehearsal, and it is new enough that older runbooks do not contain it.
+
+EIP-7825 enforces a protocol-level maximum of **16,777,216 gas — 2²⁴ — for any single transaction**,
+regardless of the block gas limit, applied both at txpool validation (a transaction specifying more
+is not admitted) and at block validation (a block containing one is
+invalid).<Cite src="eip-7825" /> The stated motivation is resilience against single-transaction DoS,
+fairer gas allocation within a block, and bounded block validation times, especially in the context
+of raising the block gas limit.<Cite src="eip-7825" />
+
+Governance payloads are exactly the shape of transaction that runs into this: a batch touching thirty
+markets, each with several storage writes, executed as one atomic call. A rehearsal on a fork can
+happily execute a sequence that consumes more than the cap, because a fork is not enforcing txpool
+admission rules. **Read the gas used by the execution step in your rehearsal and compare it against
+the cap explicitly.** If it does not fit, the fix is to split the proposal — which is a governance
+decision with its own timeline, and one you want to make before the vote rather than after.
+
+## What the rehearsal does not establish
+
+Four gaps, and each one has produced a real incident somewhere.
+
+**That the electorate will behave as rehearsed.** You manufactured quorum. Whether the proposal
+passes, whether it passes with the participation people expect, and whether a single holder can carry
+it alone are governance questions your `vm.store` call answered by fiat.
+
+**That the state at execution resembles the state you forked.** A timelock delay is a window in which
+the world keeps moving. Between the queue and the execution, the parameter your proposal reads may
+change, a market may be drained, or a dependency may be upgraded. A rehearsal pinned before the vote
+is a claim about a block two weeks in the past by the time it matters — which is the argument for
+re-running it immediately before execution, against head.
+
+**That the proposal is the only thing that will execute in that window.** A queued proposal is public.
+Anyone can read the payload, work out what it does to prices or positions, and position around it.
+Rehearsing the payload alone rehearses the best case in which nobody else acts.
+
+**That the description matches the payload for the reader, rather than for you.** You built both, so
+you know they agree. The artifact in the next section exists precisely because that knowledge does
+not transfer to anyone else by being true.
+
+## Worked example: the rehearsal as a single test
+
+**Subgoal — build the payload once, in code, and reuse the same bytes everywhere.** Construct the
+`targets`, `values`, `calldatas` and `description` in one function. The test proposes with them, the
+publication script decodes them, and the production script submits them. The moment the payload is
+built twice, the two copies can differ, and the difference is a proposal id nobody can queue.
+
+**Subgoal — fork at a recent block so the electorate and the roles are current.** Not a cached
+convenient block. Who holds voting power and which roles the timelock has are both live facts, and
+both are exactly what you are testing.
+
+**Subgoal — reach the vote honestly enough.** Give voting power before proposing, then advance past
+the voting delay, then vote. If you write storage after proposing, the snapshot the vote reads has
+already been taken.<Cite src="oz-governance-docs" />
+
+**Subgoal — advance with the right cheatcode for the clock.** `vm.roll` for a block-numbered
+Governor, `vm.warp` for a timestamped one,<Cite src="foundry-fork-testing" /> and both when the
+targets have their own time-based logic.
+
+**Subgoal — capture the "before" values of everything the proposal claims to change, and everything
+it claims not to.** The second list is longer and is where the surprises are.
+
+**Subgoal — execute, then assert on values, not on absence of revert.** `assertEq(pool.reserveFactor(), 1500)`, not `assertTrue(success)`.
+
+**Subgoal — record the gas of the execute step and check it against the per-transaction
+cap.**<Cite src="eip-7825" />
+
+**Subgoal — emit the diff as a file, not as console output.** A rehearsal whose output is a committed
+artifact can be attached to the proposal, diffed on the next revision, and re-run in CI. Console
+output is gone when the terminal scrolls.
+
+<Check type="spot-bug" concept="governance-rehearsal">
+A governance rehearsal test is proposed for review. It forks mainnet at a recent block and then does
+this:
+
+```solidity
+function test_ProposalExecutes() public {
+    address[] memory targets   = new address[](1);
+    uint256[] memory values    = new uint256[](1);
+    bytes[]   memory calldatas = new bytes[](1);
+    targets[0]   = POOL;
+    calldatas[0] = abi.encodeWithSignature("setReserveFactor(uint256)", 1500);
+
+    uint256 id = governor.propose(targets, values, calldatas, "Raise reserve factor to 15%");
+
+    vm.store(address(token), _votesSlot(WHALE), bytes32(uint256(10_000_000e18)));
+    vm.prank(WHALE);
+    governor.castVote(id, 1);
+
+    vm.warp(block.timestamp + 30 days);
+    governor.queue(targets, values, calldatas, keccak256("Raise reserve factor to 15 %"));
+    vm.warp(block.timestamp + 3 days);
+    governor.execute(targets, values, calldatas, keccak256("Raise reserve factor to 15 %"));
+    assertTrue(true);
+}
+```
+
+Find every defect you can and rank them by what they would cost in production.
+
+<Answer>
+**Six defects. Three of them mean the test proves nothing at all.**
+
+**1 — The description hash does not match the description.** `propose` was given
+`"Raise reserve factor to 15%"`; `queue` and `execute` were given
+`keccak256("Raise reserve factor to 15 %")` — with a space before the percent sign. Since the
+proposal id is the hash of the targets, values, calldatas and description
+hash,<Cite src="oz-governance-docs" /> those are two different proposals. In a rehearsal this reverts
+and you find it in seconds. In production this is the whole nine-day cycle repeated. **Build the
+payload and the description once, in one place, and pass the same values everywhere.**
+
+**2 — The voting power is written after `propose`.** Voting weight is read from a past snapshot
+rather than the current balance,<Cite src="oz-governance-docs" /> and the module determines it from
+the balance held when the proposal became active.<Cite src="oz-governance-docs" /> Writing the slot
+afterwards changes a value nobody will consult. The whale votes with whatever they actually had. Give
+the power first, then propose, then advance past `votingDelay`.
+
+**3 — Nothing advances past the voting delay or the voting period before voting and queueing.** The
+proposal is not active when `castVote` is called and not succeeded when `queue` is. Also, `vm.warp`
+alone moves timestamps; if this Governor's token clock is block numbers — the default —
+none of the warps advance the Governor at all<Cite src="oz-governance-docs" /> and every state check
+fails for a reason unrelated to the payload.
+
+**4 — `assertTrue(true)` is not an assertion.** Even with everything above fixed, this test passes
+whenever `execute` does not revert. The failure mode of a governance payload is frequently a call
+that succeeds against the wrong target and changes nothing. The assertion must read the value:
+`assertEq(IPool(POOL).reserveFactor(), 1500)`.
+
+**5 — `values[0]` is left at zero by default, which is silently correct here and a landmine in
+general.** `setReserveFactor` is not payable, so zero is right — but the array was never explicitly
+populated, so nothing in this test would notice the day the payload gains a call that needs ETH
+forwarded. Populate every array element explicitly, including the zeroes.
+
+**6 — Nothing checks the executor's role or the gas of the execution.** With
+`GovernorTimelockControl` the operations are executed by the timelock,<Cite src="oz-governance-docs" />
+so the question is whether *the timelock* holds the role on `POOL` — and this test cannot distinguish
+"has the role" from "the call reverted for another reason", because it does not assert on the
+outcome. And nothing compares the execute step's gas against the 16,777,216-gas per-transaction
+cap,<Cite src="eip-7825" /> which for a one-call payload is fine and for the batch this file will
+eventually grow into is not.
+
+**Ranking by production cost.** Defect 1 costs a full governance cycle and public embarrassment.
+Defects 2 and 3 cost the value of the whole rehearsal, because the test is green while never
+reaching the payload. Defect 4 costs the specific class of failure this exercise exists to catch.
+Defects 5 and 6 cost nothing today and are the ones that will bite the version of this file that
+exists in six months.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now rehearse an action that takes two weeks and cannot be recalled, in a test that runs in
+seconds, and publish an account of what it does that a non-engineer can evaluate.
+
+Both of the module's headline rehearsals — the upgrade and the proposal — are now single commands.
+Which raises the obvious question, and it is the last one.
+
+**Next**: a rehearsal you ran once is evidence about one afternoon. The chain moves, dependencies
+upgrade, roles get revoked, and other people's governance changes parameters you rely on. Making the
+rehearsal run on every change, pinned and cached, is what converts "we simulated it" into a standing
+assertion that your deployment path still works — and the same machinery, already built and already
+warm, is what you reach for at three in the morning when something is going wrong right now.

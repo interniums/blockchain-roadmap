@@ -1,0 +1,263 @@
+---
+id: defi-hooks-one-contract-every-pool
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [uniswap-v4-poolmanager, uniswap-v4-core-poolkey, uniswap-v4-flash-accounting-docs, uniswap-v4-vs-v3-docs, uniswap-v4-vision, uniswap-hooks-docs, uniswap-v4-dynamic-fees-docs, zealynx-v4-security, uniswap-v3-core-factory, eip-6909]
+stack: {}
+---
+
+In Uniswap v3, creating a market is a deployment. `UniswapV3Factory.createPool` takes two tokens and
+a fee, looks up the tick spacing, and deploys a fresh `UniswapV3Pool` contract whose address is then
+recorded in a mapping.<Cite src="uniswap-v3-core-factory" /> Every pool is a distinct account with
+distinct code, distinct storage and its own token balances.
+
+In Uniswap v4, creating a market is a `SSTORE`. The pool exists as an entry in one contract's
+storage, and the "address" you route through is the same for every pool on the chain.
+
+That is the entire architectural change in this lesson, and its effects are broader than gas. It
+determines what a pool's *identity* is, what a multi-hop route physically does, where the tokens
+live, and what a bug is worth. Everything the rest of the module builds — netted settlement, hooks,
+and the trust question that follows — needs the singleton first.
+
+<Figure
+  caption="Each change in this module is a precondition for the next, and the security question the last lesson asks is what the first three make possible."
+  alt="The four lessons of this module as a chain: one PoolManager holding every pool as a key in storage; a whole sequence of operations settling once at the end; a hook contract called at fixed lifecycle points; and the resulting question of whose code runs inside your swap."
+>
+  <Flow
+    dir="down"
+    lanes={['lesson 1', 'lesson 2', 'lesson 3', 'lesson 4']}
+    nodes={[
+      { id: 'single', label: 'one PoolManager', note: 'a pool is a key in its storage, not a deployment', col: 0, tone: 'accent' },
+      { id: 'net', label: 'settle once', note: 'any number of operations, two token transfers', col: 1 },
+      { id: 'hook', label: 'a hook per pool', note: 'called at fixed points in the pool lifecycle', col: 2, tone: 'warn' },
+      { id: 'trust', label: 'choosing a pool', note: 'is choosing whose code runs inside your swap', col: 3, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+## A pool is now a key, not an address
+
+`PoolKey` has five fields:<Cite src="uniswap-v4-core-poolkey" />
+
+```solidity
+struct PoolKey {
+    Currency currency0;   // the lower currency, sorted numerically
+    Currency currency1;   // the higher currency
+    uint24   fee;         // LP fee, capped at 1_000_000
+    int24    tickSpacing; // positions must use multiples of this
+    IHooks   hooks;       // the pool's hook contract
+}
+```
+
+The pool's identifier is derived from that struct; the docs describe `initialize` as taking the token
+pair, fee tier, tick spacing and optional hook address, after which the `PoolManager` initialises the
+state and associates it with a unique `PoolId`.<Cite src="uniswap-v4-poolmanager" />
+
+Four things follow from the shape of that key, and each one is a change you would miss reading only
+the headline.
+
+**Identity is structural, not registered.** Nothing has to be looked up to know which pool a key
+refers to. Change any field and you are addressing a different pool — Trail of Bits makes exactly
+this point, that the hook address is part of the pool's identity and trusting the wrong `PoolKey`
+means trusting the wrong pool.<Cite src="zealynx-v4-security" />
+
+**Tick spacing came loose from the fee.** In v3 the factory bound the two together: fee 500 with
+spacing 10, 3000 with 60, 10000 with 200, fixed at deployment and unchangeable
+afterwards.<Cite src="uniswap-v3-core-factory" /> In v4 they are independent fields of the key, so any
+fee can pair with any spacing. What was a protocol-level decision about three supported market types
+is now a per-pool choice, and the coupling you learned in the concentrated-liquidity module — fine
+spacing for stable pairs, coarse for volatile ones — becomes a convention rather than a constraint.
+
+**The fee field carries a mode bit.** The comment on `PoolKey.fee` states that if the highest bit is
+set, the pool has a dynamic fee and the field must be exactly
+`0x800000`.<Cite src="uniswap-v4-core-poolkey" /> The docs add the consequence: whether a pool uses
+dynamic fees is determined at pool creation and is
+immutable.<Cite src="uniswap-v4-dynamic-fees-docs" /> A dynamic-fee pool has no fixed fee in its key
+at all — the number comes from the hook or from `updateDynamicLPFee`, per swap or per
+interval.<Cite src="uniswap-v4-dynamic-fees-docs" />
+
+**Hookless is a valid key.** Hooks are optional, set at pool creation, and one hook contract can
+serve many pools.<Cite src="uniswap-hooks-docs" /> A pool with `hooks` set to the zero address behaves
+like a v3 pool with v4's accounting, which is worth knowing because it is the baseline every
+hook-bearing pool should be compared against.
+
+## What deployment used to cost, and what it bought
+
+The docs put the v3 problem plainly: each pool was a separate contract deployed through the factory,
+which provided flexibility but led to increased gas costs for pool creation and multi-hop
+swaps.<Cite src="uniswap-v4-poolmanager" /> The v4 comparison page is more specific about why: because
+pools are contract *state* and not entirely new *contracts*, pool creation is significantly cheaper,
+whereas in v3 initialisation is costly because contract creation is
+gas-intensive.<Cite src="uniswap-v4-vs-v3-docs" />
+
+This lesson will not put a number on that saving — the figures that circulate are measured against
+particular chains, calldata and gas prices, and none are first-party constants. What matters is the
+*shape*: pool creation went from a cost proportional to deploying bytecode to a cost proportional to
+writing a handful of storage slots.
+
+Three consequences matter more than the saving itself.
+
+**Multi-hop stopped being multi-contract.** In v3, routing ETH to DAI through USDC meant calling two
+pool contracts and moving tokens between them. The v4 documentation walks the same trade: call
+`swap()` on the first pool, call `swap()` on the second using the credit from the first, and resolve
+the deltas at the end — skipping the intermediate `transfer` entirely, and scaling so that any number
+of hops still needs only two token transfers.<Cite src="uniswap-v4-flash-accounting-docs" /> That is
+the subject of the next lesson; note here that it is *only* possible because both pools' accounting
+lives in the same contract.
+
+**Native ETH became a first-class currency.** v4 pool pairs support native tokens, so ETH swappers
+and liquidity providers avoid wrapping costs and get cheaper transfers; in v3, ETH had to be wrapped
+before it could be paired.<Cite src="uniswap-v4-vs-v3-docs" /> The field is called `Currency` rather
+than `token` for this reason.
+
+**Balances inside the manager became fungible claims.** Because tokens do not have to leave the
+`PoolManager` between operations, v4 exposes internal balances through ERC-6909, the minimal
+multi-token interface.<Cite src="eip-6909" /> A frequent trader or a hook can hold a claim on the
+manager instead of round-tripping the ERC-20 on every interaction.
+
+<Misconception
+  belief="A singleton means all pools share their liquidity."
+  reality="Liquidity stays strictly per-pool, keyed by PoolId. What is shared is the contract, the accounting machinery and the token custody — not the reserves."
+  why="'Singleton' is heard as 'pooled', and the gas story is told alongside a routing story, which makes it sound as though a trade can reach across pools. It cannot: a swap still executes against one pool's own liquidity, and a multi-hop route is still two swaps."
+  src="uniswap-v4-poolmanager"
+/>
+
+## The trade-off nobody puts in the headline
+
+One contract now holds the assets of every pool. Trail of Bits states the inversion directly: where
+v3 had a separate contract per pool, v4 keeps all pool state in a singleton `PoolManager`, with each
+pool represented in its storage.<Cite src="zealynx-v4-security" />
+
+Run that through the threat modelling you already have. In v3, a defect confined to one pool's code
+path is confined to that pool's balances, because the balances are in that pool's account. There is
+no such boundary in v4 — **the blast radius of a core defect is every pool at once**, and the
+contract's correctness is a systemic property rather than a per-market one.
+
+That is not an argument against the design; it is the price of the design, and it is paid for
+deliberately in exchange for the netting the next lesson describes. But it changes what "audited"
+buys you and where monitoring should point. Two practical consequences:
+
+- **Core and application are different risk tiers now, and the split is sharp.** Trail of Bits frames
+  it as a division of responsibility: the `PoolManager` enforces the protocol's own mechanics — pool
+  initialisation rules, swap and liquidity maths, hook-callback sequencing, end-of-session settlement
+  — while hook developers are responsible for validating the application-specific assumptions their
+  hooks add.<Cite src="zealynx-v4-security" /> The two failure populations barely overlap, and the
+  second one is where the losses have actually occurred.
+- **A per-pool balance check is no longer a real invariant.** You cannot read the manager's token
+  balance and attribute it to a pool. Any monitoring that used to work by watching a pool contract's
+  ERC-20 balance has to be rebuilt on the manager's internal accounting.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Uniswap v3', note: 'a contract per pool' },
+    { title: 'Uniswap v4', note: 'a key per pool', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'What is a pool?', cells: [<>A deployed contract with its own storage<Cite src="uniswap-v3-core-factory" /></>, <>A record in one contract, named by a PoolKey<Cite src="uniswap-v4-core-poolkey" /></>] },
+    { label: 'What does creating one cost?', cells: [<>Deploying bytecode<Cite src="uniswap-v4-vs-v3-docs" /></>, <>Writing a handful of storage slots<Cite src="uniswap-v4-vs-v3-docs" /></>] },
+    { label: 'How many pools per pair and fee?', cells: [<>Exactly one, enforced by the factory mapping<Cite src="uniswap-v3-core-factory" /></>, 'Arbitrarily many, differing only in spacing or hook'] },
+    { label: 'Is tick spacing tied to the fee?', cells: ['Yes — 500 with 10, 3000 with 60, 10000 with 200', 'No — independent fields of the key'] },
+    { label: 'Where do the tokens sit?', cells: ["In that pool's own account", <>In the PoolManager, for every pool at once<Cite src="zealynx-v4-security" /></>] },
+    { label: 'What does a core defect reach?', cells: [{ v: "That pool's balances", tone: 'warn' }, { v: 'Every pool at once', tone: 'danger' }] },
+  ]}
+  caption="The gas saving and the systemic risk are one change read twice: the boundary that used to isolate a pool was its account, and accounts are what v4 removed."
+  alt="Uniswap v3 and v4 compared on what a pool is, what creating one costs, how many can exist per pair and fee, whether tick spacing is tied to the fee tier, where the tokens are custodied, and how far a core defect reaches."
+/>
+
+<Aside kind="warn">
+When you evaluate any singleton design — this one, a shared vault, a router that custodies — ask the
+same two questions. *What used to be isolated by being in a separate account, and is now isolated
+only by being in a different mapping key?* And *what is the smallest bug that crosses that key?* The
+answers are what the concentration actually costs.
+</Aside>
+
+## What did not change
+
+It is worth being explicit, because the marketing around v4 makes it sound like a new protocol. The
+comparison page opens by saying that v4's underlying concentrated liquidity is the same as v3's, with
+key differences in the architecture and accounting.<Cite src="uniswap-v4-vs-v3-docs" />
+
+<Misconception
+  belief="v4 is a new AMM design, so the concentrated-liquidity maths has to be relearned."
+  reality="The pricing core is unchanged. Ticks, square-root prices, L and the segment-crossing swap loop are the same; what changed is the container, the settlement, and the extension point."
+  why="v4 is presented as a major version alongside a genuinely new capability — hooks — so the whole thing reads as a rewrite. The comparison page opens by saying the underlying concentrated liquidity is the same as v3's, with differences in architecture and accounting."
+  src="uniswap-v4-vs-v3-docs"
+/>
+
+So everything from the previous module carries over intact: ticks at `1.0001^i`, square-root prices
+in Q64.96, `L` as the position parameter, the swap loop crossing initialised ticks, fee growth
+accumulated per unit of liquidity. The `Pool.State` struct the manager holds per pool contains
+exactly what you would expect — current price, liquidity, tick bitmap, fee growth and position
+information.<Cite src="uniswap-v4-poolmanager" />
+
+Two accounting details did change, and both bite integrators.
+
+**Fees behave as a credit when you modify liquidity.** Increasing liquidity converts accrued fee
+revenue into liquidity inside the position; decreasing liquidity forces withdrawal of unclaimed
+fees.<Cite src="uniswap-v4-vs-v3-docs" /> There is no "collect without touching the position" path in
+the same shape as v3's.
+
+**Positions of the same range can be kept separate with a salt.** v3 positions with the same owner
+and range share state, which pushed fee management onto integrating contracts. v4 adds a `salt`
+parameter so two positions with the same range can be distinguished, which the docs recommend when
+two users would otherwise share state in the `PoolManager`.<Cite src="uniswap-v4-vs-v3-docs" />
+
+<Check type="explain" concept="singleton-poolmanager">
+A team is porting an integration from v3 to v4. Their v3 code does three things, all of which used to
+work:
+
+1. It resolves a market by calling `factory.getPool(tokenA, tokenB, 3000)` and caches the address.
+2. It monitors solvency by comparing that address's ERC-20 balances against its own accounting.
+3. It assumes that for a given pair and fee tier there is exactly one pool.
+
+Say what breaks in each case and what the v4 replacement is.
+
+<Answer>
+**1 — there is no address to resolve.** A v4 pool is identified by a `PoolKey` of five fields and the
+`PoolId` derived from it.<Cite src="uniswap-v4-core-poolkey" /> The contract address is the
+`PoolManager` and it is the same for every pool. The replacement is to carry the whole key, not a
+pool address — and note that the key contains `tickSpacing` and `hooks`, two fields the v3 lookup had
+no analogue for, so the migration cannot be a mechanical substitution. Anything that cached "the pool
+address for this pair" has to become "the key I have decided to trade against".
+
+**2 — the balance check is meaningless.** The manager's ERC-20 balance is the sum over every pool,
+plus outstanding ERC-6909 claims,<Cite src="eip-6909" /> plus anything mid-flight. It cannot be
+attributed to one pool, and comparing it to one pool's accounting will fail immediately. The
+replacement is to read the pool's own state through the manager's accounting rather than through
+token balances. The deeper point: v3's per-pool balance check was an invariant you got for free from
+the address boundary, and **the boundary is what disappeared, not the invariant's usefulness**.
+
+**3 — "one pool per pair and fee" is now false, and this is the important one.** In v3, the factory's
+`getPool` mapping enforced uniqueness per pair and fee.<Cite src="uniswap-v3-core-factory" /> In v4,
+`tickSpacing` and `hooks` are part of the key, so the same pair at the same fee can exist as
+arbitrarily many distinct pools, differing only in which hook contract is attached — and pool
+creation is permissionless and cheap.<Cite src="uniswap-v4-vs-v3-docs" />
+
+Two things fall out of that. **Routing** becomes a search over pools rather than a lookup, so
+liquidity for a pair can be fragmented across keys. And **safety** stops being a property of the
+pair: two pools that look identical in every field a v3 integration knew about can behave completely
+differently, because one of them has a hook that runs code inside your swap. That is the subject of
+the last lesson in this module, and it starts here — with the observation that the pool's identity
+grew a field pointing at somebody else's contract.
+</Answer>
+</Check>
+
+## What this unlocks
+
+The singleton is a precondition, not a feature. Two things become available now that every pool's
+accounting sits in one place.
+
+- **Netted settlement.** A caller can unlock the manager, perform a sequence of swaps and liquidity
+  changes across many pools, and transfer tokens once at the end. That is the next lesson, and it
+  depends on the manager being able to see every leg of the sequence.<Cite src="uniswap-v4-vision" />
+- **Hooks.** A per-pool contract called at fixed lifecycle points only makes sense when the pool is a
+  record rather than a deployment — otherwise "attach a hook" would mean deploying a new pool
+  implementation.<Cite src="uniswap-hooks-docs" /> The key field you saw above is the whole
+  attachment mechanism.
+
+The thing to carry forward is the field you would not have predicted: **a pool's identity now
+includes the address of a contract someone else wrote.** Everything else in this module is a
+consequence of that.

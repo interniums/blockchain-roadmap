@@ -1,0 +1,484 @@
+---
+id: app-wagmi-ssr-flash
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [wagmi-ssr, wagmi-create-config, wagmi-provider-doc, wagmi-src-create-config, wagmi-src-cookie, wagmi-src-create-storage, wagmi-src-hydrate-core, wagmi-src-react-hydrate, wagmi-use-connection, wagmi-use-connectors, tanstack-query-ssr, nextjs-server-client-components, nextjs-headers, eip-6963, mipd-repo]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+Hard-refresh a connected Next.js dapp and record your screen. Frame by frame you will see this:
+
+1. **Connect wallet**
+2. **Connect wallet**
+3. `0xd8dA…6045`
+
+Somewhere between two and four hundred milliseconds in which your application told a returning,
+connected user that they were a stranger. It is not a rendering glitch and it is not slow
+JavaScript — it is a correct consequence of where wagmi keeps connection state, and it has a real
+fix that most apps have half-installed.
+
+"Half-installed" is the important word. There are **two different defects** hiding behind that
+recording, they have different causes and different fixes, and the flag most teams reach for solves
+exactly one of them while leaving the visible one untouched.
+
+## The server cannot know, and it is not wagmi's fault
+
+wagmi reconstructs connection state on the client from two sources, both of which exist only in a
+browser.
+
+**Persistent storage.** `createConfig`'s `storage` defaults to `createStorage` over
+`window.localStorage` when a window exists, and a no-op store
+otherwise.<Cite src="wagmi-create-config" /> Which connector you used last, which accounts it
+reported, and which chain you were on live there.
+
+**[EIP-6963](/c/wagmi-eip6963-discovery) announcements.** The set of injected wallets is discovered
+by dispatching a window event and collecting the replies, through the `mipd`
+library.<Cite src="eip-6963" /><Cite src="mipd-repo" /> In wagmi's source that store is only created
+at all when `typeof window !== 'undefined'`.<Cite src="wagmi-src-create-config" />
+
+Now think about what a server render has. It has a URL, some headers, and a cookie jar. It has no
+`localStorage`, no `window`, and nobody to dispatch an event to. So the HTML it produces says
+"disconnected", necessarily and always — not because wagmi failed to look, but because the
+information is not in the request.
+
+That leaves the client with two ways to be wrong, and the choice between them is what `ssr` is for.
+
+**Render the truth immediately and React objects.** The client store reads `localStorage`
+synchronously during the first render, produces "connected", and React finds markup that does not
+match the server's. You get a hydration mismatch error in the console, and React discards and
+re-renders the subtree.
+
+**Defer the read and the user sees the lie.** The client renders "disconnected" to match the server,
+then reads storage in an effect and re-renders. React is happy. The user watched their identity
+appear.
+
+<Misconception
+  belief="The flash is a performance problem — the app is reading localStorage too slowly, or hydration is slow."
+  reality="It is a correctness constraint. The first paint is produced from a request that contains no wallet information, so the only way to remove the flash is to put the information into the request."
+  why="The symptom is a timing artefact, and every other flash-of-wrong-content problem in web development really is about load order."
+  src="wagmi-ssr"
+/>
+
+## What `ssr: true` actually does
+
+The documentation describes the flag as indicating that the config is used in a server-side rendering
+environment, and says turning it on means content from the external stores will be hydrated on the
+client **after the initial mount**.<Cite src="wagmi-create-config" /><Cite src="wagmi-ssr" /> The
+source makes that concrete in three places, and each one is worth knowing because each one explains
+a symptom.
+
+**It defers the persisted read.** The store is built with zustand's `persist` middleware and
+`skipHydration: ssr`.<Cite src="wagmi-src-create-config" /> With the flag on, the config is
+constructed without touching storage; something must later call `rehydrate()`.
+
+**It moves the mount work out of render.** wagmi's `Hydrate` component calls `onMount()` directly
+during render when `ssr` is false, and inside a `useEffect` when it is
+true.<Cite src="wagmi-src-react-hydrate" /> That is the entire mechanism by which the mismatch
+disappears: the first client render is guaranteed not to have consulted any browser-only source.
+
+**It gates EIP-6963 discovery at construction.** In `createConfig`, discovered providers are appended
+to the connectors store only when `!ssr`; with the flag on, that work moves into `onMount`, which
+rehydrates the store and then adds the announced connectors.<Cite src="wagmi-src-create-config" /><Cite src="wagmi-src-hydrate-core" />
+This is why an SSR app's wallet list is empty for a beat — the same deferral, applied to a different
+store.
+
+So `ssr: true` buys you a clean console and costs you a visible flash. It changes **when** the client
+reads its own storage. It puts nothing into the server's HTML, because it cannot: the server still
+has no wallet information.
+
+<Misconception
+  belief="Setting ssr: true fixes Next.js hydration."
+  reality="It removes the hydration warning by deferring the client-store read to an effect. The disconnected-then-connected flash is still there, and is arguably now guaranteed rather than intermittent."
+  why="The flag is named after the environment rather than after its behaviour, so it reads as 'make this work under SSR'."
+  src="wagmi-ssr"
+/>
+
+## Cookies are the only channel the server can read
+
+If the fix is "put the information into the request", there is exactly one place a browser puts
+information into a request without JavaScript: the cookie header. wagmi's answer is to swap the
+storage backend.<Cite src="wagmi-ssr" />
+
+```ts
+import { createConfig, createStorage, cookieStorage, http } from 'wagmi'
+import { mainnet, base } from 'wagmi/chains'
+
+export function getConfig() {
+  return createConfig({
+    chains: [mainnet, base],
+    ssr: true,
+    storage: createStorage({ storage: cookieStorage }),
+    transports: { [mainnet.id]: http(), [base.id]: http() },
+  })
+}
+```
+
+`cookieStorage` is thirty lines: `getItem` parses `document.cookie`, `setItem` writes
+`key=value;path=/;samesite=Lax`, `removeItem` sets `max-age=-1`.<Cite src="wagmi-src-cookie" /> On the
+server side, `cookieToInitialState(config, cookie)` looks for the entry named
+`` `${config.storage?.key}.store` ``, deserialises it, and returns the `state`
+field.<Cite src="wagmi-src-cookie" /> The default storage key prefix is `wagmi`, so the cookie you
+are looking for in devtools is `wagmi.store`.<Cite src="wagmi-src-create-storage" />
+
+Then the server component reads the header and threads the result down:<Cite src="wagmi-ssr" />
+
+```tsx
+// app/layout.tsx — a Server Component
+import { headers } from 'next/headers'
+import { cookieToInitialState } from 'wagmi'
+import { getConfig } from './config'
+import { Providers } from './providers'
+
+export default async function Layout({ children }) {
+  const initialState = cookieToInitialState(getConfig(), (await headers()).get('cookie'))
+  return (
+    <html lang="en">
+      <body>
+        <Providers initialState={initialState}>{children}</Providers>
+      </body>
+    </html>
+  )
+}
+```
+
+`headers()` is asynchronous and must be awaited — it was synchronous in Next.js 14 and
+earlier.<Cite src="nextjs-headers" /> Most wagmi snippets you will find predate that change and will
+hand you a promise where you expected a `Headers`.
+
+<Aside kind="warn">
+`headers()` is a request-time API, and using it **opts the route into dynamic
+rendering**.<Cite src="nextjs-headers" /> Calling it in the root layout therefore makes every page
+under that layout dynamic. That is a real cost — no static generation, no full-route cache — paid to
+remove a 300ms flash, and it is a product decision rather than a technical one. A marketing page and
+a portfolio page do not have to make it the same way; the usual compromise is to scope the wagmi
+provider to the authenticated part of the tree rather than the root.
+</Aside>
+
+<Aside kind="note">
+wagmi's SSR guide documents this for the Next.js App Router only. The **Pages Directory** and
+**Vanilla SSR** sections of that page are both a single line inviting you to open a pull
+request.<Cite src="wagmi-ssr" /> The mechanism transfers — read the cookie header wherever your
+framework exposes it, call `cookieToInitialState` with the same config, pass the result as
+`initialState` — but you are assembling it from the primitives rather than following a recipe, and
+the blog posts that appear to have a recipe are usually reproducing the App Router code with the
+imports changed.
+</Aside>
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'ssr: true alone', note: 'the flag most apps have', tone: 'warn' },
+    { title: 'ssr: true plus cookieStorage', note: 'and cookieToInitialState', tone: 'good' },
+  ]}
+  rows={[
+    {
+      label: 'What is in the HTML the server produced?',
+      cells: [
+        'Disconnected — the request carried no wallet information',
+        'The last-known connection, read out of the wagmi.store cookie',
+      ],
+    },
+    {
+      label: 'Is there a hydration mismatch?',
+      cells: [
+        'No — the client store read is deferred to an effect',
+        'No, for the same reason',
+      ],
+    },
+    {
+      label: 'What does the user see in the first frame?',
+      cells: [
+        'Connect wallet',
+        'Their address, if the component branches on address',
+      ],
+    },
+    {
+      label: 'What is the state during that frame?',
+      cells: [
+        'Genuinely empty',
+        'Connections and chain id present, with status reconnecting',
+      ],
+    },
+    {
+      label: 'What does it cost?',
+      cells: [
+        'Nothing',
+        'headers() opts the route into dynamic rendering',
+      ],
+    },
+  ]}
+  caption="The flag and the cookie fix different halves of the recording at the top of this lesson."
+  alt="Setting wagmi's ssr flag alone against pairing it with cookieStorage: the flag removes the hydration mismatch in both cases, but only the cookie puts a connection into the server's HTML, at the cost of opting the route into dynamic rendering."
+/>
+
+## Five moments, and exactly where the flash lives
+
+The whole problem fits in one sequence. Follow a hard refresh by a connected user through it twice,
+once without cookie storage and once with, and the fix stops being a configuration incantation.
+
+<Figure
+  caption="The wallet is not asked whether it is still authorised until the last of these five, which is why the fix has to change what the third one renders."
+  alt="A hard refresh in five moments: the request arrives carrying only a cookie header and a URL; the server renders with no window and no storage; the browser paints that HTML; React hydrates against matching markup; and only then does an effect rehydrate the store, append discovered connectors and call reconnect."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'req', label: 'the request arrives', note: 'a cookie header, a URL, nothing else', col: 0 },
+      { id: 'srv', label: 'the server renders', note: 'no window, no storage, nobody to ask', col: 1 },
+      { id: 'paint', label: 'the browser paints', note: 'what the user sees first', col: 2, tone: 'accent' },
+      { id: 'hyd', label: 'React hydrates', note: 'markup matches; no mismatch', col: 3 },
+      { id: 'mount', label: 'the effect runs', note: 'rehydrate, add connectors, reconnect', col: 4, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+**Moment 1 — the request arrives.** Cookie header, URL, nothing else. Without cookie storage there is
+no wallet information anywhere in it.
+
+**Moment 2 — the server renders.** The Config is constructed with `skipHydration: true`, so storage
+is not consulted, and no `mipd` store exists because there is no
+`window`.<Cite src="wagmi-src-create-config" /> Without a cookie, `initialState` is `undefined` and
+the state is genuinely empty. With one, `hydrate()` has already put the connections map and the chain
+id into the store before any component renders.<Cite src="wagmi-src-hydrate-core" />
+
+**Moment 3 — HTML reaches the browser and paints.** This is the frame the user sees first, and the
+only frame you can change. Without the cookie it says "Connect wallet". With it, it can say
+`0xd8dA…6045` — if your component reads `address` rather than `isConnected`.
+
+**Moment 4 — React hydrates.** The client renders from the same state the server had, so the markup
+matches and there is no mismatch. This is what `ssr: true` bought, in both
+configurations.<Cite src="wagmi-src-react-hydrate" />
+
+**Moment 5 — the effect runs.** `onMount` rehydrates the persisted store, appends the discovered
+EIP-6963 connectors, and calls `reconnect`, which actually asks the connector whether it is still
+authorised.<Cite src="wagmi-src-hydrate-core" /> Only now does `status` become `'connected'` or
+`'disconnected'`, and only now is the wallet list complete.
+
+**The flash is the gap between moments 3 and 5**, and cookie storage does not shorten it — the
+connector still has to answer. What cookie storage changes is what moment 3 renders. That is the
+entire idea, and it is why "make hydration faster" is not a plan.
+
+## The state that arrives is `reconnecting`, not `connected`
+
+Here is the detail that turns a working setup into "it still flashes, but less", and it is in
+`hydrate()`. When an `initialState` is supplied, wagmi sets the state
+to:<Cite src="wagmi-src-hydrate-core" />
+
+```ts
+config.setState({
+  ...initialState,
+  chainId: /* initialState.chainId if configured, else chains[0].id */,
+  connections: reconnectOnMount ? initialState.connections : new Map(),
+  status: reconnectOnMount ? 'reconnecting' : 'disconnected',
+})
+```
+
+`reconnectOnMount` defaults to `true`, so on the server render you get the connections map, the
+address inside it, the chain id — and `status: 'reconnecting'`.<Cite src="wagmi-provider-doc" /><Cite src="wagmi-src-hydrate-core" />
+Not `'connected'`. The connector has not answered yet; it cannot, because there is no
+browser.<Cite src="wagmi-use-connection" />
+
+That is honest, and it means a component written as
+
+```tsx
+const { address, isConnected } = useConnection()
+if (!isConnected) return <ConnectButton />
+```
+
+still renders the connect button on the server, and still flashes, with the cookie doing everything
+right. `isConnected` is derived from `status`, and `status` is `'reconnecting'`.<Cite src="wagmi-use-connection" />
+
+**Branch on what you actually have.** During `'reconnecting'` you have an address you can render —
+optimistically, because the wallet has not confirmed it — and you do not yet have a wallet you can
+send a transaction to. Those are different questions and they deserve different guards:
+
+| Question | Guard |
+|---|---|
+| What identity do I paint? | `address` is defined |
+| Is this state settled? | `status === 'connected'` or `'disconnected'` |
+| May I prompt for a signature or a write? | `status === 'connected'` |
+
+Treating `'reconnecting'` as disconnected is the single most common reason a correctly configured
+cookie setup still flashes. Treating it as connected is how you enable a Send button that has nothing
+to send through.
+
+## Two providers, one client component, and a QueryClient per mount
+
+`WagmiProvider` and `QueryClientProvider` are React context providers, and React context is not
+supported in Server Components — the file must carry `"use client"`.<Cite src="nextjs-server-client-components" /><Cite src="wagmi-ssr" />
+wagmi's own guide says the provider **must** be in a Client Component and shows the
+pattern:<Cite src="wagmi-ssr" />
+
+```tsx
+'use client'
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { useState } from 'react'
+import { type State, WagmiProvider } from 'wagmi'
+import { getConfig } from './config'
+
+export function Providers({ children, initialState }: { children: React.ReactNode; initialState: State | undefined }) {
+  const [config] = useState(() => getConfig())
+  const [queryClient] = useState(() => new QueryClient())
+
+  return (
+    <WagmiProvider config={config} initialState={initialState}>
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    </WagmiProvider>
+  )
+}
+```
+
+Two things in that snippet are not stylistic.
+
+**`useState(() => new QueryClient())`, not a module-level constant.** TanStack's server-rendering
+guide is unambiguous: a `QueryClient` at module scope in a server-rendering app is shared across
+every request the process handles.<Cite src="tanstack-query-ssr" /> The cache is keyed by query key,
+and a query key contains an address — so user A's balance, fetched during their render, is a warm
+cache entry when user B's render asks the same question with the same key. You do not need a
+malicious actor for this; you need two users and one Node process. It is a data-leak class of bug
+that presents as "the wrong balance sometimes", which is why it survives so long.
+
+**`useState(() => getConfig())`, not a module-level `createConfig`.** Same reasoning, plus the
+single-config rule from this module's first lesson: a Config built at module scope in a server
+process is one Config for all requests, and its store would be shared the same way.
+
+<Aside kind="note">
+A `QueryClient` created per mount and a Config created per mount both look wasteful to a client-side
+instinct — you are constructing objects on every navigation. You are not: `useState` with an
+initialiser function runs it once per component instance, and the provider mounts once per page
+load. The waste you are avoiding is measured in incidents.
+</Aside>
+
+## What is actually in that cookie
+
+Worth knowing before you ship it, because it is now on every request to your origin.
+
+`partialize` in `createConfig` restricts the persisted object to three things: `connections`, with
+each connector reduced to its `id`, `name`, `type` and `uid`; `chainId`; and `current`, the uid of
+the active connection.<Cite src="wagmi-src-create-config" /> No private keys, no signatures — but
+**the user's address, on every request**, readable by your server and by anything that terminates TLS
+for you.
+
+Three practical consequences.
+
+**It is not `httpOnly` and it cannot be.** It is written by `document.cookie` from client
+JavaScript.<Cite src="wagmi-src-cookie" /> Any script on your origin can read it. That is the same
+trust boundary as `localStorage`, so the change is not a downgrade — but it now also travels to your
+server, which is a new place for it to be logged.
+
+**`samesite=Lax` and `path=/` are chosen for you**, and there is no `secure` attribute in the
+implementation.<Cite src="wagmi-src-cookie" /> If your compliance posture requires more, you supply
+your own `BaseStorage` implementation to `createStorage` rather than editing wagmi.
+
+**The persisted `chainId` is validated on read.** `createConfig` checks the persisted chain against
+the configured `chains` and falls back to the default when it does not
+match.<Cite src="wagmi-src-create-config" /> Remove a chain from your config and returning users
+silently land on your first configured chain — which is correct, and which is a chain change nobody
+initiated. The next lesson is about what that costs.
+
+## Getting the address into the first paint
+
+The module's practice exercise asks for exactly one observable outcome: the address string is present
+in the initial HTML response, before any client JavaScript runs. Here is the reasoning, step by
+purpose.
+
+**Subgoal — prove which of the two defects you have.** With client JavaScript disabled, load the page
+and view source. If the address is absent, the cookie path is not working and no amount of React
+debugging will help. If it is present but the browser still flashes, your components are branching on
+`isConnected` during `'reconnecting'`. These are different bugs and the test separates them in
+seconds.
+
+**Subgoal — confirm the cookie exists and is named what the server looks for.** In devtools, find
+`wagmi.store` on your origin.<Cite src="wagmi-src-create-storage" /><Cite src="wagmi-src-cookie" />
+If it is absent, `storage: createStorage({ storage: cookieStorage })` is missing or a second Config
+without it is the one your app actually uses. If it is present but named differently, you passed a
+custom `key` and `cookieToInitialState` is deriving the name from the config you handed it — which
+must be the same config.
+
+**Subgoal — verify the server is reading the header at all.** Log the return value of
+`cookieToInitialState`. `undefined` means the cookie header was missing, the entry was absent, or
+deserialisation threw — the implementation catches and returns `undefined` for all
+three.<Cite src="wagmi-src-cookie" /> A silent `undefined` is the most common failure and the
+`await` on `headers()` is the most common reason for it.<Cite src="nextjs-headers" />
+
+**Subgoal — check the prop actually reaches `WagmiProvider`.** `initialState` is a prop on the
+provider, not a global.<Cite src="wagmi-provider-doc" /> It has to be threaded from the server
+component through your client provider component, and it is easy to accept the prop and forget to
+pass it on.
+
+**Subgoal — fix the guards.** Render identity from `address`, gate actions on
+`status === 'connected'`, and show a subdued reconnecting affordance in between rather than the
+connect button.<Cite src="wagmi-use-connection" />
+
+**Subgoal — check the wallet list separately.** Even with all of the above, `useConnectors()` is
+short on the first client render, because discovered connectors are added during `onMount` when `ssr`
+is true.<Cite src="wagmi-src-hydrate-core" /><Cite src="wagmi-use-connectors" /> A picker rendered
+from a memoised snapshot of that array will be missing wallets. This is a separate deferral with the
+same root cause, and it is not fixed by the cookie.
+
+<Check type="predict" concept="wagmi-cookie-storage">
+A team ships the cookie setup. `ssr: true`, `cookieStorage`, `cookieToInitialState` in
+`app/layout.tsx`, providers in a `"use client"` file, `QueryClient` in `useState`. Four things
+happen. Predict the cause of each.
+
+1. The flash is gone on the dashboard but still present on the marketing homepage, which uses the
+   same root layout.
+2. A user reports the dashboard showed another user's token balance for a second after login. It has
+   happened twice, in production, never locally.
+3. The wallet picker shows two entries on first open and four a moment later.
+4. Lighthouse reports the site is no longer statically rendered, and TTFB has gone up.
+
+<Answer>
+**1 — the marketing page is not rendering the wagmi component.** The cookie and the initial state are
+present for both routes; the flash is a property of the component that reads connection state. If the
+homepage renders a header with a connect button that branches on `isConnected`, that branch is false
+during `'reconnecting'` and the button flashes there while the dashboard, branching on `address`,
+does not.<Cite src="wagmi-use-connection" /><Cite src="wagmi-src-hydrate-core" /> The fix is in the
+guard, not in the configuration — which is why "it works on one page" is a diagnosis rather than a
+mystery.
+
+**2 — a shared cache across requests.** The described setup puts the `QueryClient` in `useState`, so
+either that is not what shipped, or the same mistake exists elsewhere: a Config built at module
+scope, a second `QueryClient` created in a utility module, or a cache adapter with process-level
+state. TanStack's guidance exists exactly because a module-scope client in a server-rendering process
+is shared by every render.<Cite src="tanstack-query-ssr" /> "Never locally" is the signature: one
+developer, one request at a time, no interleaving. The reproduction is two concurrent requests for
+different addresses against one server process.
+
+**3 — EIP-6963 discovery deferred to onMount, working correctly.** With `ssr: true`, discovered
+providers are not appended at config construction; they are added when `onMount` rehydrates the
+store.<Cite src="wagmi-src-create-config" /><Cite src="wagmi-src-hydrate-core" /> The two initial
+entries are the explicitly configured connectors; the later four include the announced ones. Nothing
+is broken. If the jump is objectionable, reserve the space rather than memoising the array — the list
+is designed to grow, since a wallet may announce at any point in the page's
+life.<Cite src="eip-6963" />
+
+**4 — `headers()` opted the root layout into dynamic rendering, and that is the deal.** Reading the
+request's cookie is a request-time API by definition, so the route cannot be prerendered.<Cite src="nextjs-headers" />
+There is no configuration that gives you both a server-rendered connected state and a static page,
+because they are contradictory requirements. The available move is scope: put the wagmi provider and
+the `headers()` call in a layout that covers only the routes that need a connected identity, and
+leave the marketing tree static.
+
+**The pattern across all four.** Three of them are the system behaving as designed, and the
+surprising one is the data leak — which is the only one that is not about wagmi at all. Server
+rendering turns "one process, many users" from a backend concern into a frontend concern, and the
+per-request lifetime of every object holding user state is the thing to review.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**A first paint that tells the truth.** Cookie storage puts the last-known connection into the
+request, `cookieToInitialState` turns it into an `initialState`, and your guards distinguish "I know
+who this is" from "the wallet has confirmed it".
+
+**A checklist for any provider you add next.** Client component, per-mount instance, no module-scope
+state that holds a user's data, and an explicit answer to what the server render can and cannot know.
+
+**One lesson left, and it is the one that returns wrong answers instead of missing ones.** The chain
+in the wallet and the chain in your hook are separate pieces of state. When they disagree your app
+does not break — it confidently shows a balance from a chain the user is not on.

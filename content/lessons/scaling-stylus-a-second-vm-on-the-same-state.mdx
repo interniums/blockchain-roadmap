@@ -1,0 +1,318 @@
+---
+id: scaling-stylus-a-second-vm-on-the-same-state
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [arbitrum-stylus-gentle-intro, arbitrum-stylus-vm-differences, arbitrum-stylus-troubleshooting, arbitrum-stylus-activation, arbitrum-stylus-gas-metering, arbitrum-stylus-opcode-hostio-pricing, arbitrum-stylus-non-rust-wasm, arbos32-release-notes, arbitrum-precompiles-reference, arbitrum-inside-nitro, eip-170, arbitrum-stylus-sdk-overview]
+stack: {}
+---
+
+Point an RPC client at Arbitrum One and call `eth_getCode` on two contract addresses. The first
+comes back starting `0x60806040` — the Solidity dispatcher prologue you have read a hundred times.
+The second comes back starting `0xEFF00000`, and then a run of bytes that is not EVM bytecode at
+all, in any encoding, under any compiler version.
+
+Now call a view function on each. Both work. Same `eth_call`, same ABI encoding of the arguments,
+same 32-byte-padded return data, same revert semantics if you pass something invalid. Your client
+library does not have a code path for the second case, because from where it stands there is no
+second case.
+
+Something is executing that second contract, and it is not the EVM. That is the whole subject of
+this module, and getting the shape of it right in the first five minutes saves you from a family of
+wrong conclusions later.
+
+<Figure
+  caption="Two machines, one state — the only fork in the path is a four-byte check on the contract's own code."
+  alt="A call to an Arbitrum address makes the node read the account's code and branch on its first four bytes to either the EVM or a separate WASM VM; both engines then read and write the same storage layer."
+>
+  <Flow
+    lanes={['the call', 'the branch', 'the engine', 'the state']}
+    nodes={[
+      { id: 'call', label: 'call to an address', note: 'ordinary tx, ordinary ABI', col: 0 },
+      { id: 'read', label: 'read the code', note: 'inspect the first four bytes', col: 1, tone: 'accent' },
+      { id: 'evm', label: 'EVM', note: 'code starts 0x60…', col: 2 },
+      { id: 'wasm', label: 'WASM VM', note: 'code starts 0xEFF00000', col: 2, tone: 'accent' },
+      { id: 'state', label: 'one storage layer', note: 'same slots, same prices', col: 3 },
+    ]}
+    edges={[
+      { from: 'call', to: 'read' },
+      { from: 'read', to: 'evm' },
+      { from: 'read', to: 'wasm', tone: 'accent' },
+      { from: 'evm', to: 'state' },
+      { from: 'wasm', to: 'state' },
+    ]}
+  />
+</Figure>
+
+## The prefix is a dispatch decision, not a format marker
+
+Arbitrum's troubleshooting page states the rule directly: a special EOF-inspired prefix
+distinguishes Stylus contracts from traditional EVM contracts, and when a contract's bytecode starts
+with the magic `0xEFF00000` prefix, it is a Stylus WASM
+contract.<Cite src="arbitrum-stylus-troubleshooting" /> The same page notes that Stylus contracts
+are deployed on-chain as a blob of bytes exactly as EVM ones are, with no special transaction type —
+the only difference being that when the contract executes, a separate WASM runtime is invoked
+instead of the EVM.<Cite src="arbitrum-stylus-troubleshooting" />
+
+Read that as a change to one branch in the node. When a call lands on an address, the node reads the
+account's code, checks the first four bytes, and picks a machine. Everything before that branch —
+address derivation, nonce handling, calldata, value transfer, gas accounting at the transaction
+level — is unchanged. Everything after it is a different execution engine.
+
+That is what **Stylus** is: an upgrade to Arbitrum Nitro, shipped in ArbOS 32, that adds a second,
+coequal virtual machine alongside the EVM.<Cite src="arbitrum-stylus-gentle-intro" /><Cite src="arbos32-release-notes" />
+Arbitrum's own name for the arrangement is MultiVM, and the documentation is explicit that it is
+additive: EVM contracts continue to behave exactly as they would on
+Ethereum.<Cite src="arbitrum-stylus-gentle-intro" />
+
+<Aside kind="note">
+The prefix borrows its shape from EOF — the `0xEF` byte that [EIP-170's](/c/code-deposit-and-size-limits)
+era of contract deployment reserved as invalid start-of-code — precisely so that no existing EVM
+contract can be mistaken for a Stylus one and no Stylus contract can be run by
+accident.<Cite src="arbitrum-stylus-troubleshooting" /><Cite src="eip-170" /> The reservation is what
+makes a one-branch dispatch safe rather than ambiguous.
+</Aside>
+
+### Reading the answer off the chain rather than off the bytes
+
+The prefix tells you a contract *is* WASM. It does not tell you the contract can currently run,
+which turns out to be a different question with a different answer, and the chain exposes both.
+
+Activation is handled by a precompile, `ArbWasm`, at address
+`0x0000000000000000000000000000000000000071`.<Cite src="arbitrum-stylus-activation" /><Cite src="arbitrum-precompiles-reference" />
+Two of its views are the ones you will reach for. `codehashVersion(bytes32)` returns the Stylus
+protocol version a given codehash was activated against, and reverts if the code is not activated,
+needs an upgrade, or has expired. `programTimeLeft(address)` returns the number of seconds until
+that program expires.<Cite src="arbitrum-stylus-activation" />
+
+Sit with the second signature for a moment. A view function, on a chain precompile, whose entire
+job is to tell you how long a deployed contract has left. Nothing in the EVM has a counterpart,
+because in the EVM the answer is always "forever". That single method is the fourth lesson of this
+module in miniature.
+
+## What "coequal" is claiming, precisely
+
+The word does a lot of work, so pin it to observable facts rather than to a feeling of equality.
+
+**One account space.** A Stylus contract has an ordinary Arbitrum address, an ordinary balance, and
+an ordinary nonce. It is created by the same deployment mechanism, and it can be the target of a
+`CALL` from any contract on the chain.<Cite src="arbitrum-stylus-troubleshooting" />
+
+**One storage layer.** Arbitrum's VM-differences page states that both environments use the same
+storage system — a 256-bit key-value store — that EVM and WASM contracts can share storage, and that
+`SLOAD` and `SSTORE` costs are identical between
+them.<Cite src="arbitrum-stylus-vm-differences" /> The [storage slot](/c/storage-slot) model you
+learned for Solidity is not translated for Stylus; it is the same slots in the same trie.
+
+**One set of call semantics.** The same page records that both environments support contract calls
+and delegate calls, value transfers, event emission, block and transaction properties, `keccak256`,
+`CREATE` and `CREATE2`, and revert handling; that ABI encoding is identical in both directions; and
+that gas forwarding follows [the 63/64 rule](/c/63-64-rule) in both
+cases.<Cite src="arbitrum-stylus-vm-differences" /> Call depth is capped at 1024 levels in the WASM
+VM as well, explicitly for compatibility.<Cite src="arbitrum-stylus-vm-differences" />
+
+**One fraud-proof system.** This is the part that makes the whole thing structurally possible rather
+than merely convenient, and it is worth a paragraph of its own.
+
+### Why Arbitrum could add a VM and Ethereum could not
+
+You know from [the rollup module](/c/rollup) that an optimistic rollup's settlement rests on a
+[fraud proof](/c/fraud-proof): a dispute is bisected down to a single step of execution, and that
+one step is replayed by a contract on L1. The replayed machine has to be something the L1 contract
+can execute.
+
+Nitro's answer to that, since long before Stylus, was WASM. The gentle introduction makes the
+lineage explicit: WASM has been a fundamental component of Arbitrum's fraud proofs ever since the
+Nitro upgrade, and Stylus builds on that same fraud-proving
+technology.<Cite src="arbitrum-stylus-gentle-intro" /><Cite src="arbitrum-inside-nitro" /> In normal
+operation a Stylus program executes as native code for speed; if there is a dispute, the execution
+history compiles to WASM so validators can run interactive fraud proofs on
+Ethereum.<Cite src="arbitrum-stylus-gentle-intro" />
+
+**Subgoal 1 — name what a new VM normally costs.** Adding an execution environment to a chain
+usually means writing a new dispute protocol for it, because every state transition the chain
+accepts must be arbitrable.
+
+**Subgoal 2 — check what Nitro already had.** Nitro's dispute machinery already replays WASM,
+because that is the form its own state transition function takes when it is being proven.
+
+**Subgoal 3 — state the consequence.** A WASM VM for user programs reuses the proving machinery
+rather than requiring a new one. The result, in Arbitrum's phrasing, is a system where any program
+compiled to WASM can be deterministically fraud-proven.<Cite src="arbitrum-stylus-gentle-intro" />
+
+**Subgoal 4 — say what does not follow.** This argument is entirely about Arbitrum's architecture.
+It does not say a second VM is cheap in general, and it does not transfer to a chain whose dispute
+protocol or validity proof is built around EVM execution. Stylus is documented as an upgrade to the
+stack powering Arbitrum One, Arbitrum Nova and Arbitrum
+chains.<Cite src="arbitrum-stylus-gentle-intro" /> Code you write for it is not code you can move to
+an unrelated L2, and no part of the design promises otherwise.
+
+<Compare
+  columns={[
+    { title: 'EVM contract', note: 'Solidity, Vyper, anything that emits bytecode' },
+    { title: 'Stylus contract', note: 'Rust, C, C++ — anything that emits WASM', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'Which engine executes the code?', cells: ['The EVM', { v: 'A separate WASM runtime', tone: 'accent' }] },
+    { label: 'What selects that engine?', cells: ['Code that does not start 0xEF', 'The 0xEFF00000 prefix'] },
+    { label: 'Where does its storage live?', cells: ['The chain\'s 256-bit key-value store', 'The same store — shared, not mirrored'] },
+    { label: 'What do SLOAD and SSTORE cost?', cells: ['EVM prices', { v: <>Identical<Cite src="arbitrum-stylus-vm-differences" /></>, tone: 'warn' }] },
+    { label: 'How are arguments encoded?', cells: ['ABI', 'The same ABI, in both directions'] },
+    { label: 'How much gas does a sub-call get?', cells: ['63/64 of what remains', 'The same 63/64 rule'] },
+    { label: 'How deep can calls nest?', cells: ['1024 frames', '1024 frames, capped for compatibility'] },
+    { label: 'What replays a disputed step on L1?', cells: ['WASM, via Nitro\'s fraud proofs', 'WASM, via the same fraud proofs'] },
+  ]}
+  caption="Everything a caller can observe is shared; the divergence is one branch deep and never reaches the wire."
+  alt="EVM and Stylus contracts held against the same questions: which engine runs them, what selects it, where storage lives, what storage costs, argument encoding, gas forwarding, call depth, and what replays a disputed step on L1."
+/>
+
+## What a WASM program cannot do by itself
+
+Here is the fact that shapes every cost argument in the rest of the module, and it follows from
+taking "separate VM" literally.
+
+WebAssembly, as a specification, knows about a linear memory, a typed operand stack, locals,
+functions and control flow. It knows nothing about accounts, storage slots, block numbers, or the
+identity of a caller. None of that is in the instruction set, because none of it is in the language.
+So a Stylus program reaches the chain the only way a sandboxed WASM module can reach anything: by
+calling out to its host.
+
+Arbitrum names these calls **host I/Os**, or hostios, and prices them separately from opcodes. The
+reference page is explicit about what is happening physically: certain operations require suspending
+WASM execution so that the Stylus VM can perform the task natively in the host, and doing so costs
+about 0.84 gas.<Cite src="arbitrum-stylus-opcode-hostio-pricing" /> The published table is a list of
+exactly the things a contract cannot compute for itself — `msg_sender`, `block_number`, `chain_id`,
+`read_args`, `write_result`, `keccak`, `evm_gas_left`, and the rest — each with an ink
+price.<Cite src="arbitrum-stylus-opcode-hostio-pricing" />
+
+Two things follow, and both are worth carrying into the cost lesson.
+
+**The execution flow has a shape.** Arbitrum draws it as: transaction, then the WASM VM, then native
+code execution, with hostio calls branching off for state
+access.<Cite src="arbitrum-stylus-vm-differences" /> Pure computation stays inside the fast native
+region. Anything that touches the world leaves it.
+
+**The boundary is where the EVM's prices reappear.** When a hostio performs a storage read, what
+happens on the other side of that call is an ordinary `SLOAD` against an ordinary trie, charged at
+the ordinary rate. Nothing about running in a faster VM makes the state access cheaper, because the
+state access is not the part running in the faster VM. This is the mechanism behind the module's
+central asymmetry, and it is why that asymmetry is structural rather than an artefact of current
+pricing that a future release might tune away.
+
+<Aside kind="note">
+The `0xEFF00000` blob is not the WASM your compiler emitted. `cargo stylus` strips custom sections,
+removes dangling references, adds a project-hash metadata section, and Brotli-compresses the result
+at maximum level before the prefix goes on the front — which is why the bytes on chain are smaller
+than the module they represent.<Cite src="arbitrum-stylus-activation" /> Hold that thought; it comes
+back when the documentation gives you two different numbers for the maximum contract size.
+</Aside>
+
+## The distinction everybody gets wrong
+
+Every previous "write contracts in a language other than Solidity" project you have met was a
+compiler. Vyper produces EVM bytecode. Yul produces EVM bytecode. So does Huff, so does Fe. The
+output is a `0x60...` blob and the EVM runs it. The claim "you can write contracts in Rust" arrives
+pre-loaded with that shape, and the shape is wrong here.
+
+Arbitrum answers the question in as many words. Asked whether Stylus contracts compile down to EVM
+bytecode like prior attempts, the documentation says: no — Stylus contracts are compiled down to
+WASM, from a program written in Rust, C or C++.<Cite src="arbitrum-stylus-troubleshooting" />
+
+<Misconception
+  belief="Stylus is Rust compiled down to EVM bytecode, the way Vyper is Python-flavoured syntax compiled down to EVM bytecode."
+  reality="Nothing is transpiled. The WASM is stored on-chain behind a 0xEFF00000 prefix and executed by a separate WASM runtime — a fork of Wasmer — that compiles to the node's native machine code."
+  why="Every earlier alternative-language project for Ethereum was a compiler to EVM bytecode, so the category 'contracts in language X' has one established meaning and Stylus does not fit it."
+  src="arbitrum-stylus-troubleshooting"
+/>
+
+The difference is not a technicality. Four consequences follow from it that would not follow from a
+compiler, and each of them is a lesson in this module:
+
+- **A different metering unit.** Because WASM instructions are far cheaper than EVM opcodes, Stylus
+  meters in **ink** and converts to gas, at a documented rate of 10,000 ink to 1
+  gas.<Cite src="arbitrum-stylus-gas-metering" /> A compiler to EVM bytecode has no reason to invent
+  a unit.
+- **A different memory price.** The EVM charges for memory with
+  [a quadratic term](/c/memory-expansion-quadratic); Stylus charges by the 64 KB WASM
+  page.<Cite src="arbitrum-stylus-vm-differences" />
+- **A deployment step Solidity does not have.** WASM must be *activated* — compiled to native code
+  and registered — before the contract is callable at all.<Cite src="arbitrum-stylus-activation" />
+- **A different size limit, measured differently.** Not the EVM's 24,576-byte deployed-bytecode
+  ceiling.<Cite src="eip-170" /><Cite src="arbitrum-stylus-vm-differences" /> Which limit, exactly,
+  is a question the documentation currently answers two ways; the final lesson of this module deals
+  with that honestly.
+
+<Misconception
+  belief="Stylus replaces the EVM on Arbitrum, so existing Solidity contracts are on a deprecation path."
+  reality="It is additive. Arbitrum's own framing is MultiVM: EVM contracts continue to behave exactly as they would on Ethereum, and the two VMs call each other freely."
+  why="'New VM' reads as 'migration' because that is what a new VM has meant on every chain that shipped one before."
+  src="arbitrum-stylus-gentle-intro"
+/>
+
+## The language is not the boundary either
+
+One more correction, because it changes how you evaluate the technology. Rust has the first-class,
+fully supported SDK, and C and C++ are also supported. Any other language that compiles to WASM is
+described as theoretically possible with experimental rather than officially maintained support, and
+languages that carry their own runtimes — Python, JavaScript — are called out as more complex to
+support though not
+impossible.<Cite src="arbitrum-stylus-gentle-intro" /><Cite src="arbitrum-stylus-non-rust-wasm" />
+
+So the VM's contract is with WASM, not with Rust. Rust is the language with the mature SDK — at the
+time of writing, `stylus-sdk` v0.10.7, requiring Rust 1.91.0 or later and targeting
+`wasm32-unknown-unknown`.<Cite src="arbitrum-stylus-sdk-overview" /> That is a statement about
+tooling maturity, and tooling maturity moves. The architectural fact underneath it does not.
+
+<Check type="predict" concept="coequal-wasm-vm">
+A Solidity contract on Arbitrum One holds a mapping `balances` at storage slot 3. A Stylus contract
+is deployed and, through a proxy arrangement, ends up executing with the Solidity contract's storage
+as its own.
+
+Predict two things. First: can the Stylus code read the value the Solidity code wrote at
+`keccak256(abi.encode(user, uint256(3)))`? Second: does that make Stylus a good idea for this
+contract?
+
+<Answer>
+**First: yes, and by construction rather than by translation.** Both VMs use the same 256-bit
+key-value storage system, EVM and WASM contracts can share storage, and `SLOAD` and `SSTORE` behave
+and cost identically.<Cite src="arbitrum-stylus-vm-differences" /> The slot address is computed the
+same way because the slot layout is a property of the storage trie, not of the language that writes
+into it. There is no serialisation boundary to cross and no adapter to write. The Stylus SDK exposes
+this through its own storage types, and the low-level hostio path reads an arbitrary slot
+directly.<Cite src="arbitrum-stylus-vm-differences" />
+
+**Second: nothing so far argues that it is.** You have established that Stylus *can* touch that
+storage. You have not established that it touches it any more cheaply, and the VM-differences page
+says flatly that it does not — state-bound work is identical across the two
+environments.<Cite src="arbitrum-stylus-vm-differences" /> A contract whose work is "read a mapping,
+adjust it, write it back" is exactly the shape that gains nothing.
+
+**The trap the question is set to catch** is the inference from "shares state" to "is a drop-in
+improvement". Shared state is what makes Stylus *composable* with your existing system. Whether it
+makes any part of that system *cheaper* is a separate question with a separate answer, and the
+answer depends entirely on the ratio of computation to storage on your hot path. That is the third
+lesson of this module, and it is the one that decides whether you use Stylus at all.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You now have the correct object in mind: a second machine, sharing one state, selected by four bytes
+at the head of a contract's code, provable by machinery the chain already had.
+
+**The next lesson** takes the coequality claim and makes it operational — how a Solidity contract
+calls a Rust one and back, what `cargo stylus export-abi` produces, and the one naming transformation
+between the two worlds that will silently give you the wrong four-byte selector if you do not know
+about it.
+
+**The third lesson** is the one that decides whether any of this is worth doing. Ink, the per-opcode
+and per-host-I/O price table, the memory model, and the honest arithmetic on where the savings are
+and are not.
+
+**The fourth** covers what deployment means when a contract can stop being callable because nobody
+sent a maintenance transaction — a category of operational risk that does not exist for a Solidity
+contract, and that belongs in a runbook rather than in a footnote.
+
+**The fifth** returns to the size-limit disagreement flagged above, to the Solidity idioms that do
+not survive the port, and to the security question that "written in Rust" quietly fails to answer.

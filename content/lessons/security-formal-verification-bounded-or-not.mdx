@@ -1,0 +1,381 @@
+---
+id: security-formal-verification-bounded-or-not
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [a16z-halmos-post, a16z-halmos-config, a16z-halmos-repo, certora-cli-options, certora-gentle-intro, kontrol-docs, kontrol-repo, k-framework-repo, foundry-forge-testing, certora-prover-changelog, allthingsfuzzy-fv-practice, symbolic-execution-survey-2025, certora-prover-repo]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Read this sentence from the tool's own designers slowly, because the second half is the one everybody
+misses:
+
+> If the bound is set to 3, Halmos will iterate the loop at most 3 times **and will not consider input
+> values that would cause the loop to iterate more than 3 times** — that is, any values greater than or
+> equal to `2^3`.<Cite src="a16z-halmos-post" />
+
+The first half is the familiar idea: unroll the loop three times. The second half is the part with
+consequences. Inputs requiring a fourth iteration were not tested and failed; they were **removed from
+the question**. A run at bound 3 over a function whose iteration count is the bit-length of its input has
+silently narrowed the domain from all `uint256` values to the numbers below eight, and then reported
+success.
+
+Nothing about that is a defect. It is the documented, intended behaviour of a tool that chose automation
+over completeness, and it is stated plainly in the design rationale.<Cite src="a16z-halmos-post" /> The
+defect is downstream, in the sentence "we formally verified it" arriving in a channel without the number
+3 attached.
+
+This lesson is about that number: where it lives in each tool, what it costs to raise, and the entirely
+different machinery that removes the need for it.
+
+## Bounded verification: a real proof over a truncated tree
+
+Draw the execution of a contract as a tree. The root is the entry point; each branch is a conditional;
+each loop back-edge is a subtree that repeats. For most contracts that tree is infinite, because loop
+counts depend on input.
+
+Bounded verification cuts the tree at a fixed depth and proves the property over what remains. Inside the
+cut, the result is genuine and total: **every** input reaching those paths satisfies the property, which
+is a strictly stronger claim than any fuzz campaign can make about the same region. Outside the cut,
+there is no claim at all — not a weak claim, not a probable one. None.
+
+This is why the honest report of a bounded result is two facts, not one. "Verified" is half a sentence.
+"Verified at loop bound 3, call depth 2" is the whole one.
+
+### The bounds Halmos actually ships
+
+Defaults matter more than documented maxima, because defaults are what runs. Read out of the tool's own
+configuration source rather than from a blog:<Cite src="a16z-halmos-config" />
+
+<Matrix
+  corner="Setting"
+  cols={['Default', 'What it silently excludes']}
+  rows={[
+    { label: '--loop', cells: ['2', { v: 'Any input requiring a third iteration', tone: 'warn' }] },
+    { label: '--invariant-depth', cells: ['2', { v: 'Any bug needing a three-call sequence', tone: 'warn' }] },
+    { label: '--default-array-lengths', cells: ['0,1,2', { v: 'Every dynamic array of length 3 or more', tone: 'warn' }] },
+    { label: '--default-bytes-lengths', cells: ['0,65,1024', { v: 'Every bytes/string of any other length', tone: 'warn' }] },
+    { label: '--width', cells: ['0 (unlimited paths)', '—'] },
+    { label: '--depth', cells: ['0 (unlimited steps per path)', '—'] },
+    { label: '--solver', cells: ['yices', '—'] },
+    { label: '--solver-timeout-assertion', cells: ['60s', { v: 'Anything the solver cannot close in a minute', tone: 'warn' }] },
+  ]}
+  caption="Five of these eight defaults narrow what the question covers, and nothing in the result line says which."
+  alt="The settings Halmos ships by default: loop bound 2, invariant depth 2, array lengths 0,1,2, bytes/string lengths 0,65,1024, unlimited path width and depth, the yices solver, and a 60-second assertion timeout, each with the inputs it excludes."
+/>
+
+Two rows deserve a second look.
+
+**`--default-bytes-lengths 0,65,1024`** is not an arbitrary triple. 65 is the size of an ECDSA
+signature — the tool is pre-loading the length that matters for the code people actually verify. It is a
+good default and it is still a *default*: a contract that behaves differently on a 64-byte signature blob
+is not covered until you say so.
+
+**`--default-array-lengths 0,1,2`** is the one that catches people. A batch function's interesting
+behaviour frequently starts at three elements, because that is where "the loop body ran more than once
+after the first" and "the last element is special" become distinguishable. The default explores empty,
+singleton and pair. Everything else is outside the result.
+
+<Aside kind="note">
+The same shape appears in Foundry's in-tree symbolic mode, with different names. Exploration is bounded by
+configuration including `symbolic.max_depth`, `symbolic.max_paths`, `symbolic.max_solver_queries`, dynamic
+calldata length settings and `symbolic.invariant_depth`; and when `--symbolic` is enabled, `invariant*`
+and `statefulFuzz*` functions are explored as **bounded symbolic call sequences** instead of using the
+normal fuzzer.<Cite src="foundry-forge-testing" /> Foundry also labels the feature an MVP whose modelled
+EVM surface, configuration and reporting are still expected to
+evolve.<Cite src="foundry-forge-testing" /> Take the label seriously; it is unusually candid.
+</Aside>
+
+### Certora unrolls too, and its default is one
+
+Certora is the unbounded tool in this module, which makes its loop handling counter-intuitive until you
+see the mechanism. The Prover unrolls loops — if the loop should execute three times, it copies the code
+inside the loop three times — and `--loop_iter` sets that number. **The default number of iterations
+unrolled is one**, run time grows exponentially in the number of iterations, and the vendor's own
+guidance is that two, or in some cases three, is usually the most you will ever need to uncover
+bugs.<Cite src="certora-cli-options" />
+
+That last clause is worth arguing with. It is good advice about *finding bugs* and it is not a statement
+about proof strength. Two iterations is where most off-by-one and accumulation errors show up; it is not
+where a claim about arbitrary iteration counts comes from.
+
+What Certora adds, and what makes it structurally different, is what happens at the cut. After finishing
+the unrolled iterations the Prover **adds an assertion that the loop actually finished** — for a
+`while (a < b)` loop, it appends `assert a >= b`. This is called the loop unwind
+condition.<Cite src="certora-cli-options" />
+
+Sit with that. The default behaviour is not to silently drop deeper executions. It is to **fail loudly**
+when an execution would have needed more iterations than you allowed. The bound announces itself.
+
+<Misconception
+  belief="Halmos does full formal verification — it says verified."
+  reality="It is explicitly bounded. It verifies up to the loop and call-depth limits supplied, and says nothing past them; inputs that would exceed the bound are excluded from the question rather than tested."
+  why="Bounded and unbounded tools print the same word, and the bound is a flag rather than part of the result line."
+  src="a16z-halmos-post"
+/>
+
+## The escape hatch, and what it costs
+
+If the unwind assertion fires on every run, work stops. So there is a flag, and it is the cleanest
+example in this whole module of a technique that buys termination with coverage.
+
+`--optimistic_loop` changes the loop unwind condition **from an assertion into a requirement** — from
+`assert a >= b` to `require a >= b`. In the vendor's own words: that means we ignore all the cases where
+the loop unwind condition does not hold, instead of considering them as a
+failure.<Cite src="certora-cli-options" /> The documentation adds a caution directly underneath:
+`optimistic_loop` could cause vacuous rules.<Cite src="certora-cli-options" />
+
+With that flag on, Certora's loop treatment is Halmos' loop treatment. The deep executions stop being
+failures and become non-existent. This is standard practice, it is often the only way to get a run to
+finish, and **every report produced with it is a bounded result wearing an unbounded tool's name.** When
+you read a verification appendix, this flag is one of the first things to look for.
+
+## Unbounded verification: proving by induction instead of by enumeration
+
+The alternative is to stop enumerating iterations and reason about the loop as a whole. That requires a
+**loop invariant**: a property with three obligations, all of which must hold.
+
+1. **Establishment.** It is true when the loop is first reached.
+2. **Preservation.** If it is true at the top of an iteration and the loop condition holds, it is true at
+   the top of the next.
+3. **Sufficiency.** Together with the negated loop condition, it implies what you wanted after the loop.
+
+Discharge those three and you have a claim about *any* number of iterations, from zero to the maximum the
+type allows, with no unrolling and no bound. The solver never sees a repeated loop body — it sees three
+finite obligations.
+
+The price is that somebody has to supply the invariant, and for non-trivial arithmetic that is where the
+expert time in an engagement goes.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'A bounded check', note: 'unroll, then stop', tone: 'warn' },
+    { title: 'An unbounded proof', note: 'induct over the loop', tone: 'good' },
+  ]}
+  rows={[
+    { label: 'What happens to executions past the cut?', cells: [
+      'Inputs that would need another iteration are removed from the question, not tested and failed',
+      'There is no cut; the claim runs from zero iterations to the maximum the type allows',
+    ] },
+    { label: 'What does a green result assert?', cells: [
+      'Every input reaching the paths inside the cut satisfies the property, and nothing at all outside it',
+      'Every execution satisfies the property, whatever its iteration count',
+    ] },
+    { label: 'Who supplies the hard part?', cells: [
+      'Nobody — the bound is a flag with a default',
+      'A person, who must find a statement that is established, preserved and sufficient',
+    ] },
+    { label: 'How does the cost grow?', cells: [
+      'Run time grows exponentially in the number of iterations unrolled',
+      'Three finite obligations; the solver never sees a repeated loop body',
+    ] },
+    { label: 'What does it force into writing?', cells: [
+      'Nothing — an assumption can stay unstated and the run still reports success',
+      'Every assumption the induction step depends on, or the step does not discharge',
+    ] },
+  ]}
+  caption="These answer different questions, and only one of them makes you write the assumption down."
+  alt="A bounded check and an unbounded inductive proof compared across what happens beyond the cut, what a green result asserts, who supplies the invariant, how cost grows, and what each forces the author to state."
+/>
+
+### Why the obvious invariant is usually the wrong one
+
+Certora's introduction gives the canonical trap, and it is worth reproducing because the same shape
+recurs in every real specification.
+
+Invariants are properties that hold in every reachable state. **Inductive** invariants are the ones
+preserved by arbitrary executions: start in *any* state satisfying the invariant, take a transition, and
+the invariant still holds.<Cite src="certora-gentle-intro" /> The distinction sounds academic until you
+meet the example: the claim that every address's balance in an ERC-20 is less than or equal to the total
+supply is **correct but not inductive**.<Cite src="certora-gentle-intro" />
+
+Why it fails induction: start from an arbitrary state where the claim holds. Nothing in the claim forbids
+two accounts each holding the entire supply. Transfer from one to the other, and the recipient now holds
+twice the supply. The claim is true of every state the contract can actually reach, and false of a state
+the induction step is allowed to start from.
+
+The repair is **strengthening**: prove a stronger statement that is inductive, and derive the one you
+wanted from it. Here, the sum of all balances equals total supply. Every invariant can be made inductive
+by strengthening,<Cite src="certora-gentle-intro" /> which is a reassuring theorem and a merciless
+practical burden — finding the strengthening is the creative act, and it usually requires state the
+contract does not itself compute. Which is exactly what ghosts and hooks exist for, and the subject of the
+next lesson.
+
+<Misconception
+  belief="Halmos and Certora do the same thing with different syntax — pick whichever language you like better."
+  reality="They prove structurally different statements. Halmos unrolls to a bound and excludes inputs beyond it; Certora reasons inductively over invariants and quantifies rules over all methods. A green result from one is not the same claim as a green result from the other."
+  why="Both accept properties, both emit counterexamples, and both are filed under formal verification."
+  src="a16z-halmos-post"
+/>
+
+## Three tools, three different statements
+
+The comparison below is about **what each tool proves**, not about which is better. No independent,
+non-vendor benchmark of these three on a common corpus exists — every side-by-side that surfaced during
+this track's research was authored by a market participant, including the vendors' own, and that fact
+should be part of how you read any ranking you meet.
+
+| | Certora Prover | Halmos | Kontrol |
+|---|---|---|---|
+| Specification | CVL, a separate language<Cite src="certora-gentle-intro" /> | Existing Foundry tests, symbolic inputs<Cite src="a16z-halmos-post" /> | Existing Foundry tests<Cite src="kontrol-docs" /> |
+| Loop reasoning | Unrolls by default (`loop_iter` = 1); invariants for unbounded claims<Cite src="certora-cli-options" /> | Bounded, `--loop` default 2<Cite src="a16z-halmos-config" /> | Bounded model checking **plus** lemmas and loop invariants<Cite src="kontrol-docs" /> |
+| Verified against | Compiled EVM bytecode<Cite src="certora-gentle-intro" /> | EVM execution under a symbolic interpreter<Cite src="a16z-halmos-post" /> | KEVM, machine-checked EVM semantics<Cite src="kontrol-docs" /> |
+| Quantifies over methods | Yes, parametric rules<Cite src="certora-gentle-intro" /> | No — one test, one entry point | No |
+| Licence | Prover source is public<Cite src="certora-prover-repo" /> | Open source<Cite src="a16z-halmos-repo" /> | BSD-3; KaaS is the paid cloud tier<Cite src="kontrol-docs" /> |
+
+Kontrol's row is the interesting one, because it does not fit the bounded/unbounded binary. Its
+documentation advertises compositional symbolic execution that generates proofs during verification,
+supporting lemmas, loop invariants **and** bounded model checking, on the foundation of KEVM — described
+as validated formal semantics of EVM bytecode, so that verified contracts demonstrate the same behaviour
+when executed by the virtual machine.<Cite src="kontrol-docs" /> Both modes are available; which one a
+given proof used is a property of that proof, not of the tool.
+
+<Aside kind="warn">
+**Two honesty notes this track will not paper over.**
+
+*Versions.* Certora publishes a Prover changelog and it is the one version source in this space this
+curriculum was able to establish from a primary
+document.<Cite src="certora-prover-changelog" /><Cite src="certora-prover-repo" /> For Halmos and Kontrol,
+the research sweep could not establish current versions: package-index and release-page data came back
+inconsistent, and Kontrol distributes through `kup`/Nix rather than the index that was
+checked.<Cite src="a16z-halmos-repo" /><Cite src="kontrol-repo" /> Check the releases pages before pinning
+anything in CI, and do not trust a version number you read in a tutorial — including this one, which
+therefore prints none.
+
+*Maintenance.* Kontrol sits on the K Framework tooling.<Cite src="k-framework-repo" /> Reading a
+project's release cadence and funding posture before adopting it is part of tool selection, and it is
+worth doing for all three rather than assuming the well-marketed one is the well-funded one.
+</Aside>
+
+## Worked example: the same property, twice
+
+One function, two ways to make a claim about it. The gap between the two claims is the whole lesson.
+
+```solidity
+function sumBalances(address[] calldata accounts) external view returns (uint256 total) {
+    for (uint256 i = 0; i < accounts.length; i++) {
+        total += balanceOf[accounts[i]];   // Solidity 0.8: checked, reverts on overflow
+    }
+}
+```
+
+Property: **`total` never exceeds `totalSupply`**, assuming the accounts are distinct.
+
+**Subgoal: state the claim the bounded run will actually make.** Under Halmos' shipped defaults, dynamic
+array lengths are drawn from `0,1,2` and the loop bound is 2.<Cite src="a16z-halmos-config" /> So the
+green result means: *for arrays of length zero, one or two, over all address and balance values, the sum
+does not exceed total supply.* Length three is not a failing case; it is not a case.
+
+**Subgoal: find out whether the excluded region matters, cheaply.** Raise the array length to 3 and
+re-run. If the result and the time barely move, the property is probably not length-sensitive and the
+default was fine. If solve time jumps by an order of magnitude, you have learned that the formula grows
+fast in this dimension — which is itself the finding, because it tells you the bound cannot simply be
+raised to something reassuring later.
+
+**Subgoal: watch the cost curve rather than the outcome.** Certora's documentation states the run time
+grows exponentially in the number of loop iterations.<Cite src="certora-cli-options" /> Exponential means
+a bound sweep is not a linear budget decision: 1, 2, 4, 8 is a sequence that terminates, plateaus, and
+then does not return. Record the point where it stops terminating. That point, not the bound you started
+with, is the real limit of the bounded approach on this function.
+
+**Subgoal: write the invariant that removes the bound.** For the unbounded claim, quantify over the loop
+counter. At the top of iteration `i`, `total` equals the sum of `balanceOf` over the first `i` accounts.
+Establishment: at `i = 0`, `total` is 0 and the empty sum is 0. Preservation: iteration `i` adds
+`balanceOf[accounts[i]]` to both sides. Sufficiency: when the loop exits, `i == accounts.length`, so
+`total` is the sum over all of them — and *now* the conservation invariant relating the balance map to
+total supply finishes the argument, for arrays of any length.
+
+**Subgoal: notice which assumption the invariant made explicit.** The distinctness of the accounts never
+appeared in the bounded run's output, because at length 2 a duplicate is a specific pair the solver either
+did or did not find interesting. In the inductive proof it is unavoidable: the step from "sum over the
+first `i`" to "sum over all" is false if an address appears twice. **The bounded run can be green with the
+assumption unstated; the unbounded proof cannot be written without stating it.** That is the second reason
+to write invariants, and on a long-lived codebase it is often the more valuable one.
+
+<Aside kind="note">
+The practical sequencing that falls out of all this: **fuzz first, bound second, prove third.** Fuzzing
+finds counterexamples cheaply and tells you which properties are even true. A bounded symbolic run over
+the tests you already have upgrades them for the cost of an afternoon. An unbounded proof is the expensive
+tier and is worth buying only for properties that survived the first two. One of the few non-vendor
+practitioner accounts of running these tools side by side reaches the same
+ordering.<Cite src="allthingsfuzzy-fv-practice" />
+</Aside>
+
+<Check type="predict" concept="bounded-verification">
+A team reports: "We formally verified our merkle-proof verifier with Halmos. All properties pass." The
+verifier walks a proof array, hashing pairwise up to the root, and the contract accepts proofs of any
+length. The team ran with default settings and did not change the array-length configuration.
+
+State precisely what has been proved, name the input class most likely to contain a bug that this run
+could not have found, and describe the cheapest single experiment that would tell you whether the bound
+is load-bearing here. Then say what would have to change for the claim "verified" to be defensible
+without a bound.
+
+<Answer>
+**What was proved.** Under the shipped defaults, dynamic array lengths are drawn from `0,1,2` and loops
+unroll twice.<Cite src="a16z-halmos-config" /> So the established claim is: *for proof arrays of length
+zero, one and two, over all values of the leaf, the root and the proof elements, the properties hold.* For
+a merkle verifier that is a tree of depth at most two — four leaves. The contract accepts proofs of any
+length, so the verified region is a rounding error inside the deployed input space. The word "verified"
+is not wrong; the sentence containing it is missing its second half.<Cite src="a16z-halmos-post" />
+
+**The input class most likely to hide the bug: longer proofs, and specifically proofs whose length differs
+from the tree's actual depth.** The classic merkle-verifier defects live exactly there — second-preimage
+attacks that reuse an internal node as a leaf, and length-extension style confusions where a 32-byte
+internal node is presented as a leaf because the hash function does not distinguish the two. Both need at
+least one internal level above the leaf to express, and both scale in interest with depth. A bound of two
+is the region where these bugs are least visible, because at depth two there is barely an interior.
+
+The runner-up class: **duplicate or ordered-vs-unordered sibling handling.** Whether the implementation
+sorts the pair before hashing changes which forged proofs succeed, and the difference typically shows up
+once there are enough levels for an attacker to choose where to inject.
+
+**Cheapest single experiment: sweep the array length and watch the clock, not the verdict.** Re-run at
+lengths 3, 4 and 8 and record time-to-result at each. Three outcomes, three different conclusions.
+*If it stays green and fast*, the property is genuinely not depth-sensitive and the default bound was
+adequate — you have bought real confidence for minutes of work. *If it goes red*, you have a
+counterexample: concrete leaf, root and proof, replayable as a normal Foundry test, and a finding. *If
+solve time explodes and you hit the 60-second default assertion timeout*,<Cite src="a16z-halmos-config" />
+you have learned the most useful thing of the three: the bound is load-bearing, it cannot be raised to
+anything reassuring, and the honest report is that the verifier is verified only for shallow trees. Note
+that this third outcome is `Incomplete`, not a pass — "not established", not a proof — and the fact that
+the run *would not finish* at realistic depth is itself worth writing into the report.<Cite src="foundry-forge-testing" />
+
+**What it would take to drop the bound.** The proof loop needs an inductive invariant instead of an
+unrolling: at each level, the running hash equals the root of the subtree containing the leaf, restricted
+to the levels consumed so far. Establishment at level zero is the leaf hash; preservation is one pairwise
+hash step; sufficiency at exit is the equality against the stored root. That invariant is expressible in a
+tool that reasons inductively over loops rather than copying the body — Certora with an invariant, or
+Kontrol, whose documentation lists lemmas and loop invariants alongside bounded model
+checking.<Cite src="certora-gentle-intro" /><Cite src="kontrol-docs" /> It is also where the real cost
+sits: the invariant refers to "the subtree containing the leaf", a quantity the contract never computes,
+so it needs specification-level state.
+
+**The meta-point.** Nothing in this answer says the team did something wrong. A bounded run over an
+existing test suite is one of the best assurance-per-hour trades available. What is wrong is the
+*reporting* — "all properties pass" travels to people who will read it as a claim about the deployed
+contract, and the number that would have made it true stayed on the command line.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next**, the specification itself: the two ways to say what must be true, what each costs, and why a rule
+quantified over every public method survives a codebase that grows and a hand-written property list does
+not.<Cite src="certora-cli-options" />
+
+**Then the exclusions lesson**, where `--optimistic_loop` reappears alongside its siblings — the family of
+flags that make runs finish by assuming the hard case away — and where you learn to read a verification
+appendix for its assumptions rather than its checkmarks.
+
+**On the audit side**, the bound is something you now know to ask for. When a client says a component is
+formally verified, "at what bound, and with which optimistic flags" is the question that turns a badge
+back into a checkable claim — the same move you will make on
+[scope statements](/c/scope-statement) in the audit-craft module.
+
+**And in the literature**, path explosion is the first-named limit of symbolic execution in the
+peer-reviewed survey of the technique.<Cite src="symbolic-execution-survey-2025" /> Bounds are the
+industry's answer to it. Knowing that they are an answer to a specific problem, rather than a
+configuration detail, is what lets you argue about them.

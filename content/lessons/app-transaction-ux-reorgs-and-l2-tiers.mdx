@@ -1,0 +1,365 @@
+---
+id: app-transaction-ux-reorgs-and-l2-tiers
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources:
+  [
+    ethereum-org-json-rpc,
+    viem-watch-contract-event,
+    quicknode-reorg,
+    envio-reorgs,
+    anvil-rpc-methods,
+    op-transaction-statuses,
+    op-interop-reorg,
+    arbitrum-tx-lifecycle,
+    l2beat,
+    eth-pos-finality,
+  ]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The ticket had a screenshot attached. An order row in the admin panel, status **Paid**, with a
+transaction hash rendered as a link. Support had clicked the link. The explorer said the hash did not
+exist.
+
+Nothing was corrupted. The database row was written by code that worked, from a receipt that was real,
+for a transaction that had been in a block. Then the chain replaced that block, and every layer of the
+stack found out at a different moment, in a different way, or — in the case of the row in the
+screenshot — not at all.
+
+You know the mechanism. [A reorg](/c/reorg) is the canonical head changing so that transactions which
+were included become un-included, and you know from
+[reorg depth in practice](/c/reorg-depth-in-practice) that the ordinary ones are one or two slots deep
+and cost the attacker nothing. This lesson is about the other side of that: what a reorg *hands your
+code*, which of those signals your stack is actually subscribed to, and how to reproduce the whole
+thing on a laptop before it reproduces itself in production.
+
+## Four things you are holding, and what happens to each
+
+When the branch containing your transaction loses, your application is holding four artefacts. They
+degrade differently and that asymmetry is the entire bug class.
+
+**The receipt goes back to nothing.** `eth_getTransactionReceipt` returns `null` when no receipt was
+found, and the documentation notes plainly that the receipt is not available for pending
+transactions.<Cite src="ethereum-org-json-rpc" /> So the same call that answered your poll ten minutes
+ago starts answering `null` again — and `null` is the exact value that meant "still pending" in
+[lesson one](/c/tx-is-not-request-response). The signal for "this was undone" is identical to the
+signal for "this has not happened yet".
+
+**The transaction may come back different.** It can be re-included in a later block, and because it now
+executes against a different preceding state, it can produce a different result: a swap at a different
+price, a mint of a different token id, a call that reverts where it previously succeeded. It can also
+be reordered relative to other transactions, or dropped entirely if it conflicts with what the winning
+branch already contains.<Cite src="quicknode-reorg" /> A "confirmed" row whose transaction later
+re-executes is not stale — it is *wrong about what happened*.
+
+**The logs are re-delivered, with a flag.** This is the one signal the protocol actually gives you. A
+log record carries a `removed` field: "true when the log was removed, due to a chain reorganization.
+false if its a valid log."<Cite src="ethereum-org-json-rpc" /> You already know
+[the log record shape](/c/log-record-shape) — address, topics, data. `removed` is the field that makes
+a log stream something other than an append-only queue.
+
+**Your database is holding a row, and nothing at all happens to it.** There is no callback. This is the
+asymmetry: three of the four artefacts live on someone else's machine and get corrected; the fourth is
+yours and does not.
+
+<Misconception
+  belief="Event logs are append-only, like every other event stream I have consumed."
+  reality="Reorged logs are re-delivered with `removed` set to true, which means a consumer that only knows how to append will accumulate records derived from blocks that no longer exist."
+  why="A log stream has every surface property of a message queue — ordered, offset-addressed, replayable — and message queues do not retract. The retraction here is a boolean on a record you may not be reading."
+  src="ethereum-org-json-rpc"
+/>
+
+<Matrix
+  caption="Only one of these four corrects itself in a way your code can subscribe to, and it is a boolean on a log record."
+  alt="Four artefacts an application holds after a reorg. The receipt starts answering null again and null is indistinguishable from pending. The transaction may be re-included, reordered, re-executed or dropped, discoverable only by re-deriving. The logs are re-delivered with the removed field set. The database row is untouched and nothing reports it."
+  corner="What you hold"
+  cols={['What the reorg does to it', 'How you find out']}
+  rows={[
+    {
+      label: 'The receipt',
+      cells: [
+        <>Answers null again<Cite src="ethereum-org-json-rpc" /></>,
+        { v: 'You do not — null is also what pending looks like', tone: 'danger' },
+      ],
+    },
+    {
+      label: 'The transaction',
+      cells: [
+        <>May be re-included later, reordered, re-executed against different state, or dropped<Cite src="quicknode-reorg" /></>,
+        { v: 'Only by re-deriving from the chain that won', tone: 'warn' },
+      ],
+    },
+    {
+      label: 'The logs',
+      cells: [
+        <>Re-delivered with removed set to true<Cite src="ethereum-org-json-rpc" /></>,
+        { v: 'A field on the record — if your transport delivers removals at all', tone: 'good' },
+      ],
+    },
+    {
+      label: 'Your database row',
+      cells: [
+        { v: 'Nothing whatsoever', tone: 'danger' },
+        { v: 'Nothing whatsoever', tone: 'danger' },
+      ],
+    },
+  ]}
+/>
+
+## The trap: whether you get told depends on which code path your provider took
+
+Handling `removed: true` is necessary. It is not sufficient, and the reason is worth reading carefully
+because it is invisible in your own source code.
+
+viem's `watchContractEvent` will attempt to create an event filter and poll it for changes — but if the
+RPC provider does not support filters (that is, `eth_newFilter`), it falls back to using `getLogs`
+instead.<Cite src="viem-watch-contract-event" /> Both paths call your `onLogs` handler. Both look
+identical at the call site. Only one of them can ever deliver a removal, because `getLogs` answers a
+question about a block range: it returns what is in those blocks *now*. If the contents changed, you
+get a different answer with no indication that a previous answer existed.
+
+So whether your reorg handling works can depend on which provider your fallback transport happened to
+select this hour — a fact you already had reason to care about from
+[the fallback transport](/c/viem-transport-fallback), now with a correctness consequence rather than an
+availability one.
+
+The technique that does not depend on the transport is to verify the chain you built your state from is
+still the chain that exists. Envio's rollback guard documents the shape: HyperSync validates block
+parent hashes internally and re-syncs when it detects a fork, and a consumer detects staleness by
+comparing the `first_parent_hash` of the current response against the hash stored from the previous
+one — if they differ, a reorg has occurred and the affected range must be
+re-fetched.<Cite src="envio-reorgs" /> That is the same instrument in every context: **store the block
+hash next to anything you derived from a block, and re-check that the hash at that number still
+matches.** A block number is not an identity. A block hash is.
+
+<Aside kind="note">
+This is the client-side version of [reorg-safe indexing](/c/reorg-safe-indexing), which you met as an
+indexer property. The framing that transfers is
+[an indexer is a deterministic fold](/c/indexer-is-a-deterministic-fold): if your UI state is a fold
+over an event stream, then un-appending is not an exotic feature, it is the inverse of the fold you
+already wrote. If your UI state is a pile of imperative `setState` calls fired from a callback, there
+is no inverse, and that is the actual reason reorg handling feels impossible in front-end code.
+</Aside>
+
+Two more facts from the same documentation are worth carrying because they set expectations you will
+otherwise get wrong. Frameworks that handle this for you roll back **their** store: Envio's rollback
+covers all entities in your schema and all data your handlers read or write to its database, and
+explicitly does **not** cover side effects in your handler code — API calls, external services, custom
+caches, files.<Cite src="envio-reorgs" /> And the depth they defend is finite: reorg support is on by
+default via `rollback_on_reorg`, with `max_reorg_depth` currently defaulting to 200 blocks for all
+chains, and any reorg deeper than that threshold will not trigger a rollback.<Cite src="envio-reorgs" />
+
+That is exactly [the indexer handles reorgs, your database does not](/c/indexer-handles-reorgs-your-db-does-not),
+stated by a vendor about their own product. Every copy you made downstream is yours.
+
+## Worked example: cause one, on your laptop, in four commands
+
+You do not have to wait for this. Anvil exposes the reorg directly, and building the exercise is the
+cheapest way to find out which layer of your stack is unprotected.
+
+**Subgoal: put something worth losing into a block, so the reorg has a target.** Turn off automatic
+mining first, so that inclusion is a step you control rather than a side effect of sending.
+`anvil_setAutomine` takes a boolean and enables or disables automatic mining of a new block with each
+new transaction; `evm_mine` mines a single block regardless of the configured mining
+mode.<Cite src="anvil-rpc-methods" />
+
+```bash
+cast rpc anvil_setAutomine false
+cast send $VAULT "deposit(uint256)" 1000000 --private-key $PK   # returns a hash
+cast rpc evm_mine                                               # now it is included
+cast receipt $TX_HASH                                           # a receipt exists; your app says Paid
+```
+
+**Subgoal: rewind the chain and rebuild it without that transaction, which is what a reorg is.**
+`anvil_reorg` rewinds by `depth` blocks and mines new blocks back to the same height, optionally
+including supplied transactions in the replacement blocks; passing `[]` gives empty replacement
+blocks.<Cite src="anvil-rpc-methods" />
+
+```bash
+cast rpc anvil_reorg 3 '[]'
+```
+
+The chain is the same height it was. Your transaction is not in it.
+
+**Subgoal: read each of the four artefacts, so you see the asymmetry rather than take my word for it.**
+Ask for the receipt again — it is `null`.<Cite src="ethereum-org-json-rpc" /> Ask your event watcher
+what it delivered. Ask your database what it thinks. Ask your UI what it is rendering. The interesting
+output of this exercise is not the chain state; it is the list of components that did not notice.
+
+**Subgoal: make the failure sharper by putting the transaction back in a different position**, because
+"vanished" is the easy case and "came back different" is the one that produces wrong money.
+`anvil_reorg` also accepts `tx_block_pairs` — an array of `[transaction, blockIndex]` pairs where the
+transaction is a raw signed hex string or a request object and the zero-based `blockIndex`, less than
+`depth`, selects which replacement block includes it.<Cite src="anvil-rpc-methods" /> Re-include the
+deposit in a later replacement block, behind a second transaction that moves the price, and watch a
+system that stored the *outcome* rather than re-deriving it produce a number that never existed on any
+chain.
+
+<Aside kind="warn">
+Two neighbouring methods are worth knowing so you do not reach for the wrong one. `anvil_rollback`
+rolls the chain back by a number of blocks **without** mining replacements, shortening the chain — that
+models a truncation, not a reorg.<Cite src="anvil-rpc-methods" /> And `anvil_dropTransaction` removes a
+transaction from the pool, returning its hash if it was pending and `null`
+otherwise<Cite src="anvil-rpc-methods" /> — that is the reproduction for
+[dropped](/c/tx-dropped) from lesson two, a different state with a different message.
+</Aside>
+
+The assertion to write is the one your product actually needs: after the reorg, the row is not "Paid".
+It is back to pending, or it is flagged for reconciliation, and — the part teams forget — **anything
+irreversible that fired off the back of it has been recorded as having fired against a transaction that
+no longer exists.** You cannot un-send the email. You can at least know that you sent it.
+
+## On a rollup, "confirmed" is three or four different promises
+
+Everything above assumed one chain with one head. On a rollup, the word splits, and the tiers are
+documented per stack rather than shared.
+
+Optimism publishes the ladder for OP Mainnet explicitly, in the order a transaction moves through it,
+with the JSON-RPC call used to observe each one.<Cite src="op-transaction-statuses" />
+
+<Matrix
+  caption="One ladder, four rungs, and the times between them differ by four orders of magnitude."
+  alt="The OP Mainnet transaction status ladder: pending is instant after sending to the sequencer and guarantees nothing; sequencer confirmed or unsafe takes typically two to four seconds and means the transaction is in a sequencer block but not yet published to Ethereum; published to Ethereum or safe takes typically five to ten minutes and up to twelve hours; finalized takes typically fifteen to thirty minutes and up to twelve hours and guarantees inclusion in the chain."
+  corner="Status"
+  cols={['Typical time to reach', 'What it guarantees']}
+  rows={[
+    {
+      label: 'Pending',
+      cells: ['Instant after sending to the sequencer', 'Not part of the chain; no guarantee of inclusion'],
+    },
+    {
+      label: 'Sequencer confirmed / unsafe',
+      cells: [
+        { v: 'Typically 2–4 seconds', tone: 'warn' },
+        { v: 'In a sequencer block, not yet published to Ethereum', tone: 'warn' },
+      ],
+    },
+    {
+      label: 'Published to Ethereum / safe',
+      cells: ['Typically 5–10 minutes, up to 12 hours', 'On Ethereum, not yet finalized'],
+    },
+    {
+      label: 'Finalized',
+      cells: [
+        { v: 'Typically 15–30 minutes, up to 12 hours', tone: 'good' },
+        { v: <>Guaranteed to be included in the chain<Cite src="op-transaction-statuses" /></>, tone: 'good' },
+      ],
+    },
+  ]}
+/>
+
+Read the second row closely, because it is the row that matters for product decisions. A transaction
+that is sequencer-confirmed can still be excluded from the final chain if the sequencer fails to
+publish the block to Ethereum within the sequencing window — approximately 12 hours — and applications
+are told, in the documentation, to consider that possibility when displaying information about
+transactions in this state.<Cite src="op-transaction-statuses" /> That is
+[a soft confirmation](/c/soft-confirmation): a receipt backed by the sequencer's promise and nothing
+else. The last row is [hard finality](/c/hard-finality), where the batch containing your transaction
+has been posted to and finalized on L1.
+
+The instrument is the one you built in the last lesson. The latest safe block and the latest finalized
+block are retrieved with `eth_getBlockByNumber` using the `safe` and `finalized`
+tags<Cite src="op-transaction-statuses" /><Cite src="ethereum-org-json-rpc" /> — so a policy table
+written against tiers rather than durations ports to an L2 without changing shape.
+
+<Misconception
+  belief="The L2 showed a green check in under a second, so the transaction is final."
+  reality="That is the sequencer's acknowledgement. The block still has to be published to Ethereum, and then that Ethereum block has to finalize, before the transaction inherits L1's guarantees."
+  why="The interface gives identical feedback for all three tiers, and the fast one is the one users see. The documentation for OP Mainnet says outright that a sequencer-confirmed transaction can still be excluded if the block is not published within the sequencing window."
+  src="op-transaction-statuses"
+/>
+
+### What a reorg does at each tier, and why the tiers are the answer
+
+The tiers are not a ceremony. They partition the blast radius of an L1 reorg.
+
+On an OP Stack chain, when an L1 reorg replaces a block, either the replacement carries the same batch
+data — derivation is deterministic, the L2 chain it produces is identical, and the reorg is a no-op
+from the L2's perspective — or it does not, and the sequencer reposts the affected batch in a later L1
+block.<Cite src="op-interop-reorg" /> As long as the batch lands again before the sequencer window
+elapses (documented as 3600 L1 blocks, approximately 12 hours on standard chains including OP Mainnet),
+derivation reproduces the same L2 chain; if the window elapses without it, the affected L2 blocks are
+replaced with deposit-only blocks containing only the transactions forced through
+L1.<Cite src="op-interop-reorg" /> Sequencer equivocation — gossiping one block and writing a different
+one to L1 — is resolved the same way: the L1 version wins, and every dependent **unsafe** block is
+invalidated, while anything previously labelled safe or finalized is
+untouched.<Cite src="op-interop-reorg" />
+
+That last clause is the design principle. Your exposure to an L2 reorg is exactly the set of actions
+you took at the unsafe tier.
+
+Other stacks arrange the same problem differently, which is the reason to look yours up rather than
+generalise from this one. On Arbitrum, transactions can reach the sequencer through several routes, or
+bypass it entirely by going to the Delayed Inbox contract on the parent chain; if a transaction
+submitted that way is not processed within 24 hours, anyone can call `forceInclude` on the
+`SequencerInbox` contract to guarantee inclusion.<Cite src="arbitrum-tx-lifecycle" /> Different
+vocabulary, different window, same underlying question: what is the sequencer promising, and what
+happens when it stops.
+
+<Aside kind="warn">
+**Do not hardcode any duration from this section.** The wall-clock figures above are OP Mainnet's own
+documented expectations, and the windows are chain configuration that operators set — the same OP
+documentation qualifies the 12-hour figure as applying to standard
+chains.<Cite src="op-interop-reorg" /> For a specific rollup, the proof system and maturity stage are
+tracked per project on L2BEAT,<Cite src="l2beat" /> and for optimistic systems the wait that matters is
+[the challenge window](/c/challenge-window), which is a property of that chain's dispute protocol
+rather than of rollups in general. Look it up for the chain you are shipping on, record the date you
+looked, and re-check it.
+</Aside>
+
+<Check type="predict" concept="tx-l2-confirmation-tiers">
+Your marketplace moves to an OP Stack chain. The warehouse-dispatch policy from the last lesson said
+`finalized`. A product manager points out that the L2 confirms in about two seconds and asks whether
+dispatch can now fire on that, since "the L2 is fast".
+
+Give the answer, and then say what would have to be true about the business for the fast tier to be
+acceptable. Then name the one thing that changes about your reorg handling when you move from L1 to
+this chain.
+
+<Answer>
+**No, and the reason is the same as it was on L1: the courier is irreversible.** Two seconds buys you
+the sequencer's acknowledgement, which is documented as a state from which the transaction can still be
+excluded if the block is not published to Ethereum within the sequencing
+window.<Cite src="op-transaction-statuses" /> The speed changed; the reversibility of putting a box on
+a van did not. What *has* improved is the middle of the ladder: "published to Ethereum / safe" is
+documented as typically 5–10 minutes and "finalized" as typically 15–30 minutes<Cite src="op-transaction-statuses" />
+— so the honest pitch to the PM is not "we can ship in two seconds", it is "we can show progress in two
+seconds and ship in well under an hour", which is usually the thing they actually wanted.
+
+**What would make the fast tier acceptable:** only a change in the consequence, never a change in the
+confidence. If dispatch were reversible — the warehouse batches picks hourly and a cancellation before
+the batch closes costs nothing — then the fast tier is fine, because acting and being wrong now costs a
+row in a picking queue. That is the boundary the whole module has been building toward: it is the
+reversibility of the consequence that sets the tier, not the latency of the chain.
+
+**What changes about reorg handling:** the blast radius becomes tier-shaped and, unusually, better
+defined than on L1. When an L1 reorg hits, either derivation reproduces an identical L2 chain and
+nothing happened, or the affected batch is reposted, and only if the sequencer window elapses do the
+affected L2 blocks get replaced with deposit-only blocks.<Cite src="op-interop-reorg" /> In the
+equivocation case, only **unsafe** blocks and their dependents are invalidated — blocks already labelled
+safe or finalized are untouched.<Cite src="op-interop-reorg" /> So the state you have to be able to walk
+back is precisely the state you derived from unsafe blocks. Everything the block-hash check taught you
+still applies, and the tier tells you how much of your data is in scope.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The last lesson of the module lifts the unit of work off the transaction entirely.** Everything so
+far has tracked one signed thing through one lifecycle. Real intents are usually several — approve then
+swap, bridge then act — and the interesting question becomes what the user is waiting for rather than
+what the chain is doing. That is where the confirmation policy, the durable key and the un-append
+capability all get used at once.
+
+**And the practice exercises exist for a reason.** `anvil_reorg` turns a class of bug that surfaces
+once a quarter in production into something you can trigger in a test, on demand, in
+CI.<Cite src="anvil-rpc-methods" /> A team that has never watched their own dashboard show a stale
+"Paid" has not verified their reorg handling — they have verified that no reorg happened during their
+test window.
+
+**One thing worth adding to your schema this week:** the block hash, next to every block number you
+already store. It costs 32 bytes per row and it is the difference between being able to detect that the
+history under your data changed and having to trust that it did not.

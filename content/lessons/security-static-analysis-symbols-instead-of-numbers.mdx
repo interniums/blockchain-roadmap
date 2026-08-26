@@ -1,0 +1,365 @@
+---
+id: security-static-analysis-symbols-instead-of-numbers
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [measured-static-analysis-2026-08-26, solidity-smtchecker-docs, symbolic-execution-survey-2025, a16z-halmos-repo, a16z-halmos-post, foundry-lint-docs]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+The previous lesson ended with three defects a pattern matcher could not see. One of them was
+arithmetic, and arithmetic is where the next category of tool starts earning its keep — with a binary
+you already have installed.
+
+Here is a contract with a claim written into it as an assertion.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.36;
+
+contract T {
+    mapping(address => uint256) public bal;
+    uint256 public total;
+
+    function deposit(uint256 a) external {
+        bal[msg.sender] += a;
+        total += a;
+    }
+
+    function half(uint256 x) external pure returns (uint256) {
+        assert(x / 2 * 2 == x);
+        return x / 2;
+    }
+}
+```
+
+And here is solc 0.8.36, on this machine, asked to check that assertion — no plugin, no API key, no
+second toolchain.<Cite src="measured-static-analysis-2026-08-26" />
+
+```bash
+solc --model-checker-engine chc --model-checker-targets assert \
+     --model-checker-timeout 20000 T.sol
+```
+
+```text
+Warning: CHC: Assertion violation happens here.
+Counterexample:
+total = 0
+x = 1
+ = 0
+
+Transaction trace:
+T.constructor()
+State: total = 0
+T.half(1)
+  --> T.sol:20:9:
+   |
+20 |         assert(x / 2 * 2 == x);
+   |         ^^^^^^^^^^^^^^^^^^^^^^
+```
+
+Nothing generated an input. Nothing sampled a range. The compiler treated `x` as an unconstrained
+256-bit symbol, asked a solver whether any assignment to it could make the assertion false, and the
+solver came back with a witness. The whole run takes about as long as a compile.
+
+That difference — a symbol where a value used to be — is the entire subject of this lesson, and it
+changes what a passing result is worth.
+
+## What the solver was actually asked
+
+Symbolic execution walks the code with symbols in place of concrete values. At every branch it records
+the condition that had to hold to get here, accumulating a **path constraint**. At an assertion, it
+hands the solver one question:
+
+> Is there any assignment to the symbols that satisfies the accumulated path constraint *and* falsifies
+> the assertion?
+
+Three answers are possible, and the third is the one most explanations omit.
+
+- **Satisfiable.** The solver produces an assignment. That assignment is a concrete counterexample —
+  here, `x = 1`.
+- **Unsatisfiable.** No assignment on this path violates the assertion. That is a proof about this
+  path, quantified over every input that takes it.
+- **Unknown.** The solver hit its timeout, or the formula was outside what it can decide, and gave
+  up.<Cite src="symbolic-execution-survey-2025" />
+
+The payoff is in the middle case. One symbolic run over a path says something about the entire
+equivalence class of inputs that take that path — not about one sampled member of it. That is the
+property no amount of concrete testing buys, and it is why this category is the on-ramp to formal
+methods rather than a faster kind of test.
+
+<Misconception
+  belief="Symbolic execution explores every path through the contract."
+  reality="It explores paths until it runs out of budget. Branch counts multiply, loops have to be unrolled to some bound, and the solver is entitled to return unknown on any single query. What you get is a result about the paths that were actually walked within the limits you set."
+  why="The word 'symbolic' suggests mathematics, and mathematics suggests totality. The mechanism is a search with a budget attached, and the budget is a flag you passed."
+  src="symbolic-execution-survey-2025"
+/>
+
+## Reading a counterexample as a boundary, not an input
+
+The naive reading of `x = 1` is "the tool found a failing case, patch that case". The useful reading is
+different, and it is the habit worth forming.
+
+**Subgoal: recover the class the witness stands for.** `x / 2 * 2 == x` fails whenever integer
+division truncates — that is, for every odd `x`. The solver did not choose 1 because 1 is special. It
+chose 1 because it is a member of the violating set and solvers return small witnesses. Ask "what is
+true of this value that makes it break" and you get the class; ask "why did it pick this number" and
+you get nothing.
+
+**Subgoal: decide whether the assertion or the code is wrong.** Both are on the table. If the intent
+was "halving is lossless", the intent is false for odd inputs and the assertion should not exist. If
+the intent was "callers must pass even amounts", the code is missing a check and the assertion is
+documenting a real precondition. A counterexample is evidence that the code and the stated claim
+disagree. It does not say which one to move.
+
+**Subgoal: check whether the class is reachable at the boundary you care about.** Here `half` is
+external, so any odd input from any caller reaches it. If it were internal and every call site rounded
+first, the same counterexample would be a statement about an unreachable state — true under the model,
+not a finding. This is the same disposition question the previous lesson asked of a detector hit, and
+it is asked the same way.
+
+**Subgoal: re-run and confirm the answer moved.** Fix, then look for the outcome to change from
+violated to proved. A tool whose verdict you never watched change is a tool you have not learned to
+read.
+
+## Three outcomes, not two
+
+Run the same file with the arithmetic targets on instead, and the compiler reports all three outcomes
+in a single run.<Cite src="measured-static-analysis-2026-08-26" />
+
+```bash
+solc --model-checker-engine chc --model-checker-targets underflow,overflow \
+     --model-checker-timeout 20000 T.sol
+```
+
+```text
+Warning: CHC: Overflow (resulting value larger than 2**256 - 1) happens here.
+  --> T.sol:10:9:
+   |
+10 |         total += a;
+   |         ^^^^^^^^^^
+
+Warning: CHC: 2 verification condition(s) could not be proved.
+Info: CHC: 1 verification condition(s) proved safe!
+```
+
+Read the three lines as three different kinds of information, because they are.
+
+<Figure
+  caption="One run produced all three verdicts at once: a proof, a report the model cannot dispose of, and two conditions where the solver simply stopped."
+  alt="One symbolic query per assertion branching into three outcomes — unsatisfiable, which is a proof over every input on that path; satisfiable, which returns a concrete counterexample; and unknown, where the solver timed out or the formula was outside what it can decide."
+>
+  <Flow
+    nodes={[
+      { id: 'q', label: 'the solver is asked', note: 'can any input falsify it?', col: 0, tone: 'accent' },
+      { id: 'ok', label: 'proved safe', note: 'no input on this path', col: 1, tone: 'good' },
+      { id: 'ce', label: 'counterexample', note: 'a concrete witness', col: 1, tone: 'danger' },
+      { id: 'unk', label: 'could not be proved', note: 'timeout, or undecidable', col: 1, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+**One condition proved safe.** A genuine result: within the model, that arithmetic operation cannot
+overflow, for any input, on any reachable path. This is the line people scroll past, and it is the only
+line in the output that is a guarantee.
+
+**One overflow reported at `total += a`.** True under the model and probably not a finding. The checker
+does not know that `total` is bounded by the token supply, because nothing in the contract says so. On
+Solidity 0.8 the consequence of that overflow is a `Panic`, not a silent wrap, so the honest
+disposition is "reverts under conditions no depositor can reach" — and the way to make the tool agree
+is to give it the missing fact, not to silence it.
+
+**Two conditions that could not be proved.** Not safe, not violated. The solver did not finish. If you
+read this run as "one problem found", you have quietly converted two unknowns into two passes, and
+unknowns are where the interesting bugs sit — they are unknown *because* the reasoning got hard, and
+reasoning gets hard around the parts of a contract that are actually intricate.
+
+<Aside kind="warn">
+This is the single most common misreading of every tool in this half of the module. A verification run
+has a three-way outcome, and only one of the three is good news. Any summary that reports "passed" or
+"failed" has thrown away the distinction between "proved" and "did not finish", and it is throwing
+away the half that should be driving your next hour of work.
+</Aside>
+
+## The flags that are really assumptions
+
+Everything the checker concludes is conditional on a model, and on this compiler the model is
+configured by a handful of defaults worth knowing by name.<Cite src="solidity-smtchecker-docs" />
+
+**The engine defaults to `none`.** `--model-checker-engine` accepts `all`, `bmc`, `chc` or `none`, and
+`none` is the default.<Cite src="measured-static-analysis-2026-08-26" /> The checker is off unless you
+turn it on. Every project that has never passed the flag has a formal-methods engine sitting unused in
+its compiler.
+
+The two engines answer different questions. Bounded model checking unrolls execution to a fixed depth
+and is good at finding shallow counterexamples fast. The constrained Horn clause engine reasons about
+the contract across an unbounded number of transactions, which is what produced the multi-transaction
+trace in the first output.<Cite src="solidity-smtchecker-docs" />
+
+**External calls default to `untrusted`.** `--model-checker-ext-calls` takes `untrusted` or `trusted`,
+and `untrusted` is the default.<Cite src="measured-static-analysis-2026-08-26" /> Under it, a call to
+an address the checker cannot resolve is modelled as arbitrary code that may do anything, including
+calling back into your contract. That is the correct default and it is also why the checker reports
+reentrancy-flavoured conditions on contracts whose authors think reentrancy is impossible. Switching to
+`trusted` assumes the callee runs the code its declared type implies — a much stronger claim about the
+world, and one you are asserting rather than proving.
+
+**Invariant inference is partial by default.** `--model-checker-invariants` selects which invariants the
+engine will try to infer; `reentrancy` is one of the options, and the default is not
+`all`.<Cite src="measured-static-analysis-2026-08-26" /><Cite src="solidity-smtchecker-docs" />
+
+**And there is a timeout.** Raise it and more conditions resolve; raise it far enough and your build is
+slower than your test suite.
+
+
+<Matrix
+  corner="Flag"
+  cols={['Default on this compiler', 'What the default assumes']}
+  rows={[
+    { label: '--model-checker-engine', cells: [{ v: 'none', tone: 'danger' }, 'nothing is checked unless you turn it on'] },
+    { label: '--model-checker-ext-calls', cells: [{ v: 'untrusted', tone: 'good' }, 'an unresolved callee may run arbitrary code, including calling back'] },
+    { label: '--model-checker-invariants', cells: [{ v: 'not all', tone: 'warn' }, 'only the invariant kinds you select are inferred'] },
+    { label: '--model-checker-timeout', cells: ['20000 ms in the runs above', 'more conditions resolve as you raise it, at the cost of build time'] },
+  ]}
+  caption="Four defaults decide what the verdict means, and the one that decides whether there is a verdict at all is off."
+  alt="The four SMTChecker flags on solc 0.8.36 with their defaults — engine none, external calls untrusted, invariant inference partial, and an explicit timeout — against the assumption each default encodes."
+/>
+
+That list is a preview of the largest idea in the formal-verification module. The verdict is never
+about the contract alone. It is about the contract under a configuration, and the configuration is
+where the interesting content lives.
+
+## Halmos: the same idea, aimed at tests you already wrote
+
+The compiler's checker takes assertions embedded in the contract. The tool most teams reach for next
+takes something they have far more of: the Foundry suite.
+
+Halmos runs Solidity test functions with their inputs replaced by symbols, and checks that no assertion
+in the test can be violated within a stated bound on loops and call depth — returning either a proof
+within that bound or a concrete counterexample.<Cite src="a16z-halmos-repo" /><Cite src="a16z-halmos-post" />
+There is no separate specification language to learn, no licence to buy, and no rewrite: a test that
+already reads `assertEq(a, b)` for one worked example becomes a claim about all inputs of the same
+shape.
+
+Two consequences follow, and they pull in opposite directions.
+
+**The adoption cost is close to zero, which is what makes it the on-ramp.** For a project with a
+Foundry suite, the distance to a first symbolic result is measured in renaming test functions and
+choosing a bound.<Cite src="a16z-halmos-post" /> Nothing else in the assurance stack has that
+property.
+
+**The bound is the price, and it is not a footnote.** Halmos is explicitly bounded: it verifies up to
+the loop and depth limits you supply, and says nothing beyond them.<Cite src="a16z-halmos-repo" /> A
+green Halmos run at a loop bound of three is a proof about executions with at most three iterations. If
+your bug needs four, the tool is silent, and silence here looks identical to success.
+
+The other consequence is about property quality rather than tooling. Symbolic inputs make your existing
+tests stronger *at their existing strength of claim*. A test that asserted a single number now asserts
+that number for a whole input class — but a test that only checked "the call did not revert" still only
+checks that, for every input, forever. The tool amplifies the property. It does not improve it.
+
+<Misconception
+  belief="Halmos does formal verification, so a passing Halmos run means the function is proved correct."
+  reality="It means no assertion in that test could be violated within the loop and call-depth bounds you set, under the tool's model. Change the bound and the claim changes with it."
+  why="Both the marketing category and the output vocabulary are shared with unbounded provers, and the word 'verified' does not carry its own asterisk."
+  src="a16z-halmos-repo"
+/>
+
+<Aside kind="note">
+One thing to check rather than assume. Some write-ups describe a symbolic path shipping inside Foundry
+itself, with test prefixes that only run under a symbolic flag. On forge 1.7.1 as installed here,
+`forge test --help` carries no symbolic, prover or solver
+flag.<Cite src="measured-static-analysis-2026-08-26" /> The lesson generalises past this one release:
+this area moves quickly, and the difference between the documentation and the binary you have is a
+one-command check — the same check that found sixty-eight documented lints missing from the same
+binary.<Cite src="foundry-lint-docs" />
+
+This module therefore pins no version for any analyser, symbolic tool or fuzzer. Where a version was
+not confirmed directly, printing one would be inventing precision.
+</Aside>
+
+## Why this does not simply replace everything else
+
+If one symbolic run covers a whole class of inputs, the obvious question is why anyone still fuzzes.
+Three answers, all structural.<Cite src="symbolic-execution-survey-2025" />
+
+**Paths multiply.** Every branch doubles the frontier in the worst case. Contracts with a dozen
+independent conditionals in a hot function are ordinary, and the search space is not.
+
+**Loops do not have a symbolic shape.** A loop whose trip count depends on a symbol has to be unrolled
+to a bound, or generalised with an invariant that someone has to write. Bounding is cheap and partial;
+invariants are expensive and complete. Every tool in this space sits somewhere on that line, and where
+it sits is the main thing that distinguishes them.
+
+**Solvers are allowed to give up.** The underlying decision problem is hard, and the practical
+consequence is the unknown outcome above — a non-answer that arrives after you have waited for it.
+
+So the category is at its best on **arithmetic and small, dense functions**: a rounding direction, a
+share-price formula, a bit-packing routine, an encoding round trip. It is at its worst on long stateful
+sequences, which is exactly the terrain of the next lesson.
+
+<Check type="predict" concept="symbolic-execution">
+You add a Halmos check for the vault from the previous lesson. The property is that after any sequence
+of at most three calls drawn from `deposit`, `withdraw` and `sweep`, the sum of `shares` equals
+`totalShares`. You run it with a loop bound of three and it reports no counterexample found.
+
+A colleague writes in the pull request: "solvency is now formally verified." Rewrite that sentence so
+it is true, then say what single change would make the strongest improvement to what you are entitled
+to claim.
+
+<Answer>
+**A true version.** "Under Halmos, with a call-depth bound of three and a loop bound of three, no
+sequence of up to three calls to `deposit`, `withdraw` or `sweep` was found that makes the sum of
+`shares` differ from `totalShares`, and no unresolved conditions were reported."
+
+Four things had to be added, and each corresponds to something the original sentence silently dropped.
+
+**The tool and its bound.** The result is bounded verification: a proof within the loop and depth
+limits supplied, and no statement at all outside them.<Cite src="a16z-halmos-repo" /> "Formally
+verified" with no bound attached reads as a claim about all executions, which is a strictly stronger
+statement than the one that was produced.
+
+**The call set.** `sweep` iterates over a caller-supplied array; with a loop bound of three, sequences
+that sweep four addresses are outside the result. Anything reachable only through a longer loop was
+never examined.
+
+**The property's scope.** Sum-of-shares equals `totalShares` is an accounting identity. It says nothing
+about whether a share is worth what it should be — the manipulable divisor in `deposit` can hold this
+property exactly while destroying every depositor's value. A proof of the wrong property is still a
+proof.
+
+**The absence of unknowns.** If any condition came back unresolved, the run contains a hole the summary
+does not mention, and the hole is where the reasoning got hard.
+
+**The single strongest improvement.** Raise the bound and watch what happens. Run the same property at
+successively larger loop and depth limits and record, for each, the outcome and the wall-clock time.
+You learn two things at once: whether the property survives deeper sequences, and where verification
+stops terminating. The second is more valuable than the first, because it tells you the honest ceiling
+of the claim you can make with this tool on this code — and that ceiling, stated out loud, is what
+turns the sentence from marketing into evidence.
+
+Adding a second tool would come after that, not before. The bound is a property of the result you
+already have.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson inverts the trade.** Fuzzing gives up the "all inputs on this path" guarantee and
+buys the ability to run long, stateful sequences against real code. Read it as the other half of this
+one: symbols reason about width, campaigns reason about depth.
+
+**The lesson after that removes the bound.** [Unbounded verification](/c/unbounded-verification) is
+what you get when a loop invariant replaces an unrolling limit, and it is the difference between the
+tool in this lesson and the heavyweight prover in the next.
+
+**The three-outcome habit is the transferable one.** Proved, violated, unknown. Once you are reading
+for the third, you will start noticing how many dashboards, CI badges and audit summaries have quietly
+collapsed it into the first — and the assurance track ends by making that collapse the thing you check
+for in someone else's report.
+
+**And the flags are the assumptions.** Engine, external-call trust, invariant inference, timeout. That
+list of four is the small version of the assumptions section you will learn to read first in a
+verification report, where the same knobs are called [summarization](/c/summarization) and
+[optimistic assumptions](/c/optimistic-assumption) and are worth considerably more money.

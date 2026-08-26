@@ -1,0 +1,401 @@
+---
+id: scaling-op-stack-messaging-without-a-bridge
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [op-specs-interop-overview, op-specs-interop-depset, op-docs-interop-explainer-current, op-docs-supernode-explainer, op-docs-interop-reorg, op-docs-interop-security, op-docs-hardfork-lagoon, op-docs-superchain-registry, op-specs-derivation]
+stack: {}
+---
+
+The bridges module ended somewhere uncomfortable: every cross-chain message you send is a claim about
+another chain's state, and somebody has to be convinced. Third-party bridges resolve that by
+appointing a committee, which is why they [are the honeypot](/c/bridge-is-the-honeypot). Native
+bridges resolve it by going through L1, which is correct and slow.
+
+Superchain interop is a third answer, and its trick is to reuse machinery you already have. The
+specification states the goal exactly: relatively trustless interop is already possible between
+rollups by using L1 Ethereum as a hub — withdraw from one chain to L1, deposit to another — and the
+goal of OP Stack native interop is to enable cross-chain messaging at much lower latency than going
+through L1.<Cite src="op-specs-interop-overview" />
+
+Lower latency, not lower assurance. This lesson is about what that costs, and the cost turns out to be
+paid entirely by the people running nodes.
+
+## Two transactions, and one of them is just a log
+
+The vocabulary is small and precise. A **source chain** includes an initiating message; a
+**destination chain** includes an executing message; an **initiating message** is an event emitted
+from a source chain; an **identifier** is a unique pointer to an initiating message; an **executing
+message** is an event emitted from a destination chain's `CrossL2Inbox` that includes an initiating
+message and identifier; and the **dependency set** is the set of chains that originate initiating
+transactions where the executing transactions are valid.<Cite src="op-specs-interop-overview" />
+
+A total of two transactions are required to complete a cross-chain message: the first on the source
+chain, where any emitted log can serve as an initiating message, and the second on the destination,
+carrying the initiating message and the identifier that points at it
+uniquely.<Cite src="op-specs-interop-overview" />
+
+**Any log.** That is the design decision worth stopping on. There is no `sendMessage` that must be
+called on the source side, no registry of messageable contracts, no opt-in. The docs put it plainly:
+the initiating message is just a log event, and any log event on any chain in the destination's
+dependency set can initiate a cross-domain message.<Cite src="op-docs-interop-explainer-current" />
+
+That inverts the familiar model. You already know the [cross-domain messenger](/c/cross-domain-messenger)
+pattern where a sender explicitly posts a message and a relayer delivers it. Here the source chain does
+nothing special at all; the destination chain *reads*. Interop is a pull, and the messenger contracts —
+`L2ToL2CrossDomainMessenger` and friends — are conveniences built on top of a raw log-reading
+primitive, not the primitive itself.<Cite src="op-docs-interop-explainer-current" />
+
+An executing message identifies its initiating message by source chain ID, source contract address
+(the `origin`), source block number, log index within the block, and source block timestamp; if
+everything checks out, `CrossL2Inbox` emits an `ExecutingMessage` event recording the cross-chain
+reference.<Cite src="op-docs-interop-explainer-current" />
+
+## The clever part: `CrossL2Inbox` never reads another chain
+
+Here is the mechanism that makes this work inside an EVM that has no idea other chains exist.
+
+`CrossL2Inbox` itself never reads other chains' state. It verifies that the executing transaction has
+**pre-declared** every cross-chain message it intends to use, so that the destination chain's node can
+check those declarations against its index of source-chain logs before the transaction is allowed into
+a block.<Cite src="op-docs-interop-explainer-current" />
+
+The declarations live in the transaction's EIP-2930 [access list](/c/access-list), targeting the
+`CrossL2Inbox` predeploy address. Per executing message, the spec defines up to three typed storage-key
+entries: a **lookup-identity** entry packing source chain ID, block number, log timestamp and log
+index — the hint the node uses to find the referenced log; an optional **chain-ID extension** entry,
+present only when the source chain ID does not fit in 64 bits; and a **checksum** entry, a versioned
+hash committing to the message's full `Identifier` and message hash, which is the only entry the EVM
+itself touches.<Cite src="op-docs-interop-explainer-current" />
+
+Two checks then happen in two different places, and the pairing is the whole design.
+
+**Before inclusion, outside the EVM.** The node iterates over each access-list entry targeting
+`CrossL2Inbox`, reconstructs the message it points at, and confirms that an initiating log with that
+identifier and hash really exists on the source chain at the required safety level. Any unrecognised
+entry, or any entry pointing at a message the node cannot prove, fails the check and the transaction is
+dropped.<Cite src="op-docs-interop-explainer-current" />
+
+**At runtime, inside the EVM.** `CrossL2Inbox.validateMessage` recomputes the checksum from the
+`Identifier` and `msgHash` it was called with and uses **gas-cost measurement** to confirm the matching
+storage slot is warm — meaning the checksum entry really was in the access list. A missing or wrong
+entry reverts with `NotInAccessList`.<Cite src="op-docs-interop-explainer-current" />
+
+Read that second one again, because it is a genuinely unusual piece of engineering. The contract cannot
+introspect its own transaction's access list, so it infers membership from the *cost* of touching a
+slot. Warm means declared. You know the warm/cold accounting from the EVM track; here it is being used
+as a one-bit oracle about transaction metadata. The result is that a transaction which bypassed or
+contradicts the node's pre-check can never succeed at runtime.<Cite src="op-docs-interop-explainer-current" />
+
+<Figure
+  caption="Neither check can read another chain. One reads the node's own index of source-chain logs; the other reads a gas cost."
+  alt="A cross-chain message in four stages. A log emitted on a source chain is the initiating message. The executing transaction pre-declares it in an EIP-2930 access list targeting CrossL2Inbox. Before inclusion, outside the EVM, the node reconstructs the referenced message and drops the transaction if no such log exists at the required safety level. At runtime, inside the EVM, validateMessage recomputes the checksum and infers access-list membership from whether the slot is warm, reverting with NotInAccessList if it is not."
+>
+  <Flow
+    dir="down"
+    lanes={['source', 'destination tx', 'before inclusion', 'at runtime']}
+    nodes={[
+      { id: 'log', label: 'any log', note: 'the initiating message', col: 0, tone: 'accent' },
+      { id: 'al', label: 'access list', note: 'lookup-identity + checksum', col: 1 },
+      { id: 'node', label: 'node pre-check', note: 'does that log exist yet?', col: 2 },
+      { id: 'drop', label: 'dropped', note: 'entry it cannot prove', col: 2, tone: 'danger', dashed: true },
+      { id: 'vm', label: 'validateMessage', note: 'is the checksum slot warm?', col: 3 },
+      { id: 'rev', label: 'reverts', note: 'NotInAccessList', col: 3, tone: 'danger', dashed: true },
+    ]}
+    edges={[
+      { from: 'log', to: 'al' },
+      { from: 'al', to: 'node' },
+      { from: 'node', to: 'drop', tone: 'danger', dashed: true },
+      { from: 'node', to: 'vm' },
+      { from: 'vm', to: 'rev', tone: 'danger', dashed: true },
+    ]}
+  />
+</Figure>
+
+<Aside kind="note">
+One corollary is a hard rule with no workaround: because deposit transactions cannot carry access
+lists, calls to `CrossL2Inbox.validateMessage` from inside a deposit always
+revert.<Cite src="op-docs-interop-explainer-current" /> The forced-inclusion path and the interop path
+are disjoint. You cannot force an executing message through L1, which means interop liveness is not
+inherited from the deposit escape hatch and has to be reasoned about separately.
+</Aside>
+
+The point of doing it in the access list rather than in the contract is stated directly: it gives
+sequencers, builders and verifiers a uniform, EVM-free way to drop transactions whose referenced
+messages do not exist — including under reorgs and equivocation — before they are ever included in a
+block.<Cite src="op-docs-interop-explainer-current" />
+
+## The safety rule is last lesson's rule, applied sideways
+
+Interop does not add a fourth block label. It keeps `unsafe`, `safe` and `finalized` and changes what
+`safe` requires.<Cite src="op-docs-interop-explainer-current" />
+
+A block is **safe** when it has been derived from data on L1 **and every initiating message it
+references has itself reached at least the same safety level**.<Cite src="op-docs-interop-explainer-current" />
+The docs illustrate it: blocks on chain B that reference initiating messages from chain A cannot become
+safe until the referenced chain-A block has also been written to
+L1.<Cite src="op-docs-interop-explainer-current" />
+
+And it is transitive. A chain's direct dependency set is the chains it accepts messages from; its
+transitive dependency set includes those chains' dependencies, and so on. A block on chain D depending
+on an unsafe initiating message from chain E stays unsafe until that chain-E block is on L1 — and so
+does every chain-B and chain-A block that depends on the chain-D
+block.<Cite src="op-docs-interop-explainer-current" />
+
+<Figure
+  caption="Unsafe is contagious. One chain's unposted block pins every block that transitively executes it, however far away."
+  alt="Chain E's block carries an initiating message that has not yet been written to L1. Chain D's block executes that message and therefore stays unsafe. Chain B's block depends on chain D's block and stays unsafe, and chain A's block depends on chain B's and stays unsafe in turn."
+>
+  <Flow
+    nodes={[
+      { id: 'e', label: 'chain E block', note: 'not yet on L1', col: 0, tone: 'danger' },
+      { id: 'd', label: 'chain D block', note: "executes E's message", col: 1, tone: 'warn' },
+      { id: 'b', label: 'chain B block', note: 'depends on D', col: 2, tone: 'warn' },
+      { id: 'a', label: 'chain A block', note: 'depends on B', col: 3, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'e', to: 'd', label: 'pinned unsafe', tone: 'warn' },
+      { from: 'd', to: 'b', tone: 'warn' },
+      { from: 'b', to: 'a', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+This is what buys the double-spend protection. With asset transfers, the initiating message burns
+tokens on the source and the executing message mints them on the destination, and the mechanism ensures
+that should a reorg happen, either both transactions remain or both revert — in every case, there is no
+window of opportunity to double spend.<Cite src="op-docs-interop-reorg" />
+
+### The dial a chain operator actually turns
+
+The safety rule constrains promotion, not inclusion. A sequencer still has to decide which safety level
+it demands of an *inbound* message before it will build a block on it, and the docs lay out three
+settings:<Cite src="op-docs-interop-security" />
+
+- **Accept unsafe initiating messages.** Minimal latency, at the cost that the source sequencer can
+  equivocate.
+- **Require cross-safe.** A cross-safe block is written to L1 and has all its dependencies, direct or
+  indirect including those of previous blocks in the same chain, also written to L1. Higher-throughput
+  chains submit a batch about every five minutes, so on average it takes about two and a half minutes
+  for an initiating message to become safe.
+- **Require finalized.** Currently adds about fifteen minutes to message latency.
+
+Even at the loosest setting the destination's own blocks stay unsafe until their dependencies land on
+L1.<Cite src="op-docs-interop-security" /> So the dial does not trade away the safety rule; it trades
+how much *unsafe* exposure the chain accumulates before the rule can be satisfied.
+
+The failure mode at the loose end is specific and worth internalising. If the destination block
+containing the executing message reaches L1 *first*, and the source block that eventually lands on L1
+lacks the initiating message, verifiers detect that the destination block's derivation is incorrect,
+and that block and all subsequent blocks on any chain that depend on it are classified as deposit-only
+blocks.<Cite src="op-docs-interop-security" />
+
+Deposit-only blocks — the same construct from the derivation lesson, now reaching across chains. A
+sequencer on chain B that trusted chain A's gossip can have its own users' transactions stripped out
+because a sequencer it does not employ equivocated.<Cite src="op-docs-interop-reorg" />
+
+<Misconception
+  belief="Superchain interop means tokens move instantly and trustlessly between OP chains, with no assumptions left over."
+  reality="At minimum latency the destination is trusting every sequencer in its transitive dependency set to eventually post what it gossiped. If any of them equivocates, the executing-message blocks are reorged out and replaced with deposit-only blocks."
+  why="'No bridge in the middle' is read as 'no trust assumption', when what was removed is a third-party committee — replaced by an assumption about other chains' sequencers that you can dial down at a latency cost."
+  src="op-docs-interop-explainer-current"
+/>
+
+## The dependency set is a door that only opens
+
+The dependency set is configured per cluster, and all chains in it can accept initiating messages from
+any other chain in it, producing a mesh. A chain's own chain ID must be part of its own dependency set,
+which lets it consume its own logs far more cheaply than providing a block hash
+proof.<Cite src="op-specs-interop-depset" /> Chain IDs used in dependency sets must fit within a
+`uint64`, though software should be designed to support up to `uint256`
+IDs.<Cite src="op-specs-interop-depset" />
+
+Then two sentences that should change how you think about joining one.
+
+**Adding a chain to the dependency set is considered an upgrade to the network. It is not possible to
+remove chains from the dependency set.**<Cite src="op-specs-interop-depset" />
+
+Every other configuration decision in this module can be revisited at some cost. This one is specified
+as one-way. Accepting a chain's messages means accepting its derivation and its failure modes as inputs
+to your own chain's validity, permanently — and the security-considerations section names the price
+directly: it becomes increasingly expensive to fully validate the full cluster as the dependency set
+grows, and because the proof system requires validating all of the chains, the size of the dependency
+set is limited by the performance of the proof.<Cite src="op-specs-interop-depset" />
+
+The Superchain's chosen topology maximises both sides of that. The OP Stack builds a single
+fully-connected mesh on top of the underlying protocol: every chain in the Superchain interop cluster
+has every other chain in its dependency set, so any chain can message any other
+directly.<Cite src="op-docs-interop-explainer-current" /> Dependency sets do not have to be symmetric
+or fully connected — a chain whose set is `{A, C}` forces messages from `E` to be relayed via `A` — but
+the Superchain's is.<Cite src="op-docs-interop-explainer-current" />
+
+Which is exactly why membership is gated on the charter rather than the registry. Every chain in the
+cluster shares the same security model to mitigate the weakest-link risk, sharing the same L1
+`ProxyAdmin` Owner, with any change to the cluster going through the standard Protocol Upgrade
+vote.<Cite src="op-docs-interop-explainer-current" /> A permanent, transitive dependency on a chain is
+only tolerable if that chain cannot unilaterally change what it is.
+
+## The software that exists because somebody has to check
+
+Now the bill. Before interop, a node derived its own chain. With interop, a node has to derive **every
+chain in its dependency set**, because any of them can emit an initiating message the local chain
+depends on — and the local chain cannot advance past a block whose dependencies it cannot prove, so the
+derivation of every other chain is on the critical path.<Cite src="op-docs-supernode-explainer" />
+
+Without consolidation, every operator runs a full `op-node` and execution client per chain, duplicating
+the L1 client, the beacon-chain client, the derivation pipeline, the storage layout and the operational
+glue around each — and for a fully-connected set, that duplication scales with the size of the
+cluster.<Cite src="op-docs-supernode-explainer" />
+
+`op-supernode` collapses it: every chain runs as an in-memory **virtual node** inside one process, with
+a single L1 client and a single beacon client serving all of them, plus the cross-chain verification
+work layered above the per-chain layer.<Cite src="op-docs-supernode-explainer" /> Its structure is
+**chain containers** and **activities** — each container hosting one chain's consensus layer in-process
+(today, `op-node` hosted as a library) and each activity operating above the chain layer with access to
+every chain.<Cite src="op-docs-supernode-explainer" />
+
+The shared-resource details are the ones that matter when you operate it. A single L1 RPC and beacon
+client serve every chain, with cache hits on L1 blocks and blob lookups carrying across chains. The
+JSON-RPC surface is namespaced per chain by chain ID prefix — `11155420/` reaches OP Sepolia's RPC,
+`1301/` reaches Unichain Sepolia's — and metrics and data directories are namespaced the same way, so
+SafeDB and P2P state cannot collide. `--l1` and `--l1.beacon` are owned at the supernode level, and any
+per-chain override of them is silently replaced by the top-level
+value.<Cite src="op-docs-supernode-explainer" />
+
+Four activities ship with it: **Heartbeat**, a liveness signal; **SuperRoot**, producing a super root —
+a commitment over verified L2 blocks across the dependency set at a given timestamp, which the fault
+proof system needs to produce an interop-aware proof; **Supernode**, exposing an aggregate per-chain
+sync status; and **Interop**, which does the cross-chain message
+verification.<Cite src="op-docs-supernode-explainer" />
+
+**The interop activity is the decision-maker.** For every block on every chain it answers one question —
+have all the initiating messages this block executes been reproduced from L1, at the same safety level
+the destination block is trying to reach — and decides per round between `wait`, `advance`,
+`invalidate` and `rewind`, persisting the decision to a write-ahead log before applying it so a restart
+resumes in the same state.<Cite src="op-docs-supernode-explainer" /><Cite src="op-docs-interop-reorg" />
+
+And it never reaches into a chain directly. When the answer is `advance`, the signal flows through an
+authority interface the chain container holds and the virtual node defers to: the supernode advances
+safety on a chain only via that chain's own consensus layer, which stays the single source of truth for
+safety on its chain, and the execution layer never has to learn about interop at
+all.<Cite src="op-docs-supernode-explainer" />
+
+The deployment topology follows. One trusted supernode, or a small high-availability pool, runs
+derivation for every chain plus the interop activity; the rest of the fleet runs `op-node` or
+`kona-node` in **Light CL** mode, which turns off local derivation and mirrors safe and finalized state
+from a trusted external source over `optimism_syncStatus` while still advancing the unsafe chain over
+P2P.<Cite src="op-docs-supernode-explainer" /> The expensive multi-chain derivation happens once; the
+rest of the fleet stays cheap.<Cite src="op-docs-supernode-explainer" />
+
+<Misconception
+  belief="op-supernode is an optimisation — nice for large operators, optional for everyone else."
+  reality="Verifying an executing message requires deriving the source chain. In a fully-connected mesh that means deriving every member chain. The supernode is not a faster way to do the work; it is a way to do it once instead of N times, and the alternative to doing it is delegating your safe view to somebody who did."
+  why="Every previous scaling component had a lighter mode that still verified. Here the lighter mode — Light CL — explicitly mirrors somebody else's safe and finalized view rather than computing its own."
+  src="op-docs-supernode-explainer"
+/>
+
+That misconception is the honest measure of the design. A fully-connected mesh is cheap to use and
+expensive to check, and the number of independent parties actually checking it is bounded by how many
+can afford a supernode. Compare it to the [weakest-link](/c/security-is-the-weaker-link) framing from
+the bridges module: interop removes the bridge committee and replaces it with a verification cost that
+concentrates verification among fewer parties. Whether that is a better trade depends on how many
+supernodes exist, which is an empirical question with an answer that will change.
+
+## Where this actually is, as of 26 August 2026
+
+Be careful here, because the documentation reads more shipped than the activation data does.
+
+The hardfork registry lists **Lagoon** as the upgrade that activates Superchain interop, with status
+**In development**, mainnet superchain-wide activation **Not scheduled**, and Sepolia superchain-wide
+activation **Not scheduled**.<Cite src="op-docs-hardfork-lagoon" /> No superchain-wide activation
+defaults are set in the registry yet; the first activations are being prepared per chain, with an
+operator notice covering **OP Sepolia and Unichain Sepolia**.<Cite src="op-docs-hardfork-lagoon" /> The
+governing specification is itself noted as not yet finalised.<Cite src="op-docs-hardfork-lagoon" />
+
+Meanwhile the registry documentation states in the present tense that standard chains get Superchain
+interop by default,<Cite src="op-docs-superchain-registry" /> and the interop explainer says the cluster
+is being rolled out iteratively, pointing readers at the Superchain Index for chains eligible to
+join.<Cite src="op-docs-interop-explainer-current" /> The `op-supernode` page opens by saying the
+architecture and interfaces described may continue to evolve as the rollout
+progresses.<Cite src="op-docs-supernode-explainer" />
+
+Both readings are in first-party documentation and they are not the same claim. The defensible summary
+is: the design is specified and implemented, activation is per chain rather than superchain-wide, the
+named first activations are testnets, and **whether any mainnet chain is live on interop is not
+something these sources establish** — treat any confident statement either way, including from a chain
+selling you on it, as a claim to check against the hardfork registry on the day.
+
+<Check type="explain" concept="dependency-set">
+You operate a mid-sized OP Stack chain and are asked to approve joining the Superchain interop cluster.
+Your CTO's summary: "It is a protocol upgrade, we get instant cross-chain transfers, and we can leave
+if it goes badly."
+
+Correct the summary, then list what you would require before approving.
+
+<Answer>
+**"It is a protocol upgrade" — correct, and the important half.** Adding a chain to the dependency set
+is considered an upgrade to the network,<Cite src="op-specs-interop-depset" /> and joining the
+Superchain cluster additionally means sharing its security model and its L1 `ProxyAdmin` Owner, with
+changes going through the standard Protocol Upgrade vote.<Cite src="op-docs-interop-explainer-current" />
+So the technical decision and the governance handover are one decision.
+
+**"Instant" — wrong at the level that matters.** Executing messages can be accepted against unsafe
+initiating messages for minimal latency, but the destination's own blocks stay unsafe until every
+dependency is on L1.<Cite src="op-docs-interop-security" /> Fast *inclusion*, unchanged *safety*
+timeline. If your product's crediting rule is written against `safe` — and after the three-heads lesson
+it should be — inbound interop transfers settle on the source chain's batch cadence, roughly two and a
+half minutes on higher-throughput chains posting about every five
+minutes.<Cite src="op-docs-interop-security" />
+
+**"We can leave" — this is the sentence to escalate on.** The spec says it is not possible to remove
+chains from the dependency set.<Cite src="op-specs-interop-depset" /> There is no exit. You are
+accepting every member chain's derivation and failure modes as permanent inputs to your own chain's
+validity, and in a fully-connected mesh that is the entire
+membership.<Cite src="op-docs-interop-explainer-current" />
+
+**What I would require before approving.**
+
+*An honest statement of activation status.* Lagoon is In development with no scheduled superchain-wide
+activation on either network, and the first activations are being prepared per chain for OP Sepolia and
+Unichain Sepolia.<Cite src="op-docs-hardfork-lagoon" /> A plan that assumes a mainnet date needs to
+name where that date came from.
+
+*A verification budget.* Somebody has to run `op-supernode`, because verifying executing messages means
+deriving every chain in the set,<Cite src="op-docs-supernode-explainer" /> and the alternative is Light
+CL mirroring somebody else's safe and finalized view over
+`optimism_syncStatus`.<Cite src="op-docs-supernode-explainer" /> Either is defensible; only one of them
+is us verifying, and the difference belongs in the risk disclosure rather than in a footnote.
+
+*A configured inbound safety level, decided deliberately.* Unsafe, cross-safe or finalized is a product
+decision with a published latency table.<Cite src="op-docs-interop-security" /> Defaulting to the
+fastest setting because it demos well is how a chain ends up explaining deposit-only blocks to its
+users after somebody else's sequencer equivocated.<Cite src="op-docs-interop-security" />
+
+*A runbook for invalidation.* When the interop activity decides `invalidate` or `rewind`, our unsafe
+blocks are reorged out and replaced.<Cite src="op-docs-interop-reorg" /> Support, the block explorer,
+the indexer and every downstream integration need a defined behaviour for that, written before it
+happens rather than during.
+
+*A named owner for the dependency-set decision.* Since it cannot be undone, it should be signed off by
+whoever also owns the upgrade key — the same person the module's reflection prompt asks you to name.
+</Answer>
+</Check>
+
+## Where this leaves the module
+
+**The idea that carried all six lessons** was one line of specification: the L2 chain is a
+deterministic function of L1 data.<Cite src="op-specs-derivation" /> Everything since has been that
+sentence under pressure. Three block labels are three claims about how much L1 is behind a block.
+Forced inclusion works because deposits are inputs to the function rather than requests to an operator.
+The Superchain is many operators agreeing to run the same function at the same version. And interop
+extends the function's domain from one L1 to an L1 plus every chain in a dependency set — which is why
+it costs what it costs.
+
+**The reflection prompt** is the exit exam, and it is not rhetorical. Name a human for the batcher, the
+proposer, the challenger, the upgrade key, the release-adoption decision, and the user who cannot
+withdraw. After this lesson, add a seventh: whoever decides which chains your chain will trust forever.
+
+**Your own systems.** If you integrate with a chain in an interop cluster, your exposure is no longer
+bounded by that chain. It is bounded by its transitive dependency set, and the honest version of your
+risk disclosure names that set rather than the single chain on your architecture diagram.

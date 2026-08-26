@@ -1,0 +1,398 @@
+---
+id: protocol-epbs-the-committee-that-checks-the-clock
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [eip-7732, consensus-specs-gloas-beacon-chain, consensus-specs-gloas-fork-choice, consensus-specs-gloas-validator, consensus-specs-gloas-p2p, consensus-specs-mainnet-config-gloas, consensus-specs-mainnet-preset-gloas, ethresearch-epbs-threads]
+stack: {}
+---
+
+Five hundred and twelve validators are picked for a slot, and the entire question put to them is
+this:
+
+```python
+class PayloadAttestationData(Container):
+    beacon_block_root: Root
+    slot: Slot
+    payload_present: Boolean
+    blob_data_available: Boolean
+```
+
+Two booleans.<Cite src="consensus-specs-gloas-beacon-chain" /> Did the payload turn up, and was its
+blob data there. Not "is it valid". Not "does it execute". Not "does the state root match". Did it
+turn up.
+
+This is the payload timeliness committee, and almost every wrong summary of EIP-7732 goes wrong right
+here, by reading "the committee attests to the payload" as "the committee validates the payload". The
+inversion matters because the committee's uselessness for validation is exactly what makes the design
+work.
+
+## What the committee is
+
+Each slot, a subset of that slot's [attesters](/c/attestation) is selected as the PTC — a per-slot
+[committee](/c/committee) in the protocol's usual sense of the word. The size is a preset:
+`PTC_SIZE = 512`.<Cite src="consensus-specs-mainnet-preset-gloas" />
+
+The selection concatenates every beacon committee for the slot in order, then draws 512 members from
+that pool by balance-weighted selection, seeded from the slot number under
+`DOMAIN_PTC_ATTESTER`:<Cite src="consensus-specs-gloas-beacon-chain" />
+
+```python
+def compute_ptc(state: BeaconState, slot: Slot) -> PTC:
+    """
+    Get the payload timeliness committee, with possible duplicates, for the given ``slot``.
+    """
+    epoch = compute_epoch_at_slot(slot)
+    seed = hash(get_seed(state, epoch, DOMAIN_PTC_ATTESTER) + uint_to_bytes(slot))
+    indices: list[ValidatorIndex] = []
+    committees_per_slot = get_committee_count_per_slot(state, epoch)
+    for i in range(committees_per_slot):
+        committee = get_beacon_committee(state, slot, CommitteeIndex(i))
+        indices.extend(committee)
+    return PTC(
+        compute_balance_weighted_selection(
+            state, indices, seed, size=PTC_SIZE, shuffle_indices=False
+        )
+    )
+```
+
+Two details in the docstring and the call deserve attention.
+
+**"With possible duplicates."** Selection is balance-weighted, so a validator with a large effective
+balance can occupy more than one of the 512 seats. The committee is 512 *seats*, not necessarily 512
+distinct validators. Anyone computing committee statistics who assumes distinctness will be quietly
+wrong.<Cite src="consensus-specs-gloas-beacon-chain" />
+
+**The membership is precomputed and cached.** Beacon state carries a `ptc_window`, refreshed at epoch
+boundaries, and `get_ptc` reads from it rather than recomputing.<Cite src="consensus-specs-gloas-beacon-chain" />
+On the validator side, `get_ptc_assignment` is called at the start of each epoch so a validator knows
+its assigned slots in advance, the same rhythm as ordinary attestation
+duties.<Cite src="consensus-specs-gloas-validator" />
+
+A member's obligation is a single `PayloadAttestationMessage` broadcast on its own global gossip
+topic, before a deadline expressed in milliseconds into the
+slot.<Cite src="consensus-specs-gloas-p2p" /><Cite src="consensus-specs-gloas-validator" /> Those
+messages are later aggregated into `PayloadAttestation` objects — an aggregation bitvector of
+`PTC_SIZE` bits plus the shared data and signature — and up to
+`MAX_PAYLOAD_ATTESTATIONS`, which is 4, ride in the *next* beacon
+block.<Cite src="consensus-specs-gloas-beacon-chain" /><Cite src="consensus-specs-mainnet-preset-gloas" />
+
+## What the committee explicitly does not do
+
+The EIP is unusually direct about this. PTC members do not need to validate the execution payload
+before attesting to it. They perform basic checks — verifying the builder's signature and that the
+correct block hash is included — and that is the extent of
+it.<Cite src="eip-7732" />
+
+Execution validity is established elsewhere and later: against the *following* block. The next
+proposer builds on top of the payload and, in doing so, must have validated it; the attesters of the
+next slot vote on that proposer's block.<Cite src="eip-7732" /> The chain still refuses invalid
+payloads. It refuses them one slot later than it used to.
+
+<Misconception
+  belief="The payload timeliness committee validates the execution payload."
+  reality="Its members attest only that the payload arrived within its window and that the blob data was available. Execution validity is checked against the next block."
+  why="'Committee attests to the payload' reads as validation, and every other committee in the protocol votes on something's correctness."
+  src="eip-7732"
+/>
+
+**This is the whole trick.** If the PTC had to validate, the payload's execution would be back on a
+committee's critical path and nothing would have been gained. By restricting the committee's question
+to something answerable by *looking at the clock and your own inbox*, the design gets a chain-wide
+consensus answer to "did it arrive" at almost no computational cost — and answering "did it arrive"
+is precisely what the payment and fork-choice rules need.
+
+<Aside kind="note">
+Note what kind of question "did it arrive on time" is. It is a question about each validator's local
+view, and local views differ. That is why it needs a committee at all: no single node's opinion about
+arrival is authoritative, and unlike execution validity, arrival is not something you can recompute
+from first principles later. It has to be *witnessed*.
+</Aside>
+
+It is worth asking why a committee is needed rather than letting every node decide for itself. Every
+node *does* decide for itself — that is the local-availability check in fork choice below. But two
+things in the protocol need a single shared answer rather than a per-node one. The builder's payment
+settles or does not settle in the state transition, which is the same for everyone by
+definition.<Cite src="consensus-specs-gloas-beacon-chain" /> And fork choice has to converge, which it
+cannot do if half the network considers a slot full and half considers it empty with no mechanism for
+resolving the split. A sampled committee is the protocol's standard instrument for turning many local
+observations into one number the state transition can read, and it is being used here for exactly
+that.
+
+What makes it cheap is the narrowness of the question. An attestation committee's vote requires each
+member to have executed a block; a PTC vote requires each member to check a timestamp against its own
+inbox. The design is buying consensus on a fact that costs nothing to observe, and deliberately not
+buying consensus on the fact that costs everything.<Cite src="eip-7732" />
+
+### One member's decision procedure, in full
+
+The honest validator guide gives the whole algorithm for a PTC member, and it is short enough to read
+as a whole. Written out:<Cite src="consensus-specs-gloas-validator" />
+
+**Subgoal: decide whether you have anything to attest about.** If the validator has seen no beacon
+block for its assigned slot, it does not submit a payload attestation at all — the guide notes it
+would be ignored anyway. No block, no opinion.
+
+**Subgoal: name what you are attesting about.** `data.beacon_block_root` is the hash tree root of the
+block it did see; `data.slot` is the assigned slot.
+
+**Subgoal: answer the timeliness question from your own inbox and your own clock.** If a previously
+seen `SignedExecutionPayloadEnvelope` references that block root *and* it was seen before
+`get_payload_due_ms()` milliseconds into the slot, set `payload_present` to `True`. Otherwise `False`.
+That is the entire test: did this object cross my network interface before this millisecond.
+
+**Subgoal: answer the availability question with the check you already run.** `blob_data_available` is
+`is_data_available(data.beacon_block_root)` — the same data-availability routine the node already
+performs, not a new one.
+
+**Subgoal: sign the data, not the message.** The attester signs `PayloadAttestationData` only, not the
+`validator_index` field of the message. That is what makes the messages aggregatable: 512 members
+signing an identical payload produce signatures that combine.
+
+<Figure
+  caption="Two booleans, one signature, and a seat in next slot's block — the committee's entire output."
+  alt="A PTC member that has seen no beacon block for its slot does not attest at all; otherwise it answers payload_present from whether the envelope reached its inbox before the payload deadline and blob_data_available from the data-availability check it already runs, signs the attestation data alone so the messages aggregate, and up to four aggregates ride in the next beacon block."
+>
+  <Flow
+    dir="down"
+    lanes={['precondition', 'the two booleans', 'signature', 'next slot']}
+    nodes={[
+      { id: 'blk', label: 'beacon block seen?', note: 'no block, no attestation at all', col: 0 },
+      { id: 'present', label: 'payload_present', note: 'envelope in my inbox before the payload deadline', col: 1, tone: 'accent' },
+      { id: 'blob', label: 'blob_data_available', note: 'the availability check the node already runs', col: 1, tone: 'accent' },
+      { id: 'sig', label: 'sign the data', note: 'not the validator index, so 512 signatures combine', col: 2 },
+      { id: 'agg', label: 'up to 4 aggregates', note: 'included in the next beacon block', col: 3 },
+    ]}
+    edges={[
+      { from: 'blk', to: 'present' },
+      { from: 'blk', to: 'blob' },
+      { from: 'present', to: 'sig' },
+      { from: 'blob', to: 'sig' },
+      { from: 'sig', to: 'agg' },
+    ]}
+  />
+</Figure>
+
+Read that list and notice how little of it is judgement. Every step is either a lookup or a
+comparison against a deadline. A PTC member cannot be wrong in an interesting way; it can only report
+a different network view, which is the thing the committee exists to sample.
+
+### Where the votes end up
+
+The messages go out on a global gossip topic during the slot. The next slot's proposer aggregates
+them and includes up to `MAX_PAYLOAD_ATTESTATIONS` — four — aggregate objects in its
+block.<Cite src="consensus-specs-gloas-validator" /><Cite src="consensus-specs-mainnet-preset-gloas" />
+Each aggregate is a `Bitvector[PTC_SIZE]` of which seats signed, the shared data, and one aggregate
+signature.<Cite src="consensus-specs-gloas-beacon-chain" />
+
+An observation, offered as an observation rather than as the specification's stated rationale: for a
+fixed block root and slot, `PayloadAttestationData` has exactly two free bits, so the committee can
+hold at most four distinct opinions. Four aggregates is therefore enough to carry every one of them.
+The specification states the constant without explaining it, so treat the correspondence as a
+consistency check on your reading, not as a sourced
+justification.<Cite src="consensus-specs-mainnet-preset-gloas" />
+
+## The committee cannot lie a payload into existence
+
+There is a design detail in fork choice that decides how much power the PTC actually holds, and it
+answers the obvious worry — that 512 validators voting "it arrived" could make everyone believe in a
+payload nobody has.
+
+```python
+def payload_timeliness(store: Store, root: Root, timely: bool) -> bool:
+    # The beacon block root must be known
+    assert root in store.payload_timeliness_vote
+
+    # If the payload is not locally available, the payload
+    # is not considered available regardless of the PTC vote
+    if not is_payload_verified(store, root):
+        return not timely
+
+    votes = store.payload_timeliness_vote[root]
+    return sum(vote == timely for vote in votes) > PAYLOAD_TIMELY_THRESHOLD
+```
+
+The comment is doing the work.<Cite src="consensus-specs-gloas-fork-choice" /> A node that does not
+have the payload does not treat it as timely no matter how the committee voted. The PTC's votes
+break ties *among nodes that already have the data*; they never substitute for having it.
+
+The threshold is a simple majority of seats: `PAYLOAD_TIMELY_THRESHOLD = PTC_SIZE // 2`,
+256.<Cite src="consensus-specs-gloas-fork-choice" /> Worth flagging, because the EIP's rationale
+discusses raising it to two thirds as a mitigation against a specific attack — so a description
+written from the EIP's rationale and a description written from the merged fork-choice rules will
+give you different numbers.<Cite src="eip-7732" /><Cite src="consensus-specs-gloas-fork-choice" />
+The merged specification at the tag read for this lesson says 256.
+
+### How hard is the committee to capture?
+
+The EIP puts a figure on it: for an attacker controlling 35% of total stake, the expected time to
+achieve majority control of the PTC is 205,000 years.<Cite src="eip-7732" /> Take the figure for what
+it is — a statement about random sampling from a large validator set, under the stated stake share,
+and nothing more. It says a randomly drawn 512-seat committee is a poor thing to try to capture by
+luck. It says nothing about coordinated behaviour by a large staking entity that is *legitimately*
+drawn into many seats over time.
+
+And the specification is candid about a cheaper attack that does not require capturing the committee
+at all. There is **no penalty for PTC equivocation or payload equivocation** — no slashing condition
+for a builder that reveals a payload and simultaneously signals it withheld, nor for a PTC member that
+signs both ways. A builder that controls a network partition, colluding with a single malicious PTC
+member, can produce a split view in which part of the network concludes the payload was present and
+part concludes it was withheld.<Cite src="eip-7732" />
+
+The EIP names two possible mitigations — raising the timeliness threshold to two thirds, or adding
+slashing conditions for equivocation — and states that it opted for simplicity of implementation
+instead, on the grounds that the attack costs the builder something (it reveals a payload that may
+not be included) and produces a split view rather than a
+theft.<Cite src="eip-7732" /> Whether that is the right call is a live question, not a settled one,
+and it is exactly the kind of thing that changes between devnets and
+mainnet.<Cite src="ethresearch-epbs-threads" />
+
+## Diffed against the committee you already know
+
+Set the PTC beside the attestation committee and the differences are sharper than the similarities.
+
+<Compare
+  axis="Property"
+  columns={[
+    { title: 'Beacon committee attester' },
+    { title: 'PTC member', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'Votes on', cells: [<>head, source and target checkpoints<Cite src="eip-7732" /></>, <>payload arrival and blob availability<Cite src="consensus-specs-gloas-beacon-chain" /></>] },
+    { label: 'Must execute anything?', cells: [<>yes — consensus and execution state transition before voting<Cite src="eip-7732" /></>, { v: <>no — signature and block hash checks only<Cite src="eip-7732" /></>, tone: 'good' }] },
+    { label: 'Membership', cells: ['the whole active set, spread over an epoch', <>{"512 balance-weighted seats per slot, drawn from that slot's attesters"}<Cite src="consensus-specs-gloas-beacon-chain" /></>] },
+    { label: 'Aggregated into', cells: ['attestations in later blocks', <>up to 4 payload attestations in the next block<Cite src="consensus-specs-mainnet-preset-gloas" /></>] },
+    { label: 'Equivocation slashable?', cells: ['yes', { v: <>no slashing condition defined<Cite src="eip-7732" /></>, tone: 'warn' }] },
+  ]}
+  caption="A vote that costs nothing to produce is also a vote nobody is punished for getting wrong."
+  alt="Beacon committee attesters vote on head, source and target after running both state transitions, are drawn from the whole active set across an epoch, and can be slashed for equivocating; PTC members vote on payload arrival and blob availability after signature and block-hash checks only, hold 512 balance-weighted seats per slot drawn from that slot's attesters, aggregate into at most four payload attestations in the next block, and have no slashing condition defined."
+/>
+
+That last row pairs with something in the state transition worth noting explicitly.
+`process_payload_attestation` checks three things — that the attestation is for the parent block, that
+it is for the previous slot, and that the aggregate signature verifies — and then
+returns.<Cite src="consensus-specs-gloas-beacon-chain" /> No balance is increased, no participation
+flag is set, no penalty is applied.
+
+So at this tag, the PTC duty carries **neither a reward for performing it nor a penalty for
+skipping it**, and equivocating on it is not slashable. The incentive to participate is the ordinary
+one — a validator that is also an attester has already done the work of watching for the payload —
+plus whatever a client implementation chooses to do by default. Whether that stays true is precisely
+the kind of thing that gets revisited between devnets and mainnet, and it is worth re-reading the
+merged spec rather than assuming this
+paragraph.<Cite src="ethresearch-epbs-threads" /><Cite src="consensus-specs-gloas-beacon-chain" />
+
+## A slot can be full, skipped, or empty
+
+Now the consequence that reaches furthest outside the consensus layer.
+
+The EIP defines three states a slot can be in:<Cite src="eip-7732" />
+
+- **Full** — the beacon block and the execution payload were both revealed and included.
+- **Skipped** — no beacon block, and therefore no payload.
+- **Empty** — the beacon block was included; the committed payload was not.
+
+<Matrix
+  corner="Slot state"
+  cols={['Beacon block', 'Execution payload', 'Existed before this fork?']}
+  rows={[
+    { label: 'Full', cells: ['included', 'revealed and included', 'yes'] },
+    { label: 'Skipped', cells: ['none', 'none', 'yes'] },
+    { label: 'Empty', cells: ['included', { v: 'committed, never revealed', tone: 'warn' }, { v: 'no', tone: 'accent' }] },
+  ]}
+  caption="Only one column separates an empty slot from a full one, and it is not the beacon block."
+  alt="A full slot has both a beacon block and a revealed execution payload; a skipped slot has neither; an empty slot has a beacon block whose committed payload was never revealed, a state that did not exist before this fork."
+/>
+
+The third one is new. Between the Merge and this fork, a valid beacon block implied an execution
+payload, one for one, because the payload was inside it. After this fork a beacon block is valid
+whether or not the thing it committed to ever showed up.
+
+Beacon state records it explicitly:
+
+```python
+execution_payload_availability: Bitvector[SLOTS_PER_HISTORICAL_ROOT]
+```
+
+One bit per slot in the historical window.<Cite src="consensus-specs-gloas-beacon-chain" /> The chain
+now carries, as first-class state, a record of which of its own slots have execution content.
+
+Fork choice grows a matching notion. A node in the fork-choice tree carries a `payload_status` that is
+one of `PAYLOAD_STATUS_EMPTY`, `PAYLOAD_STATUS_FULL` or
+`PAYLOAD_STATUS_PENDING`.<Cite src="consensus-specs-gloas-fork-choice" /> The same beacon block can be
+tracked in two states — with its payload and without — and the head-selection rules choose between
+them. Fork choice is no longer choosing among blocks; it is choosing among (block, payload-status)
+pairs.
+
+### Ordinary attesters vote on this too
+
+The PTC is not the only source of payload-presence information. The `index` field of
+`AttestationData`, unused since Electra, is repurposed: an attester sets `index = 0` when attesting to
+the current block or to a past block whose payload is absent, and `index = 1` for a past block whose
+payload is present.<Cite src="eip-7732" /><Cite src="consensus-specs-gloas-validator" /> Fork choice
+reads that to decide which node a message supports.<Cite src="consensus-specs-gloas-fork-choice" />
+
+Two mechanisms, two jobs. The PTC gives a fast, same-slot signal used for timeliness and payment. The
+ordinary attesters give the durable fork-choice weight for whether a past slot was full or empty. If
+you have wondered why an EIP that "adds one committee" touches the attestation container as well, that
+is why.
+
+<Misconception
+  belief="Every slot with a valid beacon block has an execution block."
+  reality="A beacon block can be valid while its committed payload was never revealed. Beacon state carries an availability bitvector precisely because that state exists."
+  why="The two have been one-to-one since the Merge, so every tool, mental model and database schema written since then encodes the assumption."
+  src="eip-7732"
+/>
+
+<Check type="explain" concept="payload-availability-bit">
+You maintain a service that gives users a canonical block number for a given beacon slot — bridges,
+receipt lookups and a block explorer all depend on it. Today the mapping is total: every slot with a
+block has exactly one execution block. After this fork, describe what your schema and your API have
+to change to, and name the failure you would ship if you changed only the parsing code.
+
+<Answer>
+**The mapping stops being total, and that is a schema change, not a parsing change.**
+
+The relation between beacon slot and execution block becomes partial: a slot may be full, skipped, or
+empty, and only full slots have an execution block.<Cite src="eip-7732" /> A column that was
+`NOT NULL` is now nullable, and an API that returns a block number for a slot now needs a third
+response distinct from both "here it is" and "no such slot".
+
+Concretely, three things change:
+
+1. **The return type.** "Slot exists, has no execution block" is a legitimate success, not an error
+   and not a 404. Collapsing it into either is how downstream consumers get corrupted.
+2. **The source of truth for presence.** You can read it from beacon state's
+   `execution_payload_availability` bitvector rather than inferring it from whether a fetch
+   succeeded — inference cannot distinguish "no payload exists" from "I could not get
+   it".<Cite src="consensus-specs-gloas-beacon-chain" />
+3. **The timing.** Payload presence is not decided at block arrival. Fork choice tracks the block as
+   `PAYLOAD_STATUS_PENDING` until the votes come in, so a service answering the instant the block
+   lands is answering before the answer exists.<Cite src="consensus-specs-gloas-fork-choice" />
+
+**The failure you ship by changing only the parser** is the quiet one. Your ingest reads the new
+container, finds no payload for an empty slot, treats it as a fetch failure, and retries — or worse,
+skips the slot and advances the cursor. Nothing throws. The gap appears weeks later, as a bridge that
+cannot prove a receipt, or a balance history missing a day.
+
+The general form: a breaking change that turns an impossible state into a legal one does not
+announce itself at the type boundary. It announces itself in reconciliation, much later.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now state the committee's job in one sentence without getting it wrong: 512 balance-weighted
+seats drawn from the slot's attesters, answering two booleans about arrival and blob availability,
+with no execution validity in scope and no authority over a node that does not hold the
+data.<Cite src="consensus-specs-gloas-beacon-chain" /><Cite src="consensus-specs-gloas-fork-choice" />
+
+You can also state the new chain state precisely — full, skipped, empty — and say where it is
+recorded.<Cite src="eip-7732" />
+
+What is still missing is the clock the committee is checking against. Everything above happens at
+deadlines: the payload has one, the payload attestation has another, and the ordinary attestation
+deadline moved. The next lesson puts numbers on all of them, works out how much validation budget the
+design actually buys, and explains why the honest answer to "how much wider is the window" is a range
+rather than a figure.<Cite src="consensus-specs-mainnet-config-gloas" />

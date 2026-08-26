@@ -1,0 +1,324 @@
+---
+id: toolchain-fuzzing-from-example-to-property
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [foundry-writing-tests, foundry-forge-testing, foundry-testing-config, foundry-invariant-testing, measured-fuzz-probe-1-7-1, measured-forge-1-7-1]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Here is a test file from a real fee module. Six cases, all green, written by someone who was being
+careful.
+
+```solidity
+function test_FeeOnZero()        public { assertEq(f.feeOn(0), 0); }
+function test_FeeBelowTier()     public { assertEq(f.feeOn(9_999), 499); }
+function test_FeeAtTier()        public { assertEq(f.feeOn(10_000), 300); }
+function test_FeeAboveTier()     public { assertEq(f.feeOn(10_001), 300); }
+function test_FeeOnRoundNumber() public { assertEq(f.feeOn(1 ether), 3e16); }
+function test_FeeOnLarge()       public { assertEq(f.feeOn(1_000_000 ether), 3e22); }
+```
+
+Every one of those assertions carries two pieces of information: the input, chosen by a human, and
+the expected output, computed by the same human. The suite is a list of pairs. It can fail in exactly
+six ways, and it will keep failing in exactly six ways for as long as it exists, because the set of
+inputs it examines was frozen the moment it was written.
+
+Now the same module, differently:
+
+```solidity
+function testFuzz_FeeAndNetAreConserved(uint256 amount) public view {
+    amount = bound(amount, 0, type(uint128).max);
+    assertEq(f.net(amount) + f.feeOn(amount), amount);
+}
+```
+
+No expected value appears anywhere. There is nothing here a human computed. What is asserted is a
+*relationship* — the part you keep plus the part you pay adds up to what you started with — and the
+input is supplied by the tool.<Cite src="foundry-forge-testing" />
+
+That is the whole move this module is about, and the interesting difficulty is not where you would
+expect it.
+
+<Figure
+  caption="The fuzzer supplies the input, so the only place your judgement enters a run is the constraints — which is why the rest of this module is about them."
+  alt="One fuzz run in four stages: a value arrives from the fuzzer, the test's constraints bound or reject it, one call is made from the post-setUp state, and the property either holds or yields a counterexample."
+>
+  <Flow
+    lanes={['the fuzzer', 'you', 'the call', 'the result']}
+    nodes={[
+      { id: 'gen', label: 'a value arrives', note: 'runs: 256 by default', col: 0 },
+      { id: 'con', label: 'your constraints', note: 'bound it, or reject it', col: 1, tone: 'accent' },
+      { id: 'call', label: 'one call', note: 'from the post-setUp state', col: 2 },
+      { id: 'ok', label: 'property holds', note: 'a search found nothing', col: 3, tone: 'good' },
+      { id: 'ce', label: 'counterexample', note: 'the input that broke it', col: 3, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+## What actually changes about your job
+
+The mechanical difference is that a fuzz test runs many times with different arguments. The
+difference that matters is what you have to think of.
+
+An example-based test asks you to imagine a case, and you are good at that in proportion to how well
+you already understand the failure — which is to say, good at it for bugs you have already had.
+`test_FeeAtTier` and `test_FeeAboveTier` exist because someone thought about the boundary. There is
+no `test_FeeJustBelowOverflow` because nobody thought about that one, and writing more cases in the
+same style will not produce it: the same mind generates both the cases and the blind spots.
+
+A property test asks a different question: **what must be true of the output no matter what went
+in?** You do not need to know which input breaks it. You state the invariant precisely enough that a
+machine can check it, and let the machine look for the input.
+
+The skill this demands is unfamiliar, and worth naming rather than pretending the transition is a
+syntax change. Forty unit tests are forty small acts of recall; four good properties require you to
+say what the system guarantees, and frequently that sentence has never been written down anywhere on
+the team.
+
+### The property shapes that keep working
+
+You do not have to invent the form from nothing each time. A small number of shapes cover most of
+what a single function can promise.
+
+- **Conservation.** Something is preserved across the call. Fee plus net equals gross; the sum of all
+  balances is unchanged by a transfer.
+- **Round trip.** Encode then decode is the identity. Deposit then immediately withdraw returns what
+  you put in, or strictly less by an amount you can bound.
+- **Monotonicity.** A larger input never produces a smaller output. Depositing more never mints fewer
+  shares.
+- **Range.** The output is always inside a stated interval. A fee is never larger than the amount it
+  is charged on.
+- **Equivalence to a simpler model.** The optimised assembly path agrees with the obvious Solidity
+  path for every input — unreasonably effective and unreasonably underused.
+- **Idempotence.** Calling twice is the same as calling once.
+
+Each of those is a sentence about the function, not about a case. When you cannot write one, that is
+information: either the function does not promise anything stable, or you do not yet know what it
+promises.
+
+### Worked: turning six examples into one property
+
+Go back to the fee suite at the top and do the conversion deliberately, naming what each step is for.
+
+**Subgoal 1 — find the relationship the examples were all instances of.** Read the six assertions
+looking for what they have in common rather than what distinguishes them. `feeOn(0) == 0`,
+`feeOn(9_999) == 499`, `feeOn(10_000) == 300`: every one of them is a spot check on a rate table.
+Behind all six is a single claim — the fee and the net are two parts of one amount. That is the
+conservation shape, and it is the property.
+
+**Subgoal 2 — check the property is not vacuous before you trust it.** If `net` is implemented as
+`amount - feeOn(amount)`, then `net(a) + feeOn(a) == a` is arithmetic rather than a claim about the
+fee table, and it will hold no matter how wrong the rates are. Read the implementation and confirm
+the two quantities are computed independently. A property that restates the implementation is the
+most common way a fuzz suite ends up testing nothing.
+
+**Subgoal 3 — decide the domain, and write down why.** `bound(amount, 0, type(uint128).max)` is not
+a formality; it says the property is asserted for amounts up to about 3.4 × 10^38 and not beyond. If
+the token has 18 decimals and a supply cap, that is generous. If the parameter is a raw `uint256`
+that a caller controls, the excluded region is where the overflow lives. This is lesson four's
+subject and it starts here.
+
+**Subgoal 4 — keep one example.** Delete five of the six unit tests and keep `test_FeeAtTier`. The
+property covers the relationship; the surviving example pins the *rate* at the boundary, which the
+conservation property alone never checks. Properties and examples answer different questions and the
+suite wants both.
+
+**Subgoal 5 — name what you gained and what you gave up.** You gained every amount in the domain. You
+gave up the explicit expected values — nothing in the property says a fee at tier is 3%. If the rate
+table is itself the thing you are worried about, that belongs in a `table` test with the rates
+enumerated, which arrives in lesson four.<Cite src="foundry-forge-testing" />
+
+<Aside kind="note">
+Two of the shapes people reach for first — "the state after N operations is consistent" and "no
+sequence of calls can drain the contract" — are not available to you here. They are about sequences,
+and everything in this module is about one call. The last section of this lesson is about exactly
+where that line falls, because misplacing it is the most expensive mistake in the module.
+</Aside>
+
+## What makes a test fuzzed
+
+You already know that [forge discovers tests by function-name prefix](/c/test-discovery-by-prefix),
+and that the prefix chooses the engine: `invariant*` and `statefulFuzz*` start stateful campaigns,
+`table*` runs data-driven cases, `check*` and `prove*` only run under
+`--symbolic`.<Cite src="foundry-forge-testing" />
+
+Within the ordinary test family, the prefix is not what triggers fuzzing. The documentation states
+the rule plainly: Forge automatically fuzzes test functions that take
+parameters.<Cite src="foundry-forge-testing" /><Cite src="foundry-writing-tests" /> The parameter
+list is the mechanism. `testFuzz` is a convention that tells a human reader which functions are
+campaigns, and it has no effect on the runner.
+
+Two consequences follow, and both of them are edits that look harmless in review.
+
+**Adding a parameter converts a unit test into a campaign.** Changing `test_FeeAtTier()` to
+`test_FeeAtTier(uint256 amount)` turns one assertion into 256 runs with values you did not choose. If
+the body still says `assertEq(f.feeOn(10_000), 300)` and the parameter goes unused, you have 256
+identical runs, a slower suite and no extra coverage.
+
+**Removing a parameter collapses a property into one case.** The reverse edit leaves a function that
+still reads as a property and still has `Fuzz` in its name. The only signal is that its result line
+prints without a `runs:` figure, which is easy to miss in four hundred lines of output.
+
+<Misconception
+  belief="The testFuzz_ prefix is what makes forge fuzz a test."
+  reality="Forge fuzzes any test function that takes parameters. The prefix is a readability convention for humans; the parameter list is the trigger."
+  why="Every other prefix in Foundry does select an engine — invariant*, table*, check* — so the pattern generalises incorrectly to this one."
+  src="foundry-forge-testing"
+/>
+
+## The output line, and what it admits
+
+A passing fuzz test on forge 1.7.1 prints like this:
+
+```text
+[PASS] testFuzz_FeeAndNetAreConserved(uint256) (runs: 256, μ: 9810, ~: 9394)
+```
+
+Read only the first field for now. `[fuzz] runs` defaults to 256 and it is the subject of the next
+lesson; the other two are gas statistics and carry no correctness information at
+all.<Cite src="foundry-testing-config" /><Cite src="foundry-forge-testing" /><Cite src="measured-forge-1-7-1" />
+What is worth noticing here is what the line does *not* say. It does not say the property holds. It
+says a search of a particular size found nothing. Those are different statements, and the gap between
+them is where most of the false confidence in fuzzing lives.
+
+There is also nothing in it identifying *which* 256 values were tried, and no seed unless you pinned
+one, so the same command tomorrow examines a different 256.<Cite src="foundry-testing-config" /> A
+green fuzz test is therefore a weaker artefact than a green unit test in one specific and important
+sense: it is not repeatable evidence. Lesson five is about what to do with that.
+
+## Stateless: the ceiling, stated exactly
+
+Everything above describes one call. This is the constraint that defines what stateless fuzzing can
+and cannot reach, and it is worth establishing by observation rather than assertion.
+
+`setUp()` runs before each test function.<Cite src="foundry-forge-testing" /> The question that
+actually matters for fuzzing is finer: does state carry over from one *run* to the next inside a
+single fuzz test? Here is a test that answers it.
+
+```solidity
+contract DistTest is Test {
+    uint256 public counter;
+
+    function testFuzz_StatePersists(uint256) public {
+        counter += 1;
+        assertLt(counter, 3);
+    }
+}
+```
+
+If runs shared state, `counter` would reach 3 on the third run and the test would fail. On forge
+1.7.1 with solc 0.8.36 it passes at the full 256
+runs.<Cite src="measured-fuzz-probe-1-7-1" /><Cite src="measured-forge-1-7-1" /> Each run begins
+from the same post-setUp state, and nothing a run writes is visible to the next one.
+
+So a stateless fuzz test explores **one dimension thoroughly and the other not at all**. It sweeps
+the argument domain of a single function while holding the world fixed at whatever `setUp` built. In
+the vocabulary you will meet again in the invariant module: a unit test checks a point, a stateless
+fuzz test checks a line, and only a stateful campaign checks a
+region.<Cite src="foundry-invariant-testing" />
+
+<Figure
+  caption="A stateless campaign is 256 first transactions and never a second one."
+  alt="One post-setUp state fans out to run 1, run 2 and run 256; each run is a single transaction, and a dashed arrow to a second transaction shows that no run ever reaches one."
+>
+  <Flow
+    nodes={[
+      { id: 's', label: 'post-setUp state', note: 'the same for every run', col: 0, tone: 'accent' },
+      { id: 'r1', label: 'run 1', note: 'one transaction', col: 1 },
+      { id: 'r2', label: 'run 2', note: 'one transaction', col: 1 },
+      { id: 'rn', label: 'run 256', note: 'one transaction', col: 1 },
+      { id: 'x', label: 'a second call', note: 'no run reaches one', col: 2, tone: 'muted', dashed: true },
+    ]}
+    edges={[
+      { from: 's', to: 'r1' },
+      { from: 's', to: 'r2' },
+      { from: 's', to: 'rn' },
+      { from: 'r1', to: 'x', tone: 'muted', dashed: true },
+      { from: 'r2', to: 'x', tone: 'muted', dashed: true },
+      { from: 'rn', to: 'x', tone: 'muted', dashed: true },
+    ]}
+  />
+</Figure>
+
+### Which bugs are structurally out of reach
+
+Not "hard to find" — out of reach, in the sense that no number of runs helps. Anything requiring an
+ordered sequence across accumulated state: deposit then manipulate the price then withdraw; take a
+flash loan, call the vulnerable function inside the callback, repay. Each needs at least two
+transactions whose effects compose, and a stateless run is one transaction from a fixed
+start.<Cite src="foundry-invariant-testing" />
+
+<Misconception
+  belief="Stateless fuzzing would have caught the big protocol hacks."
+  reality="Most of those exploits are an ordered multi-call sequence over accumulated state, which is stateful-invariant territory. A stateless run restarts from the same post-setUp state every time."
+  why="Post-mortems and marketing both say 'fuzzing would have found this' without saying which kind of fuzzing, and the two are configured with the same-looking runs number."
+  src="foundry-invariant-testing"
+/>
+
+This is not a reason to skip stateless fuzzing. It is a reason to be exact about what a green
+`testFuzz_` suite entitles you to claim. Arithmetic bugs, rounding direction, encoding round trips,
+boundary handling, unchecked casts, division by a value that can be zero — these live inside a single
+call, and this is the cheapest tool that finds them.
+
+<Check type="explain" concept="stateless-fuzzing">
+A vault has a `deposit(uint256 assets)` that mints shares and a `redeem(uint256 shares)` that burns
+them. You are asked to write tests that would have caught the ERC-4626 inflation attack, where an
+attacker front-runs the first depositor with a direct token transfer so that the victim's deposit
+rounds down to zero shares.
+
+Can a stateless fuzz test find it? Answer with the mechanism, not a yes or no.
+
+<Answer>
+**No, and the reason is structural rather than a matter of budget.**
+
+The attack is a sequence over accumulated state. It needs: (1) the vault to be empty, (2) an
+attacker deposit of one wei that mints one share, (3) a *direct token transfer* into the vault that
+raises `totalAssets` without minting, and (4) the victim's deposit, which now rounds to zero shares
+because `assets * totalSupply / totalAssets` truncates. Steps two and three must both have happened
+before step four, and their effects must both still be present.
+
+A stateless fuzz test calls one function from a fixed post-setUp
+state.<Cite src="measured-fuzz-probe-1-7-1" /> Whatever `setUp` built is what step four sees. Raising
+runs from 256 to a million changes which `assets` values are tried and changes nothing about the
+state they are tried against — the counter probe above shows that a run's writes are gone before the
+next run starts.
+
+**What you can do from here, and it is worth doing.** Two options, both this module's material.
+
+First, *bake the sequence into `setUp`*. Construct the donated-balance state directly, then fuzz the
+victim's deposit amount over it. That finds the rounding boundary precisely. What it does not do is
+*discover* the scenario — you had to know the attack to write that `setUp`, which is the honest
+limitation.
+
+Second, *fuzz the arithmetic instead of the protocol*. "A deposit of a non-zero amount into a
+non-empty vault never mints zero shares" is a claim about one conversion function, checkable over a
+fuzzed `(assets, totalAssets, totalSupply)` triple with no vault at all. Bugs that live in a pure
+function should be hunted in the pure function: denser search, far more readable counterexample.
+
+Discovering the sequence without knowing it in advance is what the invariant module is for.
+</Answer>
+</Check>
+
+One habit worth forming now, because it costs nothing: **read the assertion and ask what would make
+it vacuous.** `assertTrue(x >= 0)` on a `uint256` is always true, and so is a property whose
+precondition the constraints have narrowed to a single point. A fuzz test that cannot fail still
+prints `runs: 256` and still counts as coverage in a report.
+
+## Where this pays off
+
+**Immediately, in the next two lessons.** You now have the property; what you do not have is any
+sense of how hard the tool is actually looking. The next lesson takes the `runs: 256` figure apart,
+explains the two gas statistics next to it, and shows a bug that forge finds in 61 runs with one
+setting and never finds at all with another.
+
+**In review, on somebody else's pull request.** The most useful question about a new fuzz test is not
+"is the assertion right" but "what does this test actually reach". Both halves of that question are
+answered by the constraints, and constraints are the subject of the third and fourth lessons.
+
+**At the boundary with invariant testing.** The point-line-region distinction is what tells you which
+engine a given bug belongs to, and getting it wrong is expensive in both directions: stateful
+campaigns are far slower, and pointing one at a bug that lives inside a single pure function wastes
+an afternoon a stateless test would have closed in two
+seconds.<Cite src="foundry-invariant-testing" />

@@ -1,0 +1,316 @@
+---
+id: toolchain-fork-testing-reproducing-a-moment
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    foundry-cheatcode-roll-fork,
+    foundry-cheatcode-transact,
+    foundry-cheatcode-create-fork,
+    foundry-cheatcode-create-select-fork,
+    foundry-cheatcode-prank,
+    foundry-fork-testing,
+    forge-test-reference,
+    foundry-default-config,
+    foundry-issue-5494,
+    forge-cache-reference,
+    measured-fork-cache-1-7-1,
+    measured-forge-1-7-1,
+    eip-7702,
+    eip-7825,
+  ]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+The support ticket is one line and a hash.
+
+> "Withdraw fails for me. Works for everyone else. `0x9c4f…`"
+
+You have the transaction on a block explorer. It reverted. The trace is a wall of internal calls
+ending somewhere inside a router you did not write, and the revert has no reason string. You can read
+your own code all afternoon and never find it, because the state that made it fail belonged to that
+block and no longer exists anywhere.
+
+Except it does. A fork can be placed at that block, with that state, and the transaction can be run
+again — the real one, byte for byte. This lesson is about the two cheatcodes that do it, and about one
+naming collision that costs people an hour before they notice.
+
+## Two cheatcodes, four characters apart
+
+You already use `vm.roll` to move `block.number` and `vm.warp` to move
+`block.timestamp` ([warp and roll](/c/warp-and-roll)). There is also `vm.rollFork`. They are unrelated
+operations with nearly identical names, and the difference is not subtle once you see it.
+
+Measured on forge 1.7.1, on a fork pinned to mainnet block 21,000,000, reading one token's
+`totalSupply()` at each step:<Cite src="measured-fork-cache-1-7-1" /><Cite src="measured-forge-1-7-1" />
+
+<Matrix
+  corner="Call"
+  cols={['block.number after', 'State read after']}
+  rows={[
+    { label: '—', cells: ['21,000,000', 'supply at 21,000,000'] },
+    { label: 'vm.roll(21_000_100)', cells: ['21,000,100', { v: 'unchanged — still the 21,000,000 value', tone: 'warn' }] },
+    { label: 'vm.rollFork(21_500_000)', cells: ['21,500,000', { v: 'different — the supply at 21,500,000', tone: 'accent' }] },
+  ]}
+  caption="Both cheatcodes move block.number; only one of them moves the block the state reads resolve against."
+  alt="Measured on forge 1.7.1 from a fork pinned at mainnet block 21,000,000. After vm.roll to 21,000,100 the reported block number changes but the token supply read is still the value at 21,000,000. After vm.rollFork to 21,500,000 both the block number and the supply value change."
+/>
+
+`vm.roll` rewrote a number the EVM reports. Nothing else moved: the accounts, the balances and the
+storage are still the ones fetched at the pinned block. That is usually what you want — it is how you
+test block-height-dependent logic without paying to re-fetch a world.
+
+`vm.rollFork` moved the fork. The RPC reads underneath are now scoped to a different block, so the
+values coming back are the values that were true then.<Cite src="foundry-cheatcode-roll-fork" />
+
+<Misconception
+  belief="vm.roll and vm.rollFork are the same operation, one of them just being fork-aware."
+  reality="vm.roll sets block.number in the local EVM and leaves the forked state exactly as it was. vm.rollFork re-dates the fork, so every subsequent state read resolves against a different block."
+  why="The names differ by four characters and the reference page for rollFork opens with 'Sets block.number for a fork', which is the same phrase you would use to describe roll. The behavioural difference is in what happens to everything else."
+  src="foundry-cheatcode-roll-fork"
+/>
+
+That documentation phrasing is worth flagging on its own. The `rollFork` reference genuinely does
+begin "Sets `block.number` for a fork", and it is only the following sentences — about rolling to a
+transaction's block and replaying — that reveal it is doing something categorically
+larger.<Cite src="foundry-cheatcode-roll-fork" /> If you skim the first line of that page you will
+come away with the wrong model.
+
+## The four overloads, and what the second one buys
+
+```solidity
+function rollFork(uint256 blockNumber) external;
+function rollFork(bytes32 txHash) external;
+function rollFork(uint256 forkId, uint256 blockNumber) external;
+function rollFork(uint256 forkId, bytes32 txHash) external;
+```
+
+With no fork id it updates the active fork; with one it updates that fork, which may not be the active
+one.<Cite src="foundry-cheatcode-roll-fork" /> The two-argument forms are what let a multi-fork test
+advance an L2 fork while L1 is selected.
+
+The `bytes32` overload is the one that changes what is possible. Given a transaction hash, it rolls
+the fork to the block containing that transaction **and replays all previously executed
+transactions**.<Cite src="foundry-cheatcode-roll-fork" />
+
+Read that second clause carefully, because it is the whole feature. Pinning to a block number gives
+you the state at that block's *boundary*. Real incidents do not happen at boundaries. They happen
+after the eleven transactions ahead of them in the same block have already moved a price, drained a
+reserve, or flipped a flag. `rollFork(txHash)` reconstructs the state as it stood in the instant
+immediately before that specific transaction — mid-block, with its neighbours already applied.
+
+The same argument is available at creation time, on both creators:
+
+```solidity
+vm.createFork("mainnet", txHash);
+vm.createSelectFork("mainnet", txHash);
+```
+
+Both are documented as forking at that transaction, replaying the transactions before
+it.<Cite src="foundry-cheatcode-create-fork" /><Cite src="foundry-cheatcode-create-select-fork" />
+So a reproduction test needs no separate roll step: fork at the hash and you are standing where the
+user was standing.
+
+<Figure
+  caption="The transactions ahead of the failing one inside its own block are exactly the part a block-number pin throws away."
+  alt="Within one block: the boundary, where a block-number pin lands and nothing in the block has been applied; then the transactions ahead of the target, which the hash form replays; then the failing transaction itself, where a hash fork lands."
+>
+  <Flow
+    nodes={[
+      { id: 'bnd', label: 'block boundary', note: 'where a number pin lands', col: 0, tone: 'warn' },
+      { id: 'ahead', label: 'the txs ahead of it', note: 'replayed by the hash form', col: 1, tone: 'muted' },
+      { id: 'tx', label: 'the failing tx', note: 'where a hash fork lands', col: 2, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+## `vm.transact`: running the real one
+
+```solidity
+function transact(bytes32 txHash) external;
+function transact(uint256 forkId, bytes32 txHash) external;
+```
+
+In forking mode this fetches a transaction from the RPC provider and executes it on the current
+state.<Cite src="foundry-cheatcode-transact" /> Not a re-encoding of it, not your reconstruction of
+what it did — the actual transaction, with its original sender, calldata and value.
+
+Foundry's own example is the minimal shape: fork at a block, take a transfer's hash, record the
+sender's and recipient's balances, call `vm.transact(txHash)`, and assert that the recipient gained
+exactly the transferred amount while the sender lost slightly more than
+it.<Cite src="foundry-cheatcode-transact" />
+
+Two things follow from "executes it on the current state".
+
+**It executes wherever you put the fork, which need not be where the transaction really ran.** That is
+a feature — replay an exploit against a *patched* deployment and see whether it still works — and a
+way to write a meaningless test, if you rolled somewhere the transaction was never built for.
+
+**It is subject to whatever you did to the fork first.** `vm.deal`, `vm.store`, a contract you
+deployed, a `vm.warp`: all of it is in effect. Replaying into a doctored world answers a
+counterfactual, which is often the question worth asking, provided you know that is the question.
+
+## Worked example: reproducing the ticket
+
+Back to `0x9c4f…`. Each step exists for a reason; the reason is the useful part.
+
+**Subgoal — put the fork at the instant before the failure, not at a nearby block boundary.** Fork at
+the transaction hash so the preceding transactions in that block are already
+applied.<Cite src="foundry-cheatcode-create-select-fork" />
+
+```solidity
+function setUp() public {
+    vm.createSelectFork("mainnet", 0x9c4f...);
+}
+```
+
+**Subgoal — confirm the reproduction before investigating it.** Run the real transaction first and
+check that it fails here too. If it succeeds, your fork is not where you think it is, and everything
+after this point would have been fiction.
+
+```solidity
+function test_ReproducesTheRevert() public {
+    vm.expectRevert();
+    vm.transact(0x9c4f...);
+}
+```
+
+**Subgoal — replace the opaque replay with a call you can instrument.** The real transaction tells you
+*that* it fails. To learn *why*, issue the same call yourself as the same sender, so that traces name
+your code and you can add `console.log` or step through
+it.<Cite src="foundry-cheatcode-prank" /><Cite src="foundry-fork-testing" />
+
+```solidity
+function test_WhyItReverts() public {
+    vm.prank(0xUser...);
+    vault.withdraw(37_500e6);   // same args as the failing tx's calldata
+}
+```
+
+Run with `-vvvv` and the trace is now yours, against the exact state that produced the ticket.
+
+**Subgoal — separate "their state" from "their call".** Two hypotheses are live, and they take
+different fixes. Either the *call* is wrong (bad arguments, stale approval, wrong decimals) or the
+*state* is wrong (a pool is thin, a rate has moved, a role was revoked). Distinguish them by re-running
+the identical call as a different address, and by re-running the identical address's call at a
+different block via `vm.rollFork`.<Cite src="foundry-cheatcode-roll-fork" /> If it succeeds for
+someone else, it is the account. If it succeeds a hundred blocks earlier, it is the state.
+
+**Subgoal — leave the reproduction behind as a regression test.** This is what makes the hour pay for
+itself. The fork is pinned to a hash, so the scenario is frozen; after the fix, the same test asserts
+success instead of revert, and no future refactor can quietly reintroduce it. Nothing drifts, and
+nobody has to reproduce the user's circumstances again.
+
+## What replay does not reproduce
+
+Three limits, all of which have bitten people who trusted a replay too far.
+
+**Gas numbers are not mainnet gas numbers.** Foundry's own tracker carries a long-standing report that
+`forge` reports less `gasUsed` than the actual mainnet
+transaction.<Cite src="foundry-issue-5494" /> Some of that is the test harness's accounting, and some
+is warmth: a forked test's `setUp` has already touched accounts and slots that were cold when the real
+transaction ran, and cold access costs 2100 for a storage read against 100 warm, 2600 for an account
+access against 100.<Cite src="measured-forge-1-7-1" /> A replay is evidence about *behaviour*. Treat
+its gas figure as a lower bound and nothing more.
+
+The surrounding configuration is no help either. Foundry's default-config reference lists
+`isolate = true` and says to disable it with `isolate = false` or
+`--no-isolate`;<Cite src="foundry-default-config" /> forge 1.7.1 rejects `--no-isolate` outright and
+accepts only `--isolate`, documented as making top-level calls execute as separate transactions for
+more precise gas accounting.<Cite src="forge-test-reference" /><Cite src="measured-fork-cache-1-7-1" />
+Documentation and binary disagree, so do not infer the effective default from either. If a gas number
+matters, set [isolation mode](/c/isolate-mode) explicitly and say which you used — and prefer to keep
+gas claims out of fork tests entirely.
+
+**The account you are impersonating may not be the kind of account you assume.** Since EIP-7702 an
+externally-owned account can carry a delegation designator and therefore have
+code.<Cite src="eip-7702" /> On a fork of real 2026 mainnet state, `vm.prank`-ing a user address and
+then branching on `code.length` behaves differently from the same test against a synthetic local
+address — see [detecting a delegated EOA](/c/detect-delegated-eoa). Reproducing a real user means
+reproducing their account type too.
+
+**Block-level constraints are real on the fork.** EIP-7825 caps a single transaction at 16,777,216
+(2^24) gas at the protocol level.<Cite src="eip-7825" /> A reproduction that constructs an enormous
+transaction can now run into a per-transaction ceiling that did not exist when most fork-testing
+tutorials were written, and the failure will look like a bug in your test.
+
+<Misconception
+  belief="If vm.transact reproduces the transaction, the gas figure in the test output is the gas the user paid."
+  reality="It is not. Foundry's own issue tracker records forge reporting less gasUsed than the real mainnet transaction, and a forked test's setup warms accounts and slots that were cold on chain, which moves the number further in the same direction."
+  why="The test replayed the real transaction, so every number it prints feels like a measurement of the real thing. Behaviour is reproduced faithfully; metering is not."
+  src="foundry-issue-5494"
+/>
+
+<Check type="predict" concept="roll-fork">
+A test is pinned to mainnet block 21,000,000 and reads a price from an on-chain oracle that updates
+roughly every few hours. The author wants to check that a position becomes liquidatable "a day later",
+and writes:
+
+```solidity
+function test_LiquidatableAfterADay() public {
+    vm.createSelectFork("mainnet", 21_000_000);
+    uint256 priceNow = oracle.latestAnswer();
+
+    vm.warp(block.timestamp + 1 days);
+    vm.roll(block.number + 7200);
+
+    uint256 priceLater = oracle.latestAnswer();
+    assertLt(priceLater, priceNow);   // expects the observed drawdown
+}
+```
+
+Predict what `priceLater` is, whether the assertion passes, and what the author should have written
+instead. Then say what the *corrected* version costs that this one does not.
+
+<Answer>
+**`priceLater` equals `priceNow`, exactly, and the assertion fails.**
+
+`vm.warp` and `vm.roll` change what the EVM reports for `block.timestamp` and `block.number`. They do
+not change the forked state.<Cite src="foundry-cheatcode-roll-fork" /> The oracle's answer lives in
+its storage, that storage was fetched at block 21,000,000, and nothing in this test asked for it
+again. Measured directly on forge 1.7.1: after `vm.roll`, a token's `totalSupply()` read from a forked
+contract is byte-identical to the value before it.<Cite src="measured-fork-cache-1-7-1" /> The oracle
+behaves the same way. The test asserts a strict `assertLt` against two identical values and fails —
+which is the lucky outcome. Had the author written `assertLe`, it would have passed and certified
+nothing.
+
+**The corrected version is `vm.rollFork(21_007_200)`** — re-date the fork so the oracle's storage is
+read at the later block, and the returned answer is the answer that was actually
+published then.<Cite src="foundry-cheatcode-roll-fork" /> If the intent is "a day later" in wall-clock
+terms, the honest form is to pick the block number that corresponds to that instant and pin it, rather
+than to compute it from a slot estimate.
+
+**What it costs.** Two things, and both matter for the rest of this module.
+
+First, RPC. The new block is a *different cache key*, so nothing the test already fetched helps it —
+every account, code blob and slot the test touches after the roll is fetched again, from scratch,
+under a second key. Measured on forge 1.7.1: a single test that pins block 21,000,000 and then
+`rollFork`s to 21,500,000 leaves **two** entries behind, one per block, roughly 10 kB
+each.<Cite src="measured-fork-cache-1-7-1" /><Cite src="forge-cache-reference" /> A test that rolls
+across four blocks has four cold fetch paths, not one.
+
+Second, honesty about what is being tested. `vm.roll` tested your contract's response to a number
+changing. `vm.rollFork` tests its response to *the market having moved the way it actually moved* — a
+stronger claim and a narrower one, true of that day and no other. Both are legitimate. They are not
+substitutes, and the choice should be deliberate rather than a consequence of which cheatcode name
+came to mind.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Immediately next:** every technique in this lesson multiplies your cache keys. A test that forks at
+one block is one key; a test that rolls to three more is four. The next lesson is about that key —
+where it lives on disk, what it is made of, and why pinning is a cost decision before it is a
+determinism one.
+
+**Last in this module:** rolling to an old block is also the moment you discover which endpoints will
+still answer you. Replaying a transaction from last year requires state that most nodes have thrown
+away, and the error you get says nothing about that.
+
+**In security work:** this is the whole method behind incident reproduction. Fork at the exploit
+transaction, replay it, assert on the balance change, then apply the candidate fix to the deployment
+and confirm the same replay now fails. Track 06 uses it directly, and it works because the state is
+real and the transaction is real, not because anyone reconstructed either one.

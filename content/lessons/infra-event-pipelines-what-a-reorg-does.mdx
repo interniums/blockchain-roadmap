@@ -1,0 +1,329 @@
+---
+id: infra-event-pipelines-what-a-reorg-does
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [quicknode-reorg, quicknode-streams-reorgs, anvil-rpc-methods, measured-forge-1-7-1, envio-reorgs, envio-indexing-and-reorgs, ponder-indexing-overview, ethereum-org-json-rpc, execution-apis-block-tags, bilinear-indexing-events, viem-get-block, viem-src-log-type]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The query that found it was two lines long and had been written for an unrelated reason:
+
+```sql
+SELECT block_number, count(DISTINCT block_hash)
+FROM transfer_event GROUP BY 1 HAVING count(DISTINCT block_hash) > 1;
+```
+
+It returned four rows. Four block numbers for which the table held events carrying two different block
+hashes. Nothing had errored, no alert had fired, and the ingester had been running for eleven weeks.
+Each of those four numbers is a moment when the chain replaced a block and the pipeline wrote both
+versions.
+
+You already know [what a reorg is](/c/reorg) and
+[what reorgs look like in practice](/c/reorg-depth-in-practice) from the consensus side. This lesson is
+about the other end of the same event: what it does to rows that are already in your database, which
+of them you can find afterwards, and what "handling" it actually has to mean.
+
+## A reorg is a mutation of your input, not an error condition
+
+The framing that makes everything else follow: **the tail of your input stream is mutable.** Not
+occasionally wrong, not unreliable — mutable, by design, as a normal outcome of the protocol. The
+execution-layer spec says so in the definition of the block tag you are almost certainly using:
+`latest` is the most recent block in the canonical chain observed by the client, and this block may be
+re-orged out of the canonical chain even under healthy/normal
+conditions.<Cite src="execution-apis-block-tags" />
+
+QuickNode's orientation piece puts the consequence for applications plainly: a reorg can cause
+confirmed transactions to disappear, transaction ordering to change, and application state to become
+inconsistent, and failing to account for it leads to phantom transactions and corrupted
+databases.<Cite src="quicknode-reorg" />
+
+Treating this as an exception is where most pipelines go wrong, because exceptions get `try/catch`
+blocks and mutations need a reconciliation path. There is nothing to catch. The RPC does not return an
+error when history changes; it returns different history.
+
+## The three things a reorg does to your rows
+
+Take a row you already wrote for an event at `(chain 1, block 19,204,411, txIndex 12, logIndex 3)`.
+After the replacement, exactly one of three things is true, and each has a different signature in your
+table.
+
+**1. The event does not exist on the new branch.** The transaction was never re-included, or was
+re-included in a later block and emitted nothing at that position. Your row is now describing
+something that did not happen. **Signature: an orphan.** It is findable only if you stored
+`block_hash`, because the position itself looks perfectly ordinary.
+
+**2. The event exists, at a different position.** The transaction was re-included at a different index,
+so its logs carry a different `transactionIndex` and `logIndex`. Under the natural key that is a
+*different row*. **Signature: a duplicate that is not a duplicate** — the same economic event appearing
+twice in your table at two positions, both looking valid, with only one of them on the canonical chain.
+
+**3. A new event appears at that position.** Some other transaction landed there. Your idempotent
+insert on `(chain, block, txIndex, logIndex)` now finds an existing row.
+
+<Compare
+  columns={[
+    { title: 'Gone', note: 'not on the new branch' },
+    { title: 'Moved', note: 're-included elsewhere' },
+    { title: 'Replaced', note: 'another transaction took the slot' },
+  ]}
+  rows={[
+    { label: 'Does an insert ever arrive for the old key?', cells: ['No', 'No — the new position is a new key', 'Yes'] },
+    { label: 'What is left in the table?', cells: [{ v: 'An orphan row', tone: 'danger' }, { v: 'Two rows for one economic event', tone: 'danger' }, 'Whichever branch your conflict action favours'] },
+    { label: 'What would surface it?', cells: ['Only the stored block_hash', 'Only the stored block_hash', 'The conflict itself'] },
+  ]}
+  caption="Only one of the three states is reachable by an insert, which is why the other two are still there tomorrow."
+  alt="The three states a written row can be in after a reorg — gone from the new branch, re-included at a different position, or replaced at the same position — compared on whether an insert arrives for the old key, what is left in the table, and what would surface it."
+/>
+
+Case 3 is the one worth sitting with, because it is where `DO NOTHING` and `DO UPDATE` genuinely
+diverge and the choice is no longer a matter of taste.
+
+- With `ON CONFLICT ... DO NOTHING`, the stale row from the abandoned branch **wins**, silently, forever.
+- With `ON CONFLICT ... DO UPDATE`, the new branch's row overwrites it, which is correct — but only for
+  positions that exist on both branches. Positions that exist only on the old branch are still orphans,
+  because nothing arrives to overwrite them.
+
+<Misconception
+  belief="An idempotent upsert makes a pipeline reorg-safe, because the new branch just overwrites the old one."
+  reality="Overwriting handles only the positions that exist on both branches. Events that existed on the abandoned branch and not on the new one are never revisited by an insert, because no insert for that position is ever attempted again."
+  why="Idempotency is taught as the fix for redelivery, and a reorg does produce redelivery. It also produces deletion, and no amount of upsert expresses a delete."
+  src="envio-reorgs"
+/>
+
+**A reorg needs a delete, and an insert-only pipeline cannot express one.** That single sentence is why
+reorg handling is a distinct mechanism rather than a property that falls out of good writes.
+
+### The correct shape: roll back to the common ancestor, then reapply
+
+Both major TypeScript frameworks converged on the same shape, arrived at from different directions.
+
+Ponder's engine records all changes — insert, update, delete — to each table defined in the schema
+using a trigger-based transaction log. On detecting a reorg it evicts all non-canonical data from the
+RPC cache, rolls the database back to the common ancestor block height using that log, fetches the new
+canonical data, and runs indexing functions to process it. It periodically drops finalized data from
+the transaction log to avoid database bloat.<Cite src="ponder-indexing-overview" />
+
+Envio's HyperIndex keeps entity state for unfinalized blocks so it can revert, with handling enabled by
+default through the `rollback_on_reorg` flag; the documentation describes the mechanism and states
+plainly that rollback covers all entities defined in your schema and all data your handlers read or
+write to the database.<Cite src="envio-reorgs" /><Cite src="envio-indexing-and-reorgs" />
+
+Both are the same algorithm: **keep enough history to undo, find the fork point, undo to there, redo
+forward.** If you are hand-rolling, that is what you are building — not a smarter upsert.
+
+<Figure
+  caption="Nothing above the common ancestor was ever safe to keep, and the backward step is the only one that removes it."
+  alt="A reorg-handling loop: the common ancestor is the last block both branches share, above it sit the rows written from the branch that lost, the database rolls back to the ancestor, then the canonical blocks are re-fetched from the ancestor forward and the handlers reapply."
+>
+  <Flow
+    lanes={['shared', 'the lost branch', 'the canonical one', 'forward again']}
+    nodes={[
+      { id: 'anc', label: 'common ancestor', note: 'the last block both branches share', col: 0, tone: 'good' },
+      { id: 'old', label: 'the rows you wrote', note: 'parent hash stops matching', col: 1, tone: 'warn' },
+      { id: 'refetch', label: 'refetch canonical', note: 'from the ancestor forward', col: 2 },
+      { id: 'redo', label: 'reapply', note: 'handlers run again', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'anc', to: 'old' },
+      { from: 'old', to: 'anc', label: 'roll back', tone: 'good' },
+      { from: 'old', to: 'refetch', label: 'then' },
+      { from: 'refetch', to: 'redo' },
+    ]}
+  />
+</Figure>
+
+## Detecting it at all
+
+You cannot roll back to a fork point you did not notice. Three signals, in increasing order of how much
+you have to build.
+
+**Parent-hash chaining.** The cheapest and the most reliable. Every block header names its parent; if
+the block you just received does not name the block you last processed, the chain moved. QuickNode's
+Streams uses exactly this: a reorg is identified when a new block's parent hash does not match the
+hash of the previous block that was streamed.<Cite src="quicknode-streams-reorgs" /> Bilinear's
+practitioner write-up gives it as the client-side check to implement —
+`newHead.parentHash` matching `lastHead.hash` — alongside the observation that most nodes will notify
+you.<Cite src="bilinear-indexing-events" />
+
+**The `removed` flag on filter-delivered logs.** The JSON-RPC log object carries `removed`, defined as
+true when the log was removed due to a chain reorganization and false if it is a valid
+log.<Cite src="ethereum-org-json-rpc" /> This is genuine information and it is also narrow: it arrives
+through filter and subscription delivery, so a pipeline built on range queries never sees it. viem
+surfaces the field on its `Log` type<Cite src="viem-src-log-type" />, which makes it easy to consume
+and easy to over-trust.
+
+**Re-reading a block by number and comparing hashes.** The brute-force version: for every block still
+inside your reorg window, ask the node for it again and compare the hash you stored. Expensive, exact,
+and the only one that catches a reorg you slept through.
+
+<Aside kind="warn">
+Detection is not guaranteed by every data source. Envio's documentation states that reorg detection is
+guaranteed when using HyperSync as the data source, and that with a custom RPC endpoint there are edge
+cases where reorgs might go undetected, depending on the provider's implementation and your indexing
+pattern.<Cite src="envio-reorgs" /> That is an unusually honest sentence in vendor documentation, and
+it applies to your hand-written pipeline too: a poller that only ever asks for ranges below where it
+last was will never observe a rewrite.
+</Aside>
+
+### Reproducing one on purpose, in about a minute
+
+The reason most pipelines have never been tested against a reorg is that people assume you have to wait
+for one. You do not. Anvil exposes it as an RPC method: `anvil_reorg` takes a `depth` and an array of
+`[transaction, blockIndex]` pairs, where `blockIndex` is 0-based and less than `depth` and selects which
+replacement block includes that transaction; passing `[]` produces empty replacement
+blocks.<Cite src="anvil-rpc-methods" />
+
+```bash
+# forge/cast 1.7.1
+cast rpc anvil_reorg 5 '[]'          # replace the last 5 blocks with empty ones
+cast rpc anvil_rollback 3            # shorten the chain by 3, no replacements
+```
+
+`anvil_rollback` rolls the chain back by a given number of blocks without mining replacements,
+shortening the chain, and the depth must not exceed the current
+height.<Cite src="anvil-rpc-methods" /><Cite src="measured-forge-1-7-1" /> Between those two you can
+produce all three of the row states above deliberately: replace blocks with empty ones to orphan rows,
+replace them with the same transactions in a different order to relocate rows, and roll back to check
+what your detector does when the head simply goes backwards.
+
+Point your ingester at the Anvil endpoint, mine a hundred blocks with transactions, reorg five of
+them, and run the `block_hash` diff query. **A pipeline that has never been pointed at a chain that
+moved backwards has not been tested; it has been demonstrated.**
+
+## Depth: design for the shallow case, bound the deep one
+
+Two things are true at once and are constantly conflated.
+
+**Shallow rewrites at the tip are the ordinary case**, and they are what your pipeline will actually
+meet. **Deep rewrites are rare**, and surviving one is a much weaker engineering goal than handling the
+shallow case correctly every single time.
+
+Be careful with numbers here. Published 2026 frequency and depth statistics for Ethereum L1 were not
+verified for this material, and the honest position is that any specific figure you have read is
+something to re-measure against a beacon-chain analytics source rather than internalise. The design
+rule survives without the number, and it is the useful part anyway: **a mechanism that is correct on a
+one-block rewrite every time beats a mechanism that could theoretically survive a fifty-block rewrite
+once.**
+
+What is verifiable is what practitioners configure, and that is more informative than a statistic.
+Envio's reorg support exposes `max_reorg_depth` — renamed from V2's `confirmed_block_threshold` —
+defining how many blocks below the chain head are considered safe from reorganisation, with all chains
+currently defaulting to a threshold of 200 blocks and the documentation noting that the thresholds will
+be tailored per chain in future releases.<Cite src="envio-reorgs" /> Their own worked example
+configures 250 for Ethereum Mainnet and 150 for Polygon, with Arbitrum left on the
+default.<Cite src="envio-reorgs" />
+
+Read that as a design artefact rather than as a measurement. Somebody had to pick a window, no chain
+publishes a bound, so the window is a guess with a safety margin — and the vendor says so by promising
+to tailor it later.
+
+**The window is chain-specific, and that part is not a guess.** Envio's engineering write-up observes
+that different networks have very different exposure: Base and the OP Stack are described as largely
+reorg-resistant with finality occurring at the head, while Polygon frequently experiences deeper
+reorgs extending over ten blocks, with one instance cited at 157 blocks.<Cite src="envio-indexing-and-reorgs" />
+The same piece quotes an Etherscan-derived figure of roughly 1% of Ethereum Mainnet blocks undergoing
+reorgs.<Cite src="envio-indexing-and-reorgs" /> Treat the depth contrast as the durable finding and the
+percentage as what it is — a vendor-published figure from 2024 that this material did not re-verify for
+2026, and exactly the kind of number to re-derive from a beacon-chain analytics source before you build
+anything on it. **A window chosen for Ethereum and copied to Polygon is not a window.**
+
+### What happens past the edge of the window
+
+This is the part that most discussions skip, and it is the only part that is genuinely dangerous.
+
+Envio's documentation is explicit: any reorg deeper than the configured threshold will not trigger a
+rollback in your indexer.<Cite src="envio-reorgs" /> Ponder periodically drops finalized data from its
+transaction log to avoid bloat<Cite src="ponder-indexing-overview" />, which is the same boundary
+expressed differently — you cannot roll back through history you no longer retain.
+
+So every reorg-handling implementation has a horizon, and past it the failure mode is not an error. It
+is **silent divergence**: your database describes a branch the chain abandoned, and nothing in the
+system is looking. The mitigation is not a bigger window. It is the reconciliation job from the last
+lesson of this module, plus the finality boundary from the next one — because a rewrite deeper than a
+sensible window is, by construction, a rewrite through finality, which is a different and much larger
+event than a pipeline bug.
+
+<Aside kind="note">
+The specific retention limits and the behaviour when a reorg exceeds them are implementation details
+that move between versions. Check them for the version you actually run rather than for the version
+whose blog post you read: Envio documents the threshold as configurable per
+chain<Cite src="envio-reorgs" />, and Ponder documents the transaction log's finalized-data eviction
+without pinning a window.<Cite src="ponder-indexing-overview" />
+</Aside>
+
+<Check type="explain" concept="reorg-definition">
+Your pipeline keys events on `(chain_id, block_number, transaction_index, log_index)`, writes with
+`ON CONFLICT ... DO UPDATE`, stores `block_hash` as a non-key column, and tails two blocks behind the
+head. A one-block reorg occurs at block 19,204,411, which contained three of your events. On the new
+branch, block 19,204,411 contains two of them — one at the same position, one at a new position — and
+the third transaction was not re-included at all.
+
+Describe the exact state of your table afterwards, and give the query that finds the damage.
+
+<Answer>
+**Walk the three original rows separately, because they end up in three different states.**
+
+*Event A — same position on both branches.* The new branch's event arrives at
+`(1, 19204411, 12, 3)`, the insert conflicts, `DO UPDATE` overwrites the payload and the
+`block_hash`. **Correct, and self-healing.** This is the case people generalise from, which is why the
+next two surprise them.
+
+*Event B — re-included at a different index.* It arrives at, say, `(1, 19204411, 5, 1)`. No conflict:
+this is a new key. The row is inserted. The **old** row at its previous position is untouched. You now
+hold two rows for one economic event, both structurally valid, differing in `block_hash`.
+
+*Event C — not re-included.* Nothing arrives for its position. Its row sits there permanently,
+describing an event on a branch that no longer exists. Nothing will ever overwrite it, because
+overwriting requires an insert at that key and no insert will be attempted again.
+
+**Net state: one row correct, one row duplicated, one row orphaned, zero errors, zero alerts.** A count
+of events for that block now reads four instead of two.
+
+**The query that finds it — the reason `block_hash` was worth a column.**
+
+```sql
+SELECT e.block_number, e.block_hash, count(*)
+FROM transfer_event e
+JOIN block_seen b
+  ON b.chain_id = e.chain_id AND b.block_number = e.block_number
+WHERE e.chain_id = 1
+  AND e.block_hash <> b.canonical_hash        -- canonical_hash re-read from the node
+GROUP BY 1, 2;
+```
+
+Every row this returns came from an abandoned branch: events B-old and C. It cannot be written without
+`block_hash`, and `block_hash` cannot be added retroactively for a branch that no longer exists — which
+is the practical reason to store it on day one.
+
+**The repair, and why it is a delete.** Rows from a non-canonical hash must be deleted, not updated.
+That is the point at which an insert-only pipeline discovers it needs a different mechanism, and it is
+exactly the mechanism the frameworks own: Ponder rolls the database back to the common ancestor using
+its transaction log before reapplying<Cite src="ponder-indexing-overview" />, and Envio reverts entity
+state retained for unfinalized blocks.<Cite src="envio-reorgs" />
+
+**The design correction the exercise argues for.** Tailing two blocks behind the head does not remove
+this — it only reduces how often it happens, and the documentation is explicit that a block at the tip
+can be re-orged under normal conditions.<Cite src="execution-apis-block-tags" /> If any consumer of
+this table must never see events B-old or C, that consumer needs to read from a boundary the chain
+defines rather than one you chose, which is the next lesson.
+</Answer>
+</Check>
+
+## What this unlocks
+
+Three things follow directly, and the module spends the next three lessons on them.
+
+**A boundary, not a window.** Choosing "two blocks behind" or "200 blocks behind" is choosing a
+probability. Finality is a different kind of object — it is the chain telling you a block cannot be
+re-orged outside of manual intervention driven by community
+coordination<Cite src="execution-apis-block-tags" />, available directly through a block tag your
+client already supports.<Cite src="viem-get-block" /> That is the next lesson.
+
+**A scope limit.** The rollback the frameworks perform covers their own database and nothing else. The
+lesson after next is about everything you copied out of it — replicas, exports, caches, and the email
+that already went out.
+
+**A verification job.** The `block_hash` diff query above should not be something you write during an
+incident. It is one of two invariants that belong on a schedule, which is where this module ends.

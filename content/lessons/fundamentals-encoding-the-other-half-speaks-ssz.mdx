@@ -1,0 +1,283 @@
+---
+id: fundamentals-encoding-the-other-half-speaks-ssz
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [ssz-specs, ssz-specs-base, ssz-specs-merkleization, ssz-specs-container, ssz-specs-collections, ethereum-org-ssz, consensus-specs, kourin-rlp-ssz, devp2p-discv5-wire, eip-778, eip-7495, eip-7916, eip-6404, eip-6493, eip-2718, yellow-paper]
+stack: {}
+---
+
+Everything in the previous lesson was true about the execution layer. A running Ethereum node is two
+processes, and the other one does not use RLP at all.
+
+The consensus layer — the beacon chain, its state, the objects validators sign — is encoded with SSZ,
+Simple Serialize. It replaced RLP everywhere on that side, with one deliberate
+exception.<Cite src="ethereum-org-ssz" />
+
+<Misconception
+  belief="Ethereum has one serialization format."
+  reality="Two, split by layer. Execution objects are RLP; consensus objects are SSZ. Peer discovery is the exception that belongs to neither layer and stayed on RLP."
+  why="Most developers only ever touch the execution layer, where everything really is RLP. The split is invisible until you read a beacon API response, verify a light-client proof, or write anything that spans both processes."
+  src="kourin-rlp-ssz"
+/>
+
+The exception is worth naming precisely, because it is the one place both layers meet. Node discovery
+runs on discv5, whose wire messages are RLP,<Cite src="devp2p-discv5-wire" /> and whose node records
+are the RLP structure defined by EIP-778.<Cite src="eip-778" /> Discovery is shared infrastructure
+that predates the beacon chain and serves both halves, so it kept the older format.
+
+## What RLP could not do
+
+RLP tells you how to turn a structure into bytes. It says nothing about how to hash it. On the
+execution layer that decision is made separately and per structure — the state trie has its own
+hashing scheme layered on top of RLP-encoded nodes.
+
+The consensus layer has a requirement that arrangement serves badly. A beacon state is large, it
+changes every slot, and clients need to prove *one field* of it — a validator's balance, a sync
+committee, a block root — to someone who will never download the rest. Under a
+serialize-then-hash-somehow design, every such proof needs bespoke code that knows where that field
+landed.
+
+SSZ's answer is to make hashing part of the type definition. For every SSZ type the specification
+defines both how it serialises and how it Merkleizes, so the shape of the Merkle tree is a
+consequence of the schema rather than a separate design.<Cite src="ethereum-org-ssz" /><Cite src="ssz-specs-merkleization" />
+The stated design goals are exactly those two properties: deterministic, and efficient to
+Merkleize.<Cite src="ethereum-org-ssz" /> That single decision explains most of what follows.
+
+## The type system
+
+Where RLP has two types, SSZ has a catalogue: booleans, unsigned integers at declared widths from 8
+up to 256 bits, fixed-length `Vector` and variable-length `List` (with a declared maximum),
+byte-oriented and bit-oriented versions of both, and `Container` for a named-field
+struct.<Cite src="ssz-specs" />
+
+Two consequences follow immediately.
+
+**Integers are little-endian.**<Cite src="ssz-specs" /><Cite src="ethereum-org-ssz" /> The opposite
+of every execution-layer value you have seen so far. The convention is total: it covers the payload
+integers, and it covers the machinery too — the offsets that locate variable-length fields are
+`uint32` values in little-endian byte order, four bytes
+each.<Cite src="ssz-specs-base" /><Cite src="ssz-specs-container" /> This is the endianness split
+from the first lesson, and it is where it bites.
+
+**Nothing is self-describing.** The bytes carry no type tags and no field names. A decoder that does
+not already hold the schema cannot parse the data at all — it cannot even find the field
+boundaries.<Cite src="ethereum-org-ssz" />
+
+<Misconception
+  belief="SSZ is self-describing, like JSON or protobuf with descriptors shipped alongside."
+  reality="The schema must be known in advance. The bytes alone do not tell you where one field ends and the next begins."
+  why="'Simple serialize' sounds like a general-purpose interchange format, and the type catalogue reinforces that impression. In a consensus protocol every participant already runs the same spec, so shipping descriptors on the wire would be pure overhead — and any decoder that could guess a schema would be a decoder that could accept two readings of the same bytes."
+  src="ethereum-org-ssz"
+/>
+
+## Layout: fixed part, then a heap
+
+Fixed-size fields are written in place, in declaration order. A variable-size field cannot be written
+in place, so its slot holds an **offset** and its real bytes go into a heap after the fixed
+part.<Cite src="ethereum-org-ssz" /> The offset counts from the start of the serialized
+object.<Cite src="ssz-specs-container" />
+
+Take a container of a `uint64`, a `List` of `uint8`, and another `uint64`, holding 1, `[1,2,3,4]`
+and 2:
+
+```text
+0100000000000000    a: uint64 = 1, little-endian, 8 bytes
+14000000            offset for b: 0x14 = 20 = width of the fixed part
+0200000000000000    c: uint64 = 2
+01020304            heap: the four elements of b
+```
+
+**Step 1 — size the fixed part from the types.** Eight bytes for `a`, four for the offset standing in
+for `b`, eight for `c`. Twenty bytes, known before any value is read.
+
+**Step 2 — the first offset must equal that width.** `0x14` is 20. The heap begins exactly where the
+fixed part ends, and a decoder that finds any other value there rejects the
+object.<Cite src="ssz-specs-container" />
+
+**Step 3 — a payload runs to the next offset.** `b` has no length field of its own; its extent is the
+distance to the following variable field's offset, or to the end of the object. The length is
+recovered from the layout, not stored.<Cite src="ssz-specs-container" />
+
+<Figure
+  caption="Every byte here is either a value or an address. Nothing in the object is a length."
+  alt="An SSZ container laid out as bytes: an eight-byte uint64, a four-byte offset holding 20, another eight-byte uint64, and then the heap starting at byte 20 with the four list elements."
+>
+  <ByteLayout
+    offsets
+    caption="Container(uint64, List[uint8], uint64)"
+    fields={[
+      { label: 'a', size: 8, note: 'uint64 = 1' },
+      { label: 'offset for b', size: 4, tone: 'accent', note: '0x14 = 20' },
+      { label: 'c', size: 8, note: 'uint64 = 2' },
+      { label: 'b', size: 4, tone: 'warn', note: 'the heap' },
+    ]}
+  />
+</Figure>
+
+Compare that with ABI encoding. The idea is identical — heads with pointers, tails with payloads —
+and every constant is different. ABI offsets are 32 bytes, big-endian, and every field is padded to a
+word; SSZ offsets are 4 bytes, little-endian, and nothing is
+padded.<Cite src="ssz-specs-base" /> Two teams solving one problem, twice, with opposite defaults.
+
+<Compare
+  caption="Only one of these rows is a difference in kind rather than in constants: SSZ alone tells you how to hash what it has just encoded."
+  alt="ABI, RLP and SSZ compared by how a variable-length field is located, which end of an integer comes first, what is padded, whether the format defines how to hash it, and what a decoder can recover without the schema."
+  axis="Question"
+  columns={[
+    { title: 'ABI', note: 'contract boundary' },
+    { title: 'RLP', note: 'execution layer' },
+    { title: 'SSZ', note: 'consensus layer', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'How is a variable-length field located?', cells: ['A 32-byte offset, big-endian', 'A length prefix in front of it', 'A 4-byte offset, little-endian'] },
+    { label: 'Which end of an integer comes first?', cells: ['Most significant', 'Most significant, no leading zeros', 'Least significant'] },
+    { label: 'What is padded?', cells: ['Everything, to 32 bytes', 'Nothing', 'Nothing'] },
+    { label: 'Does the format say how to hash it?', cells: ['No', 'No', 'Yes, per type'] },
+    { label: 'What can a decoder recover with no schema?', cells: ['Nothing', 'The structure, not the meaning', 'Nothing'] },
+  ]}
+/>
+
+## Merkleization is not hashing the bytes
+
+Here is where SSZ stops resembling a serialization format.
+
+Every SSZ type has a **hash tree root**. It is computed like this: the value's data is packed into
+32-byte chunks; the chunk count is rounded up to a power of two with all-zero chunks; and pairs are
+hashed upward with SHA-256 until one root remains.<Cite src="ssz-specs-merkleization" /> A container
+is Merkleized over the roots of its fields, not over its serialized bytes. A variable-length list
+additionally **mixes in its length** — one final hash of the data root together with a 32-byte
+little-endian word holding the element count — so two lists that differ only in length cannot share a
+root.<Cite src="ssz-specs-merkleization" />
+
+Note the hash function: SHA-256.<Cite src="ssz-specs-merkleization" /> The execution layer hashes
+with keccak256.<Cite src="yellow-paper" /> Two encodings, two byte orders, two hash functions, one
+protocol.
+
+### The tree is sized by the type, not by the data
+
+This is the detail that makes everything else work, and it is the one most write-ups skip.
+
+A `List` declares a maximum. Its Merkle tree is padded to the depth that maximum needs, regardless
+of how many elements it currently holds — a single eight-byte element under a 1024-element limit
+spans 256 chunks and costs eight hashes rather than one.<Cite src="ssz-specs-collections" /> The
+padding is not materialised: the specification substitutes pre-computed roots of all-zero subtrees,
+so the work is proportional to the real data even though the tree's *shape* is proportional to the
+declared capacity.<Cite src="ssz-specs-merkleization" />
+
+Why pay for depth you are not using? Because a field's position in the tree must not move when the
+data changes. If the tree grew with the element count, adding a validator would relocate every
+existing leaf, and every proof anyone had already issued would stop verifying.
+
+That fixed shape is what gives every field a computable address: its **generalized index**, numbering
+the root 1 and counting left to right along each level, so that a node's index is
+`2 ** depth + index-in-row`.<Cite src="ethereum-org-ssz" /> A proof for any field is then the sibling
+hashes along its path, and one generic verifier handles every field of every type. No per-field proof
+code, which is what makes light clients verifying beacon state practical at
+all.<Cite src="ethereum-org-ssz" />
+
+<Misconception
+  belief="Merkleizing a structure is a separate step you apply after serializing it — hash_tree_root is basically hash(serialized bytes)."
+  reality="It is neither separate nor equal to that. The hash tree root is defined per type as part of the type, and it is computed over a tree of field roots, not over the serialized byte string."
+  why="In most systems hashing is something you do to the output of serialization, so the two are naturally thought of as sequential steps. Here they are two views of one schema — which is exactly what makes a proof of one field possible without the other fields."
+  src="consensus-specs"
+/>
+
+### Two types, the same bytes, different trees
+
+The cleanest proof that serialization and Merkleization really are independent is a pair of types
+that share one and differ in the other.
+
+EIP-7916 introduces `ProgressiveList`, a variable-length sequence with **no declared capacity**. It
+encodes exactly like a bounded `List` — fixed-size elements packed back to back, variable-size
+elements behind an offset table — so the two produce **the same bytes, and only their Merkle trees
+differ**.<Cite src="ssz-specs-collections" /> Instead of padding to a capacity, the progressive shape
+grows the tree with the data, which costs fewer hashes for short lists and, more importantly, assigns
+a given chunk index the same generalized index however many elements follow
+it.<Cite src="eip-7916" /> Stability without having to guess a maximum up front. The EIP is in Review
+rather than Final, so treat the type as real but not yet settled.<Cite src="eip-7916" />
+
+EIP-7495's `ProgressiveContainer` does the same thing for structs: fields keep their tree positions
+as the field set changes across versions, so a layout outlives any one version of the
+struct.<Cite src="eip-7495" /><Cite src="ssz-specs-container" /> To make that safe it mixes the
+active-field layout into the root as a 32-byte word, in the same way a list mixes in its
+length.<Cite src="ssz-specs-merkleization" /> The reason is worth reading twice: a field that has
+been removed and a field that holds zero both leave a zero leaf, so the leaf tree alone cannot
+separate them, and a version that dropped a field would otherwise root exactly like one that zeroed
+it.<Cite src="ssz-specs-merkleization" />
+
+That is the same argument as the packed-encoding lesson, moved from bytes to trees. Two different
+meanings must not produce one digest, and the fix is to mix in the thing that distinguishes them.
+
+<Check type="explain" concept="ssz-merkleization">
+A container's third field is a `List` that currently holds four elements. Someone proposes caching
+`sha256(serialize(container))` and using it as the container's identity, since it is one pass over
+bytes you already have. Give two independent reasons that value is not the hash tree root.
+
+<Answer>
+**One — the tree is not a hash of a byte string.** The root is built from the field roots: each field
+is Merkleized on its own, the results are paired and hashed upward, and zero chunks pad the level to
+a power of two — for a bounded list, all the way to the depth its declared maximum
+needs.<Cite src="ssz-specs-merkleization" /><Cite src="ssz-specs-collections" /> Those zero chunks
+are never present in the serialized bytes, so the two computations have different inputs even for the
+same value. Note the size of that gap: the serialized form of a four-element list is a few dozen
+bytes, while its tree may be hundreds of chunks wide because the *type* said so.
+
+**Two — the list's length is mixed in separately.** A variable-length list finishes with an extra
+hash of its data root against a 32-byte length word.<Cite src="ssz-specs-merkleization" /> In the
+serialized form, that same length is implicit in the distance between offsets. The information is
+present in both, but it enters the digest by completely different routes.
+
+The deeper objection is what the shortcut throws away. A digest over the flat byte string proves only
+that you hold the whole object. The hash tree root lets someone who holds nothing but the root verify
+one field against it, at a generalized index computable from the schema
+alone.<Cite src="ethereum-org-ssz" /> That is the entire reason SSZ defines Merkleization in the
+first place, and it is exactly the capability the shortcut deletes.
+</Answer>
+</Check>
+
+## What is moving
+
+Two things make this an evolving topic rather than a settled one, and both matter if you are reading
+older material.
+
+**The specification has moved house and grown.** SSZ is now maintained as its own reference
+implementation repository rather than as a document inside the consensus specs, and its type
+catalogue has grown beyond the classic set — progressive lists,<Cite src="eip-7916" /> a progressive
+container whose fields keep their tree positions as the field set changes,<Cite src="eip-7495" /> and
+a union type constrained to share one tree shape.<Cite src="ssz-specs" /> If you learned SSZ from a
+2022 write-up, the list of types is no longer complete.
+
+**Execution-layer SSZ is proposed, not shipped.** The door was left open on purpose: EIP-2718 made
+the transaction payload an opaque byte array precisely so that a future type could use a different
+encoding, and it names SSZ first among the possibilities.<Cite src="eip-2718" /> Two drafts walk
+through that door — EIP-6404 defines SSZ transactions, and EIP-6493 defines a signature scheme for
+natively-SSZ transactions built on `hash_tree_root`.<Cite src="eip-6404" /><Cite src="eip-6493" />
+Both were still in **Draft** status when this lesson was verified, which is the honest summary:
+designed in detail, not adopted. Treat any claim that a particular execution object has already moved
+as needing a fresh check against the execution specs — that is a live area, and secondary sources
+describe proposals and shipped changes in the same tone.
+
+The draft is worth one look regardless of whether it ships, because of what it does about
+ambiguity. EIP-6493 mixes a `DomainType` into the signing root, stating the purpose directly:
+to uniquely identify the underlying specification and avoid hash collisions across different
+signature kinds, with vendor-defined networks required to use a different
+`DomainType`.<Cite src="eip-6493" /> Third format, third syntax, same move — `0x19` in EIP-191, the
+type byte in EIP-2718, a domain in the tree here.
+
+## Where this pays off
+
+The layer split is the shape of a node: two processes, two encodings, talking over a defined
+interface. Once that is concrete, the two-process architecture stops being trivia and starts
+explaining why certain data is awkward to get at from the other side.
+
+SSZ Merkleization is the machinery behind light-client proofs against beacon state — and now you know
+why those proofs keep working across upgrades, which is the capacity-sized tree and the stable
+generalized index rather than anything about the hash function.<Cite src="ssz-specs-collections" /><Cite src="ethereum-org-ssz" />
+The same chunk-and-Merkleize construction reappears in data availability, where a commitment has to
+be checkable by someone sampling a fraction of the data.
+
+Little-endian is the detail that will bite you first, and this is where you were warned. The next
+lesson takes the property both formats have been quietly leaning on — that a value has exactly one
+encoding — and shows what happens when it fails.

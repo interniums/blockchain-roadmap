@@ -1,0 +1,340 @@
+---
+id: protocol-fork-choice-a-thumb-on-the-scale
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [fork-choice-spec, fc-spec-v1-1-10, fc-spec-v1-2-0, fc-specs-pr-2895, fc-proposer-boost-considerations, fc-config-mainnet-v161, fc-phase0-validator-v161, fc-phase0-beacon-chain-v161, vbuterin-lmd-ghost-mitigation, casper-ex-ante-mitigation, three-attacks-pos-ethereum, neu-tas-tse-two-attacks, monnot-reorg-post]
+stack: {}
+---
+
+An honest block is published at the top of its slot with a weight of zero.
+
+Everything voting for it has yet to arrive. Meanwhile, an adversary who has been quietly not
+publishing its own attestations for the last two slots is holding a pile of weight it can release
+into the network at a moment of its choosing. That is not a hypothetical asymmetry; it is the plain
+arithmetic of a rule that compares accumulated stake, applied at the instant when the honest side has
+accumulated none.
+
+Proposer boost is the patch. It is one constant and about six lines of spec, and it is the single
+most instructive object in this module — because it does not solve the problem. It moves the problem
+from one side of a dial to the other, and the value that ships is a documented judgement about which
+side to be caught on.
+
+## What the boost is, mechanically
+
+Read the two functions, then the four conditions that gate them.
+
+```python
+def get_proposer_score(store: Store) -> Gwei:
+    justified_checkpoint_state = store.checkpoint_states[store.justified_checkpoint]
+    committee_weight = get_total_active_balance(justified_checkpoint_state) // SLOTS_PER_EPOCH
+    return (committee_weight * PROPOSER_SCORE_BOOST) // 100
+```
+
+<Cite src="fork-choice-spec" />
+
+And inside `get_weight`, after the attestation sum:
+
+```python
+    if store.proposer_boost_root == Root():
+        # Return only attestation score if ``proposer_boost_root`` is not set
+        return attestation_score
+
+    proposer_score = Gwei(0)
+    # Boost is applied if ``root`` is an ancestor of ``proposer_boost_root``
+    if get_ancestor(store, store.proposer_boost_root, store.blocks[root].slot) == root:
+        proposer_score = get_proposer_score(store)
+    return attestation_score + proposer_score
+```
+
+<Cite src="fork-choice-spec" />
+
+**The size.** `PROPOSER_SCORE_BOOST` is 40, applied as a percentage of one slot's committee weight,
+which is total active balance divided by `SLOTS_PER_EPOCH` = 32.<Cite src="fork-choice-spec" /><Cite src="fc-config-mainnet-v161" /><Cite src="fc-phase0-beacon-chain-v161" />
+Multiply it out: `0.40 / 32` = 0.0125. **The boost is worth 1.25% of the total active stake.** Small
+in absolute terms, enormous relative to what a block has accumulated four seconds into its own slot.
+
+**It applies to the whole ancestor chain.** The `get_ancestor` test means the boost lands on the
+boosted block *and every ancestor of it*, which is what makes it useful — a block's parent is
+defended too, so the boost helps the branch and not just the tip.
+
+**It is temporary, and the reset is unconditional.** `on_tick_per_slot` clears
+`store.proposer_boost_root` on every new slot.<Cite src="fork-choice-spec" /> There is no decay and
+no carry-over. For the duration of one slot the block has an extra 1.25% of stake behind it; at the
+slot boundary that is gone, and whatever attestations arrived in the meantime are all it has.
+
+**It is granted at most once per slot, to the first timely block.** This is the condition most
+descriptions omit:
+
+```python
+    is_timely = get_current_slot(store) == block.slot and is_before_attesting_interval
+    store.block_timeliness[hash_tree_root(block)] = is_timely
+
+    # Add proposer score boost if the block is timely and not conflicting with an existing block
+    is_first_block = store.proposer_boost_root == Root()
+    if is_timely and is_first_block:
+        store.proposer_boost_root = hash_tree_root(block)
+```
+
+<Cite src="fork-choice-spec" />
+
+Two gates. *Timely* means the block arrived during its own slot and before the attestation deadline —
+`ATTESTATION_DUE_BPS` = 3333 basis points of `SLOT_DURATION_MS` = 12000, which is roughly 33% of the
+slot, about four seconds in.<Cite src="fc-phase0-validator-v161" /><Cite src="fc-config-mainnet-v161" />
+*First* means no block has already claimed the boost this slot. An equivocating proposer that
+publishes two blocks gets the boost on whichever one a given node saw first, and nothing at all on the
+other — which is a defence, and also, as lesson five shows, a lever, because *which one a node saw
+first* is not a property of the protocol.
+
+<Aside kind="note">
+Note the store field the boost sets is a *root*, singular, and the reset writes `Root()` — the zero
+root. This is not a scoring adjustment recorded against a block; it is one global slot-scoped pointer
+in the store, consulted during every weight computation. A node restarting mid-slot loses it. A node
+that receives the block after the deadline never grants it and computes a different head from its
+peers for the rest of the slot — which is exactly the divergence that turned a late block into a
+seven-block reorg on mainnet in May 2022, when the split was between nodes that had the boost logic
+and nodes that did not.<Cite src="monnot-reorg-post" />
+</Aside>
+
+## Where it came from, and what changed on the way
+
+The original proposal is worth reading because the shipped version differs from it in a way that is
+easy to miss.
+
+Buterin's note frames the problem as the absence of a *synchronisation bottleneck*. In chain-based
+protocols one actor acts per slot and acts as a coordinating bottleneck that gets everyone to agree
+on the same score; in a committee-per-slot design there are many messages arriving in parallel and no
+such actor, so an attacker who manipulates network delivery can create a state of disagreement at the
+end of each slot about which messages count.<Cite src="vbuterin-lmd-ghost-mitigation" /> The proposal
+introduces an explicit synchronisation bottleneck gadget with three parts: attesters in slot `N+1`
+only consider attestations that arrived before the end of slot `N`; a proposal seen before one third
+of the way into the slot is treated as an attestation of weight `W/4` where `W` is the slot's total
+attester weight; and that adjustment is valid only for slot `N+1` and reverted
+afterwards.<Cite src="vbuterin-lmd-ghost-mitigation" />
+
+Compare that with what shipped. The timeliness deadline survived and became the attestation-due
+cutoff. The temporary, one-slot-only adjustment survived exactly. The *value* did not: `W/4` is 25%,
+and the spec first shipped 70.<Cite src="fc-spec-v1-1-10" /> And the first component — attesters
+discarding attestations that arrived after the previous slot ended — did not ship at all.
+
+That last omission is the one to hold on to. The boost as deployed is a weight bonus without the
+view-freezing rule that was proposed alongside it. Lesson seven is about a design that puts the
+view-freezing half back and drops the weight bonus, and it will make more sense knowing that the two
+were once a single proposal.
+
+Separately, the ex-ante reorg literature had been converging on a mitigation from the other
+direction. The working note tracking the candidate mitigations lists `(block, slot)`-voting first:
+honest committee members attest to an *empty slot* if they do not see a timely proposal, so an
+adversary's late block does not inherit the weight of honest attestations — the weight accrues to the
+empty slot instead.<Cite src="casper-ex-ante-mitigation" /> That approach did not ship either, and
+the naming survives in the literature as "(block, slot) fork choice", which is worth recognising when
+you meet it.
+
+### What 1.25% actually buys, in the moment it is spent
+
+The absolute figure looks unimpressive until you compare it against what it is competing with. Do
+that comparison once.
+
+**Subgoal 1 — fix the units.** Total active stake is the denominator. One slot's committee is 1/32 of
+it, so 3.125%.<Cite src="fork-choice-spec" /><Cite src="fc-phase0-beacon-chain-v161" /> The boost is
+40% of that, so 1.25%.<Cite src="fc-config-mainnet-v161" />
+
+**Subgoal 2 — establish what the honest block holds at the moment the comparison happens.** Attesters
+in slot `n` decide at the attestation deadline, roughly four seconds into the
+slot.<Cite src="fc-phase0-validator-v161" /> At that instant the block from slot `n` has whatever
+attestations from *slot n's own committee* have already been seen — and slot `n`'s committee is
+voting right now, so the answer is close to nothing. The votes the block will eventually carry arrive
+after the decision they are meant to inform.
+
+**Subgoal 3 — establish what the adversary can present at the same instant.** An adversary holding
+fraction β and controlling slot `n-1` releases a competing block plus its own withheld attestations
+from earlier slots. Because weight flows up the subtree, everything it has saved counts for its
+branch at once.<Cite src="fork-choice-spec" />
+
+**Subgoal 4 — compare, and see why the constant is where it is.** Without the boost the comparison at
+the deadline is roughly *nothing* against *β accumulated over l slots*, and the honest block loses for
+any β above the noise. With the boost the honest block enters the comparison holding 1.25% of total
+stake, which is 40% of one slot's committee, and the adversary needs `l·β` to exceed
+`W_PB`.<Cite src="fc-proposer-boost-considerations" /> **The boost is not competing against the
+block's eventual weight. It is standing in for it during the seconds before it exists.** That is why a
+figure worth one-eightieth of the stake is decisive, and why the temporary removal at the slot
+boundary costs nothing: by then the real votes have landed.
+
+**Subgoal 5 — state the residual honestly.** This makes the *simple* ex-ante reorg unprofitable for a
+small adversary. It does not make ex-ante reorgs impossible, because an adversary controlling several
+consecutive slots accumulates across them, and the requirement becomes `W_PB > l·β` rather than
+`W_PB > β`.<Cite src="fc-proposer-boost-considerations" /> The refined attacks in the literature are
+exactly about relaxing what the adversary needs, to the point where one paper achieves long-range
+reorgs with a vanishingly small fraction of stake and no control over message propagation, assuming
+only probabilistic propagation.<Cite src="three-attacks-pos-ethereum" />
+
+<Figure
+  caption="Both children of one parent, weighed at the instant the attesters decide. The honest side is holding a constant; the adversarial side is holding whatever it managed to save."
+  alt="A fork with two children of a common parent: the honest block, whose only weight at the attestation deadline is the proposer boost worth 40 percent of one slot's committee, or 1.25 percent of total stake, and the adversary's withheld branch, carrying attestations banked across l earlier slots."
+>
+  <Tree root={{ label: 'common parent', note: 'the comparison happens here', children: [
+    { label: 'honest block', tone: 'accent', note: 'boost only: 1.25% of total stake' },
+    { label: 'withheld branch', tone: 'danger', note: 'banked across l slots' },
+  ] }} />
+</Figure>
+
+## The dial has two ends, and this is the arithmetic
+
+Here is the part that makes proposer boost worth a lesson rather than a paragraph. The design
+document that set the shipped value states the tension in one sentence: a high proposer boost enables
+an adversary to abuse it and perform ex-post reorgs or sandwich ex-ante
+reorgs.<Cite src="fc-proposer-boost-considerations" />
+
+Work the sandwich example through, because it is the clearest demonstration that the defence is also
+a weapon. Write the adversary's stake fraction as β and the boost as `W_PB`.
+
+**Subgoal 1 — set up the sandwich.** A 10% adversary proposes block `n` and block `n+2`. An honest
+proposer has block `n+1` in between. The adversary's goal is that `n+1` is not in the canonical chain.
+
+**Subgoal 2 — total what the adversary can put behind its own branch.** Its validators in slot `n`
+vote for its branch: 10%. Its validators in slot `n+2` vote for it: 10%. And its block at `n+2`
+receives the boost: 70% of a committee, in the units this document uses. Sum: 90%.
+
+**Subgoal 3 — total what the honest block has.** Assuming all honest validators behave, block `n+1`
+holds the honest committee's weight: 90%.
+
+**Subgoal 4 — read off the result.** The document's own conclusion: 10% + 10% + 70% equals 90%, which
+is equal to the honest weight voting for block `n+1`.<Cite src="fc-proposer-boost-considerations" />
+A ten-percent adversary reaches parity with the honest network — *because of* the boost, not despite
+it. Two thirds of its ammunition was handed to it by the defence.
+
+**Subgoal 5 — generalise, and notice the inequalities point opposite ways.** Against a plain one-block
+ex-ante reorg the requirement is `W_PB > β`, and with the adversary controlling `l` blocks in a row it
+becomes `W_PB > l·β`. Against the sandwich the requirement is `1 - β > W_PB + l·β`, and for the pure
+ex-post case it is `W_PB < 1 - β`.<Cite src="fc-proposer-boost-considerations" /> One family of
+constraints has `W_PB` on the large side; the other has it on the small side. **No value satisfies
+both families for every β, and that is a property of the inequalities, not of anyone's engineering.**
+
+### How 40 was actually chosen
+
+The choice was not "somewhere in the middle". It was an argued optimum against a specific attack
+class, and the argument is public.
+
+The same document computes, for each boost value, the largest adversary that can be defended against
+at each reorg depth `l`, and pairs it with how often such an adversary would even get the required
+run of consecutive slots. Its findings: `l = 2` reorgs are practically the most concerning, because
+the maximum adversary defensible at `l = 2` is β = 0.2, and a 20% adversary gets the right conditions
+for a 2-reorg once every 25 blocks — more than once an epoch. At `l = 3` the maximum defensible
+adversary is β = 0.143, who would get the opportunity roughly once every 340 blocks. At `l = 4` the
+opportunities arrive about once a day for any adversary that can be defended against at
+all.<Cite src="fc-proposer-boost-considerations" />
+
+<Matrix
+  corner="Reorg depth l"
+  cols={['Largest adversary that can be defended against', 'How often that adversary draws the run']}
+  rows={[
+    { label: 'l = 2', cells: [{ v: 'β = 0.2', tone: 'warn' }, { v: 'once every 25 blocks', tone: 'danger' }] },
+    { label: 'l = 3', cells: ['β = 0.143, or 0.133 at the shipped value', 'once every 340 blocks'] },
+    { label: 'l = 4', cells: [{ v: 'not stated', tone: 'muted' }, 'about once a day'] }
+  ]}
+  caption="The constant was not set in the middle of a range — it was aimed at l = 2, the one row where a large adversary is still defensible and its opportunities arrive more than once an epoch."
+  alt="A table of reorg depth against the largest defensible adversary and how often that adversary gets the required run of consecutive slots: at depth two, beta 0.2 and once every 25 blocks; at depth three, beta 0.143 or 0.133 at the shipped boost, once every 340 blocks; at depth four the defensible adversary is not stated and opportunities arrive about once a day."
+/>
+
+The stated conclusion: `W_PB = 0.4` optimally protects against reorgs by 20% adversaries at `l = 2`,
+while trading off minimally at `l = 3` by protecting against β ≤ 0.133 instead of the 0.143 that
+`W_PB = 0.43` would give.<Cite src="fc-proposer-boost-considerations" /> The document also says
+plainly that any value in `[0.4, 0.43]` seems reasonable, and that the table suggests 0.43 is the
+best.<Cite src="fc-proposer-boost-considerations" /> Forty was picked out of a range, not derived to
+a decimal.
+
+The change landed as a spec pull request whose body records the immediate cause — an off-by-one
+mistake in an earlier PR led to a reconsideration of the parameter — and points at that document for
+the argument.<Cite src="fc-specs-pr-2895" /> It merged on 20 May 2022 and the new value appears from
+v1.2.0 onward.<Cite src="fc-specs-pr-2895" /><Cite src="fc-spec-v1-2-0" /> It still reads 40 in the
+current tagged spec and in the mainnet
+configuration.<Cite src="fork-choice-spec" /><Cite src="fc-config-mainnet-v161" />
+
+<Misconception
+  belief="Proposer boost makes reorgs harder, so a bigger boost would make the chain safer."
+  reality="Raising the boost makes ex-ante reorgs harder and ex-post and sandwich reorgs easier, because the boost is weight the *next* proposer also receives and can aim backwards. At 70 a 10% adversary could match the honest network's weight on a sandwich; at 40 it cannot."
+  why="The boost was introduced as a defence, and defences are assumed to be monotone in their parameter. This one is not — it is a weapon issued to whoever is proposing, and half the time in an attack scenario that is the adversary."
+  src="fc-proposer-boost-considerations"
+/>
+
+<Misconception
+  belief="Proposer boost eliminated the balancing attack."
+  reality="It raised the cost. The published variant that survives it exploits how equivocating votes are attributed, which the boost does not touch — and the same change made ex-post reorgs cheaper at the same time."
+  why="The boost was announced as the mitigation for balancing attacks, and the announcement is more widely read than the paper showing a surviving variant."
+  src="neu-tas-tse-two-attacks"
+/>
+
+<Check type="explain" concept="proposer-boost-tradeoff">
+A colleague reviewing this module proposes what looks like an obvious improvement: keep proposer
+boost, but make its size adaptive. When the previous slot produced a block on time, set the boost low;
+when the previous slot was empty or late, set it high. "The boost only exists to defend a fresh block
+against withheld weight," they argue. "When nothing looks wrong, we do not need it, so we should not
+be handing the next proposer a weapon."
+
+Evaluate the proposal. Does it escape the dial?
+
+<Answer>
+**Start by naming what the dial actually is, because the proposal has misidentified it.** The tension
+is not between "boost on" and "boost off". It is that the same quantity defends the current
+proposer's block against withheld attestations and arms the current proposer against the previous
+block. Those are the same 1.25% of stake<Cite src="fork-choice-spec" /> viewed from two directions —
+forward at the adversary's hidden votes, backward at the honest predecessor. Any rule that sets the
+number sets both, at the same instant, for the same actor.
+
+**Now check whether the trigger condition is observable in the way the proposal assumes.** It is not,
+and this is where it fails hardest. The signal "the previous slot was empty or late" is a signal about
+the *previous* proposer's behaviour, read by *this* proposer's node — and the ex-ante adversary's
+entire method is to be the previous proposer and to be late on purpose. A rule that says "if the
+previous slot looked bad, boost harder" is a rule an adversary can trigger at will, by proposing late,
+which is free. The proposal hands the adversary a switch labelled *increase my own weapon*.
+
+**Check the other direction too.** In the quiet case the boost drops to low. But the honest block in
+a quiet slot is precisely the block an ex-ante adversary was preparing for: it withheld a block and
+votes across earlier slots, and none of that withholding is visible in "the previous slot produced a
+block on time". The attack is set up before the victim block exists, so it leaves no trace in the
+window the trigger inspects. Lowering the boost in the quiet case lowers it in exactly the case the
+boost was built for.
+
+**Check whether the trigger is even computable consistently.** "Late" is a per-node judgement:
+`is_timely` compares arrival against the attestation deadline in the *receiving node's* clock and
+store.<Cite src="fork-choice-spec" /> Nodes near the proposer see timely; nodes far away see late. A
+boost whose *size* depends on that judgement would give different nodes different weights for the same
+block, which multiplies the divergence the boost exists to suppress. An uneven view of the boost is
+not a thought experiment: it is the documented mechanism of the May 2022 seven-block reorg, where some
+validators applied the boost and some did not, splitting votes roughly in half for seven consecutive
+slots.<Cite src="monnot-reorg-post" />
+
+**What the proposal gets right, and where that instinct actually leads.** The intuition — that the
+protocol should not compensate for disagreement it could instead prevent — is correct, and it is the
+same intuition that produced view merge: rather than nudging weight to overcome divergent views,
+freeze the views and have the proposer publish its own so everyone evaluates the same
+set.<Cite src="vbuterin-lmd-ghost-mitigation" /> That design has no dial to mis-set, which is its
+whole appeal. It is also research, not a shipped mechanism, and lesson seven states what is and is not
+known about it.
+
+**The one-line answer.** Making the boost adaptive does not escape the dial; it lets the adversary
+turn it. The escape route is not a better setting, it is a mechanism with no setting.
+</Answer>
+</Check>
+
+## What this unlocks
+
+- **A number you can now compute, not memorise.** One slot's committee weight is total active stake
+  divided by 32; the boost is 40% of that, so 1.25% of all
+  stake.<Cite src="fork-choice-spec" /><Cite src="fc-config-mainnet-v161" /> Every attack cost in the
+  next three lessons is expressible in the same unit.
+- **The two directions, named before you meet them.** Ex-ante attacks are the ones the boost defends
+  against; ex-post attacks are the ones it enables. That is the entire content of the next lesson,
+  and you already have the inequalities that separate
+  them.<Cite src="fc-proposer-boost-considerations" />
+- **Read constants out of the spec, always.** This one was 70 at
+  v1.1.10<Cite src="fc-spec-v1-1-10" /> and 40 from v1.2.0<Cite src="fc-spec-v1-2-0" /> and material
+  written between those dates is confidently wrong. The current value lives in
+  `configs/mainnet.yaml` and in `specs/phase0/fork-choice.md` at whatever tag your client
+  targets.<Cite src="fc-config-mainnet-v161" />
+- **The published inequalities are a tool, not trivia.** Given any proposed boost value you can now
+  compute what it protects against at each reorg depth, using the rule the designers used:
+  `min(boost/l, (1-boost)/(l+1))` for `l` greater than one.<Cite src="fc-proposer-boost-considerations" />
+  That is the practice exercise this module ships, and it produces the plot that makes the tradeoff
+  impossible to un-see.<Cite src="three-attacks-pos-ethereum" />

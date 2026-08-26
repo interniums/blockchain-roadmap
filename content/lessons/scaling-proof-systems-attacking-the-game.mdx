@@ -1,0 +1,338 @@
+---
+id: scaling-proof-systems-attacking-the-game
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [arbitrum-bold-economics, arbitrum-bold-deep-dive, arbitrum-bold-gentle-intro, op-specs-bond-incentives, op-docs-fault-proofs-reference, op-docs-challenger, op-specs-fault-dispute-game, arxiv-economic-censorship-games, op-docs-fault-proofs-explainer, op-specs-configurability]
+stack: {}
+---
+
+An attacker sits down with the same documentation you have just read and reaches a conclusion that
+looks like defeat: *I cannot win. The state transition is deterministic, the one-step proof will go
+against me, and my bond is gone.*
+
+Then they ask a different question. **What does losing slowly cost everybody else?**
+
+Every pending withdrawal from the chain is blocked while the dispute runs. Not one withdrawal — all
+of them, because confirmation of the assertion they are all drawn from is what is being delayed.
+Market makers fronting withdrawal liquidity have their capital stuck. Exchange deposit queues stall.
+And the attacker's cost is a number they can compute in advance, from public documentation, before
+committing a single wei.
+
+This lesson is about that attack and the machinery built to price it. It is the part of proof-system
+design that is economics rather than cryptography, and it is where the interesting mistakes live.
+
+## The damage is measured in other people's capital
+
+Arbitrum's economics documentation prices the attack by pricing the harm, and the derivation is
+short enough to do by hand.
+
+**Subgoal: state what a week of delay costs the people who are not attacking.** The documented model
+is a bank-run scenario: everyone wants out at once. With the Arbitrum One bridge holding
+approximately $3.4B of assets at the time of writing on 23 October 2024, and assuming those funds
+could earn 5% APY elsewhere, one extra week of delay costs roughly $3.27M.<Cite src="arbitrum-bold-economics" />
+
+```text
+3.4e9 USD × 0.05 per year × (7 / 365) years = 3.26e6 USD
+```
+
+**Subgoal: turn the harm into a bond floor.** The documented recommendation follows immediately: the
+bond for assertion posters should be greater than $3.7M.<Cite src="arbitrum-bold-economics" /> The
+logic is that the price of imposing the delay should exceed the delay's cost to everyone else. Not
+the attacker's cost of computation, not the defender's cost of responding — **the externality.**
+
+That is an unusual sizing principle and it is worth pausing on. A bond in most systems prices the
+attacker's expected gain. Here it prices the *bystanders' expected loss*, because the attacker's gain
+may be entirely outside the system — a short position, a competitor, a grudge.
+
+The concrete Arbitrum One parameters that come out of it: a one-time assertion bond of 3,600 WETH to
+become a proposer, and challenge bonds of 555 WETH at the big-step level and 79 WETH at the
+small-step level.<Cite src="arbitrum-bold-deep-dive" /><Cite src="arbitrum-bold-economics" /> The
+gentle introduction totals the challenge side at 1,110 ETH to fully resolve a
+dispute.<Cite src="arbitrum-bold-gentle-intro" />
+
+<Misconception
+  belief="Bond sizes are set to make attacks unprofitable."
+  reality="The assertion bond on Arbitrum One is documented as sized against the opportunity cost a week of delay imposes on everyone withdrawing — the externality, not the attacker's profit. An attacker whose payoff is external to the chain is unaffected by profitability arguments."
+  why="Every other bond in crypto prices theft, so bonds get read as anti-theft devices. This one prices griefing."
+  src="arbitrum-bold-economics"
+/>
+
+## Why the old design let delay grow without bound
+
+The pre-BoLD dispute protocol resolved challenges **one on one**. An assertion that got challenged
+had to be defended against each unique challenger separately, sequentially — the documentation's own
+analogy is a 1-vs-1 tournament.<Cite src="arbitrum-bold-gentle-intro" />
+
+**Subgoal: see the arithmetic that makes that fatal.** If resolving one dispute takes time T, and an
+adversary can open k disputes that must be resolved in series, the total delay is k·T. The adversary
+buys delay linearly in money spent, with no ceiling other than their budget. The documentation
+describes exactly this: malicious actors continuously opening disputes to extend the challenge
+period for as long as they are willing to sacrifice bonds, effectively extending it indefinitely by
+an amount equal to the time to resolve each dispute, one by one.<Cite src="arbitrum-bold-gentle-intro" />
+
+And it names the consequence, which is the part usually left out of the story: **this is why
+validation for Arbitrum One and Nova was limited to a permissioned set of entities overseen by the
+DAO.**<Cite src="arbitrum-bold-gentle-intro" /> The whitelist was not laziness. It was the
+mitigation for an unbounded delay attack. Remove the delay attack and the whitelist loses its
+justification — which is the actual causal chain behind "BoLD unlocked permissionless validation".
+
+<Figure
+  caption="The attacker concedes the dispute and collects the delay anyway, which is why the bond is priced against the delay rather than against the lie."
+  alt="An attacker posts a false claim, the honest side must answer inside the clock, and the attack ends with the attacker losing the bond while every pending withdrawal waits on the delayed assertion. Under the pre-BoLD one-on-one protocol the attacker simply opens the next dispute and the loop repeats."
+>
+  <Flow
+    lanes={['the move', 'the response', 'the outcome']}
+    nodes={[
+      { id: 'post', label: 'post a false claim', note: 'a bond, and a dispute opens', col: 0, tone: 'danger' },
+      { id: 'ans', label: 'honest side answers', note: 'inside the clock', col: 1 },
+      { id: 'lose', label: 'the bond is forfeited', note: 'the step is deterministic', col: 2, tone: 'good' },
+      { id: 'stuck', label: 'withdrawals all wait', note: 'the assertion they are drawn from is delayed', col: 2, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'post', to: 'ans' },
+      { from: 'ans', to: 'lose', tone: 'good' },
+      { from: 'ans', to: 'stuck', tone: 'danger' },
+      { from: 'lose', to: 'post', label: 'pre-BoLD: open the next one', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+## The mechanism that bounds it: timers that accrue in parallel
+
+BoLD's answer is to change what a claim *is* and what a clock measures.
+
+**Subgoal: detach claims from identities.** In BoLD, a dispute is not between two addresses. It is
+between a correct history and an incorrect one, and claims attach to Merkle commitments of chain
+history rather than to a validator. The documented consequence: if Alice and Charlie are both honest
+and Alice goes offline mid-dispute, Charlie can continue on behalf of the honest team, because they
+are making moves on the same correct history — **trustless cooperation with no communication between
+honest parties.**<Cite src="arbitrum-bold-economics" />
+
+**Subgoal: define the timer precisely, because the bound falls out of it.** An edge that has no rival
+accrues an **unrivaled timer**, measured in blocks of the first non-Arbitrum ancestor chain. The
+timer stops when a rival edge is created on-chain. An edge also has an **inherited timer**: its own
+unrivaled time plus the *minimum* inherited timer among its children, defined recursively. Once a
+top-level edge reaches an inherited timer at or above the challenge period — 6.4 days — it can be
+confirmed.<Cite src="arbitrum-bold-deep-dive" />
+
+**Subgoal: work out why k adversaries no longer buy k·T of delay.** The honest team's edges accrue
+time whenever they are unrivaled, and every adversary must rival *every* honest edge to stop that
+accrual. Adding a second adversary does not create a second sequential tournament; it creates more
+rivals inside the same structure, all racing the same clock. The documented result is a fixed upper
+bound: a dispute opened at the last second delays confirmation to a maximum of 14 days — the 6.4-day
+assertion window plus resolution — and BoLD is described as the only dispute protocol its authors
+are aware of that guarantees the bound.<Cite src="arbitrum-bold-economics" /> The gentle
+introduction adds the deployed trimmings: two challenge periods, a two-day Security Council grace
+period, and a small delta for computation.<Cite src="arbitrum-bold-gentle-intro" />
+
+<Misconception
+  belief="An attacker with enough money can win a dispute by outspending the honest side."
+  reality="BoLD is designed so a single honest party bonded to the correct state prevails, with delay bounded. On the OP Stack, the documented defence against outspending is different in kind: the Guardian can reallocate bond payments, so the deterrent rests partly on a role rather than purely on the game."
+  why="Adversarial-spending intuition transfers from proof-of-stake, where more capital really does buy more influence. In a dispute over a deterministic function it does not — but the resource-exhaustion variant is real, and the two stacks answer it differently."
+  src="arbitrum-bold-gentle-intro"
+/>
+
+That second half deserves the emphasis it just got. The op-challenger documentation states that to
+ensure correct game outcomes the combined funding of all honest actors must exceed the funding
+available to an attacker, and that there is no fixed amount that guarantees this — chain operators
+should have significant funds available at short notice.<Cite src="op-docs-challenger" /> Its
+argument for why attackers still lose is explicitly social-technical: the Guardian can intervene and
+reallocate bond payments to the honest actors.<Cite src="op-docs-challenger" /> That is a real
+deterrent. It is not a property of the bisection game.
+
+## Pricing spam: the resource ratio
+
+Now the design question underneath the bond tables. How do you price a move so that lying costs more
+than telling the truth?
+
+**Subgoal: name the asymmetry you are trying to buy.** The **resource ratio** is the ratio of the
+adversary's marginal costs to the honest party's, counting both gas and bonded capital. The stated
+design intuition: make the adversary pay 10× the honest party's marginal costs.<Cite src="arbitrum-bold-economics" />
+The illustration is memorable — defending against a $1B attack would require about $100M of bonds,
+reimbursed on winning, while the attacker's $1B is forfeited.<Cite src="arbitrum-bold-gentle-intro" />
+
+**Subgoal: derive why bonds must scale geometrically across levels.** This is the elegant bit. The
+documented structural fact is that if the adversary makes N bonds at any level, they can force the
+honest party to make N bonds at the next level down — while choosing to place no bonds there
+themselves. To keep the adversary paying a constant factor more in staking, the bond at one level
+must be that factor larger than the bond at the next level down. Because there are multiple levels,
+the bond-size equations carry an exponential factor in the desired ratio.<Cite src="arbitrum-bold-economics" />
+
+Check it against the deployed numbers:
+
+```text
+assertion bond / big-step bond = 3600 / 555 = 6.49
+big-step bond / small-step bond =  555 /  79 = 7.03
+```
+
+Both land near the documented deployed resource ratio of **6.46 for Arbitrum One**, a figure that
+accounts for the initial proposer bond and assumes a worst case of 500 gwei per gas on the parent
+chain — because an attacker can choose to attack during elevated gas
+prices.<Cite src="arbitrum-bold-economics" /> Read plainly: for every $6.46 a malicious party
+spends attacking, roughly $1 is needed to defend successfully.<Cite src="arbitrum-bold-economics" />
+
+**Subgoal: understand why the ratio is 6.46 and not 1000.** Because the bond size grows with the
+ratio and there are several levels. The documentation states the consequence bluntly: a 1000× ratio
+would require a bond of 1M ETH to open a challenge in the first place, which is
+unreasonable.<Cite src="arbitrum-bold-economics" /> A higher ratio deters attacks more and prices
+honest defenders out more. 6.46 is described as the pragmatic point in that trade-off, not as an
+optimum.<Cite src="arbitrum-bold-economics" />
+
+The OP Stack expresses the same principle at a different granularity: a bond per *move* on a smooth
+curve rather than per level. Gas charged scales from 400,000 at depth 0 to 300,000,000 at depth 73,
+giving a per-depth multiplier of 1.09493 and a total ratio of 750× from top to
+bottom.<Cite src="op-specs-bond-incentives" /> The stated rationales for the two endpoints are worth
+keeping: the 400,000 baseline is roughly double the cost to respond at the top level, and the
+300,000,000 ceiling is roughly double the cost of a max-size large preimage
+proposal.<Cite src="op-specs-bond-incentives" /> Both endpoints are "double what a response costs" —
+the ratio is smeared across 73 depths rather than concentrated in three levels.
+
+### The counter-intuitive rule: do not pay the winner everything
+
+Here is the result that most people get wrong when they design one of these systems from first
+principles, and it comes with a worked example from Ed Felten.<Cite src="arbitrum-bold-gentle-intro" />
+
+**Subgoal: state the naive design.** The loser's bond goes to the winner. It rewards honest
+vigilance, it funds challengers, and it seems strictly better than burning the bond.
+
+**Subgoal: compute what it does to the attacker's cost.** Suppose the top-level assertion bond is
+$5M. A delay attack aiming at one week of delay costs the attacker $5M. Now give the honest proposer
+20% of the confiscated bond. The attacker posts *both* bonds — $10M total — and recovers the honest
+$5M plus a $1M reward:
+
+<Matrix
+  numeric
+  corner="Attacker's ledger"
+  cols={['USD']}
+  rows={[
+    { label: 'attacker outlay', cells: ['10M'] },
+    { label: 'recovered honest bond', cells: ['−5M'] },
+    { label: 'reward on the honest side', cells: ['−1M'] },
+    { label: 'net cost of the same attack', cells: [{ v: '4M', tone: 'danger' }] },
+  ]}
+  caption="Paying the winner is a discount to any attacker who can afford to be both parties."
+  alt="Attacker's ledger under a 20 per cent reward: 10M outlay for both bonds, minus a 5M recovered honest bond, minus a 1M reward, leaving a net cost of 4M for the same one-week delay."
+/>
+
+The reward made the protocol **weaker** against delay griefing.<Cite src="arbitrum-bold-gentle-intro" />
+You can compensate by raising the assertion bond to $6.25M so that delay griefing still costs $5M
+— check it: 6.25 × 0.8 = 5 — but that raises the cost to honest parties defending against every
+*other* attack.<Cite src="arbitrum-bold-gentle-intro" />
+
+The general statement is the one to remember: **large rewards create new strategic options for the
+attacker, which may reduce their costs.** An attacker who can play both sides converts a reward
+scheme into a discount.
+
+What Arbitrum One does instead: honest parties are always refunded, confiscated bonds go to the DAO
+treasury, and a **1% Defender's Bounty** is paid to entities that deposited challenge bonds in a
+sub-challenge, proportional to what they put up.<Cite src="arbitrum-bold-economics" /> Parent-chain
+gas costs for honest defenders are reimbursed by the Foundation through an off-chain
+procedure.<Cite src="arbitrum-bold-economics" /> Small reward, no strategic option.
+
+The OP Stack's equivalent is the **left-most payout rule**. If a subgame root resolves incorrectly,
+its bond goes to the left-most claimant that countered it, which creates an incentive to identify
+the earliest point of disagreement.<Cite src="op-specs-bond-incentives" /> Its purpose is the same:
+close off positions that pay without being useful. Recall the freeloader claim from the previous
+lesson — a counter to a bad claim with the wrong pivot direction, which reclaims its own bond if
+left untouched, which is why honest challengers must counter them even though they do not affect the
+outcome.<Cite src="op-specs-fault-dispute-game" />
+
+## The problem nobody has solved
+
+Two open items, stated as open by the documentation itself.
+
+**The verifier's dilemma.** Checking assertions costs resources and produces nothing when everything
+is fine, so validators are tempted to free-ride. Arbitrum's economics page cites work finding that
+with no incentive for honest validators to participate there is no pure-strategy Nash equilibrium,
+only a mixed one — and that a pure-strategy equilibrium is reachable if honest parties are
+incentivised to check results. Future iterations of BoLD could include "attention challenges" that
+reward validators for actually doing the job.<Cite src="arbitrum-bold-economics" /> Until then, the
+interim answer is a service fee to active proposers, denominated in ETH and correlated to the
+annualised income Ethereum mainnet validators receive — estimated at approximately 3% to 4% of their
+bond at the time of writing.<Cite src="arbitrum-bold-economics" />
+
+**Censorship economics.** The academic model of an attacker bribing block proposers to censor a
+defender's moves derives the challenge period required for the defender to succeed as a function of
+the number of required protocol moves and the players' budgets — three models, not one
+answer.<Cite src="arxiv-economic-censorship-games" /> The economics of censorship and delay remain
+an active research area, and no source in this module treats the question as closed.
+
+<Check type="spot-bug" concept="bonded-challenging">
+A team is launching an optimistic chain and sends you their proof-system economics for review.
+
+```text
+Bridge TVL target, year one         : $200M
+Assertion bond                      : 5 ETH
+Challenge bond, per level (3 levels) : 5 ETH, 5 ETH, 5 ETH
+Loser's bond                        : paid 100% to the winner
+Rationale supplied                  : "5 ETH covers gas for every move with margin,
+                                       and the winner-takes-all payout means honest
+                                       challengers are profitable, so someone will
+                                       always show up."
+```
+
+Find the problems, most consequential first.
+
+<Answer>
+**1. The bond is priced against the defender's gas, not against the harm the attack causes.** This
+is the wrong quantity entirely. The documented sizing principle prices the opportunity cost that a
+week of delay imposes on everyone trying to withdraw: at $200M of TVL and a 5% alternative yield,
+one extra week is 200e6 × 0.05 × 7/365 ≈ $192,000 of externality.<Cite src="arbitrum-bold-economics" />
+An assertion bond of 5 ETH is orders of magnitude below that. Buying $192,000 of damage for a few
+thousand dollars is not a bond; it is a coupon.
+
+**2. Flat per-level bonds destroy the resource ratio.** The structural fact is that N adversary bonds
+at one level force N honest bonds at the level below, where the adversary may place none. Keeping
+the adversary paying a constant multiple therefore requires the bond at each level to exceed the
+level below it by that multiple, which is why the deployed Arbitrum One ladder is 3,600 / 555 / 79 —
+ratios of about 6.5 and 7.0, consistent with its documented 6.46 resource
+ratio.<Cite src="arbitrum-bold-economics" /><Cite src="arbitrum-bold-deep-dive" /> A flat ladder
+gives a ratio near 1: the attacker and the defender pay the same to escalate, so the attacker
+escalates for free relative to the defender's effort. The OP Stack reaches the same place from the
+other side, with a per-move curve spanning 750× from depth 0 to depth 73.<Cite src="op-specs-bond-incentives" />
+
+**3. Winner-takes-all is actively harmful, not merely generous.** Take their own numbers. With a 5
+ETH assertion bond, a delay attack costs 5 ETH. Pay the honest side 100% of the confiscated bond and
+the attacker posts both sides — 10 ETH — loses 5 and recovers 5, so the attack becomes free. Felten's
+worked example makes the general point with a 20% reward turning a $5M attack into a $4M one; at
+100% the cost goes to zero.<Cite src="arbitrum-bold-gentle-intro" /> Arbitrum's deployed answer is a
+1% Defender's Bounty with confiscated funds going to the treasury.<Cite src="arbitrum-bold-economics" />
+
+**4. "Someone will always show up" is the verifier's dilemma stated as a conclusion.** The research
+cited by Arbitrum finds no pure-strategy equilibrium when honest validators have no incentive to
+check.<Cite src="arbitrum-bold-economics" /> Profitability *conditional on an attack occurring* does
+not pay anyone to watch during the years when no attack occurs, which is when watching must already
+be happening.
+
+**5. The missing line: what the honest side must hold, and can it raise it.** Nowhere does the model
+state the total capital an honest defender needs to play one game to the bottom, or how they would
+raise it at three hours' notice. Arbitrum's answer is trustless bonding pools so that a high bond
+does not imply a small defender set.<Cite src="arbitrum-bold-deep-dive" /> The OP Stack's guidance is
+a floor of 50 ETH plus access to a large pool.<Cite src="op-docs-challenger" /> A design with no
+answer here has chosen a whitelist without writing it down.
+
+**What I would tell them.** Three numbers decide this design, and none of them is gas: the
+externality a week of delay imposes, the ratio you want between adversary and defender marginal
+cost, and the capital an honest party can actually assemble in hours. Fix those and the bond ladder
+follows. Fix gas and you have priced a spam filter, not a security parameter.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The next lesson** crosses to the other family and asks the equivalent questions. A validity rollup
+has no delay attack, because there is no game to attack — but it has a recurring bill and a wall
+clock, and both have been reported so badly that no single figure in circulation is safe to quote.
+
+**Then the closing argument.** Notice what this lesson never needed: the words optimistic and ZK. It
+was about bonds, clocks, externalities and strategic options, and every one of those varies more
+between two optimistic chains than it does between the two families. That observation is the last
+lesson.
+
+**And for your own work**, the transferable idea is the resource ratio. Any mechanism where one side
+can force the other to spend has this shape, and the question "what does the attacker pay per unit
+of work they impose on the defender?" is worth asking of rate limiters, of dispute processes, and of
+anything that lets an unauthenticated caller make your system do something
+expensive.<Cite src="op-docs-fault-proofs-explainer" />

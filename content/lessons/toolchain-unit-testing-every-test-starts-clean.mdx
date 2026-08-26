@@ -1,0 +1,328 @@
+---
+id: toolchain-unit-testing-every-test-starts-clean
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources:
+  [
+    foundry-writing-tests,
+    foundry-config-overview,
+    foundry-forge-testing,
+    forge-std-vm-1-16-2,
+    foundry-issue-5494,
+    measured-forge-1-7-1,
+    measured-forge-cli-1-7-1,
+    measured-gas-constants,
+    foundry-cheatcode-prank,
+  ]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Two tests, written in the order a person thinks:
+
+```solidity
+function test_A_Deposit() public {
+    vault.deposit(100);
+    assertEq(vault.balanceOf(address(this)), 100);
+}
+
+function test_B_Withdraw() public {
+    vault.withdraw(100);                       // fails
+    assertEq(vault.balanceOf(address(this)), 0);
+}
+```
+
+`test_B_Withdraw` reverts with an insufficient-balance error. The author's first hypothesis is that
+forge ran the tests out of order. The second is that there is a `--sequential` flag somewhere. Both
+are wrong, and the correct answer is more useful than either: nothing `test_A` did exists any more by
+the time `test_B` starts.
+
+That much is a one-line rule and most people absorb it in a day. The expensive part is the second
+half — what *does* survive into every test — and that half is almost never taught, because it is
+invisible until a fixture quietly poisons an entire suite.
+
+## Each case begins from the end of setUp
+
+`setUp()` runs before each individual test function, not once per
+contract.<Cite src="foundry-writing-tests" /> This is the opposite of a `beforeAll` hook and it is
+the single most common assumption carried in from JavaScript or JUnit.
+
+You can watch it directly. On forge 1.7.1, a contract with a `uint256 counter` state variable, a test
+that sets `counter = 42`, and a second test that logs `counter`, prints `0` from the second
+test.<Cite src="measured-forge-cli-1-7-1" /> There is no ordering subtlety to reason about, because
+there is no channel through which one case could reach the next.
+
+<Figure
+  caption="test_B_Withdraw reverts because it begins where setUp ended, not where test_A left off."
+  alt="setUp runs, test_A_Deposit runs and writes to the vault, everything it wrote is discarded, setUp runs again, and test_B_Withdraw begins from the same state test_A did."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 's1', label: 'setUp()', note: 'runs before test_A', col: 0, tone: 'accent' },
+      { id: 'a', label: 'test_A_Deposit', note: 'vault.deposit(100)', col: 1 },
+      { id: 'gone', label: 'everything test_A wrote', note: 'discarded', col: 2, tone: 'danger' },
+      { id: 's2', label: 'setUp()', note: 'runs again, before test_B', col: 3, tone: 'accent' },
+      { id: 'b', label: 'test_B_Withdraw', note: 'no deposit to withdraw', col: 4 },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="setUp() runs once for the test contract, the way beforeAll does."
+  reality="It runs before every test function. State a test mutates is gone before the next one begins, so cases cannot share mutated state and cannot be made order-dependent."
+  why="Every mainstream JS and JVM runner offers both a once hook and a per-test hook, and setUp reads like the once hook because it is the only one."
+  src="foundry-writing-tests"
+/>
+
+The practical consequence is a constraint you should welcome. You cannot write a suite where
+`test_B` depends on `test_A` having run — the kind of suite that passes locally, fails when someone
+adds a case in the middle, and gets "fixed" by renaming functions until the alphabet cooperates. That
+whole failure mode is unavailable here.
+
+There is a second consequence, and it changes what a failing run looks like. Because setUp runs
+before each case, a setUp that reverts takes down every case in the contract — and forge reports that
+as a single failure attributed to the fixture, not as N failures attributed to your tests. On forge
+1.7.1, a contract with two passing tests and a `setUp()` that reverts prints one line,
+`[FAIL: fixture broken] setUp() (gas: 0)`, and a summary reading `1 total
+tests`.<Cite src="measured-forge-cli-1-7-1" />
+
+Notice what that does to the count you were told to watch in the previous lesson: two tests became
+one reported entry. This is a good failure — it is loud, it names the fixture, and it cannot be
+mistaken for a contract bug. It is worth recognising on sight anyway, because the first instinct on
+seeing a single unfamiliar failure where a whole contract used to be is to look for the test that
+broke, and there is no such test.
+
+But "each test starts clean" is the wrong summary, and the rest of this lesson is about why.
+
+## What each case inherits
+
+Isolation works by re-establishing the state as it stood **at the end of setUp** before each case.
+Not the state as it stood before setUp ran. Everything setUp did is part of the starting conditions —
+including the things setUp did with cheatcodes.
+
+Here is a fixture that looks entirely reasonable:
+
+```solidity
+function setUp() public {
+    vault = new Vault(address(token));
+    token.mint(alice, 1_000e18);
+    vm.warp(1_000_000);          // a sane non-zero timestamp
+    vm.startPrank(alice);        // so the mints below come from alice
+    token.approve(address(vault), type(uint256).max);
+    // ... and no vm.stopPrank()
+}
+```
+
+Run any test in that contract on forge 1.7.1 and it starts with `block.timestamp` at `1000000`, and
+with every external call it makes attributed to `alice` rather than to the test
+contract.<Cite src="measured-forge-cli-1-7-1" /> Nothing announces this. `vm.startPrank` sets
+`msg.sender` for all subsequent calls until `stopPrank` is called, and "subsequent" does not stop at
+the end of setUp.<Cite src="forge-std-vm-1-16-2" /><Cite src="foundry-cheatcode-prank" />
+
+So the correct mental model is not "each test starts clean". It is:
+
+> **Each test starts from setUp's ending conditions, whatever those were.**
+
+<Matrix
+  corner="At the end of setUp"
+  cols={['Inherited by every case?', 'What the case begins with']}
+  rows={[
+    { label: 'token.mint(alice, 1_000e18)', cells: [{ v: 'Yes', tone: 'warn' }, 'alice already holds a balance'] },
+    { label: 'vm.warp(1_000_000)', cells: [{ v: 'Yes', tone: 'warn' }, 'block.timestamp at 1000000'] },
+    { label: 'vm.startPrank(alice), never stopped', cells: [{ v: 'Yes', tone: 'danger' }, 'every external call attributed to alice'] },
+    { label: 'a write made by an earlier case', cells: [{ v: 'No', tone: 'good' }, 'the post-setUp value, every time'] },
+  ]}
+  caption="The cheatcodes left running in setUp are inherited as literally as the token balances are."
+  alt="A mint, a warp and an unclosed startPrank in setUp are all inherited by every case, while a write made by an earlier case is not."
+/>
+
+### Why a leftover prank is worse than a leftover balance
+
+A leftover *balance* is usually harmless: your assertions either account for it or fail loudly.
+
+A leftover *prank* is different in kind, because it changes who is asking, and access control is
+exactly the thing a test suite is supposed to be checking. Work through the shape:
+
+**Subgoal — establish what the leftover does.** Every external call in every test is now made by
+`alice`. Not `address(this)`. The test contract, which deployed the vault and is therefore its owner,
+never speaks again.
+
+**Subgoal — find the test that now passes for the wrong reason.** A case named
+`test_RevertWhen_NonOwnerPauses` calls `vault.pause()` and expects a revert. It gets one. Green tick.
+But the revert it got is the one alice always gets, and the test would produce exactly the same
+result against a vault with **no owner check at all**, provided `pause()` reverted for any other
+reason — a paused-already guard, a zero-address check, an arithmetic panic. The assertion proves that
+alice cannot pause. It was written to prove that non-owners cannot pause. Those are the same
+statement only if alice is a non-owner *and* the revert came from the owner check, and the test
+verifies neither.
+
+**Subgoal — find the test that now fails for the right reason and gets "fixed".** A case asserting
+that the owner *can* pause fails, because the owner is no longer the caller. The cheap repair is to
+add `vm.prank(owner)` in that one test. It works. The fixture stays broken, and the next person
+inherits it.
+
+**Subgoal — state the rule that would have prevented both.** End setUp in a state you would be happy
+to describe in one sentence. If the sentence needs an "and also" — *and also alice is still pranked,
+and also we are a week into the future* — either remove it or write it as a comment on the last line
+of setUp, where the next reader will see it.
+
+<Aside kind="note">
+The mechanical version of that discipline: pair every `vm.startPrank` in setUp with a `vm.stopPrank`
+before setUp returns, and prefer single-shot `vm.prank` for the one call that needs it.
+`vm.stopPrank()` resets subsequent calls' `msg.sender` to `address(this)` — the test contract — which
+is the state a reader assumes when they see no prank at all.<Cite src="forge-std-vm-1-16-2" />
+</Aside>
+
+### You can ask, rather than guess
+
+Reading a fixture for leftovers is error-prone, and there is a cheatcode that answers the question
+directly. `vm.readCallers()` reads the current `msg.sender` and `tx.origin` from state and reports
+whether any caller modification is active, returning a `CallerMode` alongside the two
+addresses.<Cite src="forge-std-vm-1-16-2" /> The enum distinguishes `None` from a one-shot `Prank`
+and from a `RecurrentPrank` — the state a `startPrank` leaves behind.<Cite src="forge-std-vm-1-16-2" />
+
+Dropped into the first line of a test in the poisoned fixture above, on forge 1.7.1, it returns
+`RecurrentPrank` with `msgSender` set to alice.<Cite src="measured-forge-cli-1-7-1" />
+
+Two ways to use it. **As a debugging probe**, when an assertion about ownership fails and you cannot
+see why: one call tells you who is speaking. **As a fixture assertion**, at the end of a setUp you
+want to keep honest:
+
+```solidity
+import {VmSafe} from "forge-std/Vm.sol";   // the enum lives on VmSafe, not on Vm
+
+function setUp() public {
+    // ... build the fixture ...
+    vm.stopPrank();
+    (VmSafe.CallerMode mode,,) = vm.readCallers();
+    assertEq(uint256(mode), uint256(VmSafe.CallerMode.None), "setUp left a prank active");
+}
+```
+
+Against a fixture that forgot its `stopPrank`, forge 1.7.1 reports
+`[FAIL: setUp left a prank active: 4 != 0] setUp() (gas: 0)` — mode 4 being
+`RecurrentPrank`.<Cite src="measured-forge-cli-1-7-1" /> Two lines convert the module's most silent
+failure into one that names itself, in every test in the contract.
+
+## Isolation, and why a gas number from a blog post means nothing
+
+The second thing a test inherits is a metering mode, and this one has a genuine unresolved
+disagreement attached to it that you need to be able to navigate.
+
+**What isolation does.** With isolation on, each top-level external call from a test executes as a
+separate transaction in a separate EVM context. Access-list state does not carry from one top-level
+call to the next, so the second call to the same account or slot pays cold prices again — which is
+what a real user's second transaction would pay.<Cite src="foundry-forge-testing" /> With isolation
+off, the whole test body runs as one context, and everything after the first touch is warm.
+
+**Where the sources disagree.** The writing-tests page states that Forge runs tests with call
+isolation enabled by default and names `--no-isolate` / `isolate = false` as the
+opt-out.<Cite src="foundry-writing-tests" /> On forge 1.7.1, `forge config` reports
+`isolate = false`.<Cite src="measured-forge-cli-1-7-1" /><Cite src="measured-forge-1-7-1" /> Those
+two statements cannot both describe the same binary, and the documentation has framed isolation both
+ways across releases. Do not resolve it by picking the source you trust more — `isolate` is an
+ordinary configuration key, and `forge config` prints the fully merged result for the project you are
+standing in.<Cite src="foundry-config-overview" />
+
+**How to settle it for your own project in thirty seconds.** Two identical external calls, with
+`gasleft()` either side of each:
+
+```solidity
+function test_ColdWarm() public {
+    uint256 g1 = gasleft(); s.read(); uint256 g2 = gasleft();
+    s.read();                          uint256 g3 = gasleft();
+    console.log("first",  g1 - g2);
+    console.log("second", g2 - g3);
+}
+```
+
+On forge 1.7.1 with no flag, that prints `first 7624` and `second 1121` — the second call is warm,
+so isolation is not in effect. Run the same test with `--isolate` and it prints `first 7624` and
+`second 7621`.<Cite src="measured-forge-cli-1-7-1" /> The direction of the gap is cold-versus-warm
+access: a cold account access is 2600 against 100 warm, and a cold storage read is 2100 against 100
+warm.<Cite src="measured-gas-constants" /> Do not try to reconstruct the exact 6,503-gas difference
+from two numbers — read it as a signal that the metering mode changed, which is all you need it for.
+
+<Misconception
+  belief="Gas figures printed by forge are comparable to the figures in Foundry blog posts and older tutorials."
+  reality="Isolation and metering behaviour have moved within the 1.x line, and isolation is a per-run setting. A gas number is only comparable to yours if the Foundry version and the isolation setting are both stated — and they almost never are."
+  why="Gas feels like a property of the contract. It is a property of the contract measured by a particular harness in a particular mode."
+  src="foundry-forge-testing"
+/>
+
+### Two more reasons the number on your screen is not the number on chain
+
+**Forge under-reports relative to mainnet, systematically.** Test setup leaves accounts and slots
+warm, so a call that would pay cold prices in a fresh transaction pays warm prices in your
+suite.<Cite src="foundry-issue-5494" /> Isolation restores realistic accounting for top-level calls,
+which is the argument for turning it on — and it breaks any test that legitimately depends on warmth
+persisting across calls within one transaction, which is the argument against.
+
+**The old workaround folklore is out of date.** The circulating claim is that nothing can force a
+slot cold, so you cannot measure a realistic first touch. forge-std v1.16.2's `Vm.sol` declares
+`cool(address target)` — "Marks the slots of an account and the account address as cold" — and
+`coolSlot(address target, bytes32 slot)` — "mark specific storage slot as cold, simulating no prior
+read" — alongside a `warmSlot` counterpart.<Cite src="forge-std-vm-1-16-2" /> If you have read
+otherwise, check `Vm.sol` at the version you have vendored rather than the article.
+
+<Check type="predict" concept="setup-snapshot-model">
+A fixture ends like this:
+
+```solidity
+function setUp() public {
+    staking = new Staking(address(token));
+    vm.warp(block.timestamp + 90 days);   // past the cliff, so we can test claims
+    vm.startPrank(alice);
+    token.approve(address(staking), type(uint256).max);
+}
+```
+
+The suite has three cases. For each, say whether it tests what its name claims.
+
+1. `test_RevertWhen_ClaimBeforeCliff` — calls `staking.claim()` and expects a revert.
+2. `test_OwnerCanSetRewardRate` — calls `staking.setRewardRate(5)` and asserts the new rate.
+3. `test_StakeCreditsPosition` — calls `staking.stake(100)` and asserts alice's position is 100.
+
+<Answer>
+**1 — no, and it is the dangerous one.** setUp warped ninety days forward, so every case in this
+contract begins *after* the cliff.<Cite src="foundry-writing-tests" /> There is no "before the cliff"
+in this fixture. If the test passes, it is because `claim()` reverted for some other reason — nothing
+staked, a zero-amount guard, a paused flag. A test named for a time-based condition, running in a
+fixture where that condition cannot hold, is asserting nothing about the cliff. The fix is not to
+warp inside the test; it is to leave setUp at a neutral timestamp and warp explicitly in the cases
+that need it, so the reader of any single case can see the time it runs at.
+
+**2 — no.** `vm.startPrank(alice)` is still active, and it applies to all subsequent calls until
+`stopPrank`, across the setUp boundary.<Cite src="forge-std-vm-1-16-2" /> So `setRewardRate` is
+called by alice, not by the owner. The likely outcome is a failing test that gets patched with a
+one-line `vm.prank(owner)` while the fixture stays broken — and the case that really needed
+attention, the one asserting a *non*-owner is rejected, keeps passing for a reason nobody checked.
+
+**3 — yes, by accident.** This one wants alice to be the caller, and alice is the caller. It works,
+and it is the reason nobody notices the fixture is wrong: the majority of cases in a suite like this
+are user-perspective cases, so a leftover user prank makes most of the suite look correct and only
+distorts the minority that test privilege.
+
+**The general shape.** A leftover in setUp does not make a suite fail. It makes a suite *disagree
+with its own function names*, which no tool can detect, and which reviewers do not catch because they
+read the case and not the fixture.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next lesson:** what a cheatcode actually is. Everything that leaked out of setUp above did so
+through the same mechanism, and once you have seen that `vm.warp` is an ordinary call to a fixed
+address you will read a fixture differently — as a sequence of calls with lifetimes, not as
+configuration.
+
+**For the fuzzing and invariant modules:** "each run starts from the post-setUp state" is exactly
+what makes stateless fuzzing stateless. A stateless fuzz test that needs three transactions in
+sequence to reach a bug cannot reach it, because run two does not inherit run one — the same rule you
+just learned, with a different consequence.
+
+**And for anything you ever say about gas:** state the Foundry version and the isolation setting, or
+say nothing. A gas number without those two facts is not wrong, it is unfalsifiable — the reader
+cannot reproduce it and cannot compare it, which is the same as not having published it.

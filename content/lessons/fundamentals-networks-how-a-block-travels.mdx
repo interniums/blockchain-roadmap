@@ -1,0 +1,310 @@
+---
+id: fundamentals-networks-how-a-block-travels
+authorship: authored
+verifiedAt: "2026-08-25"
+volatility: evolving
+sources:
+  [
+    consensus-specs-p2p,
+    consensus-specs-validator,
+    consensus-specs-beacon,
+    libp2p-gossipsub-v1-0,
+    libp2p-gossipsub-v1-1,
+    gossipsub-paper,
+    devp2p-eth-wire,
+    ethereum-org-networking-layer,
+  ]
+stack: {}
+---
+
+A validator is chosen to propose. It assembles a block and broadcasts it. Twelve seconds later the
+next slot begins and the network has moved on.
+
+Trace what happened in between and you find something more interesting than "it was broadcast".
+There is no broadcast primitive on the internet. What actually happened is that one node handed the
+block to about eight peers, each of whom handed it to about eight more, and a wavefront crossed the
+world in a fraction of a second — while a second, slower mechanism swept up the nodes the wavefront
+missed.
+
+This lesson is about that mechanism, and about the number that falls out of it: **how long "the
+network knows" actually takes, and what the protocol does with that time.**
+
+## First, unlearn one thing
+
+Blocks do not travel over the execution layer's `eth` protocol. They used to; they no longer do. The
+`eth` specification says so in a note attached to its own block-propagation section: after the
+proof-of-work to proof-of-stake transition, block propagation is no longer handled by `eth`, the text
+applies only to proof-of-work and proof-of-authority networks, and the block propagation messages are
+slated for removal from the protocol.<Cite src="devp2p-eth-wire" />
+
+That old mechanism is still worth knowing for one detail, because you will meet it as a benchmark.
+Under proof-of-work, a node that received a new block forwarded it to a small fraction of its peers —
+"usually the square root of the total number of peers" — and told the rest only the
+hash.<Cite src="devp2p-eth-wire" /> Remember the square root. It gets measured against gossipsub
+later in this lesson.
+
+Today, a beacon block travels the **consensus layer's** network: libp2p, and specifically the pub/sub
+protocol gossipsub.<Cite src="ethereum-org-networking-layer" />
+
+## Topics, not addresses
+
+Gossipsub is publish-subscribe. Nothing is addressed to a node; everything is published to a
+**topic**, and you receive it because you subscribed.
+
+Consensus-layer topic names are plain strings of the form
+`/eth2/ForkDigestValue/Name/Encoding`.<Cite src="consensus-specs-p2p" /> The fork digest in the middle
+is the interesting part: it makes topics fork-specific, so nodes following different forks are not
+merely disagreeing, they are subscribed to different channels and never exchange the messages at all.
+
+Some topics are global — beacon blocks, aggregated attestations. Others are subnets. Attestations are
+split across `ATTESTATION_SUBNET_COUNT = 64` subnets, and a beacon node is expected to stay
+subscribed to `SUBNETS_PER_NODE = 2` of them long-term.<Cite src="consensus-specs-p2p" /> This is
+sharding of a different kind: no node carries the whole attestation load, only the two slices it was
+assigned plus whatever its validators need right now.
+
+<Aside kind="note">
+The `attnets` field in a node record, from the previous lesson, exists precisely so that discovery can
+answer "find me peers on subnet 37" without connecting to them first.<Cite src="consensus-specs-p2p" />
+Discovery and gossip are designed as one system.
+</Aside>
+
+## The mesh: eager push to a bounded few
+
+For each topic it subscribes to, a node maintains a **mesh** — a small set of peers, chosen from the
+larger set it knows about in that topic. Every new message it accepts is forwarded eagerly and in
+full to every peer in that mesh.<Cite src="libp2p-gossipsub-v1-0" />
+
+The consensus specification pins the mesh parameters:<Cite src="consensus-specs-p2p" />
+
+```text
+D                   = 8      target mesh size, per topic
+D_low               = 6      below this, graft more peers
+D_high              = 12     above this, prune some
+D_lazy              = 6      how many non-mesh peers get gossip
+heartbeat_interval  = 0.7s   how often mesh maintenance runs
+```
+
+Mesh membership is negotiated with two control messages — `GRAFT` to add, `PRUNE` to remove — and
+mesh links are bidirectional: if A has B in its mesh, B has A in
+its.<Cite src="libp2p-gossipsub-v1-0" /> A heartbeat every 0.7 seconds rebalances the mesh back
+toward `D` as peers come and go.<Cite src="consensus-specs-p2p" />
+
+Eight peers is small. That is deliberate, and it is the whole design.
+
+## Gossip: lazy pull for everyone else
+
+A mesh of eight cannot reach everyone reliably. So alongside the eager push there is a second,
+cheaper channel.
+
+Every heartbeat, a node emits **`IHAVE`** — just the message *identifiers* it has seen recently — to
+`D_lazy` peers that are *not* in its mesh. A peer that hears about a message it does not have replies
+with **`IWANT`** and gets the full content.<Cite src="libp2p-gossipsub-v1-0" /> The specification's
+own framing is that mesh members are "full message" peers and the rest are "metadata-only"
+peers.<Cite src="libp2p-gossipsub-v1-0" />
+
+That is the actual meaning of the word gossip here. It is not the message spreading; it is the
+*rumour of* the message spreading, so that anyone the mesh skipped can ask for it. The protocol's
+authors describe the pair as an eager-push model bounded in fan-out, plus a lazy-pull model to reach
+nodes far away from or outside the mesh.<Cite src="gossipsub-paper" />
+
+<Figure
+  caption="A node that accepts a message sends the bytes down one path and only the rumour down the other; the second path costs a round trip and reaches everyone the first one missed."
+  alt="One node accepting a message forwards the full message to its eight mesh peers, who forward it onward, and sends only IHAVE identifiers to six non-mesh peers, who must reply IWANT to receive the content."
+>
+  <Flow
+    lanes={['a node accepts', 'two channels', 'what happens next']}
+    nodes={[
+      { id: 'accept', label: 'new message', note: 'validated once', col: 0, tone: 'accent' },
+      { id: 'mesh', label: 'mesh peers', note: 'D = 8', col: 1 },
+      { id: 'lazy', label: 'non-mesh peers', note: 'D_lazy = 6', col: 1, tone: 'muted' },
+      { id: 'fwd', label: 'forwarded onward', note: 'eager push, full bytes', col: 2 },
+      { id: 'ask', label: 'IWANT, then send', note: 'lazy pull, one round trip', col: 2, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'accept', to: 'mesh', label: 'full message' },
+      { from: 'accept', to: 'lazy', label: 'IHAVE' },
+      { from: 'mesh', to: 'fwd' },
+      { from: 'lazy', to: 'ask' },
+    ]}
+  />
+</Figure>
+
+## Why not simply flood?
+
+Here is the misconception worth spending real time on, because the intuitive story is backwards.
+
+The simplest pub/sub design is **floodsub**: forward every new message to every peer you know in the
+topic. The gossipsub specification is candid that floodsub has genuinely desirable properties — it is
+trivial to implement, highly robust, and **it minimises latency**, because messages travel along
+every edge and therefore along the minimum-latency path among
+them.<Cite src="libp2p-gossipsub-v1-0" />
+
+Its problem is not speed. Its problem is that the outbound degree of the network is unbounded, so
+the amplification factor is bounded only by the sum of every node's degree — which punishes
+well-connected nodes hardest and does not scale.<Cite src="libp2p-gossipsub-v1-0" />
+
+Gossipsub's answer is to cap the fan-out at `D` and recover the missed coverage with cheap metadata.
+The authors state the trade explicitly: the eager-push mesh keeps fan-out low and *balances* excessive
+bandwidth consumption against fast message propagation.<Cite src="gossipsub-paper" /> Balance, not
+maximise.
+
+<Misconception
+  belief="Gossip protocols are chosen because they are fast."
+  reality="Flooding is faster. Gossipsub bounds each node's fan-out to keep bandwidth and amplification under control, and layers on peer scoring so that delivery keeps working while a fraction of participants are hostile."
+  why="'Gossip' sounds casual and cheap, so it reads as a speed optimisation. It is closer to the opposite: a deliberate, engineered cap on how much any one node is asked to send, bought at some cost in latency and paid for in redundancy."
+  src="gossipsub-paper"
+/>
+
+The security half of that answer arrived in **gossipsub v1.1**, which the consensus layer
+requires.<Cite src="consensus-specs-p2p" /> Its stated purpose is improving bootstrapping and attack
+resistance, and it adds peer scoring, outbound mesh quotas, flood publishing and adaptive gossip
+dissemination.<Cite src="libp2p-gossipsub-v1-1" /> Lesson 4 takes those apart. For now, note the
+direction of travel: v1.0 solved bandwidth, v1.1 solved adversaries, and neither was chasing latency.
+
+<Aside kind="warn">
+The specification is explicit that gossipsub v1.1's peer-scoring parameters are not fixed by the
+consensus specification itself.<Cite src="consensus-specs-p2p" /> The mesh sizes are protocol; the
+scoring weights are your client's judgement. That distinction matters when two clients behave
+differently under the same attack.
+</Aside>
+
+## A deliberate asymmetry between the two layers
+
+The execution and consensus layers made opposite choices about what to put on the wire, and the
+reasoning on both sides is written down.
+
+The **execution layer announces hashes**. A node tells peers "I have transactions with these hashes"
+via `NewPooledTransactionHashes`, and a peer that wants one asks for it with
+`GetPooledTransactions`.<Cite src="devp2p-eth-wire" /> Full objects go only to a small random
+fraction of peers.<Cite src="devp2p-eth-wire" />
+
+The **consensus layer sends whole objects**. The specification's rationale: entire objects give the
+greatest propagation speed, because a hash-only scheme makes propagation depend on a recursive
+request from every peer, and a peer holding only a hash may not know who to download the content
+from.<Cite src="consensus-specs-p2p" />
+
+Both are correct for their workload. Transactions are numerous, individually small, and most peers
+already have most of them — announcing hashes avoids enormous duplicate transfer. A beacon block is
+singular, urgent, and has a hard deadline inside the slot — an extra round trip per hop is
+unaffordable. Notice that the answer depends entirely on the deadline, which brings us to the number.
+
+## How long does propagation actually take?
+
+The honest answer has two halves: what the protocol budgets, and what anyone has measured.
+
+### What the protocol budgets
+
+A slot is `SLOT_DURATION_MS = 12000` milliseconds, and an epoch is `SLOTS_PER_EPOCH = 32`
+slots.<Cite src="consensus-specs-beacon" /> Inside a slot, the honest-validator specification sets
+two deadlines:<Cite src="consensus-specs-validator" />
+
+- `ATTESTATION_DUE_BPS = 3333` — about 33% of the slot, roughly 4 seconds in.
+- `AGGREGATE_DUE_BPS = 6667` — about 67% of the slot, roughly 8 seconds in.
+
+Read the attestation rule carefully, because it is the propagation budget stated as protocol. A
+validator should create and broadcast its attestation when **either** it has received a valid block
+from the expected proposer, **or** the attestation deadline has passed — whichever comes
+first.<Cite src="consensus-specs-validator" />
+
+That "whichever comes first" is the entire design accommodation for propagation delay. The protocol
+does not assume the block arrives instantly. It assumes the block arrives *within about a third of a
+slot*, and it specifies what an honest validator does when it does not: attest to what you have.
+
+<Figure
+  caption="A third of every slot is set aside for a block to cross the world; a block that misses that window is not rejected, it is simply not voted for."
+  alt="A twelve-second slot with the attestation deadline at roughly four seconds and the aggregate deadline at roughly eight seconds, dividing the slot into a propagation window, an aggregation window, and the remainder before the next slot."
+>
+  <Timeline
+    from={0}
+    to={12}
+    unit="seconds"
+    ticks={[0, 4, 8, 12]}
+    marks={[
+      { at: 4, label: 'attestation due', tone: 'warn' },
+      { at: 8, label: 'aggregate due', tone: 'warn' },
+    ]}
+    spans={[
+      { label: 'block must reach attesters', start: 0, end: 4, tone: 'accent', note: 'or they attest to the old head' },
+      { label: 'aggregation', start: 4, end: 8, note: 'attestations collected' },
+    ]}
+  />
+</Figure>
+
+There is a second, smaller acknowledgement of physical reality nearby. Gossip validation allows
+`MAXIMUM_GOSSIP_CLOCK_DISPARITY = 500` milliseconds of clock disparity between honest
+nodes,<Cite src="consensus-specs-p2p" /> so that slot-range checks do not make the gossip network
+brittle. Half a second is the granularity at which the specification stops trusting that two honest
+nodes agree about *now*.
+
+### What has been measured
+
+The gossipsub authors evaluated the protocol on a testbed of 1000 honest nodes plus 4000 sybils on
+AWS. Across their attack scenarios, the 99th percentile of global propagation latency for gossipsub
+ranged from roughly 141 ms to about 205 ms, with a maximum observed delivery around 178 ms in the
+network-wide eclipse test — and they report the eclipse-attack figures as identical to their
+attack-free baseline.<Cite src="gossipsub-paper" /> For comparison in the same tests, the
+square-root-fan-out scheme that the execution layer used under proof-of-work failed to meet the
+deadline, with a 99th-percentile latency around 4 seconds.<Cite src="gossipsub-paper" />
+
+Treat those as an order of magnitude, not as mainnet numbers. They are a 2020 testbed on cloud
+infrastructure with a synthetic topology; mainnet is geographically lumpier and its measured spread
+depends heavily on where you observe from. **Hundreds of milliseconds is the right mental scale.
+A precise figure for your position in the network is something you measure**, which is exactly what
+this module's propagation practice asks you to do.
+
+## What "hundreds of milliseconds" costs you
+
+Take the scale seriously and a product consequence falls straight out.
+
+For a window of time after any object is published, **the network's state is a per-node opinion**.
+Different nodes hold different sets. Nobody is wrong; the information has not arrived yet. That
+window is short in human terms and enormous in machine terms.
+
+And the window is not symmetric. A node that is one hop from the proposer sees the block before a
+node that is six hops away. Connectivity is therefore an information advantage that can be bought,
+and the people who buy it are not doing so for fun. This is the mechanical root of everything you
+will later read about searchers, latency and order flow.
+
+<Misconception
+  belief="Once a transaction is broadcast, everyone has it."
+  reality="Arrival is spread over a wavefront. Some peers get it in the first hop, others learn only that it exists and have to ask, and some never receive it at all because the node holding it dropped it first."
+  why="A single `eth_sendRawTransaction` call returns a hash immediately, and a returned hash reads as completion. It is not completion — it is one node acknowledging receipt into its own pool."
+/>
+
+<Check type="predict" concept="propagation-latency">
+A proposer publishes its block 3.9 seconds into a 12-second slot — very late, but before the
+attestation deadline at roughly 4 seconds. Predict what a validator six hops away does, and what the
+consequence is for the proposer.
+
+<Answer>
+**The distant validator almost certainly attests without the block.** Its rule is "on receiving a
+valid block from the expected proposer, or at the attestation deadline, whichever comes
+first".<Cite src="consensus-specs-validator" /> At 4.0 seconds it has not received the block, so the
+deadline fires and it attests to the head it currently believes in — which is the *previous* block.
+
+**Consequence for the proposer:** every validator that hit the deadline first has voted for a head
+that does not include this block. Those votes do not disappear when the block finally arrives a
+moment later; they are already signed and propagating. The proposer's block now has less fork-choice
+weight behind it than a punctually published block would have had.
+
+The general lesson is the one to keep: the attestation deadline converts propagation delay into
+*consensus weight*. Late is not merely slow — being late costs the proposer support from exactly
+those validators the wavefront had not reached, which is why proposer timing games are a real subject
+and not a curiosity.
+</Answer>
+</Check>
+
+## Where this pays off
+
+Three things downstream depend on this lesson rather than merely mentioning it.
+
+**Attestations and fork choice.** The 33%/67% schedule you just read is not an arbitrary carve-up of
+the slot — it is a propagation budget, an aggregation budget, and a deadline for turning both into
+votes. The fork-choice material assumes you know why those boundaries exist.
+
+**Reorgs.** A short-lived disagreement about the head is the expected behaviour of a system where
+information arrives over hundreds of milliseconds. Once you have this lesson, a one-block reorg stops
+looking like a failure and starts looking like the wavefront resolving.
+
+**Extractable value.** Every strategy that depends on seeing a transaction before someone else acts
+on it is buying a position in this wavefront. The economics are later; the physics are here.

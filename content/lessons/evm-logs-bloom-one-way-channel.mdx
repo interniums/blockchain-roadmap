@@ -1,0 +1,316 @@
+---
+id: evm-logs-bloom-one-way-channel
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [execution-specs-osaka-log, execution-specs-osaka-interpreter, execution-specs-osaka-system, execution-apis-log-object, solidity-docs-contracts, eip-214, eip-140, eip-658, eip-7745, eip-7919, eip-7773, pureth-logs-bloom, solidity-abi-events, yellow-paper]
+stack: {}
+---
+
+Two pull requests, a fortnight apart, on the same contract.
+
+In the first, the reviewer asks how the new function knows the size of the user's previous deposit.
+The author points at the `Deposited` event three lines up and says the value is right there — the
+contract wrote it, so the contract can read it. That line cannot be written. Not awkwardly, not
+expensively, not with assembly. The instruction to read a log does not exist anywhere in the EVM.
+
+In the second, an engineer is debugging a transaction that failed and wants to know how far it got.
+There is an `Attempted` event at the top of the function, before any of the logic that could have
+gone wrong, and it is not in the receipt. The transaction definitely reached that line. The event is
+missing because the frame reverted, and a reverting frame takes its logs down with it.
+
+Both surprises come from the same fact, approached from opposite sides. Logs are not a database the
+contract writes into and reads back. They are an outbound channel, they are journalled exactly like
+storage writes, and once a record leaves through them it never comes back in. This lesson is about
+what is actually in that record, why the channel only runs one way, and the two things a log in a
+receipt does and does not prove.
+
+<Figure
+  caption="Everything in this module sits on one arrow that only points right: a log goes out through a receipt into a header field, and no stage has a return path."
+  alt="A log's journey out of the EVM. The LOG opcodes write an address, topics and data into the transaction's receipt. The receipt becomes a leaf of the block's receipts trie and contributes to the block's 2048-bit logsBloom. Both end up in the block header, as receiptsRoot and logsBloom, where consensus covers them."
+>
+  <Flow
+    lanes={['inside the EVM', 'per transaction', 'per block', 'consensus']}
+    nodes={[
+      { id: 'op', label: 'LOG0…LOG4', note: 'address, topics, data', col: 0, tone: 'accent' },
+      { id: 'rc', label: 'receipt', note: 'status, gas, logs', col: 1 },
+      { id: 'tr', label: 'receipts trie', note: 'one leaf per tx', col: 2 },
+      { id: 'bf', label: 'block logsBloom', note: 'union of 2048 bits', col: 2, tone: 'muted' },
+      { id: 'hd', label: 'block header', note: 'receiptsRoot', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'op', to: 'rc' },
+      { from: 'rc', to: 'tr' },
+      { from: 'rc', to: 'bf' },
+      { from: 'tr', to: 'hd' },
+      { from: 'bf', to: 'hd' },
+    ]}
+  />
+</Figure>
+
+## Five instructions out, none in
+
+The logging family is `LOG0`, `LOG1`, `LOG2`, `LOG3` and `LOG4`. In the executable specification all
+five are the same function, `log_n`, bound to a different topic count — `log0` is `log_n` with
+`num_topics=0`, `log4` is `log_n` with `num_topics=4`, and nothing else distinguishes
+them.<Cite src="execution-specs-osaka-log" />
+
+That is the entire logging interface. There is no `LOGLOAD`, no `GETLOG`, no opcode that takes a
+block number and a log index and returns anything. Scan the opcode table for a read counterpart the
+way you would scan for `SLOAD` next to `SSTORE`, or `TLOAD` next to `TSTORE`, and there is nothing
+there. The asymmetry is not an oversight that a later fork has been meaning to fix. It is the design.
+
+The consequence for contract design is absolute, and it is worth stating in the form you will need it
+in review: **if contract logic needs a value, that value must be in storage.** An event is never a
+cheaper place to keep state. It is not state at all.
+
+<Misconception
+  belief="A contract can read its own past events — worst case, it costs more gas than reading storage."
+  reality="There is no log-reading instruction of any kind, at any price. A contract cannot read its own events, another contract's events, or events from the same transaction one frame earlier."
+  why="In every other system an application log is a table, or a file, or a stream you can replay — the same substrate the application writes to and reads from. Here the write goes somewhere the reader cannot follow."
+  src="execution-specs-osaka-log"
+/>
+
+## What is actually in the record
+
+Strip the Solidity vocabulary away and a log is exactly three things:<Cite src="yellow-paper" /><Cite src="solidity-abi-events" />
+
+- **The emitting address.** Not supplied by the caller — the EVM stamps it from the frame's current
+  target. A contract cannot emit a log claiming to be another contract, and `DELEGATECALL` follows
+  the usual rule: the log is attributed to the account whose storage is in play, not to the account
+  whose code is running.<Cite src="execution-specs-osaka-log" />
+- **Between zero and four topics, each exactly 32 bytes.** Fixed width, no exceptions, no shorter, no
+  longer.
+- **A data field of arbitrary length**, passed as a memory offset and a size, the same way `RETURN`
+  and `KECCAK256` take theirs.<Cite src="execution-specs-osaka-log" />
+
+Nothing else about a log is structured. There is no type tag, no schema, no name, no version field
+and no timestamp inside the record. Everything that looks like structure when you read a decoded log
+in a block explorer was reconstructed by the explorer from an ABI it fetched separately.
+
+<Figure
+  caption="No name, no schema, no version, no timestamp — an address the EVM stamps for you, up to four fixed-width slots, and a blob."
+  alt="The shape of one log record: a 20-byte emitting address stamped by the EVM, between zero and four topics of exactly 32 bytes each, and a data field of arbitrary length."
+>
+  <ByteLayout
+    caption="one log record"
+    fields={[
+      { label: 'address', size: 20, tone: 'accent', note: 'stamped by the EVM' },
+      { label: 'topic0', size: 32, note: 'optional' },
+      { label: 'topic1', size: 32, note: 'optional' },
+      { label: 'topic2', size: 32, note: 'optional' },
+      { label: 'topic3', size: 32, note: 'optional' },
+      { label: 'data', variable: true, tone: 'muted', note: 'any length' },
+    ]}
+  />
+</Figure>
+
+This is the point at which the word `indexed` stops being mysterious. In Solidity, marking a
+parameter `indexed` decides which of these two buckets the value lands in: a topic slot, or the data
+blob.<Cite src="solidity-abi-events" /> It is a placement instruction, not a semantic annotation. The
+same `uint256` can go in either. What changes is not what the value means, and not whether consumers
+can see it, but whether the value can be *filtered on* — which is the whole of the next lesson.
+
+<Misconception
+  belief="Topics and data hold different kinds of information — topics are identifiers, data is payload."
+  reality="They are two buckets in one record, distinguished by width and by searchability. Any value that fits in 32 bytes can go in either, and moving it between them changes nothing about its meaning."
+  why="The keyword `indexed` reads like a declaration about the nature of a field, the way `@Id` or `PRIMARY KEY` would. It is closer to a storage-class specifier."
+  src="solidity-abi-events"
+/>
+
+### The RPC object is not the record
+
+One trap before moving on, because it produces confident wrong answers about what is committed.
+
+A log as returned over JSON-RPC has ten fields: `removed`, `logIndex`, `transactionIndex`,
+`transactionHash`, `blockHash`, `blockNumber`, `blockTimestamp`, `address`, `data` and
+`topics`.<Cite src="execution-apis-log-object" /> Only the last three are the log. The other seven are
+positional metadata the serving node knows because it knows where the log sits, and `removed` in
+particular is a statement about the node's current view of the canonical chain rather than anything
+the chain itself says.
+
+Keep the two apart. When you later ask "can I prove this log", the answer concerns three fields.
+
+## Why the channel only runs one way
+
+The reason is not that reading logs would be hard to implement. It is what a read instruction would
+oblige every node to keep.
+
+Anything the EVM can read must be available to every node that executes a block, at execution time,
+without a network round trip. That is what makes [the state trie](/c/per-account-storage-trie)
+expensive: it is a live, indexed, randomly-accessible structure that every validating node has to
+maintain and every block mutates.
+Logs are deliberately outside it. They live in receipts, receipts are produced once when a block is
+executed and never mutated afterwards, and no subsequent execution ever consults them. EIP-7745 puts
+the trade in one sentence: adding logs is cheaper than writing to the state precisely because there
+is no complex structure to update, and logs mostly just have long-term storage
+costs.<Cite src="eip-7745" />
+
+That freedom is why nodes get to make their own decisions about logs. A node can index them, or not.
+It can prune old receipts, or not. It can keep them on cold storage and take a hundred milliseconds
+to answer. None of those choices can affect consensus, because no consensus-relevant computation ever
+touches a log again. The moment a read opcode existed, all of that would become protocol-mandated
+behaviour, and log storage would acquire exactly the properties that make state storage costly.
+
+### LOG is classified as a write
+
+Here is the detail that catches people who think of logging as observation rather than mutation.
+
+`LOG` is forbidden inside a static call. In the specification, `log_n` raises `WriteInStaticContext`
+when the frame is static — the same exception class that `SSTORE` raises.<Cite src="execution-specs-osaka-log" />
+EIP-214 introduced `STATICCALL` precisely to give a caller a guarantee that the callee cannot change
+anything observable, and log emission is on the forbidden list alongside state
+modification.<Cite src="eip-214" />
+
+That has a practical edge, and it is enforced twice. Solidity's own list of statements that count as
+modifying the state names "emitting events" alongside writing to storage and sending
+ether — so a `view` or `pure` function will not compile if it contains an `emit`. And since Byzantium
+the compiler calls `view` functions with `STATICCALL`, so the EVM refuses at runtime as
+well.<Cite src="solidity-docs-contracts" /> If you have ever wondered why a debugging `emit` cannot be
+dropped into a getter, that is why.
+
+The documented exception is worth knowing because it is the one place the runtime guarantee is
+absent: a `view` function in a *library* is invoked with `DELEGATECALL`, since there is no combined
+delegate-and-static call, so only the compile-time check protects it.<Cite src="solidity-docs-contracts" />
+
+## Committed, but not verified
+
+Now the opposite misunderstanding, which is more common and more consequential.
+
+Logs are not free-floating metadata that a node made up. Every log lives inside a transaction
+[receipt](/c/receipt-contents). Since Byzantium a receipt is
+`[status, cumulativeGasUsed, logsBloom, logs]`, where `status` is the 1-or-0 success byte that
+replaced the older intermediate state root.<Cite src="eip-658" /> Receipts are the values of the
+block's receipts trie, and that trie's root is `receiptsRoot`, one of
+[the header's three tries](/c/three-block-tries) and covered by consensus.
+
+So the provenance chain is unbroken: log → receipt → receipts trie → `receiptsRoot` → header →
+consensus. A log can be [Merkle-proved](/c/merkle-inclusion-proof) against a block header exactly the
+way an account balance can be proved against a state root. That is not a theoretical nicety — it is
+the mechanism that makes light-client event verification and storage-proof-style cross-chain
+messaging possible at all.
+
+<Misconception
+  belief="Events are off-chain, so they are a weaker kind of evidence than state."
+  reality="Logs are inside receipts, receipts hash into receiptsRoot, and receiptsRoot is a consensus-covered header field. A log is as provably part of the chain as a transaction is."
+  why="'Logs are for off-chain consumers' compresses, in retelling, into 'logs are off-chain data'. The audience moved, not the data."
+  src="eip-658"
+/>
+
+And now the sharp edge on the other side of that, because the two get run together constantly.
+
+**The commitment exists. Your `eth_getLogs` response does not carry it.** This is
+[proof versus trust](/c/proof-vs-trust) in its purest form: a normal RPC result is a JSON array, with
+no proof attached, no receipt, and no header. If the provider omitted a matching
+log, or invented one, nothing in the response would tell you. What it would take to actually verify
+completeness is a specific and unglamorous procedure: download every canonical block header in the
+range, consult the header filters, fetch *all* the receipts for every block that might match,
+re-derive the receipts trie and check it against `receiptsRoot`, and only then read the
+logs.<Cite src="pureth-logs-bloom" /> Almost nobody does this.
+
+Making log queries verifiable rather than trusted is live work rather than shipped reality. Both
+EIP-7745, which would replace the header filter with a structure whose query results can be
+Merkle-proved, and EIP-7919, the Pureth meta EIP that collects this agenda, are listed under
+*Declined for Inclusion* in the Glamsterdam hardfork meta as of the date on this
+lesson.<Cite src="eip-7745" /><Cite src="eip-7919" /><Cite src="eip-7773" />
+
+<Misconception
+  belief="Because logs are committed to the chain, an eth_getLogs result is verified."
+  reality="Provable and verified are different states. The commitment exists; a standard RPC response contains no proof of it, so you are trusting the provider unless you do the receipt-and-root work yourself."
+  why="Provability is the interesting property, so it is the one that gets taught — and then quietly assumed to be happening in your client, which it is not."
+  src="eip-7919"
+/>
+
+## Logs revert with their frame
+
+Back to the second pull request from the opening.
+
+Logs are part of the journalled effects of a frame, alongside storage writes. In the executable
+specification the rule is a two-line branch: when a message call finishes, if `evm.error` is set, the
+returned log tuple is emptied; otherwise the frame's logs are carried out.<Cite src="execution-specs-osaka-interpreter" />
+The same split governs nested frames — a child's logs are merged into the parent only on the success
+path, never on the error path.<Cite src="execution-specs-osaka-system" /> It makes no difference
+whether the frame ended by `REVERT`, which returns the remaining gas and unwinds state changes, or by
+an exceptional halt.<Cite src="eip-140" /> Both discard the logs.
+
+Invert that and you get the property worth remembering:
+
+**A log in a receipt is positive evidence that the code path which emitted it ran to completion and
+was not rolled back.**
+
+This is the exact opposite of ordinary application logging, where a log line is a side effect written
+outside the transaction and therefore *survives* the failure it was recording — which is what makes
+it useful for diagnosing failures. On-chain, the diagnostic value runs the other way. "We never got
+the event" is meaningful information: either the path did not execute, or something after it reverted
+the frame. Neither is ambiguous with "it executed and the log got lost".
+
+<Misconception
+  belief="An event emitted before a revert still shows up — that is what logs are for."
+  reality="It is discarded with the rest of the frame's effects. There is no partial receipt and no separate diagnostic channel."
+  why="Application loggers write to a different system than the database, so a rollback does not touch them. Here there is one journal for everything a frame did."
+  src="eip-140"
+/>
+
+<Aside kind="warn">
+The corollary for a try/catch pattern: if you call an untrusted contract inside a `try` block and it
+reverts, its logs are gone, but any logs *your* frame emitted before the call survive, because your
+frame did not revert. Log placement relative to external calls is therefore a design decision about
+what evidence you want to survive someone else's failure.
+</Aside>
+
+<Check type="predict" concept="logs-revert-with-the-frame">
+A contract's `settle()` function does the following, in order:
+
+1. emits `SettlementStarted(id)`
+2. calls an external adapter contract inside a `try`/`catch`
+3. the adapter emits `AdapterPaid(id, amount)` and then reverts with a custom error
+4. the `catch` block emits `SettlementFailed(id)`
+5. `settle()` returns normally
+
+Which logs appear in the receipt, in what order, and what does each of them let a consumer conclude?
+
+<Answer>
+Two logs appear: `SettlementStarted` first, then `SettlementFailed`. `AdapterPaid` is gone.
+
+**Why `AdapterPaid` is gone.** It was emitted in the adapter's frame, and that frame reverted. The
+child frame's logs are merged into the parent only on the success path; on the error path they are
+discarded along with its storage writes. Nothing about the fact that the adapter was called inside a
+`try` changes this — `try`/`catch` controls what the *caller* does after the child fails, not whether
+the child's effects survive.
+
+**Why the other two survive.** They were emitted in `settle()`'s own frame, which did not revert. The
+outer frame completed, so its journal is committed and both logs land in the receipt.
+
+**What a consumer can conclude.** `SettlementStarted` in the receipt proves execution reached step 1
+and that the whole outer frame subsequently completed — it is not evidence that step 1 happened at
+the moment it was emitted, but evidence that the transaction as a whole did not roll back. The
+absence of `AdapterPaid` alongside the presence of `SettlementFailed` is a positive signal that the
+adapter path was attempted and failed. What no consumer can conclude is anything at all about *why*
+it failed, because the revert data went to the `catch` block and, unless the `catch` block put it in
+a log or in storage, it left no trace on chain.
+
+The design lesson: if you want the failure reason to be visible to an indexer, the `catch` block has
+to emit it. The revert bubbles up as return data to the caller and is not recorded anywhere else.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Which parameters you can search for** is the immediate next step: now that you know a log has four
+32-byte slots and one blob, the question of which values go where turns into a question about which
+queries you will be able to run a year from now.
+
+**The block filter** in the fourth lesson only makes sense once the address-and-topics structure is
+in place, because those are the only fields the filter ever sees.
+
+**Storage-proof bridges** on the scaling track are the payoff for the provenance chain above. A
+contract on chain B that accepts "this event happened on chain A" is verifying a Merkle path from a
+log, through a receipt, to a header — the chain you just followed, run in reverse by a verifier.
+
+**Event pipelines and indexing** on the infrastructure track are, in the end, all downstream of the
+one-way property. There is an entire industry between the chain and your application precisely
+because the chain will not answer log questions on the EVM's behalf, and this module is the bridge
+into it.
+
+The next lesson takes the four topic slots and asks what each one costs you in query power.

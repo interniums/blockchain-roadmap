@@ -1,0 +1,332 @@
+---
+id: defi-liquidations-liquidator-with-no-capital
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [aave-v3-pool-docs, morpho-liquidation-docs, dss-clip-source, curve-crvusd-controller-docs, eip-3156, measured-gas-constants, aave-v3-origin-33]
+stack: { solc: "0.8.36" }
+---
+
+Open a block explorer on a liquidation and look at the liquidator's address. Before the transaction it
+holds enough ETH for gas. After, it holds enough ETH for gas plus a few thousand dollars of USDC. In
+between it briefly held ten million dollars of assets it had no right to and never owned.
+
+That gap is the subject. The last two lessons established that a protocol must pay a stranger to
+maintain its solvency, and priced what it must pay. This one establishes what the stranger actually
+is, because the answer changes which failures are plausible. A liquidator is not a well-capitalised
+market maker who likes discounts. It is a stateless contract, a bot, an RPC endpoint and a builder
+relationship, and what it is paid for is none of the things the word "capital" suggests.
+
+## The five steps, and why none of them needs money
+
+The pattern is one transaction with a nested callback, and you have every piece of it already.
+
+```solidity
+// Called by the flash lender inside our own liquidate() entrypoint.
+function onFlashLoan(address, address token, uint256 amount, uint256 fee, bytes calldata data)
+    external
+    returns (bytes32)
+{
+    (address collateral, address borrower, uint256 minOut) = abi.decode(data, (address, address, uint256));
+
+    // 1. We now hold `amount` of the debt asset. Repay the borrower's debt.
+    IERC20(token).approve(address(POOL), amount);
+    POOL.liquidationCall(collateral, token, borrower, amount, false);
+
+    // 2. The discounted collateral is now ours.
+    uint256 seized = IERC20(collateral).balanceOf(address(this));
+
+    // 3. Sell it for the debt asset. minOut is not optional; see below.
+    uint256 proceeds = ROUTER.swapExactTokensForTokens(seized, minOut, path, address(this), block.timestamp);
+
+    // 4. Repay principal plus fee. Reverts here if step 3 disappointed us.
+    IERC20(token).approve(msg.sender, amount + fee);
+
+    // 5. Whatever remains is profit and stays in this contract.
+    require(proceeds >= amount + fee, "unprofitable");
+    return keccak256("ERC3156FlashBorrower.onFlashLoan");
+}
+```
+
+The capital requirement is zero because the lender's guarantee is not collateral, it is atomicity:
+assets are lent on the condition that they are returned, plus an optional fee, before the end of that
+transaction, and if the repayment does not happen the whole transaction reverts and the loan never
+existed.<Cite src="eip-3156" /> The magic return value in step 5 is the standard's own acknowledgement
+handshake, which the lender checks before it will accept the
+repayment.<Cite src="eip-3156" /> You know the primitive from the security track; what matters here is
+which constraint it removes and which it leaves alone.
+
+<Figure
+  caption="The exit trade happens inside the loan, not after it: the collateral must be back in the debt asset before the transaction is allowed to end."
+  alt="A flash-loan liquidation as four steps. The contract flash-borrows the debt asset with no collateral, calls liquidationCall to repay the borrower's debt and seize discounted collateral, sells that collateral under a minimum-out guard, and keeps whatever the swap left. A backward edge runs from the sale to the borrow, returning principal plus fee, and the whole transaction reverts if the sale did not cover it."
+>
+  <Flow
+    nodes={[
+      { id: 'borrow', label: 'flash-borrow', col: 0, tone: 'accent', note: 'the debt asset, uncollateralised' },
+      { id: 'liq', label: 'liquidationCall', col: 1, note: 'debt repaid, collateral seized' },
+      { id: 'sell', label: 'sell collateral', col: 2, tone: 'warn', note: 'minOut, or you are sandwiched' },
+      { id: 'keep', label: 'keep the spread', col: 3, tone: 'good', note: 'whatever the swap left over' },
+    ]}
+    edges={[
+      { from: 'borrow', to: 'liq' },
+      { from: 'liq', to: 'sell' },
+      { from: 'sell', to: 'keep' },
+      { from: 'sell', to: 'borrow', label: 'repay principal + fee, or revert', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+It removes **balance sheet**. It does not remove **inclusion**, **gas**, or **exit depth**. Those three
+are the actual barriers, and they are exactly the three that move against you during a crash.
+
+Note what the sketch does *not* have to compute. Aave lets you pass `debtToCover` as `uint(-1)` and the
+protocol proceeds with the highest liquidation the close factor allows, so the contract does not need
+to reproduce the close-factor branches on its own.<Cite src="aave-v3-pool-docs" /> Curve exposes
+`tokens_to_liquidate(user)`, returning the amount of the borrowed asset required, and
+`users_to_liquidate(_from, _limit)`, returning a paginated array of positions eligible for hard
+liquidation — a discovery API for bots, published by the protocol being
+liquidated.<Cite src="curve-crvusd-controller-docs" /> Morpho points at community-contributed
+open-source liquidation bots in its own documentation.<Cite src="morpho-liquidation-docs" /> The
+barrier to entry is not merely low; it is actively subsidised by the protocols, because a protocol
+with no liquidators is a protocol with bad debt.
+
+<Misconception
+  belief="Liquidation profits are the reward for providing capital to the system."
+  reality="No capital is committed. The profit compensates latency, infrastructure and the risk that the exit trade moves against you inside the same transaction. It is a fee for showing up first with a working route, not a return on a balance sheet."
+  why="Liquidation is described everywhere as buying collateral at a discount, and buying implies buying power."
+  src="morpho-liquidation-docs"
+/>
+
+Morpho's documentation describes the population directly: liquidators are permissionless participants
+ranging from sophisticated teams running automated bots to individuals; at a basic level performing a
+liquidation requires only an RPC node and a wallet with sufficient assets, while competitive
+liquidators run bots that continuously monitor loan positions and oracle prices; and some implement
+swap systems that let them seize collateral and repay loans without holding the loan asset
+beforehand.<Cite src="morpho-liquidation-docs" /> That last clause is the pattern above, described
+from the protocol's side.
+
+## The protocols built the callback in
+
+Here is the detail most treatments miss: you often do not need an external flash lender, because the
+liquidation function itself hands you the collateral before it takes your money.
+
+<Compare
+  axis="What the venue does for you"
+  columns={[
+    { title: "Maker's Clipper", note: 'take', tone: 'accent' },
+    { title: "Curve's Controller", note: 'liquidate_extended', tone: 'accent' },
+    { title: "Aave's Pool", note: 'liquidationCall' },
+  ]}
+  rows={[
+    {
+      label: 'Do you receive the assets before you pay?',
+      cells: [
+        <>Yes — collateral is transferred, then <code>clipperCall</code> runs, then payment is collected<Cite src="dss-clip-source" /></>,
+        <>Yes — the caller names a <code>callbacker</code> that runs mid-liquidation<Cite src="curve-crvusd-controller-docs" /></>,
+        'No. The call repays and seizes in one step',
+      ],
+    },
+    {
+      label: 'What is the hook?',
+      cells: [
+        <><code>clipperCall</code>, refused if the receiver is the <code>Vat</code> or the <code>Dog</code><Cite src="dss-clip-source" /></>,
+        <><code>callback_liquidate(address,uint256,uint256,uint256,uint256[])</code><Cite src="curve-crvusd-controller-docs" /></>,
+        'None',
+      ],
+    },
+    {
+      label: 'What do you end up holding?',
+      cells: [
+        'Collateral you already sold inside your own callback',
+        'Collateral you already sold inside your own callback',
+        <>The underlying — or the aToken, if you set <code>receiveAToken</code>, which is a position and needs capital<Cite src="aave-v3-pool-docs" /></>,
+      ],
+    },
+  ]}
+  caption="Aave is the odd one out: it settles inside one call, so its liquidator must arrive already holding the debt asset or bring a flash lender of their own."
+  alt="Maker's Clipper and Curve's Controller both transfer the seized collateral to the caller and invoke a caller-supplied callback before collecting payment, so the caller needs no assets of their own. Aave's liquidationCall repays and seizes in a single step with no callback, offering only a receiveAToken flag that leaves the liquidator holding an interest-bearing position."
+/>
+
+**Maker's Clipper.** Inside `take`, the collateral is transferred to the receiver, then — if the caller
+supplied non-empty `data` — the contract calls `clipperCall` on that receiver, and only *after* that
+does it collect payment with `vat.move(msg.sender, vow, owe)`.<Cite src="dss-clip-source" /> That
+ordering is a flash loan of the seized collateral, built into the auction. The source is explicit
+about the one guard it needs: the external call is refused if the receiver is the `Vat` or the `Dog`,
+the two contracts the Clipper is itself authorised on.<Cite src="dss-clip-source" />
+
+**Curve's Controller.** `liquidate_extended` takes a `callbacker` address and `callback_args`, and the
+contract defines `CALLBACK_LIQUIDATE` as the selector of
+`callback_liquidate(address,uint256,uint256,uint256,uint256[])`.<Cite src="curve-crvusd-controller-docs" />
+A later revision added a bytes-carrying variant specifically to allow leveraging and de-leveraging
+through the 1inch router, which tells you what these callbacks are used
+for.<Cite src="curve-crvusd-controller-docs" />
+
+**Aave.** No callback in `liquidationCall`, but a flag that changes the exit: `receiveAToken` lets the
+liquidator take the interest-bearing aToken instead of the underlying
+asset.<Cite src="aave-v3-pool-docs" /> That converts an immediate sell into a position — useful if you
+believe the collateral will recover, and a way to avoid the exit trade entirely if you are willing to
+carry the exposure. It is the one path in this lesson that genuinely does require capital, because
+now you are holding something.
+
+The generalisation worth keeping: **liquidation venues that expect to be integrated with give the
+liquidator the assets first.** A design that requires the caller to arrive holding the debt asset has
+restricted its keeper set to parties who happen to hold that asset, which is a much smaller and much
+less reliable population.
+
+The Clipper carries one more integration detail worth copying: a minimum-lot constant. If a partial
+purchase would leave the remaining debt below `chost` while still non-zero, the purchase amount is
+reduced so the remainder lands exactly on `chost`; and once the remaining debt is at or below `chost`,
+partial purchases stop being possible at all and the rest must be taken
+entirely.<Cite src="dss-clip-source" /> That is the close-factor dust problem from the last lesson,
+solved at the auction level instead of the parameter level.
+
+<Aside kind="note">
+This is the mirror image of a hook or callback in any other protocol. The security track's habit
+applies unchanged: the callback receiver is untrusted code executing in the middle of a state
+transition, so the calling contract must have finished everything reentrancy-sensitive before making
+the call, or must hold a lock. Maker's `take` runs under a `lock` modifier and settles its accounting
+around the callback rather than through it.<Cite src="dss-clip-source" />
+</Aside>
+
+## What the profit actually is
+
+Return to the profit function from lesson one, now with a name for each term:
+
+```text
+profit(V) = b·V  −  G  −  V²/R
+```
+
+`b·V` is set by governance or by a formula and is not something you can compete on. `G` is your gas
+cost and is roughly the same for everyone running the same call path. `V²/R` is the only term you
+control, and you control it by having better routing than the next bot.
+
+So the competitive edge in liquidation is a routing problem wearing a finance costume. Morpho's own
+practical-consideration line reduces to this: for the $4.3k spread on its worked example to be worth
+taking, that spread must exceed gas fees plus potential swap fees plus potential price slippage
+costs.<Cite src="morpho-liquidation-docs" /> Three of the four terms are execution quality.
+
+### Two places the arithmetic is done wrong
+
+**Pricing the exit at the oracle price.** The seized collateral is valued by the protocol at the oracle
+price — Morpho states it explicitly: the liquidator receives collateral valued at debt amount times
+the incentive factor *at the oracle price*, regardless of market conditions or price volatility
+elsewhere.<Cite src="morpho-liquidation-docs" /> Your bot's profitability check must use the price you
+will actually realise on the exit venue, which during a crash is not the oracle price and not the
+current spot either, because you are the one moving it. A bot that computes `seized · oraclePrice −
+debtRepaid` and calls it profit will send losing transactions all day and only discover it in the P&L.
+
+**Omitting the minimum-out.** `minOut` in the sketch above is what converts a losing liquidation into a
+reverted one. Skip it and you get filled at whatever the pool offers after somebody sandwiches you —
+and a liquidation is an unusually attractive sandwich target, because the size and direction of your
+swap are computable from public state the moment the position becomes eligible.
+
+The protocols know this. Curve's `liquidate` takes `min_x`, documented as the minimal amount of assets
+to receive *to avoid liquidators being sandwiched*.<Cite src="curve-crvusd-controller-docs" /> Maker's
+`take` takes `max`, enforced with `require(max >= price)` before anything
+moves.<Cite src="dss-clip-source" /> The liquidator, the predator in every diagram of this mechanism,
+needs slippage protection like anybody else.
+
+<Check type="spot-bug" concept="liq-flash-loan-liquidator">
+A liquidation bot has run profitably for eight months. Its profitability filter, run off-chain before
+submitting, is:
+
+```text
+seizedCollateral = debtToCover * liquidationBonus / oraclePrice
+profitUsd        = seizedCollateral * oraclePrice - debtToCover - estimatedGasUsd
+submit if profitUsd > 50
+```
+
+The on-chain contract has a correct `minOut` and reverts cleanly when the swap disappoints. During a
+sharp move the operator sees a large number of reverted transactions, all of them paying gas. Name the
+defect, say why eight profitable months did not surface it, and say what to change.
+
+<Answer>
+**The defect.** `profitUsd` reduces algebraically to `debtToCover * (liquidationBonus - 1) -
+estimatedGasUsd`. The `oraclePrice` cancels. The filter is not modelling the exit at all — it is
+computing the *gross bonus* and calling it profit, so it approves any position whose gross bonus
+clears $50 regardless of whether the collateral can be sold for anything near the oracle price. It is
+the `b·V − G` half of the profit function with the `V²/R` term missing entirely.
+
+**Why eight months hid it.** In calm markets the missing term is small. For `V` well under `b·R` the
+quadratic barely bites, so the filter's answer and the truth agree to within the noise. The term only
+becomes decisive when `V` grows relative to `R` — large positions — or when `R` shrinks — a crash. Both
+conditions arrive at the same time, which is why the failure looks sudden.
+
+**The second-order damage.** Every rejected transaction still pays for the gas it consumed before the
+revert, and during congestion that gas is expensive. The bot is not merely failing to earn; it is
+paying to fail, at the moment its capital reserves are most needed for the trades that *are*
+profitable. Note that a revert does not refund the intrinsic cost or the work already done, and the
+liquidation path is storage-heavy: each unfamiliar account or slot the call touches is charged at the
+cold rate — 2,600 for a cold account access, 2,100 for a cold storage read on the measured
+configuration — before any of your own logic runs.<Cite src="measured-gas-constants" />
+
+**What to change, in order.**
+
+1. **Quote the exit.** Replace `seizedCollateral * oraclePrice` with the router's actual quote for
+   selling `seizedCollateral` on the route you will use, including fees. This is one extra call and it
+   replaces the fiction with the number.
+2. **Simulate, do not estimate.** Run the whole bundle against the pending state and read the returned
+   profit, rather than reconstructing it arithmetically. The estimate is a model of your contract; the
+   simulation is your contract.
+3. **Cap size, or split.** Where the quote shows the quadratic biting, liquidate a fraction rather than
+   the maximum. Morpho permits any amount up to the full debt precisely so liquidators can trade gas
+   cost against market impact;<Cite src="morpho-liquidation-docs" /> Aave lets you pass the maximum
+   `debtToCover` and have the protocol clamp it to the close factor, which is convenient and is not
+   the same as it being optimal.<Cite src="aave-v3-pool-docs" />
+4. **Send privately.** A reverting transaction in a private bundle costs nothing when the bundle is not
+   included, which converts a paid failure into a free one.
+
+The bug is one missing term. The lesson is that the term you dropped is the one the whole design turns
+on.
+</Answer>
+</Check>
+
+## What this makes possible, and what it does not
+
+**It makes liquidation latency sub-block in normal conditions.** With no capital requirement, the
+population of potential liquidators is everyone who can write the contract above and run a node.
+Competition among many parties with near-zero entry cost produces the outcome the protocol wants,
+which is that eligible positions are retired almost immediately.
+
+**It makes the keeper set look larger than it is.** Every one of those parties depends on an RPC
+provider, a funded gas wallet, a working oracle read, a liquid exit route and a builder who will
+include their bundle — dependencies heavily correlated across the population, since many bots use the
+same two or three providers and the same handful of routers. A keeper set of two hundred addresses may
+be a keeper set of four failure domains.
+
+**It does not make liquidation robust.** Zero capital means zero commitment. Nobody here has an
+obligation to act, inventory to work down, or a reason to take a trade whose expected value is
+negative. When the arithmetic goes negative the whole keeper set stops at once, because they are all
+running the same calculation on the same inputs.
+
+<Misconception
+  belief="Because liquidators need no capital, there will always be enough of them."
+  reality="Needing no capital lowers the entry cost, which raises the count. It does not create a single participant who will act at a loss. A population of purely opportunistic actors is maximally responsive above the profitability line and identically absent below it."
+  why="Barrier-to-entry arguments predict how many participants exist, and the question that matters is how many act under conditions where the trade is unprofitable."
+  src="morpho-liquidation-docs"
+/>
+
+That is the hinge of the module. Aave's v3.3 notes concede the same point from the other direction when
+they say the dust threshold must be chosen best-effort for *average* network
+conditions.<Cite src="aave-v3-origin-33" /> A mechanism tuned for average conditions, staffed by
+actors with no commitment, defending against an event that is by definition not average.
+
+## What this unlocks
+
+**The next lesson** takes the three surviving constraints — inclusion, gas, exit depth — and shows that
+all three degrade together, in the same event, in the same direction. That is the assumption this
+module is named after, and it is where the profitable band from lesson one collapses and bad debt
+appears.
+
+**The practice for this module** is the contract above, built against a mainnet fork: detect an
+eligible position, flash-borrow, liquidate, swap, repay, assert a strictly positive balance. Then
+inject three percent of slippage into the swap and watch the same test go net-negative. That second
+run is the lesson; the first is only the setup.
+
+**A reading habit.** When you evaluate any liquidation mechanism, find the callback. If the design
+hands the liquidator assets before collecting payment — `clipperCall`,
+`callback_liquidate` — it was built to be integrated with and its keeper set is everyone.<Cite src="dss-clip-source" /><Cite src="curve-crvusd-controller-docs" />
+If it requires the caller to arrive holding the debt asset, its keeper set is smaller than the address
+count suggests, and you should be correspondingly less confident in the liveness assumption the design
+rests on.

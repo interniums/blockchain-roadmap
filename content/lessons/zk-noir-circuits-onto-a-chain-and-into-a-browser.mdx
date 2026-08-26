@@ -1,0 +1,388 @@
+---
+id: zk-noir-circuits-onto-a-chain-and-into-a-browser
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [bb-docs-solidity-verifier, bb-docs-browser, bb-docs-cli-reference, bb-docs-getting-started, barretenberg-docs, noir-docs-noirjs, noir-docs-data-types, noir-docs-quickstart, noir-docs-profiler, orbiter-verifier-gas, eip-1108, arxiv-zk-rollup-bottlenecks]
+stack: {}
+---
+
+Your circuit proves locally. `bb verify`, handed only the proof and the verification key, says
+success — no witness required, which is the point.<Cite src="bb-docs-getting-started" /> You generate the Solidity verifier, deploy it,
+call it from a contract, and the transaction reverts with this:
+
+```text
+PUBLIC_INPUT_COUNT_INVALID(3, 2)
+```
+
+Nothing is wrong with your proof. The circuit declared two public inputs and a public return value,
+and a circuit has no notion of a return value — Barretenberg documents it as syntactic sugar, passed
+into the circuit as an input and checked at the end — so the verifier expects an array of length
+three, ordered `[in1, in2, return]`.<Cite src="bb-docs-solidity-verifier" /> You passed two.
+
+That is the friendly version of this class of bug. This lesson covers both destinations a Noir proof
+reaches — an EVM contract and a browser — and in each case the failures that revert are the ones you
+should hope for.
+
+## Generating the verifier
+
+Two commands, and the flag on the first one is load-bearing:<Cite src="bb-docs-solidity-verifier" />
+
+```bash
+# Generate the verification key. The --oracle_hash keccak flag is needed on the
+# vkey AND on proving, to instruct bb to use keccak, which is more optimal in Solidity.
+bb write_vk -b ./target/<noir_artifact_name>.json -o ./target --oracle_hash keccak
+
+# Generate the Solidity verifier from the vkey
+bb write_solidity_verifier -k ./target/vk -o ./target/Verifier.sol
+```
+
+`--oracle_hash` selects the hash standing in for the verifier's challenge generation. Keccak is
+documented as optimised for verification in an Ethereum smart contract, where it has a privileged
+position because of the EVM precompile; Poseidon2 is for proofs intended to be verified *inside*
+another circuit; Starknet targets verification through the Garaga
+library.<Cite src="bb-docs-cli-reference" /> Pass the same choice to `bb prove` — the guide's proving
+command carries `--oracle_hash keccak` too.<Cite src="bb-docs-solidity-verifier" /> A proof and a
+verifier built for different oracle hashes are two correct artifacts that will never agree.
+
+Two more flags on `write_solidity_verifier` worth knowing before you deploy: `--optimized` selects an
+optimised Solidity verifier, and `--disable_zk` uses a non-ZK version of the scheme, documented as
+false by default.<Cite src="bb-docs-cli-reference" /> Read that second one carefully in a review.
+Turning it on is a decision about whether the proof hides the witness, made at verifier-generation
+time, in a flag.
+
+### Compiling the thing it emits
+
+The generated artifact is not one contract. It is several working together, and the guide notes Remix
+resolves the dependencies for you so that you deploy the `Verifier`
+contract.<Cite src="bb-docs-solidity-verifier" /> Expect the first compile to fail: hitting compile
+will most likely report the contract is too big to deploy on mainnet, or complain about stack too
+deep, and the documented fix is to enable optimisation, where the default 200 runs
+suffices.<Cite src="bb-docs-solidity-verifier" />
+
+If you have shipped Solidity, that pair of errors is familiar — contract size limits and stack depth
+are the two walls generated code hits. The point worth carrying is that the verifier is machine
+output at the edge of what the EVM accepts, so it belongs in your build pipeline as a *generated
+artifact regenerated from a pinned toolchain*, never as a file someone pasted in once.
+
+<Figure
+  caption="Two artifacts descend from one compiled circuit and meet again at the call, which is the only place a divergence between them shows up."
+  alt="The compiled circuit produces a verification key that becomes the Solidity verifier, and separately a proof; both carry the same oracle-hash choice, and the two meet at the verify call."
+>
+  <Flow
+    nodes={[
+      { id: 'ckt', label: 'compiled circuit', col: 0, tone: 'muted' },
+      { id: 'vk', label: 'bb write_vk', note: '--oracle_hash keccak', col: 1, tone: 'accent' },
+      { id: 'prove', label: 'bb prove', note: '--oracle_hash keccak', col: 1, tone: 'accent' },
+      { id: 'sol', label: 'Verifier.sol', note: 'derived from the key, then deployed', col: 2 },
+      { id: 'proof', label: 'proof', col: 2 },
+      { id: 'call', label: 'verify(...)', note: 'agrees only if both sides chose the same hash', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'ckt', to: 'vk' },
+      { from: 'ckt', to: 'prove' },
+      { from: 'vk', to: 'sol' },
+      { from: 'prove', to: 'proof' },
+      { from: 'sol', to: 'call' },
+      { from: 'proof', to: 'call' },
+    ]}
+  />
+</Figure>
+
+### The interface, and where the danger is
+
+```solidity
+function verify(bytes calldata _proof, bytes32[] calldata _publicInputs)
+    external view returns (bool);
+```
+
+<Cite src="bb-docs-solidity-verifier" />
+
+Three layout rules govern that second argument, and each is a way to be wrong without an error:
+
+1. **The return value is appended.** Two public inputs plus a public return means a three-element
+   array.<Cite src="bb-docs-solidity-verifier" />
+2. **Structs are flattened.** A public `x`, then a public nested struct containing a `Type1` of two
+   `Field`s and a `bool`, then a public `y`, arrives as
+   `[x, nested.t1.val1, nested.t1.val2, nested.is_true, y]`.<Cite src="bb-docs-solidity-verifier" />
+3. **Everything is `bytes32`.** The array carries no type information, so two same-width values in the
+   wrong order type-check perfectly.
+
+Rule 3 is the one that does not revert.
+
+Here is the shape the guide gives, from an example voting application:<Cite src="bb-docs-solidity-verifier" />
+
+```solidity
+function castVote(bytes calldata proof, uint proposalId, uint vote, bytes32 nullifierHash)
+    public returns (bool)
+{
+    bytes32[] memory publicInputs = new bytes32[](4);
+    publicInputs[0] = merkleRoot;
+    publicInputs[1] = bytes32(proposalId);
+    publicInputs[2] = bytes32(vote);
+    publicInputs[3] = nullifierHash;
+    require(verifier.verify(proof, publicInputs), "Invalid proof");
+    // ...
+}
+```
+
+<Figure
+  caption="Provenance is invisible at this boundary: the verifier receives four field elements and no history."
+  alt="The four-element bytes32 public-input array in the voting example: merkleRoot read from contract storage, then proposalId, vote and nullifierHash supplied by the caller."
+>
+  <ByteLayout
+    caption="bytes32[] publicInputs"
+    fields={[
+      { label: 'merkleRoot', size: 32, tone: 'good', note: 'contract storage' },
+      { label: 'proposalId', size: 32, tone: 'warn', note: 'caller argument' },
+      { label: 'vote', size: 32, tone: 'warn', note: 'caller argument' },
+      { label: 'nullifierHash', size: 32, tone: 'warn', note: 'caller argument' },
+    ]}
+  />
+</Figure>
+
+**Subgoal: sort those four slots by who supplies them.** `merkleRoot` is a contract variable — the
+contract's own state. The other three are function arguments — supplied by the caller. That
+difference is the entire security model of a verifier-calling contract.
+
+A public input the *contract* supplies is a binding: the proof must be about the root this contract
+believes in. A public input the *caller* supplies is not a binding at all on its own; it is a label
+the caller attached to their own proof. It becomes safe only when the contract goes on to treat that
+same value as authoritative — storing `nullifierHash` so it can never be reused, tallying the vote
+under `proposalId` — so that lying about it gains nothing.
+
+Get that backwards and you have the classic failure. A contract that reads a state root from storage
+but passes a *caller-supplied* root as a public input will happily accept a proof against a stale or
+invented root. The verifier did its job perfectly; it attested to the statement it was given.
+
+<Misconception
+  belief="If the verifier returns true, the action is authorised."
+  reality="Verification says only that a witness exists for the public inputs supplied. Binding those inputs to the state the contract cares about, and preventing the same proof from being used twice, are the calling contract's job."
+  why="The verifier returns a boolean, and a boolean returned from a security-sounding function reads as an authorisation check rather than as an attestation about an argument list."
+  src="bb-docs-solidity-verifier"
+/>
+
+Proofs are bytes. The same valid proof submitted twice verifies twice. The nullifier in that example
+is not decoration — it is the only thing standing between one credential and unlimited votes, and it
+works only because the contract stores it and rejects repeats.
+
+### Where it will and will not run
+
+Barretenberg proof verification requires the `ecMul`, `ecAdd`, `ecPairing` and `modexp` EVM
+precompiles, and the verifier can be deployed on any EVM chain implementing
+them.<Cite src="bb-docs-solidity-verifier" /><Cite src="barretenberg-docs" /> The docs keep a
+manually tested list. **Working:** Optimism, Arbitrum, Polygon PoS, Scroll, Celo, BSC, Blast L2,
+Avalanche C-Chain, Mode, Linea, Moonbeam. **Failing:** zkSync ERA and Polygon
+zkEVM.<Cite src="bb-docs-solidity-verifier" />
+
+That second list is the interesting one and it is worth understanding rather than memorising: chains
+that themselves reimplement the EVM are the ones most likely to diverge on precompiles, and a
+verifier is precompile-dependent code by construction. Check your target chain before you design
+around it — the list is community-maintained and the docs invite pull requests to update
+it.<Cite src="bb-docs-solidity-verifier" />
+
+### What it costs, stated honestly
+
+**This module has no gas figure for an UltraHonk verifier to give you.** A search for one found no
+published benchmark. The per-proof gas models that circulate widely — roughly 207k plus about 7.2k
+per public input for Groth16, around 200k plus about 0.9k per input for FFLONK — are for different
+proof systems and come from a single 2024 community analysis rather than from a
+specification.<Cite src="orbiter-verifier-gas" /> Do not transfer them to UltraHonk. Deploy the
+generated contract in a Foundry test and measure it at the public-input count you will actually use.
+
+Two structural facts do transfer, and they shape what your measurement will look like. Verifier cost
+is dominated by pairing operations, priced by EIP-1108's reduction of the alt_bn128 precompile
+costs;<Cite src="eip-1108" /> and public-input count is a real cost lever rather than a rounding
+error, since each additional input adds work whose size depends on the proof
+system.<Cite src="orbiter-verifier-gas" /> Design the public-input list with that in mind: every
+value you publish costs privacy *and* gas.
+
+<Aside kind="warn">
+**"Verification is free" is true in a sentence that almost never applies.** `verify` is a view
+function, and the docs make the observation that a view function does not alter state, runs only on
+the executing node, and therefore costs no gas — so Bob can check Alice's proof with an `eth_call`
+and no Noir infrastructure at all, and it would be incorrect to say Noir proof verification costs any
+gas.<Cite src="bb-docs-solidity-verifier" /> The same passage supplies the qualifier: most of the
+time the result of `verify` is used to modify state, in which case the whole network executes it and
+it does incur gas — calldata and execution, though not storage.<Cite src="bb-docs-solidity-verifier" />
+Off-chain checking is genuinely free. Anything that changes a balance, a tally or a nullifier set is
+not, and the second is what you are building.
+</Aside>
+
+## Into a browser
+
+The other destination is the user's own machine, and it changes what "private" means.
+
+NoirJS runs circuit execution in the browser, and `bb.js` — the TypeScript library wrapping the
+Barretenberg C++ implementation through WebAssembly bindings — runs the
+proving.<Cite src="noir-docs-noirjs" /><Cite src="barretenberg-docs" /> The circuit it loads is the
+same compiled `target` artifact that `nargo compile` writes for the command
+line.<Cite src="noir-docs-quickstart" /> The witness is generated on
+the device and never leaves it, so no server is trusted with the private inputs. That is the whole
+value proposition, and it is a real one: the previous lesson's boundary between private and public
+inputs only protects the user if the private half was never transmitted.
+
+The flow is small:<Cite src="noir-docs-noirjs" />
+
+```js
+const noir = new Noir(circuit);
+const barretenbergAPI = await Barretenberg.new();
+const backend = new UltraHonkBackend(circuit.bytecode, barretenbergAPI);
+
+const { witness } = await noir.execute({ age });
+const proof = await backend.generateProof(witness);
+const isValid = await backend.verifyProof(proof);
+```
+
+For a proof destined for an EVM verifier, the Keccak variant is selected at call time:
+`generateProof(witnessBuffer, { keccak: true })`, with the matching
+`getVerificationKey({ keccak: true })`, and `getSolidityVerifier` taking that Keccak-variant
+key.<Cite src="bb-docs-browser" /> Same choice as the CLI's `--oracle_hash`, expressed as an options
+object.
+
+### The four things that make it a product problem
+
+**Two WASM modules must be loaded before anything runs.** The tutorial initialises `acvm_js` and
+`noirc_abi` explicitly, and notes that a bundler will not include them by default — Vite needs
+configuration, plus Node polyfills for `Buffer`, `global` and `process`, and an ESNext target because
+`bb.js` uses top-level await which some browsers do not support.<Cite src="noir-docs-noirjs" /> That
+is a bundle-size and browser-support conversation, not a cryptography one, and it arrives on day one.
+
+**Multithreading requires cross-origin isolation.** To prove across multiple threads, the browser must
+expose `SharedArrayBuffer`, which requires the page to be served with
+`Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` — and the
+tutorial is explicit that a production host must send these same headers on the page **and any
+documents it embeds**.<Cite src="noir-docs-noirjs" /><Cite src="bb-docs-browser" /> Cross-origin
+isolation breaks third-party iframes, some analytics, and embedded widgets. It is an infrastructure
+decision made by the cryptography, and it is better discovered now than during a launch.
+
+**Threads and memory are yours to configure.** `Barretenberg.new()` auto-detects a thread count;
+you can cap it, for instance to `Math.min(navigator.hardwareConcurrency || 1, 8)`, or force single
+threaded for compatibility; and initial and maximum WASM memory can be set explicitly, which the docs
+call out as useful for memory-constrained environments such as
+Safari.<Cite src="bb-docs-browser" /> Every one of those knobs is a trade between proving time and
+leaving the user's device usable while it happens.
+
+**Circuit size stops being a backend concern.** On a server, a large circuit is a bigger instance. In
+a browser it is a spinner on a phone, a memory ceiling on Safari, and a battery cost — which is why
+the gate count from the previous lesson is a product metric here and not an engineering one. Profile
+it at the dimensions you will ship, reading the backend gate flamegraph rather than the ACIR
+one.<Cite src="noir-docs-profiler" />
+
+### On proving time: measure, do not quote
+
+You will want a number for "how long will the user wait". This module will not give you one, and the
+reason is worth stating precisely.
+
+Published ZK proving latencies span from seconds to over an hour, and the figures are not comparable:
+they describe different workloads, on different hardware, in different years. An academic measurement
+study of ZK-rollup bottlenecks makes the structural point cleanly while running on a *desktop CPU* —
+its transferable findings are that verification time is constant in batch size, that proof generation
+grows with it and is the primary bottleneck, and that per-transaction cost falls with batch size;
+its absolute numbers transfer to nothing.<Cite src="arxiv-zk-rollup-bottlenecks" /> None of those
+figures were measured in a browser, on a mid-range phone, on your circuit.
+
+So: **publish no latency number without its circuit, its gate count, its device and its date.** Then
+go and produce your own, on the three devices your analytics say your users actually have. The
+tutorial's own example shows where to instrument — it wraps `generateProof` with a timer and logs the
+elapsed milliseconds, the proof size in bytes and the number of public
+inputs.<Cite src="bb-docs-browser" /> That is the measurement, and it takes an afternoon.
+
+<Misconception
+  belief="Client-side proving means the feature is private end to end."
+  reality="It means the witness never leaves the device. What the application publishes afterwards — the proof's public inputs as permanent calldata, a nullifier, an amount, the submitting address, the timing — is unchanged by where the proof was computed."
+  why="Client-side proving removes the most visible trust assumption, the server, and removing the most visible one feels like removing the category."
+  src="noir-docs-data-types"
+/>
+
+<Check type="spot-bug" concept="noir-verifier-generation">
+A team ships private voting. Circuit signature and calling contract below. Find the problems.
+
+```rust
+// circuit
+fn main(
+    secret: Field,
+    path: [Field; 20],
+    index: Field,
+    root: pub Field,
+    proposal: pub Field,
+    choice: pub Field,
+) -> pub Field {          // returns the nullifier
+    // ...
+}
+```
+
+```solidity
+function castVote(bytes calldata proof, bytes32 root, uint proposal, uint choice, bytes32 nullifier)
+    external
+{
+    bytes32[] memory pi = new bytes32[](4);
+    pi[0] = root;
+    pi[1] = bytes32(proposal);
+    pi[2] = bytes32(choice);
+    pi[3] = nullifier;
+    require(verifier.verify(proof, pi), "bad proof");
+    tally[proposal] += choice;
+}
+```
+
+<Answer>
+**Start with what is right, because it is fragile.** Count the public inputs: `root`, `proposal` and
+`choice`, plus the returned nullifier appended as a fourth, giving `[root, proposal, choice, return]`
+— which is exactly the order the contract builds.<Cite src="bb-docs-solidity-verifier" /> The layout
+is correct, and it is correct only because the return value happens to sit last in both places. Change the circuit to take the nullifier as a fourth public
+*input* instead of returning it, and the array silently keeps working while meaning something
+different.<Cite src="bb-docs-solidity-verifier" /> Pin the layout in a test that asserts a known-good
+proof verifies, so a signature change fails in CI rather than in production.
+
+**Bug 2 — `root` comes from the caller.** This is the real break. The contract accepts the Merkle
+root as a function argument and passes it straight into the public inputs, so a voter proves
+membership in *a tree of their choosing* — one they built containing themselves. The verifier
+confirms the proof matches the root supplied; nobody confirms the root is the electoral roll. *Fix:*
+read the root from the contract's own storage, as the reference implementation does with its
+`merkleRoot` state variable.<Cite src="bb-docs-solidity-verifier" />
+
+**Bug 3 — the nullifier is never stored.** Proofs are bytes, and the same bytes can be submitted
+again. Nothing here records that this nullifier has been seen, so one credential votes as many times
+as it likes. *Fix:* a mapping, checked and written before the tally is touched.
+
+**Bug 4 — `choice` is unconstrained on the contract side and added directly to a tally.** The
+contract does `tally[proposal] += choice` with no bound on `choice`. If the circuit does not
+constrain it to zero or one, a voter submits a valid proof carrying `choice = 2^200`. Public inputs
+are attacker-supplied values that a proof happens to accompany; the proof says nothing about them
+beyond what the circuit's constraints say. *Fix:* constrain it in the circuit **and** bound it in the
+contract, because the two artifacts are deployed and upgraded independently.
+
+**Bug 5 — nothing binds the vote to the submitter.** Any relayer or observer who obtains the proof
+bytes before inclusion can front-run it. Whether that matters depends on the design — a relayer is
+often deliberate, for metadata reasons — but it has to be a decision rather than an oversight.
+
+**And one non-bug worth naming.** Marking `choice` public is right, not a privacy failure: the
+contract cannot tally what it cannot see, and the confidentiality that matters comes from `secret`,
+`path` and `index` being private.
+</Answer>
+</Check>
+
+## Where this leaves you
+
+You can now take a relation, decide whether it deserves a hand-written circuit, express it in a
+language whose costs you can predict, split its inputs by what the verifier must be able to compare
+against, replace expensive derivations with cheap checks without opening a soundness hole, read the
+number that says whether any of it worked, and put the result on a chain or in a browser.
+
+**The reflection at the end of this module is the part to do properly.** List every unconstrained call
+in the circuit you wrote, the constraint that discharges it, and what a malicious prover gains if the
+constraint is removed. Entries reading "nothing" are hints that bought a trust boundary for no gate
+savings, and they should come out.
+
+**Two habits generalise past Noir entirely.** The first is the unit discipline: no cost or latency
+number travels without its workload, its hardware and its date, which is why this module refused to
+give you a proving time or a verifier gas figure and told you to measure both. The second is the
+review question from the middle of the module — *what else would satisfy this check?* — which is a
+soundness question in a circuit and, in every other system you work on, the difference between a
+validation that constrains an input and one that merely inspects it.
+
+**And the module's spine, one last time.** Constraint count is to a circuit what gas is to a contract:
+fixed by the code, knowable before you run anything, and the only honest referee for an optimisation
+argument. Everything else here was a way of moving that number, or a way of reading it correctly.

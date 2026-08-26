@@ -1,0 +1,267 @@
+---
+id: ledgers-blocks-state-root-is-an-output
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [execution-specs-osaka-fork, execution-specs-osaka-blocks, yellow-paper, eip-1186, eip-4788, eip-2935, eip-7864, stateless-binary-tree]
+stack: {}
+---
+
+Watch someone build a block and you will notice they can fill the header in two passes, not one.
+
+The transaction list is chosen first. The moment it is fixed, one of the header's roots can be
+computed: hash the transactions into a trie keyed by position, take the root, write it down. Nothing
+has run yet.
+
+The state root cannot be written down. To learn it, the builder has to actually execute every
+transaction in the list, apply every withdrawal, run the system calls, and only then ask the state
+what its root has become. There is no formula, no estimate, no way to fill it in from the inputs.
+
+Two 32-byte values sitting six positions apart in the same header, and they are obtained by
+completely different kinds of act. That difference is the most consequential design decision in the
+whole protocol, and this lesson is about what it costs and what it buys.
+
+## The transactions root: a commitment to inputs
+
+Start with the straightforward one, because the contrast is the point.
+
+`transactionsRoot` is the root of a Merkle-Patricia trie whose keys are RLP-encoded positions —
+`rlp(0)`, `rlp(1)`, `rlp(2)` — and whose values are the transaction envelopes.<Cite src="yellow-paper" />
+You met these [index-keyed tries](/c/mpt-index-keyed-tries) in Track 01: unsecured, rebuilt from
+scratch every block, thrown away afterwards, nothing like the persistent keccak-keyed state trie.
+
+Two properties follow from that key choice, and the second one is the one people forget.
+
+**It commits to the set.** Add a transaction, remove one, or alter a single byte of one, and the root
+changes. That is what makes the check in the previous lesson work.
+
+**It commits to the order.** Because the key *is* the position, the same transactions in a different
+sequence produce a different trie and a different root. This matters more on this chain than it
+would elsewhere: execution is sequential and order-dependent, so "which transactions" and "in what
+order" are two separate facts and the header pins both.
+
+And critically: a verifier can compute this root from the body alone. Take the list, build the trie,
+compare. No execution required. It is a commitment to *what was given to the machine*.
+
+## The state root: a commitment to outcomes
+
+Now the other one. `stateRoot` is the root of the world-state trie *after* this block has been
+processed.<Cite src="execution-specs-osaka-blocks" /> Not before. The header does not carry the
+starting state at all.
+
+You can watch this in the specification. A client processes the block, derives the resulting state
+diff, computes the root of the post-state, and only then compares:
+
+```python
+block_output = apply_body(block_env, transactions, withdrawals)
+block_diff = extract_block_diff(block_state)
+block_state_root = chain.state.compute_state_root(block_diff)
+...
+if block_state_root != block.header.state_root:
+    raise InvalidBlock
+```
+
+<Cite src="execution-specs-osaka-fork" />
+
+Read the order of operations there. `apply_body` runs first. The comparison happens after. There is
+no branch in which the root is checked cheaply and execution is skipped.
+
+<Misconception
+  belief="The `stateRoot` in a header is the state the block started from."
+  reality="It is the post-execution root — the world state after every transaction, withdrawal and system call in this block has been applied. That is precisely why a block cannot be validated without executing it."
+  why="'The block contains the state' reads like a snapshot taken at the top of the block, the way a database transaction reads a starting version. And the pre-state root does exist somewhere — in the parent's header — which makes the confusion self-consistent until it matters."
+  src="execution-specs-osaka-fork"
+/>
+
+### "Post-execution" is broader than "post-transactions"
+
+A detail that trips up anyone reconstructing state from an RPC feed. The state the root commits to
+is the state after **all** of the block's effects, and transactions are only some of them. In
+declaration order, a block's body processing performs:
+
+1. A system call writing the parent beacon block root into a ring-buffer contract.<Cite src="eip-4788" />
+2. A system call writing the parent block hash into the historical-hashes contract.<Cite src="eip-2935" />
+3. Every transaction, in index order.
+4. Every withdrawal, as unconditional balance credits.
+5. The system calls that collect execution-layer requests.
+
+<Cite src="execution-specs-osaka-fork" />
+
+<Figure
+  caption="A state-root mismatch is one bit of information, and any of these five steps could have produced it."
+  alt="Block processing runs five state-writing steps in declaration order — the beacon-root system call, the parent-hash system call, the transactions, the withdrawals, and the request-collecting system calls — and only the final state root is compared against the header."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 's1', label: 'beacon root write', note: 'system call, before any tx', col: 0 },
+      { id: 's2', label: 'parent hash write', note: 'system call, before any tx', col: 1 },
+      { id: 's3', label: 'transactions', note: 'in index order', col: 2 },
+      { id: 's4', label: 'withdrawals', note: 'unconditional credits', col: 3 },
+      { id: 's5', label: 'request system calls', note: 'after the transactions', col: 4 },
+      { id: 'root', label: 'stateRoot', note: 'computed, then compared', col: 5, tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+Steps 1, 2, 4 and 5 write to state and none of them is a transaction. An indexer that replays only
+step 3 and expects to arrive at the header's state root will be wrong on every block — and wrong in a
+way that produces a mismatched root with no indication of which of the four other steps it forgot.
+The fourth lesson in this module is about the two of those steps that move money.
+
+### The root is global, and that cuts both ways
+
+The state trie holds every account that exists — [four fields each](/c/account-four-fields), keyed by
+[the keccak of the address](/c/mpt-secure-trie). The root is a function of all of them.
+
+**What that buys:** one 32-byte value in a header is a commitment to the complete state of the
+system. Anyone holding that value can be handed a proof about any account or any storage slot and
+check it, without holding the state themselves. That is the whole basis of
+[storage proofs](/c/storage-proof), and it is productised as `eth_getProof`, which returns exactly
+the node list needed to verify an account and chosen slots against a block's state
+root.<Cite src="eip-1186" />
+
+**What that costs:** the root tells you nothing about *what* changed. A block that moves one wei
+between two accounts and a block that touches ten thousand contracts both produce a different root
+from their parent, and the roots are equally unrevealing. Compare that with the transactions root,
+which is derived only from this block's own list. If you want to know what a block changed, you have
+to diff — or read the logs, which is the next lesson.
+
+## Why verification is expensive, and what that decision buys
+
+Put the two roots side by side and the asymmetry is stark.
+
+<Compare
+  caption="Every difference between the two roots comes from one fact: one is read off the body, the other is discovered by running it."
+  alt="The transactions root and the state root answered against five questions: where the value comes from, whether a builder can write it before executing, whether a verifier can check it without executing, what it commits to, and what a mismatch localises to."
+  axis="Question"
+  columns={[
+    { title: 'transactionsRoot', note: 'a commitment to inputs' },
+    { title: 'stateRoot', note: 'a commitment to outcomes', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'Where does the value come from?', cells: ['The body, directly', 'The result of running the body'] },
+    { label: 'Can a builder write it before executing?', cells: ['Yes — the moment the list is fixed', 'No'] },
+    { label: 'Can a verifier check it without executing?', cells: ['Yes — rebuild the trie and compare', 'No'] },
+    { label: 'What does it commit to?', cells: ["This block's inputs, and their order", 'The entire world state, afterwards'] },
+    { label: 'What does a mismatch localise to?', cells: ['A transaction, or its position', 'Nothing — something, somewhere, in the whole state'] },
+  ]}
+/>
+
+That second column is the reason a full node is expensive. **Validating a block means re-executing
+it.** Not sampling it, not trusting a signature over it — running every transaction against your own
+copy of the state and confirming you land on the same 32 bytes the proposer claimed. This is what
+people mean when they say Ethereum has a re-execution model, and it is downstream of one field's
+semantics.
+
+Which raises the obvious question: why not commit to the pre-state instead, so a header could be
+checked without running anything?
+
+Because the block would stop carrying its own claim. With a post-state root, a block is a complete,
+self-contained assertion: *here is what I did, and here is the resulting world*. Any node can take
+the block in isolation, execute it, and decide validity immediately — before propagating it, before
+attesting to it, before building on it. With a pre-state root the same block would assert only what
+it started from; you would have to wait for the *next* block to learn what the proposer thought the
+outcome was, which means an invalid block would circulate for a slot before anything contradicted it.
+
+That is the trade: verification is expensive and it is immediate. The protocol bought immediacy.
+
+<Aside kind="note">
+This is also where [the determinism requirement](/c/determinism-requirement) from Track 01 lands with
+its full weight. Every honest client must compute a byte-identical root from the same inputs. Not a
+compatible root, not a root that verifies — the same one. A client that diverges by a single storage
+write produces a different state root, rejects the block the rest of the network accepted, and takes
+its users onto a different chain. This is the failure mode where a *safety* violation happens with no
+adversary anywhere in the story: the partition is in the transition function, not the network.
+</Aside>
+
+## The thing everyone is trying to change
+
+If re-execution is the cost, the obvious research direction is to keep the commitment and drop the
+requirement to hold state and run everything yourself. Two lines of work do this, and both are
+visible in the roadmap rather than in mainnet.
+
+**Statelessness.** A verifier is handed the block *plus a witness* — the trie nodes touched by
+execution, enough to re-derive the post-state root without a local database. The block becomes
+self-verifying rather than requiring a multi-hundred-gigabyte prerequisite. The blocker has always
+been witness size, which is a property of how wide and deep the trie is, and that is why proposals to
+replace the state structure keep appearing.<Cite src="stateless-binary-tree" /> EIP-7864 is the
+current such proposal, moving Ethereum state to a unified binary tree.<Cite src="eip-7864" /> Treat
+the quoted performance benefits of any tree-replacement proposal with suspicion; the figures in
+circulation come from summaries rather than from measured benchmarks, and the proposal itself is not
+shipped.
+
+**Proving.** Instead of re-executing, verify a succinct proof that someone else re-executed
+correctly. The commitment being proved is the same one: this state root follows from that block
+against that parent state root. Nothing in the header changes; what changes is who does the work. The
+zero-knowledge track picks this up properly.
+
+Both directions share a shape worth noticing. Neither removes the state root, and neither makes it a
+pre-state root. They keep the claim exactly where it is and attack the cost of checking it.
+
+<Check type="predict" concept="state-root-commits-to-all-accounts">
+You are writing a service that mirrors mainnet state locally so you can serve balance queries without
+an archive node. Your design: for each new block, fetch the transaction list, execute the
+transactions against your local state, and assert that your computed state root equals the header's
+`stateRoot` before committing the update. If they disagree, halt and alert.
+
+You ship it. It halts on the first block.
+
+Predict what the mismatch is, name at least two distinct causes that would each produce it on
+ordinary mainnet blocks, and say what the halt-and-alert behaviour got right.
+
+<Answer>
+**The prediction.** Your computed root will differ from the header's on essentially every block,
+because you replayed only one of the five things that write to state during block processing.
+
+**Cause one — withdrawals.** After the transactions, the block applies its withdrawal list as
+unconditional balance credits to validator withdrawal addresses. These are not transactions, appear
+nowhere in the transaction list you fetched, and change balances. Any block containing withdrawals —
+which is nearly all of them — will land you on a different root. This is the subject of the fourth
+lesson.
+
+**Cause two — system calls.** Before any transaction runs, the block writes the parent beacon block
+root into the beacon-roots ring-buffer contract and the parent block hash into the historical-hashes
+contract. Both are storage writes to real accounts. Both change the root. Neither is a transaction.
+And at the end of the block, the request-collecting system calls run and can write more.
+
+**Two more worth naming.** Requests processing (deposits, withdrawal requests, consolidations) writes
+state; and any subtle divergence in your own EVM — gas accounting, an access-list warm/cold
+distinction, a fork boundary you implemented a block late — produces the same undifferentiated
+symptom.
+
+**Why they all look identical.** That is the important part. A state root mismatch is one bit of
+information: *something* diverged, somewhere in the entire world state. It does not localise. Finding
+which of the causes above you hit means diffing your state against a source of truth, not reading the
+error.
+
+**What halt-and-alert got right.** Everything. The alternative — commit anyway, log a warning,
+continue — produces a mirror that silently diverges further from mainnet with every block, serving
+balances that were correct once. Refusing to advance past an unverified root means your service is
+either correct or visibly down, and never quietly wrong. That is the same
+[safety-over-liveness](/c/safety-property) choice the protocol itself makes at a partition, applied
+to your own infrastructure.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Storage proofs and light clients** are this lesson used forward. Once you internalise that one
+header field commits to all accounts, `eth_getProof` stops looking like an exotic RPC method and
+starts looking like the obvious way to move a fact about state across a trust boundary.
+
+**Bridges and cross-chain messaging** live entirely on this. A contract on one chain that holds a
+verified state root of another can be shown, by proof, that a particular account had a particular
+balance at a particular block — with no committee attesting to it.
+
+**Reorg handling in your own indexer.** Because the state root is post-execution and global, "which
+block am I on" and "what state do I believe" are the same question. Rebuilding after a reorg means
+rewinding to a header whose root you can still verify, not patching individual accounts.
+
+**The scaling and zero-knowledge tracks** both begin from the cost this lesson named. Rollups exist
+because L1 verification is re-execution; validity proofs exist to replace that re-execution with a
+check.
+
+The next lesson takes a fact that lives inside execution — an event log — and shows what has to exist
+in the header for that fact to be provable to somebody who never ran the block at all.

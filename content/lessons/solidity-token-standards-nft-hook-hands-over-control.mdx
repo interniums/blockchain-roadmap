@@ -1,0 +1,396 @@
+---
+id: solidity-token-standards-nft-hook-hands-over-control
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-721, eip-165, oz-erc721-source, ackee-erc721-reentrancy, c4-lukso-erc721-reentrancy, blocksec-hypebears, measured-gas-constants, eip-1153, eip-7702, oz-changelog]
+stack: { solidity: "0.8.36" }
+---
+
+A mint function with a per-wallet cap. The check is the first statement in the body. The effect is
+the second. An auditor skims it, sees checks before effects, and moves on.
+
+```solidity
+function mint() external {
+    require(minted[msg.sender] < CAP, "cap");   // check
+    _safeMint(msg.sender, nextId++);            // ...effect?
+    minted[msg.sender] += 1;                    // effect
+}
+```
+
+The `_safeMint` line is not an effect. It is an external call to an address chosen by the caller,
+made in the middle of your function, and the caller can use it to come back in while
+`minted[msg.sender]` still reads zero.
+
+This is the most-shipped bug in NFT contracts, and the reason it keeps shipping is that the word
+"safe" is doing exactly the opposite of what a reader assumes. This lesson takes it apart, then
+shows a second version that survives the obvious fix.
+
+## What ERC-721 actually tracks
+
+Ownership is per item. The interface is small and its authority model has three levels, which is one
+more than ERC-20 has and the extra one is where marketplaces live.<Cite src="eip-721" />
+
+- **`ownerOf(tokenId)`** — one owner per token id.
+- **`approve(to, tokenId)`** — a single approved address for one specific token.
+- **`setApprovalForAll(operator, approved)`** — an operator authorised over **every** token the
+  caller owns in that collection, present and future, until revoked.<Cite src="eip-721" />
+
+Detection is via ERC-165: the identifier for the core interface is `0x80ac58cd`, the optional
+metadata extension is `0x5b5e139f`, and the receiver interface is
+`0x150b7a02`.<Cite src="eip-721" /><Cite src="eip-165" />
+
+Now read the rationale, which explains the design decision that gets quoted approvingly and deserves
+a second look:
+
+> In ERC-721, there is no allowance because every NFT is unique, the quantity is none or one.
+> Therefore we receive the benefits of ERC-20's original design without problems that have been
+> later discovered.<Cite src="eip-721" />
+
+That is true and it is narrow. The approve race from lesson two is genuinely gone — there is no
+quantity to race on. What replaced it is `setApprovalForAll`, which is not a bounded amount but an
+unbounded, unexpiring authority over an entire collection. Every marketplace listing flow runs on
+it, which means the normal, expected, correct user action in this ecosystem is to grant a contract
+blanket control of every item they own.
+
+Trade a bounded allowance with a race for an unbounded operator grant without one, and it is not
+obvious the user came out ahead.
+
+## `safeTransferFrom` and who it is safe for
+
+ERC-721 ships two transfer functions, and the specification's own comments say what separates them.
+The unsafe one carries a shouted warning: THE CALLER IS RESPONSIBLE TO CONFIRM THAT `_to` IS CAPABLE
+OF RECEIVING NFTS OR ELSE THEY MAY BE PERMANENTLY LOST.<Cite src="eip-721" />
+
+The safe one adds a check. When the transfer is complete, it checks whether `_to` is a smart
+contract — the spec says code size greater than zero — and if so calls `onERC721Received` on it,
+throwing if the return value is not
+`bytes4(keccak256("onERC721Received(address,address,uint256,bytes)"))`.<Cite src="eip-721" />
+That value is `0x150b7a02`.
+
+Two questions are worth asking about that design, and the specification answers both.
+
+**Why a magic value rather than "it did not revert"?** Because a contract that does not implement the
+function might still return something that looks like success. The rationale is explicit: the magic
+value works around old deployed contracts that could inadvertently return `1` (true) even without
+implementing a function, and checking for a specific constant distinguishes an actual affirmative
+response from these "vacuous trues".<Cite src="eip-721" /> You have met this shape before — a call
+that succeeds without the callee having run the code you meant. The magic value is the same
+defence that a return-selector check gives any callback protocol.
+
+**Safe for whom?** For the *recipient*. The property being protected is "tokens do not get stranded
+in a contract that cannot move them again". Nothing in the mechanism protects the sender, and the
+mechanism is an external call to an address the sender does not control, executed inside the
+sender's transaction.
+
+<Misconception
+  belief="safeTransferFrom is the safe version, so prefer it."
+  reality="It is safe for the recipient — it prevents stranding. For the contract doing the transfer it is strictly more dangerous than transferFrom, because it yields execution to code the recipient wrote."
+  why="The word 'safe' is in the name and the name does not say safe for whom. The spec's own warning on transferFrom is about the recipient too, which reinforces the reading."
+  src="ackee-erc721-reentrancy"
+/>
+
+### The check moved under you
+
+"Is `_to` a contract" is specified as code size greater than zero.<Cite src="eip-721" /> Since
+Pectra, an account with a [delegation designator](/c/delegation-designator) has 23 bytes of code
+while being an externally owned account.<Cite src="eip-7702" />
+
+Two consequences follow, and both are live compatibility questions rather than theory. A delegated
+account now takes the receiver-hook path, so if its delegate does not implement `onERC721Received`
+and return the magic value, a `safeTransferFrom` to it **reverts** — an address that could receive
+NFTs yesterday may refuse them today. And in the other direction, a transfer to what the sender
+believes is a plain wallet now executes that wallet's delegate code inside the sender's transaction.
+
+Neither is exotic. Both are the same underlying fact: the code-length test was a proxy for
+account type and it stopped being one.
+
+## Worked example one: the counter written too late
+
+Back to the opening contract. Track `minted[attacker]` per call frame — the value, not the arrows.
+
+**Subgoal: pass the cap check with a clean slate.** The attacker calls `mint()` from a contract they
+control. `minted[attacker]` is 0, `CAP` is 1, the check passes.
+
+**Subgoal: reach the hook before the counter is written.** `_safeMint` mints the token and then calls
+`onERC721Received` on the attacker's contract.<Cite src="oz-erc721-source" /> Control is now inside
+attacker code, and the line `minted[msg.sender] += 1` has not executed.
+
+**Subgoal: re-enter with the state the check reads still stale.** The attacker's hook calls `mint()`
+again. `minted[attacker]` is still 0. The check passes again.
+
+**Subgoal: unwind, and let every frame write 1.** Each nested call eventually returns; each executes
+`minted[msg.sender] += 1` on the way out.
+
+<Figure
+  caption="The cap is checked three times against the same zero, because every check runs inside a frame that has not reached its own write."
+  alt="Frame 1 checks minted equals zero and passes, then calls onERC721Received before writing the counter. Frame 2 checks the same zero and passes. Frame 3 does too. Only as the frames unwind does each write plus one, leaving minted at 3 against a cap of 1."
+>
+  <Flow
+    lanes={['frame 1', 'frame 2', 'frame 3', 'unwind']}
+    nodes={[
+      { id: 'f1', label: 'mint(): minted = 0', note: 'passes, then calls the hook', col: 0, tone: 'accent' },
+      { id: 'f2', label: 'mint(): minted = 0', note: 'nothing was written yet', col: 1, tone: 'danger' },
+      { id: 'f3', label: 'mint(): minted = 0', note: 'and a third time', col: 2, tone: 'danger' },
+      { id: 'u', label: 'frames unwind', note: 'minted = 3, cap = 1', col: 3, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'f1', to: 'f2', label: 'hook', tone: 'danger' },
+      { from: 'f2', to: 'f3', label: 'hook', tone: 'danger' },
+      { from: 'f3', to: 'u', label: 'returns' },
+    ]}
+  />
+</Figure>
+
+Three tokens against a cap of one. The check genuinely ran first. It ran first against a value that
+had not been updated yet, three times, and correctness here was never about statement order — it was
+about whether the state the check reads is final before control leaves the function.
+
+The recorded incidents are of exactly this shape. A Code4rena finding against LUKSO reports the
+`onERC721Received` reentrancy as an audit issue,<Cite src="c4-lukso-erc721-reentrancy" /> and
+BlockSec's write-up of the HypeBears incident traces the pattern in a production
+mint.<Cite src="blocksec-hypebears" />
+
+## Worked example two: the one that survives the obvious fix
+
+Move the counter above the mint and the first version is fixed. Now here is a version where the
+per-item effect *does* precede the hook and it breaks anyway.
+
+Ackee's analysis walks a batch-mint function of this shape:<Cite src="ackee-erc721-reentrancy" />
+
+```solidity
+function mintNFT(uint256 numberOfNft) public payable {
+    require(totalSupply() + numberOfNft <= MAX_NFT_SUPPLY, "supply");
+    for (uint256 i = 0; i < numberOfNft; i++) {
+        _safeMint(msg.sender, totalSupply());
+    }
+}
+```
+
+Look at where the effects are. `_mint` updates the owner set — so `totalSupply()` increments —
+*before* `_checkOnERC721Received` runs.<Cite src="ackee-erc721-reentrancy" /><Cite src="oz-erc721-source" />
+Per item, effects precede interactions. This contract passes the naive reading of
+Checks-Effects-Interactions.
+
+It still breaks, and the analysis is precise about why.
+
+**Subgoal: make one batch-level promise.** The attacker calls `mintNFT(20)`. Let `totalSupply()` be
+`N`. The check compares `N + 20` against the maximum and passes. That check is the only one; it will
+not run again for the remaining 19 iterations.
+
+**Subgoal: interrupt after the first iteration.** The first `_safeMint` brings supply to `N + 1` and
+then calls the hook.<Cite src="ackee-erc721-reentrancy" />
+
+**Subgoal: re-enter and make a second promise against a stale basis.** The attacker calls
+`mintNFT(20)` again. The check now sees `N + 1`, not `N + 20`, because 19 of the outer call's mints
+have not happened yet. It checks `N + 1 + 20` where it should be checking `N + 20 + 20`. The
+analysis states this as the main point of the attack.<Cite src="ackee-erc721-reentrancy" />
+
+**Subgoal: repeat.** Each nested call re-enters before its own loop completes. The published result
+is 110 NFTs minted, exceeding both the per-transaction limit and the maximum
+supply.<Cite src="ackee-erc721-reentrancy" />
+
+Here is the generalisation, and it is the reason this second example is in the lesson:
+**Checks-Effects-Interactions is a discipline about one invocation, and a batch check is a promise
+about many.** When a function reserves capacity for N items and then yields control after item 1,
+the reservation exists only in the stack frame. Nothing on chain records that 19 more mints are
+owed. Every re-entrant frame reads a world where they are not.
+
+Which means the ordering rule you learned as "write state before you call out" needs a second
+clause for loops: **anything the check promises must be committed to storage before the first
+interaction, not accumulated across iterations.** Reserving the whole batch up front —
+incrementing supply by `numberOfNft` before the loop — makes the second version safe without a
+guard.
+
+<Misconception
+  belief="A mint cap checked with a require on minted[msg.sender] before _safeMint is enforced."
+  reality="If the counter is written after the mint, the receiver's callback re-enters with the counter unchanged. And if the check is a batch-level reservation, moving the per-item effect earlier does not help — the reservation itself is only in the stack frame."
+  why="The check is literally the first line, so the code reads as Checks-Effects-Interactions to anyone scanning statement order rather than asking what state the check depends on."
+  src="ackee-erc721-reentrancy"
+/>
+
+## `_mint` or `_safeMint`, and the tension nobody resolves
+
+OpenZeppelin's `ERC721` exposes both, and the source comment on the unsafe one is unambiguous:
+usage of `_mint` is discouraged, use `_safeMint` whenever possible.<Cite src="oz-erc721-source" />
+
+That guidance is correct for the risk it is aimed at — a token minted to a contract that cannot
+move it is gone, permanently, and the library cannot know which contracts those are. It is also in
+direct tension with everything above, because "whenever possible" is doing a lot of work and most
+mint functions have state after the mint.
+
+The resolution is not to pick a side. It is to notice that the two failures land on different
+people:
+
+- **`_mint` risks the recipient's asset.** A contract that cannot transfer holds a dead token. The
+  loss is confined to that recipient, it is visible immediately, and it is theirs.
+- **`_safeMint` risks your contract's invariants.** The loss is your supply cap, your per-wallet
+  limit, your allowlist — and it lands on everyone, including users who were never in the
+  transaction.
+
+So the decision rule is about who the caller is. When the recipient is `msg.sender` — an ordinary
+public mint — they have chosen their own address and the stranding risk is theirs to take;
+`_mint` is defensible and removes the hazard entirely. When you are minting *to* an address supplied
+by somebody else, or delivering to a recipient chosen by a market, the stranding risk is not the
+caller's to take and the hook earns its cost.
+
+Either way the ordering discipline stands. `_safeMint` as the final statement of a function whose
+state is already committed is fine. `_safeMint` in the middle is a call to a stranger.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: '_mint', note: 'no callback' },
+    { title: '_safeMint', note: 'calls onERC721Received', tone: 'warn' },
+  ]}
+  rows={[
+    {
+      label: 'What can go wrong?',
+      cells: [
+        'A contract that cannot transfer holds a token that can never move again.',
+        'The recipient runs code inside your function, before it has finished.',
+      ],
+    },
+    {
+      label: 'Who pays for it?',
+      cells: [
+        'That one recipient, immediately and visibly.',
+        'Everyone the invariant protected, including users who were never in the transaction.',
+      ],
+    },
+    {
+      label: 'Does control leave your function?',
+      cells: [
+        'No. Nothing runs that you did not write.',
+        "Yes — to an address the sender does not control, inside the sender's transaction.",
+      ],
+    },
+    {
+      label: 'When is it the right default?',
+      cells: [
+        'When the recipient is msg.sender and has chosen their own address.',
+        'When you deliver to an address somebody else supplied.',
+      ],
+    },
+  ]}
+  caption="The choice is not safe against unsafe; it is which party carries the risk you cannot remove."
+  alt="_mint and _safeMint compared on what goes wrong, who pays, whether control leaves the function, and when each is the right default."
+/>
+
+## Writing the other side
+
+If your contract is the recipient, the requirement is exactly one thing: implement
+`onERC721Received` and return `0x150b7a02`, or the transfer
+reverts.<Cite src="eip-721" /><Cite src="eip-165" /> OpenZeppelin ships `ERC721Holder` for
+contracts that just need to accept tokens, and since 5.5.0 it is flagged as stateless and is no
+longer transpiled into the upgradeable package — import it from the main package even in an
+upgradeable project.<Cite src="oz-changelog" />
+
+Three things to get right on this side.
+
+**Do not do work in the hook that you would not do in a public function.** The hook is callable by
+anyone: a caller can `safeTransferFrom` a worthless token to you purely to invoke it. Any state your
+hook writes is state an attacker can write, at a moment of their choosing, with arguments they
+control.
+
+**Do not trust the arguments.** `_operator`, `_from` and `_tokenId` are supplied by whatever
+contract called you, and `msg.sender` is the token contract — which may be a token you have never
+heard of. If the hook credits a deposit, the only trustworthy input is `msg.sender`, checked against
+the collection you actually accept.
+
+**Reverting is a veto.** The specification says the hook may throw to prevent the transfer from
+happening.<Cite src="eip-721" /> A contract with a conditional revert in its receiver is a contract
+that can refuse delivery, which is the griefing lever the check question at the end of this lesson
+turns on.
+
+## The fixes, and what they cost
+
+**Reorder so all state the checks depend on is final before the call.** Free, and it is the fix
+that addresses the mechanism rather than blocking the symptom. For batch functions this means
+reserving the full amount up front.
+
+**Add a reentrancy guard on the entry point.** Ackee's recommendation for this
+class.<Cite src="ackee-erc721-reentrancy" /> It works regardless of how subtle the invariant is,
+which is exactly why it is worth having even when you believe the ordering is right.
+
+On cost, use measured numbers rather than the ones in circulation. On forge 1.7.1 with solc 0.8.36,
+a transient-storage guard built on `TSTORE`/`TLOAD` adds about **284 gas** to a guarded call,
+because both opcodes price at 100 and the guard never touches the state
+trie.<Cite src="measured-gas-constants" /><Cite src="eip-1153" /> A storage-based guard is **not** a
+single number: measured warm it adds about 3,104 gas, and on the first guarded call of a transaction
+the lock slot is cold, which adds the 2,100 cold-access penalty on top — so the honest statement is a
+**range of roughly 3,100 to 7,100 depending on cold/warm state**.<Cite src="measured-gas-constants" />
+Every single-figure claim you will find for this comparison — 200, 5,000, 7,100 — was wrong in this
+configuration.<Cite src="measured-gas-constants" />
+
+One property of the transient guard is easy to miss and matters here: it is transaction-scoped, not
+call-scoped. A guard set in one call frame is visible for the remainder of the
+transaction.<Cite src="eip-1153" /> That is usually what you want for reentrancy and occasionally
+not what you want for legitimate batching flows.
+
+**What is not a fix:** rejecting contract callers. `msg.sender == tx.origin` and
+`code.length == 0` were never sound as "this is a human", and since Pectra a delegated EOA defeats
+both.<Cite src="eip-7702" />
+
+**And one recent change worth knowing:** OpenZeppelin 5.6.0 (25 February 2026) made ERC-721 and
+ERC-1155 prevent setting an operator for `address(0)`, noting that in ERC-721 such an operator
+allowance could lead to obfuscated mint permission.<Cite src="oz-changelog" /> A breaking change in
+a library, closing an authority path nobody was looking at.
+
+<Check type="spot-bug" concept="erc721-callback-reentrancy">
+An auction contract settles like this. `nonReentrant` is OpenZeppelin's guard and it is on
+`settle` only.
+
+```solidity
+function settle(uint256 auctionId) external nonReentrant {
+    Auction storage a = auctions[auctionId];
+    require(block.timestamp > a.endTime && !a.settled, "not ready");
+    a.settled = true;
+    nft.safeTransferFrom(address(this), a.highestBidder, a.tokenId);
+    payable(a.seller).transfer(a.highestBid);
+}
+```
+
+The team believes the guard plus the early `settled = true` makes this correct. Say what the winner's
+`onERC721Received` can still reach, and what you would want to see before signing this off.
+
+<Answer>
+**It cannot re-enter `settle`, and that is the smaller half of the problem.** The guard blocks
+re-entry into `settle`, and `a.settled = true` makes a second settlement of this auction fail
+anyway. Those two defences are real.
+
+**It can re-enter every other function in this contract that is not guarded.** `nonReentrant` on
+OpenZeppelin's guard protects functions that carry the modifier; a function without it is reachable
+from inside the hook. If `bid`, `cancel`, `withdraw` or an admin path is unguarded, the winner's
+callback runs against a contract whose seller has not yet been paid — `settled` is true, the NFT has
+moved, and `a.highestBid` is still sitting in this contract's balance.
+
+**It can be read by anything outside.** Any other contract that prices, collateralises or reports on
+this auction can be queried from inside the hook, at a moment when the state is deliberately
+half-updated. No guard on this contract affects what a different contract observes.
+
+**It hands the transfer's success to the winner.** If `onERC721Received` reverts, or returns the
+wrong value, or consumes all forwarded gas, `settle` fails — permanently, for this auction, since
+the transfer is on the settlement path. A winner who decides they overpaid can simply refuse the
+token and block settlement, and the seller's payment is behind it.
+
+**What to ask for.** Push the NFT delivery and the payout onto pull paths, so settlement writes
+state and nobody's code runs inside it. If delivery must be pushed, use `transferFrom` and make
+receipt the recipient's problem, or make the callback the last statement with nothing behind it.
+And extend the guard to every state-mutating entry point, because the interesting question was never
+"can it re-enter this function".
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** is the same hazard with two hooks and array arguments, plus a specification that
+tried to fix the ordering problem in the standard itself — and could only fix its own half.
+
+**Lesson eight** asks the question these two lead to: what happens if you take the callbacks out
+entirely. ERC-6909 is the answer, and its rationale is the clearest statement in any EIP of why
+"safe" was the wrong word.
+
+**The security track** treats this as one of the reentrancy families — the one where the re-entrant
+call arrives through a standard you adopted for safety reasons.

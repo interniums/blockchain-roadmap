@@ -1,0 +1,372 @@
+---
+id: scaling-blobs-peerdas-the-batcher-is-not-the-sequencer
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [op-specs-batcher, op-specs-derivation, op-specs-proposals, op-specs-glossary, op-specs-fjord-derivation, op-specs-protocol-overview, op-docs-configure-batcher, op-docs-tune-batcher-costs, op-docs-configure-proposer, arbitrum-batch-poster-config, arbitrum-chain-finality, l2beat-arbitrum-project, eip-4844]
+stack: {}
+---
+
+The dashboard is green. Blocks are landing every two seconds, the RPC is answering, wallets show
+confirmations within a second of submitting. Support has one ticket, from an exchange: deposits from
+this chain stopped crediting about four hours ago.
+
+The exchange is right and the dashboard is right. Blocks are being produced. Nothing has reached L1
+since 03:40, because the account that pays for posting ran out of ether overnight and the process
+that would have complained writes to a log nobody alerts on.
+
+There are now roughly eight hours left before this becomes a chain reorganisation that rewinds every
+one of those blocks.<Cite src="op-docs-tune-batcher-costs" />
+
+This lesson is about the component that stopped, why it is a different component from the one that is
+still working, and why the third component — the one nobody has mentioned yet — has its own separate
+way of failing.
+
+<Figure
+  caption="Two arrows leave the sequencer, and only one of them is what makes the chain reconstructable by anybody else."
+  alt="The sequencer builds L2 blocks and feeds two independent processes. The batcher compresses the ordering and sends it to the batch inbox address, where no code runs. The proposer sends output roots to the bridge contracts. Each process holds its own L1 account."
+>
+  <Flow
+    lanes={['builds the chain', 'posts to L1', 'lands on L1']}
+    nodes={[
+      { id: 'seq', label: 'sequencer', note: 'orders L2 txs', col: 0 },
+      { id: 'bat', label: 'batcher', note: 'compresses and posts', col: 1, tone: 'accent' },
+      { id: 'pro', label: 'proposer', note: 'claims a state root', col: 1 },
+      { id: 'inb', label: 'batch inbox address', note: 'no code runs', col: 2, tone: 'accent' },
+      { id: 'br', label: 'bridge contracts', note: 'output roots', col: 2 },
+    ]}
+    edges={[
+      { from: 'seq', to: 'bat', label: 'the ordering' },
+      { from: 'seq', to: 'pro', label: 'the state' },
+      { from: 'bat', to: 'inb' },
+      { from: 'pro', to: 'br' },
+    ]}
+  />
+</Figure>
+
+## Three processes, three keys, three balances
+
+A rollup that a user experiences as one thing is, on the operator's side, at least three long-running
+programs that share no state and can fail independently.
+
+**The [sequencer](/c/sequencer)** receives L2 transactions, chooses their order, and builds L2 blocks.
+Its output is an ordering, published on a feed, and the receipt you get from it is a
+[soft confirmation](/c/soft-confirmation) — a promise, not a proof.
+
+**The batcher** takes that ordering, compresses it, and submits it to L1. The OP Stack specification
+names it precisely: the batch submitter, also called the batcher, is "the entity submitting the L2
+sequencer data to L1, to make it available for verifiers."<Cite src="op-specs-batcher" /> Note the
+purpose clause. Not *to make it final* — to make it **available for verifiers**. Everything downstream
+of that sentence follows from it.
+
+**The proposer** submits a claim about the resulting state. On the OP Stack this is the actor that
+constructs and submits output roots — commitments to the L2's state — which the specification
+describes as the bridge's view into that state.<Cite src="op-specs-proposals" /> Arbitrum's operator
+documentation draws the same line, treating batch posting and assertion posting as two separate
+configuration surfaces with separate parameters.<Cite src="arbitrum-batch-poster-config" />
+
+Three programs, three distinct L1 accounts: the batch submitter address, whose transactions are
+authenticated against the system configuration; the proposer account; and, upstream, the sequencer key
+that signs the feed.<Cite src="op-specs-derivation" /><Cite src="op-docs-configure-batcher" /><Cite src="op-docs-configure-proposer" />
+Each pays its own gas from its own balance, and two of them can be empty while the chain keeps
+producing blocks.
+
+<Misconception
+  belief="The sequencer posts the chain's data to L1."
+  reality="The sequencer decides order. A separate process — the batcher — posts that order to L1, from a separate account, on a separate schedule, and it can stop without the sequencer noticing."
+  why="From outside, one operator runs all of it and the marketing says 'the sequencer'. The split only becomes visible when one half fails and the other keeps going, which is exactly the moment you need to already know about it."
+  src="op-specs-batcher"
+/>
+
+## What the batcher actually does, and what the protocol knows about it
+
+The specification's description of the minimal batcher is a loop of five steps: see whether the unsafe
+L2 block number is past the safe block number, so there is unsafe data to submit; iterate the unsafe
+blocks, skipping any already submitted; open a channel and buffer the block data into it, applying the
+encoding and compression the derivation specification defines; pull frames from the channel until it
+is empty; submit those data transactions to L1.<Cite src="op-specs-batcher" />
+
+Then comes the sentence that determines the whole shape of the failure mode:
+
+> The timing, operation and transaction signing is implementation-specific: any data can be submitted
+> at any time, but only the data that matches the derivation spec rules will be valid from the
+> verifier perspective.<Cite src="op-specs-batcher" />
+
+The batcher is **outside the protocol**. Nothing on L1 schedules it, checks that it ran, or notices
+that it did not. There is no contract that a batch is submitted *to* in the sense you are used to: a
+batcher transaction is authenticated by checking that its `to` address matches the batch inbox address
+and its `from` address matches the batch-sender address in the system configuration at the time of the
+L1 block the data is read from.<Cite src="op-specs-derivation" /> No EVM code runs. The data is
+inert bytes in an L1 block, and every rule about it is enforced by nodes reading the L1 chain
+afterwards.
+
+That is the design's strength and its liability in one property. The strength: posting costs almost no
+execution gas, because nothing executes. The liability: **the only thing that enforces the batcher's
+schedule is a deadline, and the penalty for missing it is not a fine.**
+
+### The deadline
+
+Each L1 block after chain inception maps to a sequencing epoch, and to derive the L2 blocks of epoch
+`E` a node needs the L1 blocks in the range `[E, E + SWS)` — the sequencing window, of size
+`SWS`.<Cite src="op-specs-derivation" /> Batcher transactions that land inside that window count.
+Ones that land after it do not exist as far as derivation is concerned.
+
+For standard OP Stack chains the sequencing window is **3,600 L1 blocks**, twelve hours at a
+twelve-second L1 block time, and the documented consequence of breaching it is a **twelve-hour
+reorg**.<Cite src="op-docs-tune-batcher-costs" /> Not a stall, not a delay — the L2 blocks whose data
+never landed are not derivable, so they are not part of the chain that everyone else reconstructs from
+L1.
+
+This is why the standard batcher policy requires targeting batch submission at **1,800 L1 blocks (six
+hours) or lower**, with operators leaving a congestion buffer below even that.<Cite src="op-docs-configure-batcher" /><Cite src="op-docs-tune-batcher-costs" />
+The ceiling is half the cliff, on purpose.
+
+<Aside kind="warn">
+The four hours in the opening scene are not four hours of lost time. They are four hours of a
+twelve-hour budget spent, with the remaining eight to be shared between noticing, diagnosing, funding
+an L1 account, restarting a process, and pushing several hours of accumulated backlog through an L1
+whose gas price you do not control. Treat "hours since the last batcher transaction" as a
+first-class alert with a threshold well under the policy ceiling, not as a metric someone checks
+during an incident.
+</Aside>
+
+## Two submissions, two chokepoints
+
+The second structural fact is that posting the data and posting the claimed state are different
+submissions, and the specification is unusually direct about why.
+
+> The difference between an L2 block and a batch is subtle but important: the block includes an L2
+> state root, whereas the batch only commits to transactions at a given L2 timestamp.<Cite src="op-specs-derivation" />
+
+And the consequence, stated in the same section: even if the sequencer applies a state transition
+incorrectly, the transactions in the batch are still considered part of the canonical L2 chain; if the
+sequencer then posts an incorrect output root, that root is challenged by a fault proof and replaced
+by a correct one over the existing sequencer batches.<Cite src="op-specs-derivation" />
+
+Read that as an ordering of authority. **The data is the chain. The state root is a claim about it.**
+Which is why they are allowed to arrive on different schedules, from different accounts, and why
+losing one is not the same incident as losing the other.
+
+The published cadence ceilings make the asymmetry concrete. Batch submission must target 1,800 L1
+blocks — six hours — or lower.<Cite src="op-docs-configure-batcher" /> Output frequency must be
+**43,200 L2 blocks, twenty-four hours at two-second blocks, or lower**, and cannot be set to
+zero.<Cite src="op-docs-configure-proposer" /> A rollup that posts data four times as often as it
+posts state roots is not misconfigured; it is following the standard.
+
+<Matrix
+  corner="Component stops"
+  cols={['What still works', 'What breaks', 'Clock you are against']}
+  rows={[
+    {
+      label: 'Sequencer',
+      cells: [
+        'Nothing new is produced',
+        'The product is down; funds are not at risk',
+        'Whatever your users tolerate',
+      ],
+    },
+    {
+      label: 'Batcher',
+      cells: [
+        'Blocks, soft confirmations, RPC',
+        'Nobody can verify or reconstruct; the safe head freezes; deposits and bridges that wait on it stall',
+        { v: <>The sequencing window, 3,600 L1 blocks on a standard chain<Cite src="op-docs-tune-batcher-costs" /></>, tone: 'danger' },
+      ],
+    },
+    {
+      label: 'Proposer',
+      cells: [
+        'Blocks, batches, verification, the safe head',
+        'Withdrawals cannot be proved against a root that does not exist',
+        "The output-frequency ceiling, and then your users' patience",
+      ],
+    },
+  ]}
+  caption="Only the middle row is running against a protocol deadline, and it is the only failure that can rewind blocks that already happened."
+  alt="Three rollup components scored on what still works when they stop, what breaks, and what clock the operator is against. A stopped sequencer halts production. A stopped batcher leaves blocks and soft confirmations working while the safe head freezes, against the sequencing window of 3,600 L1 blocks. A stopped proposer leaves everything working except withdrawal proofs."
+/>
+
+The middle row produces the opening scene, and the heads make it precise: the **unsafe L2 head** is the
+highest block the node knows about; the **safe L2 head** is the highest block derived from L1; the
+**finalized L2 head** is the highest block derivable from finalised L1 blocks, meaning L1 blocks older
+than two L1 epochs.<Cite src="op-specs-glossary" /> A stalled batcher leaves the unsafe head racing
+ahead while the safe head stands still, and the operator documentation names who notices: exchanges
+and third-party bridges commonly wait for transactions to be marked safe before processing deposits
+and withdrawals.<Cite src="op-docs-configure-batcher" />
+
+Arbitrum's documentation states the same relationship from the other end: transactions executed
+through its sequencer reach finality equivalent to the parent chain **once the relevant transaction
+data has been posted in a batch**.<Cite src="arbitrum-chain-finality" /> Posting is the event that
+converts a promise into [hard finality](/c/hard-finality). Nothing else does.
+
+<Misconception
+  belief="If the batcher stops, users lose money."
+  reality="Users lose settlement, not funds. Everything the sequencer promised is still promised, and if the data lands inside the sequencing window it all becomes canonical. What is lost is the property that anybody else can check the chain — and, past the window, the blocks themselves."
+  why="'Data not posted to Ethereum' sounds like theft. The actual damage is subtler and more corrosive: the chain temporarily stops being a rollup and becomes a database with a good reputation."
+  src="op-specs-batcher"
+/>
+
+## Compression is not an optimisation, it is the unit of work
+
+The third thing the batcher does is the reason its output is not simply "the transactions".
+
+A **channel** is a sequence of sequencer batches compressed together, and the specification states the
+motive plainly: the reason to group multiple batches is "simply to obtain a better compression rate,
+hence reducing data availability costs."<Cite src="op-specs-derivation" /> Channels are then split
+into **frames** so they fit in transactions, and a single transaction may carry frames from more than
+one channel — which lets the batcher pack the small final frame of one channel alongside frames from
+the next.<Cite src="op-specs-derivation" />
+
+The compression itself is layered.
+
+**A general-purpose algorithm.** The base channel encoding is `zlib_compress(rlp_batches)`, zlib as
+specified in RFC-1950, with no dictionary.<Cite src="op-specs-derivation" /> The Fjord upgrade added
+a versioned channel encoding whose only valid version byte is `1`, indicating Brotli as specified in
+RFC-7932, again with no custom dictionary — and the version byte must never have its four low-order
+bits set to `0b1000` or `0b1111`, because those are reserved by the header byte of zlib-encoded data,
+which is how a decoder tells legacy from versioned format without a flag.<Cite src="op-specs-fjord-derivation" />
+If you did the encoding track, that trick will look familiar: a new format smuggled in beside an old
+one by using values the old one's header cannot produce.
+
+**A domain-specific encoding underneath it.** Span batches, introduced in the Delta upgrade, represent
+a span of consecutive L2 blocks in a more efficient form while preserving the same consistency checks
+as regular batch data, and the operator guidance is to enable them at any
+throughput.<Cite src="op-docs-configure-batcher" /><Cite src="op-docs-tune-batcher-costs" /> This is
+the layer that strips what the rollup already knows: repeated fields across consecutive blocks,
+structure that does not need restating.
+
+**And a bound, because compression cuts both ways.** Decompression is capped at
+`MAX_RLP_BYTES_PER_CHANNEL` explicitly to prevent zip-bomb attacks, and the constant was raised from
+10,000,000 to 100,000,000 in Fjord.<Cite src="op-specs-derivation" /><Cite src="op-specs-fjord-derivation" />
+A limit that exists purely because the input is attacker-influenced is a useful reminder that the
+batcher's input is public.
+
+### Why this makes most published cost figures meaningless
+
+Here is the consequence that matters for anything you will be asked to estimate.
+
+The L1 bytes attributable to one L2 transaction are not that transaction's size. They are that
+transaction's size after span-batch encoding, after Brotli, amortised across every other transaction
+in the same channel — and the ratio depends on what the transactions look like. A channel of a
+thousand near-identical token transfers compresses very differently from a channel of a thousand
+distinct contract deployments.
+
+So: **a per-transaction data-availability cost quoted without a compression ratio is not a number, it
+is a rumour.** It cannot be checked, it cannot be reproduced, and it will not survive a change in your
+chain's traffic mix. When you produce such a figure yourself, publish the ratio beside it and state
+the window it was measured over. When somebody hands you one, ask for the ratio first.
+
+<Aside kind="note">
+This curriculum's research sweep found no verifiable per-rollup compression ratios and no verifiable
+post-Fusaka per-transaction fee medians, so none appear anywhere in this module. Both quantities move
+with traffic mix and with the L1 fee markets, and a figure that was true for one chain in one week
+gets repeated as a constant for years — which is how the stale numbers in other material got there.
+</Aside>
+
+## Worked example: turning the deadline into a configuration
+
+You are setting the posting interval for a new chain. Work it in the order that produces a defensible
+number rather than a copied one.
+
+**Subgoal 1 — establish the hard boundary, the one that is not yours to choose.** The sequencing
+window. On a standard OP chain, 3,600 L1 blocks, twelve hours; miss it and you get a twelve-hour
+reorg.<Cite src="op-docs-tune-batcher-costs" /> This is a protocol parameter, not a preference.
+
+**Subgoal 2 — establish the policy ceiling, which is half of it.** Batch submission targets 1,800 L1
+blocks (six hours) or lower.<Cite src="op-docs-configure-batcher" /> The gap between six and twelve
+is the congestion buffer: it is what you spend when L1 gas spikes and your transactions sit unmined.
+
+**Subgoal 3 — take the operator recommendation, and notice it is lower again.** The recommended
+`OP_BATCHER_MAX_CHANNEL_DURATION` is 1,500 L1 blocks, five hours, described as the longest interval
+that still sits snugly inside the twelve-hour window without affecting
+stability.<Cite src="op-docs-configure-batcher" /> Three numbers, each below the last, each buying
+back a different kind of bad day.
+
+**Subgoal 4 — subtract what the safe head costs you, because that is the real constraint.** Setting
+1,500 blocks yields the cheapest fees and means the safe head can stall for up to five hours; the
+documentation names the victims — exchanges and bridges that wait for the safe head before processing
+deposits and withdrawals.<Cite src="op-docs-configure-batcher" /> So the question is not "how cheap
+can posting be" but "how long can a deposit take before an integration partner opens a ticket". That
+answer comes from the product, not the infrastructure.
+
+**Subgoal 5 — check the parameter you did not set.** A full channel posts immediately regardless of
+the duration setting, so a chain with a five-hour maximum may still submit every few
+minutes.<Cite src="op-docs-configure-batcher" /> `MAX_CHANNEL_DURATION` is a **ceiling on the wait**,
+not the interval; your real cadence is whichever trigger fires first, and on a busy chain it is never
+the timer.
+
+**Subgoal 6 — write the alert, not just the config.** The configuration says how often you intend to
+post. The alert says how long you can go without posting before someone must wake up. Those are
+different numbers and the second one is the one that saves you: time since the last batcher
+transaction from the batch submitter address, compared against a threshold set well under the policy
+ceiling, plus the L1 balance of that account. Both are readable from a public L1 node with no access
+to your infrastructure at all.<Cite src="op-specs-derivation" />
+
+<Aside kind="note">
+Arbitrum exposes the same trade under different names: `--node.batch-poster.max-delay` is the maximum
+wait, defaulting to one hour, with guidance to set five to fifteen minutes on high-throughput chains;
+`--node.batch-poster.max-calldata-batch-size` posts on volume instead.<Cite src="arbitrum-batch-poster-config" />
+A timer and a size — the same pair as the OP Stack's duration-or-full-channel. When you meet a third
+stack, look for both triggers before assuming there is one.
+</Aside>
+
+<Check type="explain" concept="batch-vs-state-commitment">
+You are on call for an L2. Two independent reports arrive within an hour of each other.
+
+**Report A.** A bridge integration says withdrawals initiated yesterday cannot be proved. Its logs say
+the withdrawal's L2 block is not covered by any output root on L1.
+
+**Report B.** A partner exchange says deposits from your chain are not crediting. Its logs say your
+chain's safe head has not advanced since 03:40, though it is receiving new blocks fine.
+
+Say which component each report implicates, which of the two is on a clock, and what you check first
+in each case.
+
+<Answer>
+**Report A is the proposer. Report B is the batcher. B is on a clock; A is not.**
+
+**Report A — the proposer.** Output roots are the bridge's view into L2 state, and a withdrawal must
+reference one.<Cite src="op-specs-proposals" /> If no root covers the block, the proposer has not
+submitted one for that range. Everything else is healthy: the data landed, the chain is verifiable,
+the safe head is moving, and the withdrawal is waiting rather than lost. Check the proposer's L1
+balance and its last successful submission against your configured output frequency, whose ceiling is
+43,200 L2 blocks — twenty-four hours at two-second blocks.<Cite src="op-docs-configure-proposer" />
+**There is no protocol deadline here.** A stalled proposer degrades withdrawals indefinitely and never
+rewinds anything.
+
+**Report B — the batcher.** The safe head is by definition the highest L2 block derived from the L1
+chain, so a frozen safe head with a live unsafe head means data is not reaching L1.<Cite src="op-specs-glossary" />
+Exchanges waiting on the safe head before crediting deposits is the documented, expected
+behaviour.<Cite src="op-docs-configure-batcher" /> **This one has a deadline.** Batcher transactions
+must land inside the sequencing window — 3,600 L1 blocks, twelve hours, on a standard chain — and
+missing it means a twelve-hour reorg of the blocks whose data never arrived.<Cite src="op-docs-tune-batcher-costs" /><Cite src="op-specs-derivation" />
+
+**What you check first for B.** The batch submitter address on an L1 explorer: its balance and the
+timestamp of its last transaction. One lookup, no access to your own systems, and it separates the
+three plausible causes — an empty account, a stuck fee market with transactions pending, and a crashed
+process. Then compute hours remaining in the window and let that set severity, because the remaining
+budget rather than the elapsed outage is what decides whether you page people.
+
+**The trap in reading these together.** They feel like one incident — "L1 posting is broken" — and
+they are unrelated. Two processes, two keys, two balances, two schedules, and only one of them can
+rewind your chain. Triaging them as one failure means over-reacting to A or, much worse,
+under-reacting to B.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next**, the encoding path in full: how the frames this lesson described get packed into a type-3
+transaction, why the L1 contract you would expect to validate a batch does not exist, and what a
+contract can actually do with data it cannot read.<Cite src="eip-4844" />
+
+**Two lessons out**, the price. The batcher's transaction is priced in two independent markets that
+share the word "gas", and the arithmetic of the second one is where every stale figure in this subject
+comes from.
+
+**And carry the split.** Any time you read "the rollup posts to Ethereum", ask which of the two
+submissions is meant, from which account, on which schedule, and what stops if it stops. Rollup
+architecture diagrams that draw one arrow from L2 to L1 are hiding a chokepoint — and, as
+[L2BEAT's per-project risk rows](/c/l2beat-stage-1) make visible, the two chokepoints have different
+owners and different recovery paths on every chain that has them.<Cite src="l2beat-arbitrum-project" /><Cite src="op-specs-protocol-overview" />

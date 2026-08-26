@@ -1,0 +1,339 @@
+---
+id: solidity-calls-delegatecall-no-call-across-contracts
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    solidity-docs-control-structures,
+    solidity-docs-contracts,
+    solidity-docs-global-vars,
+    solidity-docs-security,
+    solidity-abi-spec,
+    eip-2929,
+    eip-150,
+    eip-7825,
+    measured-gas-constants,
+  ]
+stack: { solidity: "0.8.36" }
+---
+
+Two lines, adjacent, in a pull request you are reviewing:
+
+```solidity
+_credit(to, amount);
+token.transfer(to, amount);
+```
+
+They are formatted identically. They take the same arguments. A reviewer skims both at the same
+speed. One of them is a `JUMP` to a label thirty bytes further into the same runtime bytecode. The
+other builds a byte string, hands control to a program written by someone else, and comes back — if
+it comes back — with a different byte string and a boolean.
+
+The Solidity source deliberately does not distinguish them. That is the language's most useful
+convenience and its most expensive one, and this module is about learning to see the boundary that
+the syntax hides.
+
+You already know what a [call frame](/c/call-frame) is, what it costs to open one, and what the EVM
+does with `CALL`. What you do not yet have is the mapping from *Solidity constructs* to that
+machinery: which pieces of syntax cross a frame boundary, which do not, and what the compiler
+silently inserts on either side of the crossing.
+
+<Figure
+  caption="The syntax hides a fork: one branch never leaves the frame, and the other opens one and then chooses how much of the old context to inherit."
+  alt="Call-shaped Solidity syntax splits into two families. One compiles to a JUMP with no new frame, sharing storage and memory. The other is a message call, which comes in three instructions — CALL, DELEGATECALL and STATICCALL — each covered by different lessons in this module."
+>
+  <Tree
+    root={{
+      label: 'call-shaped syntax',
+      note: 'identical at the call site',
+      tone: 'accent',
+      children: [
+        {
+          label: 'no new frame',
+          note: 'internal, super, modifiers',
+          tone: 'muted',
+          children: [{ label: 'JUMP', note: 'one storage, one memory' }],
+        },
+        {
+          label: 'a message call',
+          note: 'a byte string each way',
+          children: [
+            { label: 'CALL', note: 'a fresh context' },
+            { label: 'DELEGATECALL', note: 'borrowed code' },
+            { label: 'STATICCALL', note: 'no state writes' },
+          ],
+        },
+      ],
+    }}
+  />
+</Figure>
+
+## Four things the compiler will call a "call"
+
+Solidity emits four structurally different things from call-shaped syntax, and the difference is not
+visible at the call site without knowing the callee's declaration.
+
+**An internal call.** `_credit(to, amount)`, `super.f()`, a `private` or `internal` function, a free
+function, a modifier body. The compiler notes that all internal calls to functions of base contracts
+are internal function calls, and that `super.f(..)` will use `JUMP` and not a message
+call.<Cite src="solidity-docs-contracts" /> One contract is created on chain per deployment, and the
+code from every base contract is compiled into it.<Cite src="solidity-docs-contracts" /> There is no
+frame. Arguments are stack slots and memory pointers. A `storage` reference — a pointer to a slot —
+can be passed and returned, because both sides share one storage context.
+
+**A typed external call.** `token.transfer(to, amount)` where `token` has a contract or interface
+type. The compiler ABI-encodes the selector and arguments into memory, emits a `CALL`, and decodes
+whatever comes back into the declared return type.
+
+**A low-level call.** `addr.call(data)`, `addr.delegatecall(data)`, `addr.staticcall(data)`. No
+types, no encoding, no decoding, no checks. The docs list all three as returning
+`(bool, bytes memory)` and forwarding all available gas, subject to additional limits imposed by
+some EVM versions.<Cite src="solidity-docs-global-vars" />
+
+**A library call.** `Math.max(a, b)` compiles to an inlined `JUMP` when `max` is `internal`, and to
+a `DELEGATECALL` to a separately deployed contract when it is `public` or `external`. Two syntactic
+twins, two entirely different machines. The last lesson in this module takes that apart properly.
+
+The specification-level statement that organises all of this is one sentence from the language docs:
+a function call from one contract to another does not create its own transaction, it is a message
+call as part of the overall transaction.<Cite src="solidity-docs-control-structures" /> Not a
+subroutine invocation. A message.
+
+## What the boundary lets through
+
+A message call carries exactly two things across: a byte string in, and a byte string out. This is
+not a Solidity restriction; it is the shape of the instruction. Everything the language does at a
+call site is an attempt to make that shape look like a function signature.
+
+The consequences are worth naming individually, because each one surprises somebody.
+
+**Reference arguments are copied, twice.** Pass a `bytes memory` or a `uint256[] memory` to an
+external function and the compiler ABI-encodes it into a fresh region of *your* memory, then the
+`CALL` copies that region into the callee's calldata. The callee's `calldata` parameter is a view
+into that copy. Nothing is shared; a change the callee makes is invisible to you, and a change you
+make after the call cannot reach it. The encoding used is the ordinary contract ABI, which is not
+self-describing and requires a schema in order to decode.<Cite src="solidity-abi-spec" />
+
+**A `storage` pointer cannot cross.** `internal` functions can take parameters of internal types
+like mappings and storage references precisely because they are not exposed to the outside through
+the contract's ABI.<Cite src="solidity-docs-contracts" /> There is no ABI type for "slot 7 of
+account X", and there could not be one that means anything to a different account. If you have ever
+wondered why a helper suddenly refuses to compile when you change it from `internal` to `external`,
+this is the whole reason.
+
+**The return value is decoded in your frame, at your expense.** The callee writes bytes; your
+contract's code reads them and checks that they form a well-formed encoding of the declared return
+type. That check is real work and it can fail — which means a call that the EVM reports as
+successful can still revert your transaction, in your own frame, on the decode. Hold that; the third
+lesson turns it into a specific and very common bug.
+
+**Visibility is a calling convention, not an access control.** `public` and `external` functions are
+both part of the contract interface and both callable by anyone with an address and a nonce. The
+documented difference is narrower than people assume: an external function `f` cannot be called
+internally, so `f()` does not work but `this.f()` does, while a public function can be called either
+internally or via message calls.<Cite src="solidity-docs-contracts" /> And the docs are blunt about
+the other half: making something `private` or `internal` only prevents other contracts from reading
+or modifying the information, but it will still be visible to the whole world outside of the
+blockchain.<Cite src="solidity-docs-contracts" />
+
+<Misconception
+  belief="Marking a function external instead of public makes it harder to call."
+  reality="Both are in the ABI and both are callable by any address. The difference is that an external function has no internal entry point, so your own contract cannot reach it without a real message call."
+  why="The word external suggests a boundary that keeps people out, when it actually describes which side of the boundary the function's only entry point sits on."
+  src="solidity-docs-contracts"
+/>
+
+## Which globals are per-frame, and which are not
+
+This is the table you will reach for constantly, and it is worth memorising as two lists rather than
+one.
+
+**Reset at every message call:** `msg.sender`, `msg.value`, `msg.data`, `msg.sig`, `address(this)`,
+`address(this).balance`, `gasleft()`, the return-data buffer, and all of memory. The frame is the
+unit; nothing about the message survives it.
+
+**Unchanged for the whole transaction:** `tx.origin`, `tx.gasprice`, and every `block.*` member.
+These are properties of the envelope, not of any frame inside it.
+
+**Not a frame boundary at all:** modifiers, `super`, inheritance, internal functions, `unchecked`
+blocks, and `try`'s success branch. A modifier that wraps your function body runs in the same frame
+as the body; `msg.sender` inside a modifier and inside the function it guards are the same value by
+construction, which is exactly why the `onlyOwner` idiom works.
+
+The one entry that does not behave the way its spelling suggests is `address(this)`. It is not "the
+contract whose source I am reading". It is *the account this frame is acting as* — and the next
+lesson is entirely about the instruction that separates those two ideas.
+
+### Worked trace: three frames, one transaction
+
+A user's EOA at `0xUSER` sends one transaction to a router at `0xROUTER`, attaching 1 ether. The
+router calls `vault.deposit{value: 1 ether}()` at `0xVAULT`. The vault calls
+`token.transfer(0xUSER, 500)` at `0xTOKEN`.
+
+**Subgoal — establish the top frame from the transaction envelope, not from any opcode.** Frame 0
+executes the router's code. `address(this)` is `0xROUTER`. `msg.sender` is `0xUSER` and so is
+`tx.origin`; at the top level they are equal, which is the only place that equality is
+structural. `msg.value` is 1 ether and the router's balance already includes it — value is credited
+before the code runs.
+
+**Subgoal — cross the first boundary and record what the compiler emitted.** That call site
+ABI-encodes a four-byte selector with no arguments, then emits a `CALL` with a value
+argument. Frame 1 executes the vault's code with `address(this) == 0xVAULT`, `msg.sender ==
+0xROUTER`, `msg.value == 1 ether`. `tx.origin` is still `0xUSER`, and it now differs from
+`msg.sender` — which is the entire content of the classic warning against authorising on
+`tx.origin`.
+
+**Subgoal — notice which balance moved and when.** One ether left `0xROUTER` and arrived at
+`0xVAULT` as part of the `CALL` itself, before the vault's first instruction. If frame 1 reverts,
+that transfer is undone with everything else in the frame.
+
+**Subgoal — cross the second boundary and watch `msg.value` collapse.** `token.transfer(...)`
+carries no value option, so frame 2 runs with `msg.value == 0`. Nothing about frame 1's ether is
+visible in frame 2. A token contract that tried to read `msg.value` to decide anything would read
+zero, always, for every ordinary ERC-20 transfer ever made.
+
+**Subgoal — unwind and see what the router can still observe.** When frame 2 returns, frame 1
+resumes with its memory and stack intact and a fresh return-data buffer. When frame 1 returns, frame
+0 resumes. Frame 0 cannot see frame 1's memory, cannot see whether frame 2 happened, and knows only
+what frame 1 chose to return. Every fact about the inner frames that the router needs must have been
+serialised into return data or emitted as a log.
+
+<Matrix
+  corner="Frame"
+  cols={['address(this)', 'msg.sender', 'msg.value', 'tx.origin']}
+  rows={[
+    { label: '0 — router', cells: ['0xROUTER', '0xUSER', '1 ether', '0xUSER'] },
+    { label: '1 — vault', cells: ['0xVAULT', '0xROUTER', '1 ether', '0xUSER'] },
+    { label: '2 — token', cells: ['0xTOKEN', '0xVAULT', { v: '0', tone: 'warn' }, '0xUSER'] },
+  ]}
+  caption="Only the last column is a property of the transaction; the other three are rebuilt at every frame boundary."
+  alt="Three frames of one transaction against address(this), msg.sender, msg.value and tx.origin. The first three columns change at each boundary and msg.value collapses to zero in the third frame, while tx.origin is the same address throughout."
+/>
+
+## The braces that are not a function call
+
+Solidity puts the value and gas options in braces before the argument list:
+`feed.info{value: 10, gas: 800}()`. Two things about that syntax are worth knowing before you write
+it.
+
+The docs warn that `feed.info{value: 10, gas: 800}` only locally sets the value and amount of gas
+sent with the function call, and that the parentheses at the end perform the actual
+call.<Cite src="solidity-docs-control-structures" /> Drop the parentheses and you have written an
+expression that configures a call you never make. It compiles.
+
+The docs also state directly that it is discouraged to specify gas values explicitly, since the gas
+costs of opcodes can change in the future.<Cite src="solidity-docs-control-structures" /> That is
+not style advice. A hard-coded gas number encodes an assumption about the price schedule, and the
+price schedule is a thing that gets changed by hard forks — the sixth lesson in this module works
+through what a fixed gas budget actually buys you and why it is less than the syntax implies.
+
+<Aside kind="note">
+`value` is only available if the target function is declared `payable`; the docs make the compiler's
+requirement explicit.<Cite src="solidity-docs-control-structures" /> This is one of the few places
+where the language checks a property of the callee, and it checks it against the *interface you
+declared*, not against the code at the address. If your interface says `payable` and the deployed
+function is not, you find out at runtime.
+</Aside>
+
+## What crossing costs, and what nobody can tell you
+
+Three components are worth separating, because two of them are cheap to reason about and one of them
+is a place where confident numbers should make you suspicious.
+
+**Account access.** Every call instruction charges for touching the target account: 2,600 gas the
+first time an address is used in a transaction and 100 afterwards, from a per-transaction set that
+starts out holding the sender, the transaction's target and every precompile.<Cite src="eip-2929" />
+Measured on this repository's toolchain, the same cold and warm account-access prices show up
+directly on `EXTCODESIZE` and `BALANCE` at 2,600 and 100.<Cite src="measured-gas-constants" /> Note
+the second half of the rule: if a scope reverts, the access lists are restored to the state they
+were in before that scope was entered.<Cite src="eip-2929" /> Warmth is transactional, and it is
+reverted along with everything else.
+
+**Data movement.** Your arguments are encoded into memory, copied into the callee's calldata, and
+the return data is copied back into your memory. All three are metered, and the memory expansion is
+[quadratic](/c/memory-expansion-quadratic). This is the component an adversary can inflate, and the
+sixth lesson is about exactly that.
+
+**The instruction's own price.** Here the honest answer is that this corpus has not re-derived it.
+EIP-150's flat charge for `CALL`, `DELEGATECALL` and `CALLCODE` and EIP-2929's cold and warm account
+tiers layer on top of one another, and no one here has confirmed that no further repricing landed in
+the Fusaka schedule.<Cite src="eip-150" /><Cite src="eip-2929" /> Any single number you see quoted
+for "the cost of a CALL" in 2026 is quoting some fork's schedule without saying which. Measure it on
+the compiler and EVM version you ship; that is a one-command answer and a blog post is not.
+
+Two ceilings do bound the whole exercise. The caller always retains at least one sixty-fourth of the
+gas in a call, so a child that exhausts its budget cannot take the parent with it.<Cite src="eip-150" /><Cite src="solidity-docs-control-structures" />
+And external function calls can fail at any time because they exceed the maximum call stack size of
+1,024, which the caller is in total control of and can therefore force.<Cite src="solidity-docs-security" />
+A single transaction is additionally capped at roughly 16.78 million gas.<Cite src="eip-7825" />
+
+<Check type="predict" concept="evm-call-context">
+A vault has this pair of functions:
+
+```solidity
+function deposit() external payable {
+    _record(msg.sender, msg.value);
+}
+
+function _record(address who, uint256 amount) internal {
+    credits[who] += amount;
+    emit Recorded(who, amount, address(this).balance);
+}
+```
+
+A router calls `vault.deposit{value: 1 ether}()`. Inside `_record`, name the value of `who`, of
+`amount`, and of `address(this)`. Then say what changes about all three if `_record` is changed from
+`internal` to `external` and the call site becomes `this._record(msg.sender, msg.value)`.
+
+<Answer>
+**In the original: `who` is the router, `amount` is 1 ether, `address(this)` is the vault.**
+
+`_record` is `internal`, so calling it emits a `JUMP`. There is no new frame, so `msg.sender` inside
+`deposit` and inside `_record` are the same value — the router — and `address(this)` is the vault
+throughout. `msg.value` is 1 ether because that is what the router attached. Nothing about the
+context changed, because nothing about the context *could* change: internal calls are not message
+calls.<Cite src="solidity-docs-contracts" />
+
+**After the change: `who` is still the router, `amount` is still 1 ether, `address(this)` is still
+the vault — and all three for a different reason.**
+
+This is the part worth slowing down on. `this._record(...)` is a real message call back into the
+same account. Inside that new frame, `msg.sender` is now the vault itself and `msg.value` is zero.
+But `who` and `amount` are *parameters*, evaluated in the outer frame and encoded into the calldata
+before the crossing. They still hold the router's address and 1 ether. `address(this)` is the vault
+in both frames because the target of the call is the vault.
+
+So the observable behaviour is identical, and the reasoning behind it is completely different — and
+the difference becomes visible the moment anything inside `_record` reads `msg.sender` or `msg.value`
+directly instead of taking them as arguments. That is the trap, and the third lesson in this module
+is about what it costs when the thing reading `msg.sender` is an authorisation check.
+
+**One more difference the question does not ask about.** `address(this).balance` in the emitted
+event is the vault's balance in both cases, but the *timing* differs: in the internal version the
+event is emitted before the outer frame returns; in the external version it is emitted inside a
+child frame that could revert independently, taking the log with it while leaving `credits`
+untouched if the outer frame swallowed the failure.
+</Answer>
+</Check>
+
+## Where this goes
+
+Everything in this module is a variation on one question — when a new frame opens, which parts of
+the old context come with it. This lesson pinned down the default answer for `CALL`, and the pieces
+of Solidity syntax that produce one.
+
+**Next**, `DELEGATECALL` changes three of those answers at once and leaves the rest alone, and the
+one it changes that nobody asked for is the reason proxies are dangerous.
+
+**Then** the fact that a call to an account with no code succeeds — an EVM behaviour you already
+know — meets Solidity's compensating `extcodesize` check, and you learn precisely which calls have
+that check, which do not, and why the exceptions were added.
+
+**Later**, the same boundary is what makes `view` enforceable, what makes a low-level call's boolean
+so easy to drop on the floor, and what lets a hostile callee charge you for memory you never read.
+
+The habit to build now is small and mechanical: when you read a call site, ask which of the four
+shapes it is before you ask what it does. Most Solidity bugs that involve two contracts are visible
+at that level, before you have read either contract's logic.

@@ -1,0 +1,294 @@
+---
+id: evm-state-tries-what-a-header-commits-to
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [execution-specs, execution-apis, eip-4788, eip-4895, eip-7685, eip-2718, eip-658, eip-4844, eip-3675, eip-4399, eip-7745]
+stack: {}
+---
+
+A node rejects a block. No signature failed. No peer misbehaved. Nothing timed out.
+
+What happened is that the node executed every transaction in the block against its own copy of the
+prior state, computed a 32-byte number, compared it to a 32-byte number the proposer had written into
+the block header, and found them different in at least one bit. That is the entire failure. The block
+is discarded and the node keeps going.
+
+This is worth sitting with, because it is the point where "the network agrees on the state" stops
+being a social claim and becomes an equality check. Nobody votes on the state. Every node computes it
+and compares. This lesson is about the numbers being compared, what each of them answers, and the two
+of them that are not what they look like.
+
+## `stateRoot` is the world *after* the block
+
+The header's `stateRoot` is not the state the block started from. It is the root of the world state
+after every transaction in the block has executed and every consensus-layer withdrawal has been
+applied.<Cite src="execution-specs" />
+
+Two things follow, and they are the reason this field is the linchpin of the whole design.
+
+**It is a claim, not an announcement.** The proposer asserts "executing my transactions against the
+parent's state gives this root". A validating node re-executes and checks. A proposer who lies
+produces a block that every honest node rejects, and lying is not more profitable than being
+wrong — both outcomes are the same rejected block. This is what
+[verifying rather than re-deriving](/c/verify-vs-reexecute) buys, and why a state root is a decision
+procedure rather than a negotiation.
+
+**Withdrawals are inside it.** EIP-4895 pushes validator withdrawals into the execution layer as
+*operations* rather than as transactions: they credit balances, they change the state root, and they
+have no signature, no sender, no gas and no receipt.<Cite src="eip-4895" /> An accounting system that
+reconstructs balances by summing transactions will therefore drift on any address that receives
+withdrawals, silently, and only for validators. It is a good example of why the map is primary: the
+map moved without a transaction moving it.
+
+<Misconception
+  belief="The state root is a value the network agrees to accept — a summary the proposer publishes and everyone signs off on."
+  reality="It is a value each node independently recomputes from the parent state and the block's transactions. Disagreement is a rejected block, not a dispute to resolve."
+  why="'Consensus' in ordinary usage means arriving at agreement, so a published root reads like a proposal to be ratified. Here consensus is about which *chain* to follow; what the chain says the state is has exactly one answer, and it is arithmetic."
+  src="execution-specs"
+/>
+
+## The header, by the fork that added each field
+
+EIP-4788 prints the header's RLP field list as part of specifying its own addition. Reading it in
+order is more instructive than any diagram:<Cite src="eip-4788" />
+
+```text
+parent_hash
+0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347   # ommers hash
+coinbase
+state_root
+txs_root
+receipts_root
+logs_bloom
+0                                                                    # difficulty
+number
+gas_limit
+gas_used
+timestamp
+extradata
+prev_randao
+0x0000000000000000                                                   # nonce
+base_fee_per_gas
+withdrawals_root
+blob_gas_used
+excess_blob_gas
+parent_beacon_block_root
+```
+
+That is the Cancun-era list. Pectra added one more: EIP-7685 extends the header with a new 32-byte
+commitment value, `requests_hash`.<Cite src="eip-7685" />
+
+<Aside kind="warn">
+Take the list above as EIP-4788's enumeration at the time it was written, not as a guaranteed-complete
+current header. This project assembled the post-Cancun additions from individual EIPs and did not diff
+them against the `Header` definition in execution-specs for the latest fork. If you are writing an
+RLP encoder — where field order is load-bearing — read that definition
+directly.<Cite src="execution-specs" />
+</Aside>
+
+Three of those entries are fossils, and knowing that saves an afternoon:
+
+- **`ommers hash` is frozen** at the hash of an empty list, printed above as a literal in the
+  specification itself.<Cite src="eip-4788" /> Proof-of-stake has no uncle blocks.
+- **`difficulty` is 0** and **`nonce` is eight zero bytes**, both hardcoded by the
+  Merge.<Cite src="eip-3675" />
+- **`prev_randao` occupies the slot the mining `mixHash` used to occupy.** EIP-4399 repurposed the
+  field to carry the beacon chain's randomness output rather than removing
+  it.<Cite src="eip-4399" />
+
+The reason they were frozen instead of deleted is worth generalising. A header's field list is part of
+the block hash. Removing a field changes how every header encodes, which invalidates every historical
+hash — so a live protocol freezes obsolete fields at constants and pays a few bytes forever. Expect
+this pattern anywhere a format is hash-committed.
+
+## Four questions, four commitments
+
+The header carries separate roots because they answer separate questions, and conflating them produces
+wrong architectures.
+
+| Field | Question it answers |
+|---|---|
+| `txs_root` | What was submitted in this block? |
+| `receipts_root` | What did executing it produce? |
+| `state_root` | What world resulted? |
+| `withdrawals_root` | What did the consensus layer credit, outside transactions? |
+
+You cannot derive any of them from the others without doing the work. Given the transactions you would
+have to execute them to get the receipts; given the receipts you would still not have the state.
+Committing separately is what lets a verifier check one claim without reproducing the rest, which is
+the entire basis of light clients.
+
+Cancun added two more scalars, `blob_gas_used` and `excess_blob_gas`, which run the blob fee market,
+and `parent_beacon_block_root`, which brings the consensus layer's own root into the execution
+header.<Cite src="eip-4844" /><Cite src="eip-4788" /> That last one matters more than its size
+suggests, and lesson 5 uses it.
+
+### The field that breaks the pattern
+
+Everything root-shaped in that header is a Merkle Patricia root — except one.
+
+`requests_hash`, added by EIP-7685, is a SHA-256 accumulator. The EIP defines it by hashing each
+non-empty request object, ordering the intermediate hashes by request type ascending, skipping request
+types with empty data, and taking the SHA-256 of the concatenated intermediate
+digests.<Cite src="eip-7685" /> No trie, no RLP node structure, no keccak.
+
+<Misconception
+  belief="Every root-shaped field in a block header is a Merkle Patricia Trie root."
+  reality="requestsHash, added in Pectra, is a SHA-256 commitment over request digests rather than an MPT root."
+  why="Four of the five root-shaped fields are MPT roots, so the pattern is overwhelming and nobody re-reads the fifth. The 'Hash' rather than 'Root' in its name is the only hint in the field list itself."
+  src="eip-7685"
+/>
+
+Do not read this as an inconsistency to be tidied up. It is a signal: the header's newer commitments
+are chosen per use case, and SHA-256 over a short list is cheaper than a trie for data nobody needs to
+prove membership *within*. If you build a header parser that pattern-matches "32 bytes near the end
+must be an MPT root", it will be wrong here and probably wrong again later.
+
+<Figure
+  caption="Each commitment has its own key space, which is why no one of them can be derived from another."
+  alt="A block header holding five commitments: transactions root and receipts root keyed by index within the block, state root keyed by the hashed address, withdrawals root, and requests hash, which is a SHA-256 accumulator rather than a trie root."
+>
+  <Tree
+    root={{
+      label: 'block header',
+      note: 'hashed into the block hash',
+      tone: 'accent',
+      children: [
+        { label: 'txs_root', note: 'MPT, key = rlp(index)' },
+        { label: 'receipts_root', note: 'MPT, key = rlp(index)' },
+        { label: 'state_root', note: 'MPT, key = keccak(address)', tone: 'accent' },
+        { label: 'withdrawals_root', note: 'MPT, no transactions' },
+        { label: 'requests_hash', note: 'SHA-256 over digests', tone: 'warn' },
+      ],
+    }}
+  />
+</Figure>
+
+## Two of these tries are throwaway
+
+Now the structural surprise.
+
+The transactions and receipts tries are not maps in the sense the state trie is. EIP-2718 defines them
+precisely: the transaction root must be the root of `patriciaTrie(rlp(Index) => Transaction)`, where
+`Index` is the transaction's index in this block, and the receipt root is
+`patriciaTrie(rlp(Index) => Receipt)` with the matching index.<Cite src="eip-2718" />
+
+Keyed by position. In one block. Nothing carries forward.
+
+So there is no protocol-level mapping from a transaction hash to a transaction. None. The trie can
+answer "what was the fourth transaction in block N", and it cannot answer "where is transaction
+0xabc…" at all.
+
+**Every hash lookup you have ever done is a client-side index.** `eth_getTransactionByHash`,
+`eth_getTransactionReceipt`, the explorer search bar — all of them are built on a database a node
+operator chose to maintain outside consensus. That is why:
+
+- a node that has pruned or never built the index cannot answer, even though it is fully synced and
+  perfectly correct;
+- behaviour differs between providers, and between the same provider's tiers;
+- a receipt fetched by hash is *not* self-verifying — the index told you which block to look in, and
+  nothing in the response proves the index was honest.
+
+EIP-7745 exists as a proposal to give logs and transactions a trustless, protocol-level index; treat
+it as a live proposal rather than something you can build against.<Cite src="eip-7745" />
+
+<Misconception
+  belief="The transactions trie is how a node looks up a transaction by hash."
+  reality="It is keyed by index within one block and discarded afterwards. Hash-to-transaction lookup is a client-side index maintained outside consensus."
+  why="Explorers and RPC providers make hash lookup feel like the chain's native access pattern — it is the first thing anyone does with a transaction. The index is so universally available that its absence from the protocol is invisible."
+  src="execution-specs"
+/>
+
+### The values are not plain RLP any more
+
+One decoder trap, straight from the spec. Since EIP-2718, the *value* stored in these tries is
+`TransactionType || TransactionPayload` for typed transactions, and plain
+`rlp([nonce, gasPrice, gasLimit, to, value, data, v, r, s])` only for legacy
+ones.<Cite src="eip-2718" /> Receipts follow the same rule: `TransactionType || ReceiptPayload`, with
+the type byte matching the transaction at that index.<Cite src="eip-2718" />
+
+A hand-written verifier that RLP-decodes the leaf and expects a list will work on legacy transactions
+and fail on everything modern. The failure mode is a decode error on data that is perfectly valid,
+which sends people looking for a proof bug that is not there.
+
+## What a receipt is
+
+The receipt's shape is in the same specification: `rlp([status, cumulativeGasUsed, logsBloom,
+logs])`.<Cite src="eip-2718" />
+
+**`status` was not always a status.** Before Byzantium the first field was the state root *after that
+transaction*. EIP-658 replaced it with a success code, because computing an intermediate state root per
+transaction is expensive and a success flag is what consumers actually
+wanted.<Cite src="eip-658" /> Pre-2017 diagrams showing a post-state root in the receipt are still
+widely copied and are simply describing an older chain.
+
+**`cumulativeGasUsed` is cumulative for the block**, not for the transaction. It is the running total
+up to and including this transaction, so a single transaction's gas is the difference between
+consecutive receipts.<Cite src="eip-2718" /> The JSON-RPC layer normalises this away by returning both
+`gasUsed` and `cumulativeGasUsed`, which is convenient and hides the distinction
+entirely.<Cite src="execution-apis" /> Anyone verifying a receipt against `receipts_root` meets the raw
+field and has to know.
+
+**Logs physically live here.** Not in the state, not in the transaction — in the receipt, committed
+under `receipts_root`. That is the structural reason
+[no opcode can read a log](/c/logs-are-write-only): logs are not in a structure the EVM can address.
+It is also why a log is provable to an outside verifier at all, which the app track leans on heavily.
+
+<Check type="explain" concept="three-block-tries">
+A colleague proposes an audit feature: "For each transaction we care about, store its hash. Later, to
+prove to a regulator that it really happened and really succeeded, hand them the hash and the block
+header — the header commits to everything, so they can check."
+
+Explain precisely what is wrong, and what the design has to become.
+
+<Answer>
+**The header commits to everything, but a hash is not a position, and the tries are keyed by
+position.**
+
+To verify anything under `receipts_root`, the regulator must walk the receipts trie along the path for
+a key — and the key is `rlp(index)`, the transaction's index in its block.<Cite src="eip-2718" /> The
+hash does not give them that index. There is no protocol structure that maps hash to index; the thing
+that would tell them is a client-side index they would have to trust, which is exactly the trust the
+proof was supposed to remove.
+
+**What the design has to become:** store the block number *and* the transaction index, not the hash.
+Then the archive is:
+
+1. the transaction index and block number, which name the trie key;
+2. the receipt itself plus the proof nodes from `receipts_root` down to it;
+3. the transaction itself plus the proof nodes from `txs_root` down to the same index — this is what
+   binds the receipt to the transaction, since the two tries share an index space by
+   specification;<Cite src="eip-2718" />
+4. the block header, which supplies both roots and is itself hashed to the block hash.
+
+Two further points the colleague has not reached yet.
+
+*Decoding.* The leaf values are `type-byte ‖ payload`, not plain RLP lists, for every non-legacy
+type.<Cite src="eip-2718" /> A verifier that assumes RLP lists rejects valid evidence.
+
+*The header still has to be trusted.* All of the above proves "this receipt is committed under this
+header". It does not prove the header is a real, canonical Ethereum block. That is the next lesson,
+and it is the part that is actually hard.
+
+The transferable rule: **the chain's commitments are keyed by position, and every hash-shaped
+identifier you use day to day is an index someone built on top.** Any design that has to survive
+without that index must record positions.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Lesson 5** takes the roots in this header and asks what a device holding nothing else can do with
+them — and, more importantly, how it gets a header it has any reason to believe.
+
+The index-keyed tries explain a whole class of infrastructure. Log filtering, explorer search and
+receipt lookup are all products built in the gap the protocol left, which is why they have
+availability characteristics of their own and why [the logs bloom](/c/logs-bloom) exists as a
+per-block prefilter rather than as a queryable index.
+
+And when you meet [receipts](/c/receipt-contents) again in the app track, the fact that logs are
+committed under `receipts_root` is what makes an event provable to a contract on another chain. It is
+also, precisely, why the thing you can prove is that a log was *emitted* — never that whatever it
+described was true.

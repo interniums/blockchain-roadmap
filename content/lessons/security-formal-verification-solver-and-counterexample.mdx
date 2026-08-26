@@ -1,0 +1,404 @@
+---
+id: security-formal-verification-solver-and-counterexample
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [certora-gentle-intro, a16z-halmos-post, a16z-halmos-config, foundry-forge-testing, certora-cli-options, symbolic-execution-survey-2025, measured-gas-constants, certora-cvl-methods, certora-cvl-rules]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Here is a function that four hundred unit tests will not break, written the way people actually write it:
+
+```solidity
+function average(uint256 a, uint256 b) internal pure returns (uint256) {
+    unchecked {
+        return (a + b) / 2;
+    }
+}
+```
+
+And here is a property that every one of those tests would agree with: the average of two numbers is
+never smaller than the smaller of the two.
+
+Foundry ships a symbolic path in-tree that will take that property and either prove it or hand you the
+inputs that break it. Symbolic tests are Solidity functions named `check*` or `prove*`, and they are
+discovered only when symbolic mode is enabled with `--symbolic`.<Cite src="foundry-forge-testing" />
+
+```solidity
+contract MathSymbolicTest is Test {
+    function check_average(uint256 a, uint256 b) external pure {
+        uint256 average;
+        unchecked {
+            average = (a + b) / 2;
+        }
+        assertGe(average, a <= b ? a : b);
+    }
+}
+```
+
+```bash
+$ forge test --symbolic --match-test check_average
+```
+
+There is no fuzzing here and no sampling. The two parameters are not values; they are two unconstrained
+256-bit symbols, and the machine is being asked a question about all of them at once. It comes back with
+`a` and `b` large enough that `a + b` wraps — a pair no fuzzer had a reason to try, and one that a human
+writing test cases would have had to already suspect.
+
+This lesson is about the machine that answers that question, and about the shape of its answers. You
+already know [symbolic execution](/c/symbolic-execution) as an idea and
+[formal verification](/c/formal-verification) as a category. What follows is the layer underneath both:
+the solver, what it is actually asked, and why its most important reply is one that most tutorials do not
+mention.
+
+## Every tool in this space is a compiler into one engine
+
+Strip the branding off Certora, Halmos, Kontrol and Foundry's symbolic mode and the same architecture is
+underneath all four. Certora describes its own prover as essentially a sophisticated compiler that
+translates the bytecode and the properties into a mathematical formula concisely defining the exact
+conditions under which the program may violate the properties — a formula then fed into existing
+open-source tools that locate bugs and produce proofs.<Cite src="certora-gentle-intro" />
+
+Read that sentence as an architecture diagram, because it is one. There are three stages:
+
+1. **Front end.** Walk the code with symbolic values instead of concrete ones, accumulating the condition
+   under which each path is taken. Certora does this over compiled EVM bytecode — a deliberate choice
+   they call *verify what you execute*, motivated by not trusting the compiler that generated the
+   bytecode from source.<Cite src="certora-gentle-intro" /> Halmos does it over the EVM as
+   well.<Cite src="a16z-halmos-post" />
+2. **Verification-condition generator.** Turn the accumulated path conditions plus the negated property
+   into one formula.
+3. **Solver.** Decide whether that formula has a satisfying assignment.
+
+<Figure
+  caption="The four tools in this module differ in what they accept and how they encode it; the machine that decides is the same one."
+  alt="A verification run drawn as five stages: the specification you supply, a symbolic front end that walks the code and collects path conditions, a verification condition combining those with the negated property, the SMT solver, and its three possible answers."
+>
+  <Flow
+    dir="down"
+    lanes={['you supply it', 'stage one', 'stage two', 'stage three', 'what comes back']}
+    nodes={[
+      { id: 'spec', label: 'specification', note: 'a separate language, or the tests you already have — lesson 3', col: 0, tone: 'accent' },
+      { id: 'fe', label: 'symbolic front end', note: 'walks the code with symbols; bounds and summaries live here — lessons 2 and 4', col: 1 },
+      { id: 'vc', label: 'verification condition', note: 'the path conditions, conjoined with the negated property', col: 2 },
+      { id: 'sv', label: 'solver', note: 'Z3, CVC5, Yices, Vampire — shared by all four tools', col: 3, tone: 'accent' },
+      { id: 'out', label: 'sat, unsat, unknown', note: 'a counterexample, a proof, or nothing at all', col: 4 },
+    ]}
+  />
+</Figure>
+
+The consequence is the reason this lesson exists before any tool-specific lesson: **the solver's
+capabilities and its failure modes are the tool's capabilities and failure modes.** When a verification
+engagement stalls, it stalls in stage three, and everything the practitioner does in response —
+summarizing a function, tightening a bound, splitting a rule — is an attempt to hand stage three a
+formula it can decide.
+
+<Aside kind="note">
+The solvers are not proprietary. Certora names Z3, CVC5, Yices and Vampire and says it uses all of
+them.<Cite src="certora-gentle-intro" /> Halmos ships with Yices as its default `--solver` and a
+60-second default assertion-solving timeout.<Cite src="a16z-halmos-config" /> Foundry's symbolic mode
+requires an SMT solver to be installed and defaults to `z3`.<Cite src="foundry-forge-testing" /> Four
+tools, one small set of engines. The differentiation is entirely in stages one and two.
+</Aside>
+
+## What the solver is actually asked
+
+The formula handed to the solver is not the property. It is the **negation** of the property, conjoined
+with the path conditions. The question is not "is this always true" but "does there exist an input making
+this false".
+
+That inversion is the whole trick, and it explains the shape of every result you will ever read.
+
+- If the negation is **satisfiable**, an input making the property false exists, and the solver hands you
+  one. Property violated.
+- If the negation is **unsatisfiable**, no such input exists anywhere in the modelled space. Property
+  proved.
+- If the solver **cannot decide within the resources given**, you have learned nothing.
+
+Certora's own document is blunt about the third branch: SMT solving is undecidable, and even when all the
+values are booleans the complexity is NP-complete; the solvers *can* fail in certain cases by timing out
+with an inconclusive answer.<Cite src="certora-gentle-intro" /> Halmos' design rationale reaches the same
+place from the other side: fully automatic, complete symbolic testing would require solving the halting
+problem.<Cite src="a16z-halmos-post" />
+
+### The theories, and why the EVM makes them hard
+
+"SMT" is satisfiability *modulo theories* — plain boolean satisfiability extended with decision
+procedures for structured domains.<Cite src="certora-gentle-intro" /> Three of those theories carry
+essentially all of EVM verification:
+
+**Fixed-width bit-vectors** model `uint256` exactly, wrap-around included. This is why the `average`
+counterexample above exists at all: the solver is not reasoning about integers, it is reasoning about
+256-bit words with modular arithmetic, which is what the machine does. It is also why multiplication and
+division are expensive — bit-blasting a 256-bit multiply produces an enormous boolean formula, and
+nonlinear arithmetic is where solve times go superlinear.
+
+**Arrays** model storage and memory: a map from 256-bit keys to 256-bit values, with select and store
+operations. Every `SLOAD` and `SSTORE` becomes a select or a store on that theory.
+
+**Uninterpreted functions** model things you deliberately refuse to unfold — most importantly `keccak256`,
+which no solver can invert and no encoding should try to. It becomes a function symbol that is
+deterministic and otherwise opaque.
+
+<Misconception
+  belief="Symbolic execution is just very thorough fuzzing — it tries a lot more inputs."
+  reality="It tries no inputs. A path is explored once with a symbol standing for every value that could take it, and a solver decides the resulting formula. The cost curve is a function of formula difficulty, not of input count, which is why a bit-shift over a huge space can be instant and one nonlinear multiply can be fatal."
+  why="Both techniques report counterexamples, and both are described as exploring the input space."
+  src="a16z-halmos-post"
+/>
+
+## The counterexample is the deliverable
+
+Practitioners talk about proofs. Day to day, the artifact that changes a decision is the counterexample.
+
+When the negation is satisfiable, the solver returns a **model**: a concrete assignment to every symbol —
+the calldata, the starting storage, the block environment — under which the property is false. Halmos'
+framing of its own job is exactly this two-branch contract: it checks that tests pass for all possible
+inputs by symbolically executing them and verifying that the assertion is never violated, or, if the
+assertion is violated, by providing a counterexample.<Cite src="a16z-halmos-post" />
+
+Three properties make a counterexample worth more than the proof it failed to produce:
+
+**It is concrete.** Not "there may be an overflow in the fee path" but two specific `uint256` values —
+which converts a review comment into a failing test, and that is the difference between a finding an
+engineer argues with and one an engineer fixes.
+
+**It is complete, though not minimal.** Solvers promise no smallest witness, and a raw model often carries
+absurd-looking values like a balance of `2^255`. But every input the property depends on is pinned, so it
+replays deterministically.
+
+**It is checkable without trusting the tool.** This is the part people skip. A counterexample can be
+pasted into a normal concrete test and run. Foundry's symbolic mode does this for you and says so: when
+Forge reports a failure it first replays the concrete input or invariant sequence through the normal
+executor, so the failure is backed by a concrete example.<Cite src="foundry-forge-testing" /> That replay
+step is a soundness check on the tool itself, and its absence in a workflow is a reason for suspicion.
+
+### When the counterexample is not real
+
+Sooner or later a counterexample arrives that cannot happen. The storage it starts from is a state the
+constructor could never produce; the caller is the contract itself; a balance exceeds total supply.
+
+The instinct is to conclude the tool is wrong. It is almost never the right conclusion. The tool answered
+the question you asked, and the question was: *is there any starting state, satisfying the constraints I
+wrote down, in which this property fails?* If you wrote down no constraints on the starting state, the
+solver is entitled to invent one.
+
+So a spurious counterexample is a diagnostic about your specification, and it has exactly two honest
+repairs:
+
+**Add the missing precondition, and pay for it.** Write `require` on the invariant you were assuming —
+say, that the sum of balances equals total supply. This is correct and it is not free: you have now
+*assumed* that property rather than proved it, and it belongs on the list of things the run did not
+establish. In Certora this is the difference between `require` and `requireInvariant`; the latter obliges
+you to have proved the invariant separately.
+
+**Or discover that the state is reachable after all.** This is the good outcome and it happens often
+enough to justify never dismissing a counterexample on sight. The state you called impossible is
+impossible only under an assumption nobody wrote down — and an unwritten assumption an attacker can
+violate is the shape of most real findings.
+
+<Aside kind="warn">
+Adding preconditions has a failure mode with no error message: assume enough and the property becomes
+**vacuously** true, proved because no execution satisfies the hypotheses at all. Certora treats this as a
+first-class risk and implements vacuity checking for it, flagging tautological invariants of the form
+`x = 5 => x > 0` as potentially incorrect specifications.<Cite src="certora-gentle-intro" /> A rule that
+went from failing to passing right after you added a `require` deserves a look at whether it can still
+fail *at all*.
+</Aside>
+
+## Three outcomes, and the one that gets misfiled
+
+Most material on this subject presents a binary: verified or not verified. The tools do not.
+
+Foundry's symbolic mode publishes its result vocabulary explicitly, and it has three
+values:<Cite src="foundry-forge-testing" />
+
+<Matrix
+  corner="Outcome"
+  cols={['What the solver established', 'Correct response']}
+  rows={[
+    { label: 'PASS', cells: [
+      'Every explored path finished without a feasible failure under the currently modelled semantics and configured bounds',
+      'Record the bounds alongside the pass',
+    ] },
+    { label: 'FAIL', cells: [
+      'The solver found a failing input or sequence, and Forge replayed it concretely before reporting it',
+      { v: 'Fix, then keep the replay as a regression test', tone: 'good' },
+    ] },
+    { label: 'Incomplete', cells: [
+      'Forge could not complete the search or validate a counterexample',
+      { v: 'Treat as "not established", not as a proof', tone: 'warn' },
+    ] },
+  ]}
+  caption="Only one of the three outcomes is a proof, and only one of them is nothing at all."
+  alt="The three outcomes Foundry's symbolic mode reports - PASS, FAIL and Incomplete - with what the solver established in each case and the correct response."
+/>
+
+That third row is the load-bearing one, and Foundry's docs say so in the same words: treat it as "not
+established", not as a proof.<Cite src="foundry-forge-testing" /> The same doc puts a fence around the
+first row too — a `PASS` is scoped to the current symbolic model and configured bounds, and does not
+cover skipped dynamic lengths, deeper invariant sequences, larger loop bounds, unmodelled behaviour,
+arbitrary unknown external code, or cryptographic preimage and collision
+properties.<Cite src="foundry-forge-testing" />
+
+Two lessons from now, that fence is the entire subject. For now, notice only that the vendor prints it
+next to the green result, and that nobody reads it.
+
+<Misconception
+  belief="A timeout means the property is probably fine — nothing was found."
+  reality="A timeout is the absence of a result. The solver did not search the space and fail to find a violation; it failed to search the space. The valid responses are to decompose the property, summarize something, tighten a bound, or change the encoding."
+  why="A timeout looks like flaky infrastructure — the same shape as a CI runner dying — rather than like an answer, so it gets retried and then ignored."
+  src="certora-gentle-intro"
+/>
+
+## Worked example: hand-compiling one function into a query
+
+Take a fee split that any reviewer would pass on sight, and run it through the three stages by hand. The
+point is not the bug; it is to see what the solver receives.
+
+```solidity
+function split(uint256 amount, uint16 feeBps) public pure returns (uint256 fee, uint256 rest) {
+    require(feeBps <= 10_000, "bad bps");
+    fee = (amount * feeBps) / 10_000;
+    rest = amount - fee;
+}
+```
+
+The property: **`fee + rest == amount` for all inputs.** Conservation. Nothing may be created or
+destroyed by splitting.
+
+**Subgoal: replace inputs with symbols so one walk covers every value.** `amount` becomes a 256-bit
+symbol `A`; `feeBps` becomes a 16-bit symbol `F`. No values are chosen. From here every expression is a
+term over `A` and `F`, not a number.
+
+**Subgoal: collect the condition under which this path is taken.** The `require` splits execution in two.
+The revert branch is uninteresting — the property is not claimed about reverting executions — so the path
+condition for the branch we care about is `F <= 10000`. This is the first conjunct of the formula, and it
+is doing real work: without it the solver would be free to pick `F = 65535`.
+
+**Subgoal: encode the arithmetic in the theory the machine actually uses.** `fee` becomes
+`bvudiv(bvmul(A, zero_extend(F)), 10000)` over 256-bit vectors — unsigned multiply and unsigned divide,
+both truncating and both wrapping. `rest` becomes `bvsub(A, fee)`. Notice what has silently entered: a
+multiply of a 256-bit symbol by a 16-bit one is nonlinear over bit-vectors, and this is the term that
+will dominate solve time on any larger version of this function.
+
+**Subgoal: negate the property, because you are hunting a witness.** The query is not `fee + rest == A`.
+It is:
+
+```text
+F <= 10000
+AND fee  = bvudiv(bvmul(A, F), 10000)
+AND rest = bvsub(A, fee)
+AND NOT (bvadd(fee, rest) == A)
+```
+
+**Subgoal: read the answer as one of three, not one of two.** `unsat` means conservation holds for every
+one of the roughly `2^272` input pairs, including the ones where the multiply wraps — a claim no fuzzing
+budget can make. `sat` would hand you an `A` and an `F`. `unknown` would mean the nonlinear multiply beat
+the solver, and would say nothing about whether the property holds.
+
+**Subgoal: notice what the query does not contain.** There is no `msg.sender`, no storage, no block
+number, no gas. `split` is `pure`, so the model is small — and *that*, not the difficulty of the property,
+is why pure arithmetic is where symbolic tools are strongest and where a first engagement should start.
+Add one `SLOAD` and the array theory enters. Add one external call to an unknown address and you have a
+modelling decision on your hands that the next lessons are about.
+
+<Aside kind="note">
+This is also the honest answer to "why is my verification run slow when my contract is cheap". Solve time
+tracks formula difficulty, which tracks nonlinear arithmetic, unbounded loops and unresolved calls. It
+does not track gas. A function that costs 2,100 gas for one cold `SLOAD`<Cite src="measured-gas-constants" />
+may cost the solver nothing at all, while an `unchecked` multiply costing 5 gas can be the term that
+times out the run.
+</Aside>
+
+## Where the academic view lands
+
+The 2025 survey of symbolic execution in practice is worth reading precisely because it is not written by
+anyone selling a tool: it is the peer-reviewed framing of what the technique can and cannot
+do.<Cite src="symbolic-execution-survey-2025" /> The recurring limits it catalogues are the same three
+you have now met by hand — path explosion, solver cost on nonlinear constraints, and the modelling of
+code the analysis cannot see.
+
+Keep that list. Every practical technique in this module is a trade against one of those three, and each
+trade costs something specific from the strength of the result.
+
+<Check type="explain" concept="counterexample">
+A colleague runs a symbolic test suite over a vault and sends you the summary below, with the note
+"three green, one flaky, shipping it".
+
+```text
+check_totalAssetsNeverDecreases       PASS   (2m 41s)
+check_sharePriceMonotonic             PASS   (0.3s)
+check_redeemRoundsDown                FAIL   counterexample: shares=1, totalSupply=0, totalAssets=115792089237316195423570985008687907853269984665640564039457584007913129639935
+check_noDoubleWithdraw                Incomplete: solver timeout after 60s
+```
+
+For each of the four lines, say what has actually been established and what you would do next. Then say
+which single line most changes your view of the vault, and why.
+
+<Answer>
+**`check_totalAssetsNeverDecreases` — PASS, and the only one of the two passes worth anything yet.**
+A pass is scoped to the current model and the configured bounds; it does not cover deeper sequences,
+larger loop bounds, or arbitrary unknown external code.<Cite src="foundry-forge-testing" /> So the next
+question is not "is it green" but "at what bounds". If this ran at Halmos' shipped defaults, that means a
+loop unrolling bound of 2 and an invariant depth of 2 — sequences of two calls, loops unrolled
+twice.<Cite src="a16z-halmos-config" /> Two minutes forty-one of solve time also tells you the formula is
+near the edge; a small code change may push it into the fourth line's category.
+
+**`check_sharePriceMonotonic` — PASS in 0.3 seconds, and that number is the suspicious part.**
+A property over a vault's share price that discharges in 300 milliseconds either is trivially true, or is
+vacuous. Vacuity is a first-class failure mode: assume enough in your preconditions and the property holds
+because no execution satisfies the hypotheses, which is why Certora implements checks for exactly this
+pattern.<Cite src="certora-gentle-intro" /> Next step: mutate the contract — invert the rounding, delete
+the update — and confirm the rule goes red. A rule that cannot fail is not a rule.
+
+**`check_redeemRoundsDown` — FAIL, and this is a real finding until proven otherwise.**
+`totalSupply=0` with `totalAssets` at `2^256 - 1` looks unreachable, and the reflex is to dismiss it. Do
+not. There are exactly two honest resolutions. Either the state is genuinely unreachable, in which case
+the specification is missing a precondition — most likely `totalSupply > 0` or the conservation invariant
+relating supply to assets — and adding it moves that relationship onto the list of things this run assumed
+rather than proved. Or the state *is* reachable, and an empty vault with donated assets is the
+[ERC-4626 inflation attack](/c/inflation-first-depositor-attack) you already met on the Solidity track,
+arriving here as a solver model instead of an exploit write-up. Deciding which requires reading the
+constructor and every path that can zero the supply — that is the work, and it is not optional.
+
+**`check_noDoubleWithdraw` — Incomplete, and "flaky" is the wrong word for it.**
+Nothing was established. Foundry's own documentation says to treat this outcome as "not established", not
+as a proof.<Cite src="foundry-forge-testing" /> A 60-second cutoff is also the shipped default for
+Halmos' assertion solving,<Cite src="a16z-halmos-config" /> so this is not an infrastructure fault, it is
+the tool doing what it was configured to do. The valid moves are to decompose the property into smaller
+ones, summarize whatever external call is making the formula hard, tighten a bound, or raise the timeout —
+and Certora's own guidance on the last option is discouraging: if a rule is not solved in 600 seconds it
+will generally not be solved in 2,000 either, and the effort is better spent simplifying the
+rule.<Cite src="certora-cli-options" />
+
+**Which line most changes your view: the `Incomplete` one.**
+The FAIL is a candidate bug with a reproduction attached, which is a normal Tuesday. The `Incomplete` is
+the one that will be misfiled, because it looks like infrastructure noise and it will be reported upward
+as "three of four properties verified". It is the property about double withdrawal — plausibly the most
+valuable of the four — and the honest count is **one property established at unstated bounds, one
+suspicious pass, one open finding, and one unanswered question.** The colleague's summary of "three green,
+one flaky" contains four errors of reading, and every one of them is the kind that survives into a report.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The next lesson** takes the bounds seriously. Halmos ships a loop unrolling bound of 2 and an invariant
+depth of 2 by default;<Cite src="a16z-halmos-config" /> Certora unrolls one iteration unless you say
+otherwise.<Cite src="certora-cli-options" /> Those numbers decide what a green result covers, and the
+difference between unrolling a loop and reasoning about it inductively is the structural difference
+between the tools.
+
+**The lesson after that** is where the specification comes from, and what it costs — the choice between
+reusing your existing Foundry tests and learning a separate language whose rules quantify over every
+method in the contract.<Cite src="certora-cvl-rules" />
+
+**Then the exclusions.** Every technique for making a formula tractable removes something from the region
+the proof covers. Summaries, optimistic flags and bounds each buy termination with coverage, and the list
+of them is the part of a verification report that carries the information.<Cite src="certora-cvl-methods" />
+
+**And on the audit-craft side**, a counterexample is already most of a
+[proof of concept](/c/poc-as-proof): concrete inputs, deterministic replay, and a failing test the fix can
+be validated against. The step from solver model to finding is shorter than it looks.

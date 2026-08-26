@@ -1,0 +1,356 @@
+---
+id: app-error-surfaces-a-revert-is-bytes
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [measured-revert-surfaces-1-7-1, solidity-docs-src-control-structures, solidity-error-handling, solidity-custom-errors-blog, viem-src-decode-error-result, foundry-cast-reference]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+One contract, ten ways to fail, one channel out.
+
+Here is what a client actually receives. A `Prober` contract makes a low-level call into a `Target`
+and returns the raw revert bytes without interpreting them, so nothing between the EVM and this
+table has had a chance to be helpful. Compiled with solc 0.8.36, deployed to anvil 1.7.1, read back
+with `cast call`:<Cite src="measured-revert-surfaces-1-7-1" />
+
+```text
+require(x > 10, "amount too small")
+  0x08c379a000000000000000000000000000000000000000000000000000000000000000200000
+    000000000000000000000000000000000000000000000000000000000010616d6f756e742074
+    6f6f20736d616c6c00000000000000000000000000000000
+
+revert InsufficientBalance(5, 100)
+  0xcf479181000000000000000000000000000000000000000000000000000000000000000500000
+    00000000000000000000000000000000000000000000000000000000064
+
+require(x >= 100, InsufficientBalance(5, 100))
+  0xcf479181000000000000000000000000000000000000000000000000000000000000000500000
+    00000000000000000000000000000000000000000000000000000000064
+
+assert(1 == 2)
+  0x4e487b710000000000000000000000000000000000000000000000000000000000000001
+1 - 2
+  0x4e487b710000000000000000000000000000000000000000000000000000000000000011
+1 / 0
+  0x4e487b710000000000000000000000000000000000000000000000000000000000000012
+arr.pop() on empty array
+  0x4e487b710000000000000000000000000000000000000000000000000000000000000031
+arr[3] on a length-0 array
+  0x4e487b710000000000000000000000000000000000000000000000000000000000000032
+
+revert()
+  0x
+require(x > 10)      // no message
+  0x
+```
+
+Ten failure paths. Four of them come out of the compiler's own safety checks and share a prefix.
+Two are business rules and share a different prefix. Two produce nothing at all. And the third row
+is worth staring at: `require(x >= 100, InsufficientBalance(5, 100))` produces **byte-identical**
+output to `revert InsufficientBalance(5, 100)`. On solc 0.8.36 the old rule of thumb — `require`
+means a string, `revert` means a custom error — is not merely out of date, it is unobservable from
+the wire.<Cite src="measured-revert-surfaces-1-7-1" />
+
+You already know [how revert data is encoded](/c/revert-data-encoding) and where
+[an error selector](/c/sol-error-selector) comes from. This module is about the other end of that
+wire: the code you write that receives these bytes and has to turn them into a sentence a person
+can act on. This lesson establishes the shape of the problem, because the shape is smaller and
+stranger than most application code assumes.
+
+<Figure
+  caption="The module runs one direction: bytes the EVM never looks at become a sentence naming what to do next."
+  alt="A downward chain of five stages — revert return data, the four shapes it can take, the union ABI that decodes the fourth, gas estimation as a separate failure surface, and the four triage buckets — annotated with the lessons that cover each."
+>
+  <Flow
+    dir="down"
+    lanes={['the wire', 'lessons 1-4', 'lesson 5', 'lessons 6-7', 'lesson 8']}
+    nodes={[
+      { id: 'bytes', label: 'return data', note: 'REVERT hands back a byte string', col: 0 },
+      { id: 'shapes', label: 'four shapes', note: 'empty, Error, Panic, custom', col: 1, tone: 'accent' },
+      { id: 'abi', label: 'union ABI', note: 'every contract the call reaches', col: 2 },
+      { id: 'est', label: 'gas estimation', note: 'a search, four ways to throw', col: 3, tone: 'warn' },
+      { id: 'bucket', label: 'four buckets', note: 'each names a next action', col: 4, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+## The EVM has no notion of an error
+
+When execution stops with `REVERT`, the opcode takes two stack items: an offset into memory and a
+size. State changes in the frame are undone, the remaining gas is returned to the caller, and the
+memory region named by those two items is made available to the caller as return
+data.<Cite src="solidity-docs-src-control-structures" />
+
+That is the entire mechanism. The EVM does not read those bytes. It does not require them to be
+non-empty, does not check that they begin with anything in particular, and has no concept of an
+error type, an error code, or a severity. `REVERT` with a size of zero is exactly as valid as
+`REVERT` with 68 bytes of carefully structured data.
+
+Everything above the opcode is convention. Solidity's convention is: encode the failure the same
+way you would encode a call to a function, so a decoder that already knows how to parse ABI data
+can parse errors with no new machinery. That convention is why `Error(string)` has a selector at
+all, and why a custom error is described in the language documentation as being encoded "as if it
+were a call to a function".<Cite src="solidity-docs-src-control-structures" />
+
+<Aside kind="note">
+There is no channel here comparable to an HTTP status code. HTTP gives you a small, closed,
+universally-known integer that every client can branch on before it has parsed a single byte of
+body. A revert gives you a byte string whose meaning lives in an artifact — the ABI — that the
+client must already possess. The nearest HTTP analogue is not `409 Conflict`; it is a `200` whose
+body is a protobuf you may or may not have the schema for.
+</Aside>
+
+This has a consequence that shapes everything downstream. Two different contracts can revert with
+the same four bytes and mean unrelated things. The same contract can revert with the same four
+bytes from two call sites and mean the same thing. Nothing on chain records which. The mapping from
+bytes to meaning is a build-time artifact you ship in your bundle, and if you ship the wrong one,
+nothing anywhere will tell you.
+
+## The bytes are a copy, and every frame gets a vote
+
+There is a second consequence of "the EVM does not read the bytes", and it is the one that
+surprises people who have only ever seen errors arrive intact. Revert data lands in the caller's
+return-data buffer, and what happens next is entirely up to the caller's code. A high-level
+Solidity call propagates the failure and forwards the data upward, which is why a revert from four
+contracts deep usually reaches you unchanged. But that forwarding is generated code making a
+choice, not a rule of the machine.
+
+The language documentation is explicit that the low-level functions are the exception: `send`,
+`call`, `delegatecall` and `staticcall` do not bubble at all — they return `false` as their first
+value and leave the data sitting in the buffer for you to read or
+ignore.<Cite src="solidity-docs-src-control-structures" /> Every `try`/`catch` block, every
+`(bool ok, bytes memory ret) = target.call(...)` in a router, every multicall aggregator with an
+`allowFailure` flag is a point where the original bytes can be dropped, wrapped, replaced with a
+generic error of the caller's own, or forwarded verbatim. The prober used to capture the table
+above works precisely because it takes the "read it" branch instead of the "bubble it" branch.
+
+So the bytes that reach your client are not necessarily the bytes the failing contract produced.
+They are whatever survived the [bubbling path](/c/revert-bubbling) through every intermediate
+frame, and then survived the node, and then survived your RPC provider. Three of those four stages
+are code somebody else wrote. Keep that in mind when a decode comes back as a selector you cannot
+find in any contract in your call graph — the plausible explanation is not always "I am missing an
+ABI"; sometimes an intermediate contract replaced the original failure with one of its own.
+
+## Four shapes, and no fifth
+
+Sort the table above by prefix and the space collapses. Revert data arrives in exactly four
+shapes.<Cite src="solidity-docs-src-control-structures" /><Cite src="solidity-error-handling" />
+
+**Shape one: zero bytes.** No selector, no arguments, nothing. Produced by `revert()`, by
+`require(cond)` with no second argument — the documentation is explicit that this reverts "with
+empty error data, not even including the error
+selector"<Cite src="solidity-docs-src-control-structures" /> — and, as the next lessons show, by
+several causes that have nothing to do with your business logic at all.
+
+**Shape two: `Error(string)`, selector `0x08c379a0`.** The legacy structured path. A selector
+followed by an ABI-encoded `string`: an offset word, a length word, and the padded UTF-8 bytes.
+
+**Shape three: `Panic(uint256)`, selector `0x4e487b71`.** A selector followed by exactly one word
+holding a numeric code. Emitted by the compiler's own inserted checks and by a failing `assert`,
+never by your business logic.
+
+**Shape four: a custom error.** Any other four-byte selector, followed by the ABI encoding of that
+error's declared arguments. `InsufficientBalance(uint256,uint256)` hashes to `0xcf479181`, and the
+two `uint256` arguments follow as two 32-byte words.<Cite src="measured-revert-surfaces-1-7-1" />
+
+<Figure
+  caption="The fourth shape splits again on a question the chain never answers: did you ship the ABI."
+  alt="A tree from revert return data to four shapes — empty, the Error(string) selector 0x08c379a0, the Panic(uint256) selector 0x4e487b71, and any other four bytes — with the fourth branching into a decodable custom error when the ABI is present and a bare selector when it is not."
+>
+  <Tree root={{ label: 'revert return data', tone: 'accent', children: [
+    { label: '0x', note: 'no selector at all', tone: 'warn' },
+    { label: '0x08c379a0', note: 'Error(string)' },
+    { label: '0x4e487b71', note: 'Panic(uint256)' },
+    { label: 'any other 4 bytes', note: 'a custom error', children: [
+      { label: 'in your ABI', note: 'name and typed args', tone: 'good' },
+      { label: 'not in your ABI', note: 'four bytes, nothing more', tone: 'danger' },
+    ] },
+  ] }} />
+</Figure>
+
+There is no fifth shape, because there is nowhere for one to come from. Anything that is not empty
+and does not match the two built-in selectors is, by construction, "some selector plus some
+arguments" — that is all the ABI encoding can express. The Solidity documentation notes that other
+kinds of error data are *planned*, which tells you the same thing from the other
+direction.<Cite src="solidity-docs-src-control-structures" />
+
+The practical shape of this is that a revert decoder is a four-way branch, written once:
+
+```ts
+type Shape =
+  | { kind: 'empty' }
+  | { kind: 'error-string'; reason: string }
+  | { kind: 'panic'; code: bigint }
+  | { kind: 'custom'; selector: Hex; name?: string; args?: readonly unknown[] }
+  | { kind: 'unknown-selector'; selector: Hex; raw: Hex }
+```
+
+Five variants for four shapes, because the fourth splits on a question that has nothing to do with
+the chain: did you happen to ship the ABI that defines this selector. That split is where most
+production error handling quietly falls over, and it is the subject of two later lessons.
+
+<Misconception
+  belief="A revert carries a human-readable reason."
+  reality="It carries ABI-encoded bytes. A reason exists only if the client holds a matching ABI and decodes it, and a custom error contains no text of any kind — only a hash-derived selector and typed arguments."
+  why="A decade of engineers learned this from pre-0.8.4 `require(cond, 'message')`, where the reason really was a string sitting in the bytes, and where every tooling surface printed it for free."
+  src="solidity-custom-errors-blog"
+/>
+
+## Worked example: decode one of them by hand
+
+Take the second row of the table. The point of doing this manually once is that afterwards you will
+recognise, at a glance, which of the four shapes a hex string is — and, more usefully, when a
+library has decoded it *wrongly*.
+
+<Figure
+  caption="Sixty-eight bytes, of which four name the error and sixty-four are the entire message."
+  alt="The payload 0xcf479181 followed by two 32-byte words, bracketed as the 0x prefix, the four-byte selector, the first argument holding 5, and the second argument holding 100."
+>
+  <Anatomy
+    value="0xcf47918100000000000000000000000000000000000000000000000000000000000000050000000000000000000000000000000000000000000000000000000000000064"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 10, label: 'selector', note: 'cf479181', tone: 'accent' },
+      { from: 10, to: 74, label: 'arg 1', note: '5' },
+      { from: 74, to: 138, label: 'arg 2', note: '100' },
+    ]}
+  />
+</Figure>
+
+**Subgoal 1 — establish which shape this is, before attempting any decode.** Length is 4 + 64 = 68
+bytes, so it is not empty. The first four bytes are `cf479181`, which is neither `08c379a0` nor
+`4e487b71`. Therefore: shape four, a custom error. Note what this step did *not* require — no ABI,
+no network call, no library. Shape classification is free and always available.
+
+**Subgoal 2 — recover the signature, and notice that this step is not free.** Four bytes are the
+first four bytes of `keccak256` over a canonical signature. Hashes do not invert. The only way from
+`0xcf479181` to a name is a table you already hold or a lookup service you ask. Here we hold it:
+the contract declares `error InsufficientBalance(uint256 available, uint256 required)`, and
+`cast sig "InsufficientBalance(uint256,uint256)"` returns `0xcf479181`, which confirms the
+match.<Cite src="measured-revert-surfaces-1-7-1" /><Cite src="foundry-cast-reference" />
+
+**Subgoal 3 — decode the arguments using the signature's types, not the bytes' appearance.** Both
+declared parameters are `uint256`, both are static, so each occupies one 32-byte word in order.
+Word one is `0x05` = 5. Word two is `0x64` = 100. The error means: available 5, required 100.
+
+**Subgoal 4 — state what the client can now render that it could not before.** Not a sentence
+somebody wrote at contract-authoring time, but two numbers with known types and known roles. The
+interface can format them in the token's decimals, compare them, compute the shortfall of 95, and
+say "you need 95 more" — a sentence the contract author never wrote and could not have written,
+because they did not know the amounts. That is the whole trade custom errors make: they hand you
+structured data instead of prose, and hand you the obligation to write the prose yourself.
+
+**Subgoal 5 — name what would have gone wrong without step 2.** Suppose you did not hold the ABI
+and guessed a signature with one `uint256` argument instead of two. The decode succeeds. It reads
+word one, returns 5, and silently discards word two. Nothing errors, nothing warns; you get a
+plausible wrong answer. ABI decoding does not validate that the data length matches the declared
+types, which is why a selector lookup that returns a *candidate* signature is a hypothesis rather
+than an identification. The next lessons make that concrete with a live example.
+
+## Why "the four shapes" is the useful abstraction
+
+Most application code does not have a four-way branch. It has a chain of string matches against
+`error.message`, accreted one incident at a time: check for `"user rejected"`, check for
+`"insufficient funds"`, check for `"execution reverted"`, fall through to a toast that prints
+whatever is left. Every one of those checks is a guess about the phrasing chosen by a library
+version, a node implementation, and an RPC provider, none of which promised you anything.
+
+Branching on shape is different in kind. The four shapes are a property of the encoding, not of
+anybody's phrasing. `0x08c379a0` is `Error(string)` on geth, on reth, on anvil, on every L2, in
+2021 and in 2026, regardless of which provider wrapped the response or what English it put in the
+`message` field. viem builds this in at the lowest level: its decoder appends the built-in `Error`
+and `Panic` definitions to whatever ABI you pass, so those two shapes decode even if you pass an
+empty array.<Cite src="viem-src-decode-error-result" />
+
+The payoff is that the shapes carry different *actions*, and they do so reliably:
+
+- **Empty** tells you the failure did not identify itself, which means the next step is
+  contextual — how much gas was supplied, does the target hold code, is a proxy pointing anywhere.
+- **`Error(string)`** hands you text an author wrote. You can show it, but you cannot branch on it
+  safely, because it is prose in whatever language the contract author typed.
+- **`Panic(uint256)`** tells you the *contract* is broken, not the request. This is the one shape
+  whose correct destination is your alerting system rather than the user's screen.
+- **A custom error** is the only shape carrying machine-usable structure, and therefore the only
+  one from which you can generate a specific next action.
+
+That is four distinct product behaviours, decided by a four-way branch on bytes that cannot drift.
+Nothing else in error handling is this stable, which is why it is worth building the branch first
+and everything else on top of it.
+
+<Misconception
+  belief="Custom errors are just a cheaper way of writing the same thing."
+  reality="They change what the client receives, from prose to typed data. Byte size falls, but the load-bearing change is that the message stops existing on chain and starts being your responsibility to compose."
+  why="The 0.8.4 announcement framed them as a cost saving, which is true and is the smaller half of the story. The reason no trustworthy runtime gas comparison is quotable is a separate problem — published figures come from benchmarks with unstated optimiser settings and disagree with each other."
+  src="solidity-custom-errors-blog"
+/>
+
+<Check type="predict" concept="four-revert-shapes">
+You are handed four hex strings captured from four different failed calls against four different
+contracts you know nothing about. Without any ABI, and without any network access, say as much as
+you can about each — and say precisely where your knowledge stops.
+
+```text
+A  0x
+B  0x4e487b710000000000000000000000000000000000000000000000000000000000000032
+C  0x08c379a00000000000000000000000000000000000000000000000000000000000000020
+     000000000000000000000000000000000000000000000000000000000000000e
+     4e6f7420656e6f75676820455448000000000000000000000000000000000000
+D  0x7939f4240000000000000000000000000000000000000000000000000000000000000001
+```
+
+<Answer>
+**A — shape one, empty.** You know the call reverted and you know the revert carried no data. You
+know nothing else, and crucially you cannot tell a deliberate `revert()` from an out-of-gas
+failure, an `INVALID` opcode, or a call to an address holding no code. Every one of those produces
+exactly these zero bytes.<Cite src="measured-revert-surfaces-1-7-1" /> The next step is not
+decoding, it is context.
+
+**B — shape three, `Panic(uint256)`, code `0x32`.** You can decode this completely with no ABI,
+because the shape is built into the language: selector `0x4e487b71`, one `uint256` argument,
+value `0x32` = 50. Per the normative table that is an out-of-bounds array, `bytesN`, or array-slice
+index.<Cite src="solidity-docs-src-control-structures" /> You now know something important about a
+contract you have never seen: it has a bug, or it was handed input it failed to validate. What you
+do *not* know is which line — panics carry no location.
+
+**C — shape two, `Error(string)`.** Selector `0x08c379a0`, then an offset of `0x20`, a length of
+`0x0e` = 14, and 14 bytes that decode as `Not enough ETH`. Again, no ABI needed. You can show that
+string to a user. You cannot safely branch on it: the same condition in another contract might say
+"insufficient ETH", "value too low", or nothing at all.
+
+**D — shape four, a custom error, selector `0x7939f424`.** This is where knowledge stops. You know
+the data is well-formed as "selector plus one 32-byte word", so *if* the signature has exactly one
+static parameter the argument is 1. You do not know the error's name. You do not know whether that
+word is a `uint256` of 1, a `bool` of `true`, or an `address` of `0x…0001` — the encoding of all
+three is identical, and only the declared type disambiguates them. You do not even know the
+parameter count: a signature with one `uint256` and a signature with one dynamic `bytes` would both
+be accepted by a naive decoder against different readings of the same word.
+
+**The general shape of the answer.** Three of the four classified themselves with no external
+information, and two of those decoded fully. The fourth needs an artifact you either shipped or did
+not. That asymmetry — free classification, expensive identification — is the reason the four-way
+branch belongs at the bottom of your error stack and the ABI lookup belongs above it, rather than
+the other way round.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The next lesson** takes the two shapes your own contracts choose between — `Error(string)` and a
+custom error — and works through what changes on the client when the text stops arriving. Including
+the fact, measured above, that `require` and `revert` no longer tell you which one you are getting.
+
+**Then panics**, which are the one shape with a fixed, published meaning and a hard rule attached:
+they are never a message for the user.
+
+**Then the empty case**, which has more distinct causes than anyone expects and is triaged by
+context rather than content — and the four-byte selector, which turns out not to identify anything
+uniquely at all.
+
+**After that the client side proper**: how viem gets from a thrown action error down to the bytes,
+what its decoder does when the selector is not in your ABI, and why the contract that reverted is
+so often not the contract you called.
+
+**Then gas estimation**, which is a different failure surface entirely — one where the bytes you
+have spent four lessons learning to read are sometimes not sent to you at all.

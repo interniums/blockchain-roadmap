@@ -1,0 +1,399 @@
+---
+id: infra-rpc-economics-provider-is-down
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [viem-fallback-transport, viem-multicall, execution-apis-spec, ethereum-org-json-rpc, quicknode-ethereum-rpc, quicknode-reorg, eth-pos-finality, alchemy-throughput, alchemy-compute-units]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The ticket said the app had charged for the same approval twice. It had.
+
+The flow was ordinary. The user approves the router; the UI reads the allowance back to confirm it
+landed; if the allowance is zero the approve button stays on screen. The approval was mined, the
+receipt came back, the UI re-read the allowance, got zero, and left the button up. The user pressed
+it again.
+
+Two approvals, two gas payments, one angry customer, and nothing at all in the logs. Every request
+returned 200. Every response was well-formed JSON-RPC. The allowance really was zero — at the block
+the node that answered happened to be sitting on, which was one block behind the block containing the
+approval.
+
+That is one half of this lesson. The other half is the case everyone imagines on hearing "the provider
+is down", where requests fail and you can see them fail. Both are the same condition: **your product
+has exactly one way to reach the chain, and it is a service you do not operate.** Nobody decided that.
+It arrived as the default in a scaffold, got copied into a `.env`, and became load-bearing before
+anyone priced it.
+
+This lesson makes the dependency explicit and then removes it twice — once against failure, which is
+a few lines of client configuration, and once against disagreement, which is a discipline.
+
+## Five ways an endpoint fails, and the one you design for
+
+"Down" is a category people plan for because it is the one that looks like an outage. It is also the
+rarest and the least damaging, because it is loud.
+
+<Matrix
+  corner="Failure"
+  cols={['What your code sees', 'Who notices']}
+  rows={[
+    { label: 'Hard down', cells: ['connection refused, 5xx', 'your monitoring, immediately'] },
+    { label: 'Slow', cells: ['responses, eventually', 'users, as a spinner'] },
+    {
+      label: 'Throttled',
+      cells: [
+        <>HTTP 429, or a JSON-RPC error object with code 429<Cite src="alchemy-throughput" /></>,
+        <a href="/c/rate-limit-two-axes">the previous lesson&apos;s whole subject</a>,
+      ],
+    },
+    {
+      label: <strong>Behind</strong>,
+      cells: ['correct-looking data from an older block', { v: 'nobody', tone: 'danger' }],
+    },
+    {
+      label: <strong>Inconsistent</strong>,
+      cells: ['two correct answers that disagree', { v: 'nobody, until a support ticket', tone: 'danger' }],
+    },
+  ]}
+  caption="Read down the list: the further you go, the fewer people find out."
+  alt="Five ways an endpoint fails. Hard down shows connection refused or 5xx and monitoring catches it immediately; slow shows late responses and users see a spinner; throttled shows a 429; behind shows correct-looking data from an older block and nobody notices; inconsistent shows two correct answers that disagree and nobody notices until a support ticket."
+/>
+
+The bottom two rows have a property the top three do not: **there is no error anywhere in the
+system.** Every layer you would normally instrument — HTTP status, response schema, error rate,
+latency — reports success. Your alerting is watching a channel the failure does not use.
+
+<Aside kind="note">
+Notice which failures a status page can tell you about. A provider status page reports the top three
+rows, because those are the ones the provider can measure from its own side. A single node in a fleet
+lagging by two blocks is not an incident by any definition the provider uses, and it is exactly the
+condition that double-charged your user.
+</Aside>
+
+## Correlated, and correlated with the worst moment
+
+One assumption to kill before designing anything: that provider degradation is independent of what is
+happening on chain. It is not. A depeg, a liquidation cascade, a live exploit or a mint everyone wants
+to be early to drives traffic across the whole ecosystem at once — every bot polls harder, every user
+opens the app they otherwise check weekly — so the provider's load and your need for an answer are
+driven by the same event.
+
+The useful design question is therefore not "what is the provider's uptime" but **"what does my
+product do during the fifteen minutes when everybody wants the chain at once"**, because that is the
+window in which the failure actually arrives and being wrong is most expensive.
+
+## The fallback transport, which is the best ratio in this entire track
+
+The structural fix for the top three rows is to have more than one door. viem ships it as a transport
+rather than as a pattern you assemble, which is why this is a configuration change and not a project.
+
+```ts
+// viem 2.x
+import { createPublicClient, fallback, http } from 'viem'
+import { mainnet } from 'viem/chains'
+
+const client = createPublicClient({
+  chain: mainnet,
+  transport: fallback([
+    http(PRIMARY_URL),
+    http(SECONDARY_URL),
+  ]),
+})
+```
+
+The `fallback` transport "consumes **multiple** Transports. If a Transport request fails, it will
+fall back to the next one in the list."<Cite src="viem-fallback-transport" /> Four documented details
+decide how well it behaves.
+
+**It exhausts the list before it retries.** `retryCount` defaults to 3 and `retryDelay` to 150 ms with
+exponential backoff between retry cycles, and the documentation attaches an explicit note to
+`retryCount`: the fallback tries all the transports before retrying any of
+them.<Cite src="viem-fallback-transport" /> That ordering is worth understanding rather than
+accepting. Under a throughput limit, waiting is the wrong move, because the bucket you are waiting on
+belongs to the provider that just rejected you. **A second provider is a second bucket**, so moving
+sideways is strictly faster than waiting — and it is what the default does.
+
+**Ranking is off unless you turn it on.** `rank` defaults to `false`, so the list is a strict priority
+order. With `rank: true`, transports are scored by "a weighted moving score algorithm" over recent
+pings, weighting stability `0.7` and latency `0.3`, with `sampleCount` defaulting to 10 samples and
+`rank.timeout` to 1,000 ms.<Cite src="viem-fallback-transport" />
+
+**The default health probe measures the wrong thing.** This is the part to read twice. `rank.ping`
+defaults to calling `net_listening` "to check if the Transport is
+online".<Cite src="viem-fallback-transport" /> A node that is forty blocks behind is online. It will
+answer `net_listening` truthfully, instantly, and with excellent latency — so a stale node scores
+*better* than a healthy but busier one and gets promoted to the front of the list. The docs show the
+override, and it is one line:
+
+```ts
+const transport = fallback([primary, secondary], {
+  rank: {
+    // The default ping is net_listening, which a stale node passes.
+    ping: ({ transport }) => transport.request({ method: 'eth_blockNumber' }),
+  },
+})
+```
+
+That is better and still not sufficient, because `eth_blockNumber` tells you a node's own opinion of
+the height and nothing about whether that opinion is behind everybody
+else's.<Cite src="execution-apis-spec" /> Comparing heights *across* providers and demoting the
+laggard is a health check you have to write. Nothing ships it.
+
+**It triggers on errors, not on wrongness.** A response that arrives, parses and contains stale data
+is a success by every definition the transport has. The fallback covers rows one to three of the
+table. It does nothing whatsoever about rows four and five, which is the rest of this lesson.
+
+<Figure
+  caption="The retry cycle is the last resort rather than the first, because the bucket you would be waiting on belongs to the endpoint that just rejected you."
+  alt="A read goes to the primary transport; on an error or a 429 the fallback moves sideways to the secondary, which has its own rate-limit bucket, and only after the whole list is exhausted does a retry cycle return to the primary. A response that merely parses counts as success."
+>
+  <Flow
+    lanes={['one read', 'first', 'sideways', 'to your code']}
+    nodes={[
+      { id: 'req', label: 'one read', note: 'from a call site', col: 0 },
+      { id: 'a', label: 'primary', note: 'http(PRIMARY_URL)', col: 1 },
+      { id: 'b', label: 'secondary', note: 'its own bucket', col: 2, tone: 'good' },
+      { id: 'ok', label: 'a response', note: 'it parsed, so: success', col: 3 },
+    ]}
+    edges={[
+      { from: 'req', to: 'a' },
+      { from: 'a', to: 'b', label: 'error, 429 or 5xx', tone: 'warn' },
+      { from: 'b', to: 'ok' },
+      { from: 'b', to: 'a', label: 'retry cycle (×3)', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="Adding a second provider behind a fallback transport makes the app resilient to provider problems."
+  reality="It makes the app resilient to provider requests failing. A provider that answers every request from a node two blocks behind is, to a fallback transport, a perfectly healthy provider — and the default ranking probe will actively prefer it, because it is fast."
+  why="'Failover' is inherited from systems where a node is either serving or not. A chain node has a third state: serving, and behind."
+  src="viem-fallback-transport"
+/>
+
+<Aside kind="warn">
+Two limits on what the second provider buys you.
+
+**It is not independence unless the providers are independent.** Two endpoints resolving to the same
+upstream, or two brands under one operator, fail together — and you generally cannot verify the
+absence of a shared dependency from outside.
+
+**A fallback list only means something if every endpoint in it answers every method you call.** That
+is a constraint on your call inventory, and it is the entire subject of the next lesson.
+</Aside>
+
+## Failing over a write is a different problem
+
+Reads are stateless: reissuing one against another provider is free and safe. Writes are not, and the
+distinction is sharper than most teams treat it.
+
+**Broadcast itself is the safe part.** A signed transaction hashes to one value, so sending the same
+bytes to a second provider is a *duplicate submission of the same transaction*, not a second
+transaction. Whichever endpoint reaches a mempool first wins and the loser reports something it
+already knows about. That follows from the hash committing to the signature, which makes
+`eth_sendRawTransaction` the method in the standard set that fails over most
+naturally.<Cite src="execution-apis-spec" />
+
+**The nonce read is the dangerous part.** `eth_getTransactionCount` takes a block
+parameter,<Cite src="ethereum-org-json-rpc" /> and the `pending` answer depends on which mempool the
+answering node can see. Provider A holds your just-submitted transaction; provider B has never heard
+of it. Read the pending count from B and you get a number one lower than the truth, sign with it, and
+you have built a **replacement** for the transaction already in flight rather than the one that
+follows it — the [same-nonce replacement path](/c/tx-replacement-same-nonce), entered by accident.
+
+The rule that falls out: **pin the provider for the duration of a write sequence, and fail over
+between sequences, not inside one.** Or track the nonce yourself and treat the endpoint as a
+broadcast channel rather than as a source of truth about your own account. Either is defensible; the
+default — a fallback list under a signing flow that reads its nonce from whichever endpoint answers
+— is not.
+
+## The height can go backwards
+
+Now the failure from the opening.
+
+One URL is not one server. Providers say so in their own marketing: QuickNode describes its endpoint
+as access to a global network that "always routes your API requests to the nearest available
+location".<Cite src="quicknode-ethereum-rpc" /> Routing implies a set, and a set of independently
+syncing nodes is a set of nodes at slightly different heights, because propagation takes time.
+
+So two consecutive requests can be answered by different members of that set, and the second can be
+older than the first. Nothing is broken. `latest` means "the latest proposed
+block"<Cite src="ethereum-org-json-rpc" /> — and the specification cannot say *whose* latest, because
+the method is answered by one node with one view.
+
+Three separate mechanisms present as "the data moved backwards", and telling them apart is the
+diagnostic skill here.
+
+<Matrix
+  corner=""
+  cols={['What changed', 'Bounded by', 'Your fix']}
+  rows={[
+    {
+      label: <strong>Fleet skew</strong>,
+      cells: ['which node answered', 'propagation delay, seconds', { v: 'pin a block number', tone: 'good' }],
+    },
+    {
+      label: <strong>Reorg</strong>,
+      cells: [
+        { v: 'the canonical chain', tone: 'danger' },
+        <a href="/c/finality-vs-confirmations">finality</a>,
+        'confirmations, or a finalised tag',
+      ],
+    },
+    {
+      label: <strong>Your own cache</strong>,
+      cells: ['nothing on chain', 'your TTL', 'invalidate on block change'],
+    },
+  ]}
+  caption="Pinning a block number fixes exactly one of these three."
+  alt="Three mechanisms that present as data moving backwards: fleet skew changes which node answered and is bounded by propagation delay of seconds, fixed by pinning a block number; a reorg changes the canonical chain, is bounded by finality, and is handled with confirmations or a finalised tag; a stale local cache changes nothing on chain and is bounded by your own TTL."
+/>
+
+The middle row is the one you already know, and it is not purely a your-side problem either: during a
+reorg, nodes genuinely disagree — "Node A might see Block X first and consider it canonical, while
+Node B sees Block Y first".<Cite src="quicknode-reorg" /> Skew and reorg overlap in symptom and
+differ in duration; skew resolves in a slot or two, a reorg rewrites history you may already have
+written to a database.
+
+Ethereum gives you tags for the second row. The block parameter accepts an integer, `earliest`,
+`latest`, `safe`, `finalized` and `pending`.<Cite src="ethereum-org-json-rpc" /> `finalized` is the
+strong one: finality arrives when checkpoints — the first block of each epoch, an epoch being 32
+slots of 12 seconds — attract votes from at least two-thirds of staked ETH, so the finalised head
+trails the tip by roughly two epochs, on the order of thirteen minutes.<Cite src="eth-pos-finality" />
+That is a long time for a UI and a very short time for a payout.
+
+<Misconception
+  belief="Calling latest twice in a row gives non-decreasing block numbers."
+  reality="Each call is answered by one node in a routed fleet, and different nodes are at different heights at the same instant. The second answer can be older than the first, with no error and no reorg involved."
+  why="Developers reason about the URL as though one server were behind it, because that is what a URL means everywhere else in their stack."
+  src="quicknode-ethereum-rpc"
+/>
+
+## Worked example: pin the block
+
+The fix is mechanical and it takes an afternoon. What matters is doing it at the right granularity,
+so work through the decisions rather than the code.
+
+**Subgoal — define the unit that must be internally consistent.** Not the request, not the session:
+the *refresh cycle*. Everything the user sees at one moment should describe one moment of the chain —
+balance, positions, prices and health factor together. Name the unit first, because it decides where
+the pin goes.
+
+**Subgoal — read the height exactly once per cycle, and treat it as an input to everything else.**
+One `eth_blockNumber` at 10 units is the cheapest call on the table and it buys you a coordinate
+system.<Cite src="alchemy-compute-units" />
+
+**Subgoal — pass that number explicitly to every read in the cycle.** Every state-reading method
+takes a block parameter — `eth_getBalance`, `eth_getCode`, `eth_getTransactionCount`,
+`eth_getStorageAt` and `eth_call`<Cite src="ethereum-org-json-rpc" /> — so there is no read on the
+screen that cannot be pinned.
+
+```ts
+// viem 2.x — one coordinate system per refresh.
+const blockNumber = await client.getBlockNumber()
+
+const [balance, positions] = await Promise.all([
+  client.getBalance({ address: user, blockNumber }),
+  client.multicall({ contracts: positionCalls, blockNumber }),
+])
+```
+
+[Batching the reads](/c/viem-multicall-batching) is the same change seen from the cost
+side.<Cite src="viem-multicall" /> A multicall is one `eth_call` at one block by construction, so
+collapsing twelve reads into one both cuts the bill and removes eleven opportunities for the snapshot
+to tear. The cheap fix and the correct fix are rarely the same fix; take it when they are.
+
+**Subgoal — decide what happens when the pinned block is not available.** This is where the design
+actually gets made. Pin block N and a node three blocks behind cannot answer — it does not have N
+yet, and it will say so. **Pinning converts a silent inconsistency into a visible error**, which is
+the improvement rather than a side effect: a wrong number on a screen has become a failed request
+your existing error handling can see. Retry within the cycle, fall through to the next transport, or
+pin a few blocks behind the head so the whole fleet is guaranteed to have it — the last option trades
+freshness for availability in a way a trading UI and a tax report should answer differently.
+
+**Subgoal — choose the tag by consequence, not by screen.** A displayed balance can use a pinned
+recent block; nobody is harmed if it is nine seconds stale. Anything authorising an irreversible
+action — crediting a deposit, releasing goods, marking a payout complete — should read at `safe` or
+`finalized`, because a pinned recent block is still
+reorgable.<Cite src="ethereum-org-json-rpc" /><Cite src="eth-pos-finality" /> Pinning fixes fleet
+skew; it does not fix the chain changing its mind.
+
+**Subgoal — carry the block number into the UI, or at least into the logs.** It costs nothing, and it
+turns the least reproducible bug report in this domain — "the numbers were wrong for a minute" — into
+one you can replay exactly, because every read in that cycle is a pure function of one block.
+
+<Check type="spot-bug" concept="rpc-consistency-hazard">
+A lending dashboard shows, for the connected user: collateral value, debt, health factor, and a
+liquidation warning banner when the health factor drops below 1.05. It refreshes every 12 seconds.
+
+The implementation, after last quarter's reliability work:
+
+1. The client uses `fallback([http(A), http(B)])` with `rank: true` and default options.
+2. Each refresh issues four independent reads with no block argument: `eth_call` for collateral,
+   `eth_call` for debt, `eth_call` for the oracle price, `eth_getBalance` for the wallet balance.
+3. The health factor is computed in the browser from those four values.
+4. On any read failure the component keeps the previous render and retries next cycle.
+5. When the user clicks "Repay", the app reads the nonce with `pending`, signs, and broadcasts —
+   through the same client.
+
+Users report the liquidation banner flickering on and off, and one user reports a repayment that
+"replaced" an earlier one. Find the defects.
+
+<Answer>
+**1 — Four unpinned reads cannot be combined into one number.** This is the core bug. The four
+values are answered by up to four different nodes at up to four different heights, and the health
+factor is a *ratio* of values that must come from the same block. A collateral figure from block N
+divided by a debt figure from block N−1 is not a health factor of anything; it is an artefact. The
+banner flickers because the artefact crosses 1.05 and back as the skew shuffles. Read the block
+number once and pass it to all four reads.<Cite src="ethereum-org-json-rpc" /> Better still, collapse
+the three contract reads into one multicall, which makes the shared block structural rather than
+conventional.<Cite src="viem-multicall" />
+
+**2 — `rank: true` with default options actively prefers stale nodes.** The default ping is
+`net_listening`, which checks that a transport is online.<Cite src="viem-fallback-transport" /> A node
+that has stopped keeping up answers it fast and reliably, scores well on both the stability weight of
+0.7 and the latency weight of 0.3, and gets promoted.<Cite src="viem-fallback-transport" /> Override
+`rank.ping` to something height-aware, and understand that even then you are measuring a node against
+itself rather than against its peers.
+
+**3 — The nonce is read through a failover client.** This is the reported "replaced" repayment.
+`eth_getTransactionCount` at `pending` depends on which mempool the answering node
+sees;<Cite src="ethereum-org-json-rpc" /> if the previous repayment is in provider A's mempool and
+the nonce read lands on provider B, the app signs the same nonce again and the second transaction
+[replaces the first](/c/tx-replacement-same-nonce). Pin the transport for the whole write sequence,
+or track the nonce locally.
+
+**4 — "Keep the previous render on failure" has no staleness bound.** A screen that has stopped
+updating is indistinguishable from one that is current, so under a sustained provider problem the
+dashboard confidently shows a health factor from twenty minutes ago — on a screen whose whole purpose
+is to warn about a fast-moving number. Stale-on-failure is legitimate; stale-on-failure *without a
+visible timestamp and an expiry* is not.
+
+**5 — Nothing measures the thing that broke.** No height comparison across providers, no alert on
+"the two endpoints disagree by more than two blocks", no block number in the logs. The flicker was
+reproducible only by luck. Log the pinned block with every render and this class of report becomes a
+one-minute investigation.
+
+**Remediation, in order.** Pin the block for the refresh cycle and multicall the reads — this alone
+removes the flicker. Pin the transport for write sequences. Give the stale render an expiry and a
+timestamp. Replace the default rank ping. Then add the cross-provider height check, because it is the
+only one of these that finds the *next* problem rather than this one.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next**, the assumption this lesson quietly leaned on: that your second provider can answer the same
+calls as your first. For standard JSON-RPC that holds. For everything outside it — the tracing
+namespace, per-provider log-range caps, the convenience endpoints that made a feature easy — it does
+not, and that is what turns a provider migration from a URL change into a project.
+
+**Then**, whether to run the node yourself — where this lesson has quietly made the case *for* a
+provider from an unexpected direction. A self-hosted node is one node: one height, one uptime and one
+maintenance window, which is precisely the shape you have spent this lesson learning to distrust.
+
+**And one change to make this week.** Find the screen that shows several chain-derived numbers at
+once, read the height once, pass it to every read on that screen, and log it. It is an afternoon, it
+costs nothing at runtime, and it retires an entire class of bug report that currently has no repro
+steps.

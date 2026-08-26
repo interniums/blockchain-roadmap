@@ -1,0 +1,357 @@
+---
+id: infra-rpc-economics-two-limits
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [alchemy-throughput, alchemy-compute-units, alchemy-compute-units-explainer, geth-pubsub, execution-apis-spec, ethereum-org-json-rpc, viem-fallback-transport, viem-watch-contract-event, chainstack-request-units]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The support thread opens with a screenshot of the usage dashboard. Five percent of the monthly
+allowance, twenty-six days into the month. Underneath it, a paste of forty-one consecutive HTTP 429
+responses from the same two-minute window.
+
+The engineer's question is reasonable and the answer is that the screenshot and the log are about
+different limits, enforced by different mechanisms, that have nothing to do with each other. Being at
+five percent of a monthly allowance tells you exactly nothing about whether your next second of
+traffic will be served.
+
+This lesson separates the two axes, gives each one its failure signature, and then deals with the
+retry policy — which is not a nicety, because the wrong one converts a two-second burst into a
+four-minute outage. It closes on the subscription, which people reach for to escape the throughput
+axis and which trades that problem for a different one.
+
+## Axis one: throughput, measured per second and enforced per account
+
+The throughput limit is a rate. Alchemy states it in compute units per second, and three details of
+how it is enforced change how you should reason about it.<Cite src="alchemy-throughput" />
+
+**It is evaluated over a rolling window, not per instant.** "Limits are evaluated over a 10-second
+rolling window using a token bucket algorithm with strict refill rates", and the page's own worked
+example is that a customer with a 300 CU/s limit "can consume up to 3,000 CUs over any 10-second
+period" — a design the page says "helps accommodate short-term traffic spikes without exceeding the
+overall limit".<Cite src="alchemy-throughput" /> So a one-second spike three times your nominal rate
+is fine, provided the surrounding nine seconds are quiet. This is more forgiving than a per-second cap
+and much harder to reason about, because whether a request succeeds depends on the previous ten
+seconds of everything you did.
+
+**It is an account-level limit, not a per-application one.** Throughput "is now configured at the
+account level (no longer per app), meaning the combined usage of all your Alchemy apps counts toward
+your overall throughput limit".<Cite src="alchemy-throughput" /> Read that against the inventory from
+the first lesson. Your CI fork suite, your indexer backfill and your production frontend are eight
+rows sharing one budget. A backfill kicked off at 14:00 is a frontend incident at 14:00.
+
+**It is soft, which is worse than hard.** The explainer says applications "can greatly exceed their
+dedicated throughputs based on elastic demand in our system", and immediately adds that if you are
+seeing throughput errors you should implement retries.<Cite src="alchemy-compute-units-explainer" />
+A soft ceiling means your load test passes, your staging environment never sees a 429, and the first
+time you meet the real limit is a day when the provider's own system is busy. **A limit you cannot
+reproduce on demand is a limit you will discover in production.**
+
+### What it looks like when you hit it
+
+Two shapes, depending on transport.<Cite src="alchemy-throughput" />
+
+Over HTTP: an **HTTP 429 (Too Many Requests)** status code, sometimes carrying a `Retry-After` header
+telling you how long to wait — the documentation notes it recommends exponential backoff anyway,
+because `Retry-After` only accepts whole seconds.
+
+Over WebSocket there is no HTTP status to carry it, so it arrives as a JSON-RPC error object with
+code 429:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "error": {
+    "code": 429,
+    "message": "Your app has exceeded its compute units per second capacity. ..."
+  }
+}
+```
+
+That second shape catches people. A JSON-RPC error is a *successful* WebSocket message. Client code
+that treats "the socket is fine" as "the request succeeded" will parse a rate-limit rejection as a
+result, and the failure surfaces somewhere downstream as missing data rather than as an error.
+
+## Axis two: volume, measured per period and enforced as a wall
+
+The volume cap is a total: units per day, or per month, or requests per month. It is what your billing
+dashboard shows, because it is the number tied to the invoice.
+
+Its failure signature is completely different. A throughput limit *delays* you — the bucket refills
+and the next request works. A volume cap **stops** you, and stays stopped until the period rolls over
+or someone with a credit card intervenes. There is no backoff strategy for a volume cap. The only
+mitigations are consuming less, buying more, or degrading deliberately.
+
+The two limits also respond to different fixes, which is the practical reason to keep them apart:
+
+<Compare
+  axis=""
+  columns={[
+    { title: 'Throughput', tone: 'warn' },
+    { title: 'Volume', tone: 'danger' },
+  ]}
+  rows={[
+    { label: 'Unit', cells: ['units per second', 'units per period'] },
+    { label: 'Triggered by', cells: ['a burst', 'sustained traffic'] },
+    { label: 'Symptom', cells: ['429s, partial page loads, flaky CI', 'hard cutoff, everything down'] },
+    { label: 'Duration', cells: ['seconds', 'until the period resets'] },
+    { label: 'Fixed by', cells: ['backoff, batching, spreading load', 'fewer or cheaper calls, bigger plan'] },
+    { label: 'Visible in the dashboard?', cells: [{ v: 'rarely, and not by default', tone: 'danger' }, 'yes — it is the headline number'] },
+  ]}
+  caption="Every row differs, which is how 'we are well inside our quota' and 'we are being throttled' are true in the same minute."
+  alt="Throughput is measured in units per second, triggered by a burst, shows up as 429s and partial page loads, lasts seconds, is fixed by backoff and batching, and is rarely on the dashboard. Volume is measured in units per period, triggered by sustained traffic, shows up as a hard cutoff, lasts until the period resets, is fixed by cheaper calls or a bigger plan, and is the dashboard's headline number."
+/>
+
+That last row is why teams are repeatedly surprised. The dashboard foregrounds the number that
+generates the invoice. The number that generates the incident is a different one, and on most
+dashboards you have to go looking for it.
+
+<Misconception
+  belief="I am at five percent of my monthly quota, so I will not be rate limited."
+  reality="Throughput is enforced independently of volume, over a short rolling window, against the combined usage of every application on the account. You can sit at one percent of a monthly allowance and be throttled all afternoon."
+  why="The dashboard shows the monthly number because that is the billing number, and 'quota' in ordinary usage means a total rather than a rate."
+  src="alchemy-throughput"
+/>
+
+## The retry policy is a correctness requirement
+
+Here is the arithmetic that makes this non-negotiable.
+
+Take the portfolio refresh from the previous lesson: about 410 units per refresh. Take a 300 CU/s
+budget, which under the rolling window is 3,000 units per ten seconds.<Cite src="alchemy-throughput" />
+Steady state is comfortable — a thousand sessions a day at eight refreshes each, spread evenly, is
+under forty units a second, an eighth of the budget.
+
+Now a market moves and 200 users refresh in the same second. That is 82,000 units demanded against a
+bucket that refills at 300 a second. Even if not one further request arrives, the backlog needs
+**roughly 270 seconds** of refill to clear. Four and a half minutes, from one second of real demand.
+
+<Figure
+  caption="A rate limit does not shrink demand. It converts a spike into a queue you wait out, and the waiting is measured in minutes."
+  alt="Two hundred users refreshing in the same second demand 82,000 compute units against a bucket that refills at 300 units per second, so the backlog takes roughly 270 seconds to clear even if no further request arrives."
+>
+  <Timeline
+    from={0}
+    to={300}
+    unit="seconds"
+    ticks={[0, 60, 120, 180, 240, 300]}
+    caption="300 CU/s budget — Alchemy's own worked example, read 26 August 2026"
+    marks={[{ at: 0, label: '200 users refresh at once', tone: 'warn' }]}
+    spans={[
+      {
+        label: 'backlog draining',
+        start: 0,
+        end: 270,
+        tone: 'danger',
+        note: '82,000 units demanded against a bucket that refills at 300 a second',
+      },
+    ]}
+  />
+</Figure>
+
+Now add the naive retry: every rejected request tries again immediately. Each retry consumes nothing
+from the bucket — it is rejected — but it does consume your connection pool, your event loop and the
+provider's admission path, and it guarantees that the instant a token appears it is taken by a
+retrying client rather than by a new one. The queue never drains in a useful order and it never gets
+shorter, because the population of retrying clients is growing. **The burst lasted one second; the
+outage lasts as long as your users keep the tab open.**
+
+The fix is published, and the reason each part exists is worth reading rather than copying. Alchemy's
+recommended algorithm: wait 1 second plus a random offset and retry; then 2 plus an offset; then 4;
+and so on, with the wait time given as `min(((2^n)+random_number_milliseconds), maximum_backoff)`,
+where `random_number_milliseconds` is a random number of milliseconds no greater than 1000 and
+`maximum_backoff` is "typically 32 or 64 seconds".<Cite src="alchemy-throughput" />
+
+**The exponential part shrinks the offered load.** Doubling the wait halves the retry rate each round,
+so the aggregate demand decays instead of holding steady, and the bucket gets a chance to refill.
+
+**The random part is the piece people delete, and it is the piece that matters most.** The
+documentation says why: jitter "helps to avoid cases in which many clients are synchronized by some
+situation and all retry at once, sending requests in synchronized
+waves".<Cite src="alchemy-throughput" /> Your 200 clients were synchronised *by the event that caused
+the burst*. Without jitter, pure exponential backoff keeps them synchronised forever — they all wait
+one second, all retry, all fail, all wait two. The waves get further apart and never get smaller.
+Jitter is what breaks the correlation, and it is one line.
+
+**The value is recalculated after each retry**, not sampled once.<Cite src="alchemy-throughput" />
+A single random offset applied to every wait just shifts the whole wave.
+
+**And there must be a stop.** The page's own framing is that clients should eventually be prevented
+from retrying indefinitely.<Cite src="alchemy-throughput" /> A retry loop with no ceiling is a
+denial-of-service tool you shipped to your users' browsers.
+
+<Aside kind="note">
+You get a defensible default without writing any of this. viem's `fallback` transport takes
+`retryCount` (default 3) and `retryDelay` (default 150 ms) and applies exponential backoff between
+retry cycles, and it tries every transport in the list before it retries any of
+them.<Cite src="viem-fallback-transport" /> That ordering is the right one under a throughput limit:
+a second provider has its own bucket, so moving sideways is strictly better than waiting. The next
+lesson but two builds on exactly this.
+</Aside>
+
+## The subscription: a real saving with a lifecycle attached
+
+Polling for new heads costs one request per interval per client. With a browser tab open on every
+desk in a trading team, that is a per-second cost that scales with attention rather than with
+activity. A push stream removes it. `eth_subscribe` is 10 units to establish, and the notifications
+that follow are not individually billed as requests.<Cite src="alchemy-compute-units" />
+
+Before adopting it, know four things about what it is.
+
+**It is not in the standard method set.** The execution API specification's `eth_` namespace does not
+include `eth_subscribe` or `eth_unsubscribe`.<Cite src="execution-apis-spec" /> The feature comes from
+Geth, which has supported publish/subscribe over JSON-RPC notifications since v1.4 to let clients
+"wait for events instead of polling for them".<Cite src="geth-pubsub" /> It is near-universally
+implemented, and it is still a portability decision rather than a spec guarantee — the same category
+as everything in the migration lesson later in this module.
+
+**It needs a connection you cannot get over HTTP.** "Subscriptions require a full duplex connection.
+Geth offers such connections in the form of WebSocket and IPC (enabled by
+default)."<Cite src="geth-pubsub" /> So adopting subscriptions means adopting a long-lived connection
+in every environment that uses one, including the serverless ones where long-lived connections are
+the thing the platform is designed not to have.
+
+**It delivers the present and nothing else.** Geth's own wording is unusually blunt: "Notifications
+are sent for current events and not for past events. For use cases that cannot afford to miss any
+notifications, subscriptions are probably not the best option."<Cite src="geth-pubsub" /> That is a
+first-party statement that the primitive is unsuitable for exactly-once delivery, printed on the
+reference page for the primitive.
+
+**It disappears with the socket, and the socket can be closed on you.** "Subscriptions are coupled to
+a connection. If the connection is closed all subscriptions that are created over this connection are
+removed." And there is a second, less obvious way to lose it: notifications are buffered, and "if the
+client is unable to keep up and the number of buffered notifications reaches a limit (currently 10k)
+the connection is closed".<Cite src="geth-pubsub" /> A slow consumer is disconnected. The page also
+warns that subscribing broadly — all logs, all blocks — can produce a flood, which is how a consumer
+becomes slow in the first place.<Cite src="geth-pubsub" />
+
+### The gap is the whole problem
+
+Put those together and the failure mode is precise. The connection drops at block N. Your client
+notices, reconnects, resubscribes, and receives block N+4. Blocks N+1 through N+3 were delivered to
+nobody. Nothing errored. Your pipeline has a hole in it, and the hole is exactly at the moment the
+network was unhealthy — which is when the interesting events happen.
+
+So a subscription is never the whole design. The pattern is subscription **plus** a backfill on
+reconnect, and the state you must keep is one number:
+
+```ts
+// viem 2.x — the shape, not a drop-in.
+let lastProcessed: bigint = await loadCheckpoint()
+
+async function onReconnect() {
+  const head = await client.getBlockNumber()
+  if (head > lastProcessed) {
+    // Close the gap with a range query BEFORE trusting the stream again.
+    const logs = await client.getLogs({
+      address: CONTRACT,
+      fromBlock: lastProcessed + 1n,
+      toBlock: head,
+    })
+    for (const log of logs) await handle(log)
+    lastProcessed = head
+  }
+  await subscribeToLogs()   // now the stream is safe to trust
+}
+```
+
+Three properties of that sketch are load-bearing. The checkpoint is **persisted**, because a process
+restart is a reconnect. The backfill runs **before** the stream is trusted, so the ordering
+guarantee survives. And `handle` must be **idempotent**, because the overlap between the backfill
+range and the first streamed notifications is not something you control — the same log will arrive
+twice and the correct behaviour is for the second one to be a no-op.
+
+<Misconception
+  belief="Switching from polling to WebSocket subscriptions makes the pipeline cheaper and simpler."
+  reality="Cheaper, yes. Simpler, no — you have traded a stateless request loop for a stateful connection with a reconnect path, a persisted checkpoint, a backfill query and an idempotency requirement. The polling loop had none of those because every poll was self-describing."
+  why="'Push instead of pull' sounds like removing work. It removes the requests and adds the delivery guarantees you were previously getting for free from the fact that every poll asked for a range."
+  src="geth-pubsub"
+/>
+
+<Aside kind="note">
+If all you need is "tell me when this event fires in a UI", you probably should not be writing any of
+this. viem's `watchContractEvent` gives you the callback interface over either transport and handles
+the polling or the subscription underneath.<Cite src="viem-watch-contract-event" /> Write the
+checkpoint-and-backfill machinery when the consequence of a missed event is wrong data rather than a
+stale badge — and notice that this is the same "which failures can you tolerate" question the
+distributed-systems track asked about [liveness](/c/liveness-property), one layer up.
+</Aside>
+
+<Check type="spot-bug" concept="rate-limit-two-axes">
+A team ships a keeper. It subscribes to `newHeads` over WebSocket; on each head it issues six
+`eth_call`s to check liquidation conditions; if any condition is met it broadcasts. On any error it
+retries immediately, up to fifty times. It runs three replicas for redundancy, all against the same
+provider account, all subscribed to the same stream. Monthly usage sits around eight percent.
+
+During a sharp market move the keeper misses liquidations for about six minutes, then recovers. The
+logs show 429s. The team's post-incident action is to upgrade to a larger monthly plan.
+
+Find every defect, and say why the proposed fix does not address the incident.
+
+<Answer>
+**The proposed fix is aimed at the wrong axis.** A larger monthly plan raises the volume cap. The
+incident was a throughput event — 429s during a burst, with usage at eight percent of the monthly
+allowance.<Cite src="alchemy-throughput" /> Larger plans do usually come with more throughput, so it
+may help by accident, which is the worst outcome: the team will conclude the diagnosis was right.
+
+**1 — Three replicas triple the load and share one budget.** Throughput is enforced at the account
+level across all applications.<Cite src="alchemy-throughput" /> Three identical replicas doing
+identical work is 18 `eth_call`s per block where one replica would do six, against the same bucket.
+The redundancy design multiplied the thing that broke. Redundancy against provider failure needs
+*different providers*, which is the subject of the failover lesson; replicas against one account are
+just load.
+
+**2 — Immediate retry, fifty times, is the amplifier.** No backoff, no jitter, no ceiling worth the
+name. The published algorithm is exponential with a random offset recalculated per attempt and a
+`maximum_backoff` typically of 32 or 64 seconds.<Cite src="alchemy-throughput" /> Fifty immediate
+retries from three replicas is 150 requests per failed call, and they are perfectly synchronised
+because they were all triggered by the same head notification.
+
+**3 — Six sequential `eth_call`s per block should be one.** Six at 26 units is 156 per block per
+replica, 468 across three.<Cite src="alchemy-compute-units" /> One multicall is 26. Cutting the burst
+by a factor of six is available for an afternoon's work and no plan change.
+
+**4 — The WebSocket 429 is probably being swallowed.** Over a socket, a rate-limit rejection arrives
+as a JSON-RPC error object with code 429, not as a transport failure.<Cite src="alchemy-throughput" />
+If the handler only treats socket-level errors as failures, some of those "missed liquidations" are
+condition checks that returned an error the code read as "condition not met" — a silent wrong answer,
+which is worse than the outage.
+
+**5 — There is no backfill on reconnect, and the socket may well have dropped.** Under a flood of
+notifications a client that cannot keep up is disconnected once the buffer reaches its limit, and all
+subscriptions on that connection are removed.<Cite src="geth-pubsub" /> A keeper that reconnects and
+resumes from the current head has skipped every block in the gap — and misses nothing at 3am and
+everything during a market move. This alone can account for the six minutes without any 429 being
+involved.
+
+**6 — Nobody is watching the axis that failed.** Monthly usage was on a dashboard. Requests per
+second, 429 rate and reconnect count were not, or the team would have named the axis in the first
+hour.
+
+**The actual remediation, in order of ratio.** Collapse six calls into one multicall. Run one active
+replica with leader election rather than three duplicating work — or point the replicas at different
+providers, which buys real redundancy and separate buckets. Implement exponential backoff with
+per-attempt jitter and a real ceiling.<Cite src="alchemy-throughput" /> Treat a JSON-RPC error object
+as an error. Add a persisted checkpoint and a `getLogs` backfill on every reconnect. Then, if the
+numbers still say so, buy a bigger plan — with the throughput figure, not the monthly one, as the
+thing you are buying.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next**, the three calls that write most of the bill: the log query and the caps providers put on it,
+what actually makes a read an archive read, and the two tracing namespaces that are not the same API.
+The near-flat rule you met last lesson has a specific consequence for backfills there — the billing
+block for a log query is `fromBlock`, so a historical scan is charged at the archive rate for almost
+its whole length.<Cite src="chainstack-request-units" />
+
+**Two lessons out**, the failover transport, which is the structural answer to everything in this
+lesson: a second bucket at a second provider turns a throughput event into a latency
+event.<Cite src="viem-fallback-transport" />
+
+**And a habit worth forming now.** Add two panels to whatever you use for monitoring: requests per
+second, and 429s per minute. They cost nothing, they are the two numbers no vendor dashboard puts on
+its front page, and the day you need them you will not have time to go and find where they live.

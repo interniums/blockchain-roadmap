@@ -1,0 +1,359 @@
+---
+id: altvm-solana-security-right-type-wrong-instance
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [sealevel-attacks, cantina-securing-solana, helius-solana-hacks, anchor-account-constraints, anchor-lang-docsrs, neodyme-workshop, wormhole-postmortem]
+stack: {}
+---
+
+Two structs, from a real audit-firm checklist's illustration of the class:
+
+```rust
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct User {
+    authority: Pubkey,
+}
+
+#[derive(BorshSerialize, BorshDeserialize)]
+pub struct Metadata {
+    account: Pubkey,
+}
+```
+
+Both are 32 bytes. Both are owned by the same program. Both decode from the same byte slice without
+error. The field names differ and the field names are not written to the chain — Borsh serialises
+values, not identifiers. On disk, a `User` and a `Metadata` are the same object.
+
+That is type cosplay, and it is the first of the two shapes this lesson covers. The second is worse,
+because in the second nothing is fake at all.
+
+## Shape one: the same bytes wearing another name
+
+The checklist's insecure program is short enough to read whole, and the instructive part is how much
+of it is correct.<Cite src="cantina-securing-solana" />
+
+```rust
+pub fn update_user(ctx: Context<UpdateUser>) -> ProgramResult {
+    let user = User::try_from_slice(&ctx.accounts.user.data.borrow()).unwrap();
+    if ctx.accounts.user.owner != ctx.program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if user.authority != ctx.accounts.authority.key() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    msg!("GM {}", user.authority);
+    Ok(())
+}
+```
+
+Question one is answered — the owner is compared against the program id. Question two is answered, in
+the accounts struct, by typing `authority` as a `Signer`. Question three appears to be answered, since
+the stored `authority` is compared against the signer's key. Three for three, by the checklist of the
+previous lesson.
+
+And it is exploitable, because a `Metadata` account can be passed as `user`. It is owned by the
+program, so the owner check passes. It decodes as a `User`, so `try_from_slice` succeeds and hands
+back a struct whose `authority` field is whatever 32 bytes the `Metadata` had in its `account` field.
+If the attacker controls a `Metadata` whose `account` field holds their own pubkey — which they do, if
+the program lets anyone create metadata pointing at themselves — the relational check passes too, and
+the program grants `User` privileges over an object that is not a user.
+
+**Subgoal: name the missing question.** It is not "who owns it" and not "did it sign". It is *what is
+this*. The program asked which program wrote these bytes and never asked which type they were written
+as. The checklist's own remediation is a discriminant field compared before use, and its audit
+instruction is explicit: identify accounts within the program that share the same data structure, and
+work out whether they can impersonate each other through that identical
+structure.<Cite src="cantina-securing-solana" />
+
+The canonical taxonomy files this as class 3, `type-cosplay`, with the usual triple of an insecure
+program, a secure one, and the framework idiom.<Cite src="sealevel-attacks" />
+
+### The eight bytes that close it
+
+Anchor's answer is a discriminator: eight bytes derived from a hash of the type's name, prefixed to
+every account's data and to every instruction payload, compared before deserialization and rejected on
+mismatch.<Cite src="anchor-lang-docsrs" /> Because the prefix differs for `User` and `Metadata`, the
+two accounts stop being interchangeable at the byte level, and the [check](/c/eight-byte-discriminator)
+is inside the `Account<'info, T>` constructor rather than something you remember to write: owner
+check, discriminator check, then deserialize.<Cite src="anchor-lang-docsrs" />
+
+Two things follow that are easy to miss.
+
+**It costs eight bytes per account and one comparison per read.** That is the entire price, and it is
+the reason people who leave the framework for compute savings often keep the discriminator idea and
+implement it themselves. Doing so is correct; forgetting to is class 3 all over again.
+
+**It is not a type system.** The comparison happens at runtime, against a value stored in
+attacker-supplied data. It works because the attacker cannot write the prefix into an account your
+program owns without going through your program — but if your program has any instruction that writes
+arbitrary caller-supplied bytes into an account it owns, the prefix is no longer a guarantee.
+Discriminators are a runtime tag, and runtime tags are only as good as the write paths around them.
+
+<Misconception
+  belief="Anchor's discriminator makes account type confusion impossible in any program that uses it."
+  reality="It closes the case where two of the program's own types share a layout. It does nothing about the second shape of this class — a legitimate account of exactly the right type, with the right discriminator, belonging to a different user."
+  why="The discriminator answers a question that feels like the last one: what is this? Having answered what and who-owns-it, the remaining question sounds like a detail rather than a different question."
+  src="sealevel-attacks"
+/>
+
+### Finding shape one in a codebase you did not write
+
+The audit instruction is to identify accounts sharing the same data structure, which sounds like
+reading struct definitions and is not.<Cite src="cantina-securing-solana" /> Names are irrelevant;
+what matters is the serialised byte layout, and two structs collide when one's layout is a *prefix* of
+the other's, not only when they match exactly. Borsh will happily decode 32 bytes out of a 96-byte
+account and ignore the rest.
+
+So the pass is: for every account type in the program, write down its serialised layout as a sequence
+of widths, and sort.
+
+<Matrix
+  corner="Type"
+  cols={['Layout (bytes)', 'Prefix-compatible with']}
+  rows={[
+    { label: 'User', cells: [<><code>pubkey(32)</code></>, { v: 'Metadata, Vault, Config', tone: 'danger' }] },
+    { label: 'Metadata', cells: [<><code>pubkey(32)</code></>, { v: 'User, Vault, Config', tone: 'danger' }] },
+    { label: 'Vault', cells: [<><code>pubkey(32) u64(8)</code></>, { v: 'User, Metadata, Config', tone: 'danger' }] },
+    { label: 'Config', cells: [<><code>pubkey(32) u64(8) u8(1)</code></>, { v: 'User, Metadata, Vault', tone: 'danger' }] },
+  ]}
+  caption="Names never collide. Widths do — and a prefix is enough, because Borsh ignores the trailing bytes."
+  alt="Four account types with their serialised byte layouts — a 32-byte pubkey, then a u64, then a u8 — and the types each one is prefix-compatible with, which is all three of the others in every case."
+/>
+
+Four types, and every one of them decodes from every other. That table takes ten minutes to build and
+it is the entire finding. If the program prefixes discriminators, the first eight bytes differ and the
+table is empty; if it does not, the table is the exploit
+surface.<Cite src="anchor-lang-docsrs" />
+
+Watch particularly for the pattern where a program starts with the framework and one instruction
+reaches past it — `try_from_slice` on an `UncheckedAccount`, or a zero-copy path that casts a byte
+slice directly. The discriminator is still on the account and it is simply not being consulted,
+which reads as safe to anyone who checked that the type derives the framework's account macro.
+
+<Misconception
+  belief="Two account structs with different field names are different types, so one cannot be passed where the other is expected."
+  reality="Field names are compile-time-only. Borsh serialises values in declaration order and writes no identifiers, so two structs with the same widths in the same order are the same object on chain."
+  why="Every language a product engineer has used before treats a struct's name and its fields as part of its identity at runtime. Here identity is whatever bytes you chose to write, which for most Rust structs is nothing."
+  src="cantina-securing-solana"
+/>
+
+## Shape two: the right type, the wrong instance
+
+Now remove everything fake. The attacker passes an account that your program created, of exactly the
+type you expect, with the correct discriminator, internally consistent, holding real value. It simply
+is not theirs.
+
+Every check that examines the account alone passes, because there is nothing wrong with the account.
+The defect is in a relationship that exists nowhere in either account's bytes until you assert it.
+
+<Figure
+  caption="No forgery, no malformed bytes, no failed check — and the instruction runs against somebody else's object."
+  alt="A genuine Vault account belonging to another user passes the owner check, which proves this program wrote the bytes, and the discriminator check, which proves the bytes are a Vault; with no relational check between the vault and the signer, the instruction proceeds on the wrong instance."
+>
+  <Flow
+    nodes={[
+      { id: 'acct', label: 'a real Vault', note: 'created by this program — just not for this caller', col: 0 },
+      { id: 'own', label: 'owner check', note: 'proves this program wrote these bytes', col: 1, row: 0 },
+      { id: 'disc', label: 'discriminator', note: 'proves these bytes are a Vault', col: 1, row: 1 },
+      { id: 'gap', label: 'nothing proves whose', note: 'no has_one, no derivation from the caller', col: 2, tone: 'danger', dashed: true },
+      { id: 'go', label: 'the instruction runs', note: "on somebody else's balance", col: 3, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'acct', to: 'own' },
+      { from: 'acct', to: 'disc' },
+      { from: 'own', to: 'gap' },
+      { from: 'disc', to: 'gap' },
+      { from: 'gap', to: 'go' },
+    ]}
+  />
+</Figure>
+
+The canonical taxonomy calls this `account-data-matching`, class 1, and it is placed immediately after
+signer authorization for good reason — the two are the pair that produce the most confident-looking
+broken code.<Cite src="sealevel-attacks" /> The audit-firm checklist covers the same ground as "PDA
+substitution check".<Cite src="cantina-securing-solana" />
+
+### Two ways to assert the relationship
+
+**By stored field.** `has_one = authority` checks that the `authority` field stored inside the
+account's data equals the key of the `authority` field in the accounts
+struct.<Cite src="anchor-account-constraints" /> Combined with `Signer` on that field, it binds an
+object to the person entitled to act on it — object says who its owner is, runtime says that person
+consented, constraint says those are the same key. That is [the third question answered](/c/has-one-links-accounts),
+and it is one line.
+
+**By derivation.** `seeds = [...], bump` makes the framework re-derive the program address from those
+seeds and compare it with the key you were handed, rejecting a
+mismatch.<Cite src="anchor-account-constraints" /> If the caller's pubkey is one of the seeds, then the
+only account that can be passed is the one belonging to that caller — the relationship is enforced by
+arithmetic rather than by a stored field. Lesson 5 is about the ways this derivation can be got wrong;
+when it is right, it is the strongest form of the check, because there is no field to forget to
+populate.
+
+Choosing between them is mostly about who else needs the relationship. A stored `authority` field is
+readable, transferable, and can be changed by an instruction you write. A derivation is immutable and
+free of storage, but it fixes the relationship at creation time forever.
+
+<Aside kind="note">
+There is a Solidity analogue and it is worth naming because the reader has already met it. A vault
+contract that takes `uint256 positionId` and looks up `positions[positionId]` without checking
+`positions[positionId].owner == msg.sender` has exactly this bug — right type, wrong instance, no
+relational check. The difference is frequency. On the EVM that pattern is one way to write a vault
+among several, and the common alternative — `positions[msg.sender]` — makes the relationship
+structural and unforgettable. On Solana there is no `positions[msg.sender]`, because there is no
+mapping and no `msg.sender`. Every lookup is by supplied account, so every lookup needs the assertion.
+</Aside>
+
+## Cashio: validating the first link is not validating the chain
+
+In March 2022 Cashio's program let an attacker mint 2 billion CASH tokens against worthless
+collateral. The root cause reported in the running incident catalogue is a missing validation of the
+`mint` field in the `saber_swap.arrow` account, which let the attacker bypass the checks intended for
+Saber USDT-USDC LP tokens — an infinite mint glitch.<Cite src="helius-solana-hacks" /> The CASH
+stablecoin's price collapsed from $1 to $0.00005, and the protocol's total value locked fell from
+$28.8 million to $579,000; minting was halted at 09:00 UTC on 23 March
+2022.<Cite src="helius-solana-hacks" />
+
+**On the loss figure, sources disagree and this module will not pick one.** The catalogue above puts
+the stolen assets at approximately $52.8 million in USDC, USDT and
+UST;<Cite src="helius-solana-hacks" /> the figure repeated more widely elsewhere is around $48
+million. Different write-ups, different valuation snapshots and different scopes. Quote the range or
+quote the mechanism, and prefer the mechanism.
+
+Because the mechanism is the transferable part, and it generalises past this incident:
+
+**Subgoal: see the structure the program was validating.** Not one account — a chain. Account A
+references account B, which references account C, and the program's conclusion depends on the whole
+path being what it claims. In Cashio's case the path ran from the collateral the user deposited
+through swap and LP accounts to the mint that made it valuable.
+
+**Subgoal: see where validation stopped.** The first links were checked. One link's `mint` field was
+not.<Cite src="helius-solana-hacks" /> An attacker who controls any unchecked link controls everything
+downstream of it, because the program is following references it never verified.
+
+**Subgoal: state the rule.** *Validating the first account in a chain is not validating the chain.*
+Every hop that your logic traverses is a separate instance of question three, and each one needs its
+own `has_one` or its own derivation. The reason this survives review is that the first check is
+conspicuous and the fourth is three files away in a helper that "just reads the pool config".
+
+The chain shape is also why this class scales so badly. A missing signer check compromises one
+instruction. A missing link in a collateral chain compromises the accounting invariant of the entire
+protocol, which is how you get an unbounded mint rather than a theft of some particular balance.
+
+### A relative worth naming precisely
+
+Wormhole, on 2 February 2022, is often filed alongside this class, and it is worth being exact about
+why it belongs and where it differs. The Solana-side verifier used a deprecated command,
+`load_instruction_at`, to establish that `Secp256k1` had been called — and that command does not check
+the value of the system address, the Instructions
+sysvar.<Cite src="wormhole-postmortem" /> The attacker created a counterfeit Instructions sysvar as a
+previously-created account referencing `Secp256k1`, and passed that fake account instead of the
+legitimate one, so the verification validated a fraudulent
+context.<Cite src="wormhole-postmortem" /> The result was 120,000 wrapped ether minted without backing,
+approximately $326 million, patched within hours and reimbursed by Wormhole's parent company the
+following day.<Cite src="helius-solana-hacks" />
+
+The shape is a spoofed account supplying fabricated data that a program read as authoritative — which
+is this lesson's shape one. But the specific missing check is an *address* comparison against a known
+constant, not a discriminator and not a relational field, and that makes it the next lesson's subject
+rather than this one's. Filed here, it would teach the wrong fix.
+
+<Check type="spot-bug" concept="account-substitution">
+A staking program. Every account is typed, the owner and discriminator checks are all in place, and
+the signer is real. Find the substitution and say what an attacker walks away with.
+
+```rust
+#[derive(Accounts)]
+pub struct ClaimRewards<'info> {
+    #[account(mut, has_one = owner)]
+    pub stake_position: Account<'info, StakePosition>,
+    pub owner: Signer<'info>,
+
+    #[account(mut)]
+    pub pool: Account<'info, Pool>,
+
+    #[account(mut)]
+    pub reward_vault: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub destination: Account<'info, TokenAccount>,
+    pub token_program: Program<'info, Token>,
+}
+
+pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
+    let owed = ctx.accounts.stake_position.amount
+        * ctx.accounts.pool.reward_rate;
+    ctx.accounts.stake_position.claimed = true;
+    // ... CPI transfer `owed` from reward_vault to destination ...
+    Ok(())
+}
+```
+
+<Answer>
+**Two substitutions, and the second is the expensive one.**
+
+**`pool` is unbound.** The `stake_position` is correctly bound to its `owner` by `has_one`, so the
+attacker cannot claim on someone else's position.<Cite src="anchor-account-constraints" /> But nothing
+binds `stake_position` to `pool`. The attacker passes *their own* small position in a low-rate pool,
+together with a completely legitimate `Pool` account belonging to a different, high-rate pool. Owner
+check passes — it is a real pool, created by this program. Discriminator passes — it is genuinely a
+`Pool`.<Cite src="anchor-lang-docsrs" /> The reward is computed at the wrong pool's rate. Right type,
+wrong instance, in the purest form.
+
+The fix is the relational check the position was already carrying for its owner and was never given
+for its pool:
+
+```rust
+#[account(mut, has_one = owner, has_one = pool)]
+pub stake_position: Account<'info, StakePosition>,
+```
+
+**`reward_vault` is unbound, and this one is unbounded.** Nothing ties the vault to the pool either.
+The attacker passes any token account of the right mint that this program can sign for — the treasury,
+another pool's reserve, an insurance fund — and the transfer drains that one instead. Notice the
+severity difference: the first substitution inflates one payout, the second re-points the source of
+funds. Fix it the same way, by storing the vault key on the pool and asserting it:
+
+```rust
+#[account(mut, has_one = reward_vault)]
+pub pool: Account<'info, Pool>,
+```
+
+or by deriving the vault as a PDA from seeds that include the pool's key, so the address itself
+carries the relationship.<Cite src="anchor-account-constraints" />
+
+**This is the Cashio shape at small scale.** The first link — position to owner — is checked, and the
+check is visible and correct, and it is exactly what makes the rest look done. Every subsequent hop
+(position to pool, pool to vault) is an unasked question three, and the money leaves through the last
+one.<Cite src="helius-solana-hacks" />
+
+**Two smaller findings, for completeness.** `claimed = true` is set but never *read* — there is no
+`require!(!stake_position.claimed)`, so the claim is repeatable. And the reward multiplication is
+unchecked, which lesson 7 will have opinions about.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**A review pass that is mechanical.** For each instruction, draw the accounts as nodes and draw an
+edge wherever the logic assumes a relationship between two of them — this position belongs to that
+pool, that pool pays from this vault, this mint backs that collateral. Then find the constraint that
+enforces each edge. Every edge without a constraint is a finding, and you can do this without
+understanding the protocol's economics at all.
+
+**A sharper reading of the framework.** `Account<'info, T>` answers what-is-this and who-owns-it in its
+constructor, and answers nothing about which instance.<Cite src="anchor-lang-docsrs" /> `has_one` and
+`seeds` are the constraints that carry relationships, and they are the only ones that
+do.<Cite src="anchor-account-constraints" /> A struct dense with typed wrappers and empty of both is a
+program that has asked two questions three times each.
+
+**And a bridge to the next two lessons.** So far every account discussed has held data. The next
+lesson asks the same three questions about accounts that hold *code* — where "wrong instance" means a
+program the attacker wrote, and where the missing check is an address comparison against a constant
+rather than a relationship between two accounts. That is where Wormhole properly
+belongs.<Cite src="wormhole-postmortem" /> After that, lesson 5 takes the derivation-based form of the
+relational check and shows the two ways it fails even when it is present. If you want the hands-on
+version first, the workshop's tip-pool level is this lesson's shape with real
+money.<Cite src="neodyme-workshop" />

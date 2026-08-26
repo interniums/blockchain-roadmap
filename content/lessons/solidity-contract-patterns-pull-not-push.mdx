@@ -1,0 +1,428 @@
+---
+id: solidity-contract-patterns-pull-not-push
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [solidity-docs-security, solidity-docs-common-patterns, solidity-docs-global-vars, solidity-changelog, eip-1884, eip-2200, eip-7825, eip-7702, eip-150, eip-6780, excessively-safe-call, weird-erc20, oz-safe-erc20-source, measured-gas-constants, eip-1153]
+stack: { solidity: "0.8.36" }
+---
+
+A revenue-sharing contract has 400 recipients and one function that pays them:
+
+```solidity
+function distribute() external {
+    for (uint256 i = 0; i < recipients.length; i++) {
+        payable(recipients[i]).transfer(owed[recipients[i]]);
+    }
+}
+```
+
+Recipient number 213 is a multisig whose `receive()` writes a storage slot. That costs more than
+2,300 gas. Its transfer throws, the throw propagates, the loop reverts, and the other 399 recipients
+are not paid. Not this block — ever, until somebody deploys new code, because the state that makes
+the call fail is not under your control and does not change.
+
+Nobody attacked anything. A contract that behaves entirely reasonably was added to a list, and the
+distribution stopped existing.
+
+This lesson is about the two moves that follow: stop pushing value out during your own logic, and
+stop using the two functions that made the failure look like a safety feature.
+
+<Figure
+  caption="Push makes every recipient a dependency of every other. Pull makes each one a dependency of nobody but themselves."
+  alt="Two shapes of the same distribution. The push version calls each recipient inside one transaction, so a recipient whose receive function costs more than the stipend reverts the loop and leaves the other 399 unpaid. The pull version writes a credit per recipient with no external call, and each recipient later withdraws in their own transaction paid for with their own gas."
+>
+  <Flow
+    lanes={['the batch', 'per recipient', 'the blast radius']}
+    nodes={[
+      { id: 'p0', label: 'push · distribute()', note: 'one transaction', col: 0, row: 0, tone: 'danger' },
+      { id: 'p1', label: 'CALL recipient 213', note: 'its receive() needs more', col: 1, row: 0, tone: 'danger' },
+      { id: 'p2', label: 'the loop reverts', note: '399 others unpaid', col: 2, row: 0, tone: 'danger' },
+      { id: 'q0', label: 'pull · distribute()', note: 'one transaction', col: 0, row: 1, tone: 'good' },
+      { id: 'q1', label: 'credits[i] += owed', note: 'a storage write, no call', col: 1, row: 1, tone: 'good' },
+      { id: 'q2', label: 'N withdrawals', note: 'one each, on their own gas', col: 2, row: 1, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'p0', to: 'p1', tone: 'danger' },
+      { from: 'p1', to: 'p2', tone: 'danger' },
+      { from: 'q0', to: 'q1', tone: 'good' },
+      { from: 'q1', to: 'q2', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+## Three ways a push fails, and they are not all attacks
+
+The Solidity documentation enumerates the failure modes in the section on sending and receiving
+Ether, and the framing worth keeping is that only one of them requires malice.<Cite src="solidity-docs-security" />
+
+**The recipient reverts.** A contract can `revert()` in its `receive` or `fallback` for any reason
+or none. The docs' worked example is a "poisoned" contract deliberately made to fail, so that
+whenever funds are delivered to it the delivering function fails too and the contract is stuck
+forever.<Cite src="solidity-docs-common-patterns" /> That is the attack version.
+
+**The recipient runs out of gas.** If a contract receives Ether without a function being called,
+its `receive` or `fallback` executes, and during that execution it can only rely on the gas stipend
+it is passed — 2,300 gas — which is not enough to modify storage, with the docs adding that you
+should not take even that for granted, since the stipend might change with future hard
+forks.<Cite src="solidity-docs-security" /> The multisig above is not attacking you. It is a normal
+contract doing a normal thing that costs more than 2,300 gas.
+
+**The recipient cannot receive at all.** If a contract has neither a `receive` nor a `fallback`
+function, Ether sent to it is rejected by throwing an
+exception.<Cite src="solidity-docs-security" /> Nothing in the ABI tells you in advance which
+addresses those are.
+
+The docs draw the same conclusion twice, in two different chapters: the best practice here is to use
+a withdraw pattern instead of a send pattern, because if you do, the attacker can only cause their
+own withdraw to fail and not the rest of the contract's
+workings.<Cite src="solidity-docs-security" /><Cite src="solidity-docs-common-patterns" />
+
+## The failure mode that stopped being a cost curve
+
+There is a fourth failure, and it is newer than most material about this pattern.
+
+A loop over N recipients costs O(N) gas. The classical framing is that this is a *cost* problem: as
+the list grows the transaction gets expensive, then very expensive, and eventually exceeds the block
+gas limit — the docs' own warning about unbounded loops is that the iteration count can grow beyond
+the block gas limit, which can cause the complete contract to be stalled at a certain
+point.<Cite src="solidity-docs-security" />
+
+Since EIP-7825, the ceiling arrives earlier and is not the block's. The EIP introduces a
+protocol-level cap on the gas a single transaction may use, fixed at **16,777,216 gas — exactly
+2²⁴** — and it is Final.<Cite src="eip-7825" /> A distribution that grows past that is not expensive.
+It is unlandable. You cannot split the difference by paying more, you cannot wait for a quieter
+block, and you cannot raise your gas limit above the cap. Meanwhile the
+[63/64 rule](/c/63-64-rule) means the inner call never receives all of the gas you have
+left,<Cite src="eip-150" /> so the usable budget for the loop body is strictly under the cap.
+
+That converts a gradual pressure into a wall with a date on it. If your batch is at 12 million gas
+today and growing, you do not have a performance problem to monitor. You have a deadline.
+
+<Aside kind="note">
+The same cap is a good argument against the reflex fix of "just batch it in chunks of 50." Chunking
+works, and it also means your distribution is now a multi-transaction process with partial-failure
+states, retry logic, and an operator who has to be awake. Pull payments give you N independent
+transactions for free, each paid for by the person who wants the money.
+</Aside>
+
+## The pull shape
+
+The conversion is mechanical. Here is the Solidity documentation's own withdrawal-pattern example,
+lightly abridged — a contract where sending more Ether than anyone before makes you "the richest",
+and the person you displaced gets their money back:<Cite src="solidity-docs-common-patterns" />
+
+```solidity
+mapping(address => uint256) pendingWithdrawals;
+
+function becomeRichest() public payable {
+    if (msg.value <= mostSent) revert NotEnoughEther();
+    pendingWithdrawals[richest] += msg.value;   // credit, no call
+    richest = msg.sender;
+    mostSent = msg.value;
+}
+
+function withdraw() public {
+    uint256 amount = pendingWithdrawals[msg.sender];
+    pendingWithdrawals[msg.sender] = 0;         // effect before interaction
+    (bool success, ) = payable(msg.sender).call{value: amount}("");
+    require(success);
+}
+```
+
+Two things happened. The external call left the function that has the business logic, and every
+recipient became responsible for their own failure. The docs state the consequence directly: with
+the withdraw pattern the attacker can only cause their own withdraw to fail, and not the rest of the
+contract's workings.<Cite src="solidity-docs-common-patterns" />
+
+Note also that `withdraw` is [checks-effects-interactions](/c/cei-order) — the zeroing precedes the
+call, with a comment in the original saying exactly why. Pull is not an alternative to CEI. It is
+CEI taken to its limit: if the interaction is the dangerous part and it must come last, the
+strongest version of last is *in a different transaction, initiated by someone else*.
+
+### Converting a push loop, with the accounting stated
+
+**Subgoal 1 — name the invariant before touching code.** For a push loop, the invariant is implicit
+in the balance: whatever the contract holds is owed to somebody. Make it explicit, because you are
+about to split it across two functions.
+
+```text
+address(this).balance  >=  sum of all credits[]
+```
+
+Everything below exists to keep that true.
+
+**Subgoal 2 — replace the transfer with a credit.** The loop stays, but it now writes rather than
+calls. This is the step that removes every external call from the batch, and with it every one of
+the three failure modes above.
+
+```solidity
+function distribute() external {
+    for (uint256 i = 0; i < recipients.length; i++) {
+        credits[recipients[i]] += owed[recipients[i]];
+        totalCredits += owed[recipients[i]];
+    }
+}
+```
+
+**Subgoal 3 — check what the loop now costs, because it is not free.** You have traded a `CALL` per
+recipient for an `SSTORE` per recipient. Writing a credit that was previously zero is the 20,000-gas
+tier; topping up an existing non-zero credit is 2,900; each is plus 2,100 the first time that slot
+is touched in the transaction.<Cite src="measured-gas-constants" /> The loop is still O(N) and still
+runs into EIP-7825's cap eventually.<Cite src="eip-7825" /> What changed is that it now fails only
+for reasons you control, and a stuck recipient cannot cause it. If the list is genuinely large, the
+next step is not a bigger loop — it is a Merkle root and a claim function, where the O(N) work moves
+off-chain entirely.
+
+**Subgoal 4 — write the withdraw with the return value checked.** A low-level call
+[returns a boolean rather than reverting](/c/low-level-call-returns-bool), and an unchecked one is a
+silent loss.
+
+```solidity
+function withdraw() external {
+    uint256 amount = credits[msg.sender];
+    require(amount > 0, "nothing owed");
+    credits[msg.sender] = 0;
+    totalCredits -= amount;
+    (bool ok, ) = msg.sender.call{value: amount}("");
+    require(ok, "transfer failed");
+}
+```
+
+**Subgoal 5 — decide the policy questions pull creates.** What happens to credits nobody claims,
+whether there is a sweep after some period, and who may call it. Pull moves the liveness dependency
+off your critical path; it does not delete it. An unclaimed balance sits on your books indefinitely
+unless you decide otherwise, in advance and in public.
+
+## The obituary for `transfer` and `send`
+
+The opening example used `.transfer()` for a reason. For most of a decade the standard advice was to
+use it, and the stated justification was that the 2,300-gas stipend prevents reentrancy. That advice
+was correct for about four years and has been wrong for seven.
+
+**What the stipend actually is.** `transfer` and `send` forward a fixed 2,300-gas stipend, and the
+documentation's function table says of both: *not adjustable*.<Cite src="solidity-docs-global-vars" />
+That number is a gas-schedule constant, and gas-schedule constants are exactly what hard forks
+change. EIP-1884 repriced trie-size-dependent opcodes in 2019, `SLOAD` among
+them<Cite src="eip-1884" /> — so a `receive` that fitted inside 2,300 gas before that fork could stop
+fitting after it. The docs carry the caveat in the text: the stipend is not enough to modify storage,
+but do not take this for granted, as it might change with future hard
+forks.<Cite src="solidity-docs-security" />
+
+The stipend is therefore a **compatibility constraint you impose on your counterparties**, not a
+security control you hold. It has never been under your control and it has never been stable.
+
+<Misconception
+  belief="The 2,300-gas stipend on .transfer() is a reentrancy defence."
+  reality="It is a fixed constant in a gas schedule that hard forks reprice. It cannot be adjusted, it was already broken as a heuristic by EIP-1884 in 2019, and what it reliably does is break smart-contract wallets, account-abstraction wallets, and now delegated EOAs."
+  why="It was correct advice before 2019 and the advice outlived the pricing it depended on. It is still repeated in tutorials because it is short."
+  src="solidity-docs-security"
+/>
+
+**What the compiler now says.** solc 0.8.31, released 3 December 2025, added a type-checker warning
+about the deprecation of `send` and `transfer` on instances of
+`address`,<Cite src="solidity-changelog" /> and the documentation's function table carries a warning
+that both are deprecated and scheduled for removal.<Cite src="solidity-docs-global-vars" /> The docs'
+own bug examples now carry the inline comment "This will report a warning
+(deprecation)."<Cite src="solidity-docs-security" /> This is not stylistic drift; it is a language
+feature on its way out.
+
+**What EIP-7702 finished.** The last assumption holding the pattern up was that pushing Ether to an
+externally owned account cannot execute code. Since Pectra, a
+[delegated account](/c/delegation-designator) carries a designator in its code slot and runs contract
+code on receipt.<Cite src="eip-7702" /> Every anti-contract guard built on
+[`code.length == 0`](/c/code-length-check-broken) or
+[`msg.sender == tx.origin`](/c/tx-origin-not-eoa) now misclassifies exactly the users who upgraded
+their wallets, and "this is an EOA, so nothing runs" is simply false.
+
+<Misconception
+  belief="Sending ETH to an EOA cannot trigger code, so a push loop over user addresses is safe."
+  reality="A delegated account runs its delegate's code when it receives value. A list of 'EOAs' is now a list of addresses that may or may not execute arbitrary logic, and you cannot tell which from on-chain data alone in a way that stays true."
+  why="The rule held for ten years and is baked into a very large amount of deployed code, none of which was wrong when it was written."
+  src="eip-7702"
+/>
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'transfer(amount)', note: 'deprecated', tone: 'danger' },
+    { title: 'call with a value', note: 'the replacement', tone: 'good' },
+  ]}
+  rows={[
+    {
+      label: 'How much gas does the recipient get?',
+      cells: ['2,300, not adjustable', 'Everything left, subject to the 63/64 rule'],
+    },
+    {
+      label: 'What happens when the recipient fails?',
+      cells: ['It throws, and takes your function with it', 'It returns false, and you decide'],
+    },
+    {
+      label: 'Can the recipient re-enter?',
+      cells: ['Not inside 2,300 gas — until the next repricing', 'Yes, so the guard is not optional'],
+    },
+    {
+      label: 'What does solc 0.8.31 say about it?',
+      cells: ['Deprecated, scheduled for removal', 'Nothing'],
+    },
+    {
+      label: 'Does it work for a delegated account?',
+      cells: ['Only if its code fits in the stipend', 'Yes'],
+    },
+  ]}
+  caption="Every property people rely on transfer for is downstream of one constant they do not set and cannot pin."
+  alt="transfer compared with a low-level call carrying value, across how much gas the recipient receives, what happens when the recipient fails, whether reentry is possible, what solc 0.8.31 reports, and whether a delegated account can be paid."
+/>
+
+## The replacement, done carefully
+
+`call{value: amount}("")` with a checked return value, behind CEI and a guard. Three details
+separate a correct one from a plausible-looking one.
+
+**It forwards everything, so the guard is not optional.** The docs are explicit that `call` with
+value is essentially the same as `transfer` except that it forwards all remaining gas, subject to
+limits like the 63/64 rule, and opens up the recipient's ability to perform more expensive actions —
+which might include calling back into the sending contract or other state changes you might not have
+thought of.<Cite src="solidity-docs-security" /><Cite src="eip-150" /> That is the price of
+compatibility, and it is why the previous two lessons come before this one.
+
+**Returndata is attacker-controlled and you pay to copy it.** A recipient can return an enormous
+byte array; the `(bool, bytes memory)` form copies it into memory, and memory expansion is quadratic.
+If you do not need the returndata — and for a value transfer you do not — discard it, or use a
+bounded low-level call of the kind Nomad's `ExcessivelySafeCall` implements for exactly this
+[returndata-bomb](/c/returndata-bomb) case.<Cite src="excessively-safe-call" />
+
+**Failure is a boolean, not a revert.** `require(ok)` is the minimum. Deciding what a failed
+withdrawal *means* is the design work: leaving the credit in place so the user can retry with a
+different account is usually right, and silently swallowing the failure never is.
+
+<Aside kind="warn">
+Do not reach for `transfer`'s cousin — capping the forwarded gas yourself with
+`call{value: x, gas: 5000}("")`. You have reinvented the stipend with a number you chose, which
+will be wrong after the next repricing for the same reason 2,300 became wrong after
+EIP-1884.<Cite src="eip-1884" /> If your goal is "the recipient cannot re-enter," the mechanism is a
+mutex, whose transient variant costs a flat ~284 gas of overhead as
+measured.<Cite src="measured-gas-constants" /><Cite src="eip-1153" /> Note the connection: EIP-1153
+specifies that `TSTORE` is deliberately *not* subject to the gas stipend check defined in
+EIP-2200,<Cite src="eip-1153" /><Cite src="eip-2200" /> which is what made a lock usable inside a
+stipend-limited frame at all.
+</Aside>
+
+<Check type="spot-bug" concept="push-payment-dos">
+An NFT marketplace settles a sale by paying the seller and the royalty recipient in one call:
+
+```solidity
+function settle(uint256 saleId) external {
+    Sale memory s = sales[saleId];
+    require(!s.settled, "done");
+    sales[saleId].settled = true;
+
+    uint256 royalty = s.price * s.royaltyBps / 10_000;
+    payable(s.royaltyRecipient).transfer(royalty);
+    payable(s.seller).transfer(s.price - royalty);
+}
+```
+
+The team's review notes say: state is written before the transfers, `transfer` reverts on failure so
+nothing can silently fail, and the stipend blocks reentrancy. Name what actually goes wrong and give
+the shape of the fix.
+
+<Answer>
+**The ordering is correct and it is not what is being tested here.** `settled` is written before both
+calls, so a re-entrant `settle` on the same sale would hit the `require`. That part of the review is
+right.
+
+**Failure one — the royalty recipient can permanently block the seller.** Royalty recipients are
+frequently contracts: splitter contracts, DAOs, multisigs. If that contract's `receive` costs more
+than 2,300 gas — a single storage write does — the transfer throws, the whole `settle` reverts, and
+the seller can never be paid for that sale.<Cite src="solidity-docs-security" /> No malice required.
+And because `settled` is set before the transfers, a reverting call unwinds that write too, so the
+sale is not stuck-and-settled; it is stuck and permanently re-attemptable, failing identically every
+time.
+
+**Failure two — delegated sellers now fail too.** A seller who accepted a wallet-upgrade prompt has a
+delegation designator in their code slot and executes code on receipt.<Cite src="eip-7702" /> If that
+code does anything beyond the stipend, the sale is unsettleable. The population this breaks grows
+every time a wallet vendor ships an upgrade, and it is exactly the population you least want to
+break.
+
+**Failure three — the compiler is already telling them.** solc emits a deprecation warning on both
+`send` and `transfer` as of 0.8.31, and the docs list both as scheduled for
+removal.<Cite src="solidity-changelog" /><Cite src="solidity-docs-global-vars" /> A build treating
+warnings as noise is how this survived review.
+
+**The fix, in two parts.**
+
+*Credit, do not send.* `settle` should write `credits[royaltyRecipient] += royalty` and
+`credits[seller] += price - royalty`, then stop. No external call, no counterparty in the critical
+path, and the two payees are no longer dependencies of each other. A separate `withdraw()` does the
+`call{value:}("")` with a checked return, behind the mutex.
+
+*If the product genuinely requires push* — instant settlement is a real feature — do it with `call`,
+check the boolean, and on failure **credit instead of reverting**:
+
+```solidity
+(bool ok, ) = payable(s.seller).call{value: amount}("");
+if (!ok) credits[s.seller] += amount;
+```
+
+That is the hybrid worth knowing. The happy path stays instant, the unhappy path degrades to pull
+instead of to a permanent revert, and nobody's payout depends on anybody else's fallback function.
+It needs the same guard and the same ordering, and it needs you to have decided what an unclaimed
+credit's lifetime is.
+
+**What is not a fix:** checking `recipient.code.length == 0` first and only pushing to "EOAs." That
+check now rejects delegated users and still admits a contract calling from inside its own
+constructor.<Cite src="eip-7702" /> It filters honest upgraded wallets and misses the case it was
+written for.
+</Answer>
+</Check>
+
+## What pull does not fix
+
+Say these out loud when you propose the change, because a reviewer will.
+
+**Dust becomes unclaimable.** A credit worth less than the gas to withdraw it will never be
+withdrawn. That is fine if you designed for it and a slow leak of user-visible broken promises if you
+did not. Batching claims, or letting a third party claim on someone's behalf to their address, are
+the usual answers.
+
+**Someone still has to hold the ETH.** The contract's balance now includes funds it owes but has not
+sent, so `address(this).balance` means two things at once. Track `totalCredits` separately and assert
+the relationship — which is also the fail-safe self-check the Solidity docs recommend building in:
+*has any Ether leaked, is the sum of the tokens equal to the balance of the
+contract*.<Cite src="solidity-docs-security" />
+
+**You cannot stop people sending you ETH anyway.** Neither contracts nor externally owned accounts
+can prevent someone from sending them Ether, and there are ways to move Ether without a message
+call.<Cite src="solidity-docs-security" /> One of the two the docs name — `selfdestruct(x)` — has been
+narrowed since EIP-6780, which restricts the destruction to the same transaction in which the
+contract was created,<Cite src="eip-6780" /> but the coinbase route remains and the general rule
+stands: never derive your accounting from your own balance. See
+[selfdestruct's neutering](/c/selfdestruct-neutered) for the details.
+
+**Tokens are the same pattern with worse ergonomics.** For ERC-20 the failure modes shift but do not
+go away: tokens that return nothing instead of a `bool`, tokens that take a fee on transfer, tokens
+with blocklists that make one recipient's transfer revert. `SafeERC20` exists to normalise the first
+of those,<Cite src="oz-safe-erc20-source" /> and the catalogue of the rest is worth reading before you
+write a token distribution loop.<Cite src="weird-erc20" /> Pull-over-push applies unchanged: credit
+the amount, let them call `claim`.
+
+## Where this pays off
+
+**Access control**, next, is the other half of "who can make this contract do something." Pull
+payments remove a liveness dependency; access control decides who may trigger the state changes that
+create credits in the first place.
+
+**Merkle-drop claims** across the app track are pull payments with the accounting moved off-chain
+entirely: the contract stores one root, and each claimant supplies their own proof and pays their own
+gas. Every argument on this page applies, one level cheaper.
+
+**L2 withdrawal queues** are the same pattern at protocol scale. A rollup does not push your funds
+back to L1; it records a claim you finalise yourself, for exactly these reasons plus one more —
+nobody can be forced to pay for someone else's exit.
+
+**Reading an audit report.** "Denial of service via unbounded loop" and "external call in a loop" are
+two names for this page. The first question is not how to make the loop cheaper. It is which
+participant is currently a dependency of which other, and whether they ever agreed to be.

@@ -1,0 +1,400 @@
+---
+id: altvm-anchor-constraints-are-if-statements
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [anchor-account-constraints, anchor-docs-errors, anchor-lang-error-docsrs, anchor-error-code-offset, anchor-docs-cli, anchor-docs-account-types, anchor-repo-changelog, solana-docs-compute-budget, anchor-docs, anza-compute-units]
+stack: {}
+---
+
+A transaction fails. This is the whole of what the chain gives back to your client:
+
+```text
+Program 9oECKMeeyf1fWNPKzyrB2x1AbLjHDFjs139kEyFwBpoV invoke [1]
+Program log: Instruction: ValidateAmount
+Program log: AnchorError thrown in programs/custom-error/src/lib.rs:11. Error Code: AmountTooLarge.
+  Error Number: 6001. Error Message: Amount must be less than or equal to 100.
+Program 9oECKMeeyf1fWNPKzyrB2x1AbLjHDFjs139kEyFwBpoV consumed 2153 of 200000 compute units
+Program 9oECKMeeyf1fWNPKzyrB2x1AbLjHDFjs139kEyFwBpoV failed: custom program error: 0x1771
+```
+
+Three things in that block are worth pausing on before we get to constraints.
+
+`0x1771` is 6001. That number is the *entire* return value — a single `u32` the program handed to the
+runtime. The file name, the line, the error name and the human message are all in the **logs**, which
+is a different channel: emitted by the program while it ran, collected by the validator, delivered
+alongside the failure, and not part of the program's return
+value.<Cite src="anchor-docs-errors" /> If your indexer only records the failure code, everything
+readable in that block is gone.
+
+And `consumed 2153 of 200000 compute units` is the price of the run, including every check. Which
+brings us to the actual subject: the checks are code, they are your code, and they run on chain.
+
+## Attributes are not configuration
+
+You have already seen the shape of this claim. Here it is with the expansion made concrete, one
+constraint at a time, manual version first.
+
+**`mut`.** By hand: assert the account is writable, and remember to write the struct back at the end
+of the instruction. With Anchor: `#[account(mut)]` checks the account is mutable and makes the
+framework persist any state changes on exit.<Cite src="anchor-account-constraints" /> Two behaviours
+in one word, and the second one — the write-back — is the one people forget exists, which is why
+mutating a field on an account you did not mark `mut` produces a transaction that succeeds and
+changes nothing you expected.
+
+**`address = expr`.** By hand: `if info.key != &EXPECTED { return Err(...) }`. With Anchor:
+`#[account(address = <expr>)]` checks the account key matches the pubkey.<Cite src="anchor-account-constraints" />
+This is the constraint for pinning a specific program, a specific sysvar, or a specific admin key.
+
+**`owner = expr`.** By hand: `if info.owner != &expected_program { ... }`. With Anchor:
+`#[account(owner = <expr>)]` checks the account owner matches the
+expression.<Cite src="anchor-account-constraints" /> Distinct from the owner check inside
+`Account<'info, T>`, which pins ownership to *this* program; `owner = ...` lets you assert that some
+other program owns it.
+
+**`executable`.** Checks the account is a program.<Cite src="anchor-account-constraints" />
+
+**`constraint = expr`.** The escape hatch: any expression that must evaluate to
+true.<Cite src="anchor-account-constraints" /> It compiles to `if !(expr) { return Err(...) }` and
+nothing more. Use it when the relationship you need has no dedicated attribute; recognise it in a
+review as the place where somebody wrote a custom rule that no framework author reviewed.
+
+**`close = target`.** Closes the account by sending its lamports to the target and resetting its
+data.<Cite src="anchor-account-constraints" /> The manual version of this is where the
+[account revival attack](/c/account-revival-attack) lives, because zeroing lamports without
+invalidating the discriminator leaves a resurrectable account behind.
+
+**`realloc`.** Resizes a program account at the start of an instruction, with
+`realloc::payer` and `realloc::zero`.<Cite src="anchor-account-constraints" /> This is the closest
+Solana equivalent to a Solidity array that grows, and the difference is that somebody must fund the
+growth, in this instruction, explicitly.
+
+Every one of these is a runtime `if` in the generated code. You can read them: `anchor expand`
+prints the macro expansion for a program or a workspace, with `--stdout` if you want it in a
+pipe.<Cite src="anchor-docs-cli" /><Cite src="anchor-repo-changelog" /> An afternoon spent reading
+one expanded `try_accounts` will do more for your Solana reviewing than any amount of constraint
+reference.
+
+<Misconception
+  belief="`#[derive(Accounts)]` validation happens off-chain, or in the client, or at compile time."
+  reality="The macro expands into on-chain Rust that executes inside the program, in front of your handler, and burns compute units in proportion to how many constraints you wrote."
+  why="The declarative attribute syntax reads like configuration — it looks like a serde annotation or a validation schema, and both of those are things that run somewhere else."
+  src="anchor-account-constraints"
+/>
+
+## The order of expansion is the order of failure
+
+`try_accounts` runs in a fixed order per account, and that order decides which error a malformed call
+produces.
+
+**Owner, then discriminator, then deserialization, then constraints.** The first three are the
+container's business — the three checks from the previous lesson — and only after all three succeed
+does any `#[account(...)]` attribute get evaluated.<Cite src="anchor-docs-account-types" /><Cite src="anchor-account-constraints" />
+
+<Figure
+  caption="The attributes you declared are evaluated last, and only for an account the container has already proved is one of yours — so the error band alone tells you how far the call got."
+  alt="Generated validation runs in a fixed order inside the program: owner, discriminator and deserialization all fail in the 3000 series, the account attributes fail in the 2000 series, and only then does the handler run, where failures are 6000 and above."
+>
+  <Flow
+    nodes={[
+      { id: 'own', label: 'owner', note: '3000-series', col: 0 },
+      { id: 'disc', label: 'discriminator', note: '3000-series', col: 1 },
+      { id: 'de', label: 'deserialize', note: '3000-series', col: 2 },
+      { id: 'con', label: 'constraints', note: '2000-series', col: 3, tone: 'accent' },
+      { id: 'h', label: 'your handler', note: '6000 and up', col: 4, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+The consequence is the useful part. A call that passes an account belonging to another program fails
+at step one with a 3000-series code, *even if* it would also have violated your `has_one`. You never
+see the `has_one` failure. So when you are reasoning about which error a given attack produces —
+which you will do constantly when writing negative tests — you resolve the checks in this order and
+stop at the first one that fails.
+
+This also explains a category of confusing test failure: you write a test expecting error 2001
+(`ConstraintHasOne`) and get 3007 (`AccountOwnedByWrongProgram`) instead, because the fixture
+account you constructed was never owned by your program in the first place. The test is failing for a
+reason more fundamental than the one you were probing, and the number tells you so.
+
+<Aside kind="note">
+Anchor 1.0 tightened one ordering-adjacent behaviour worth knowing: duplicate mutable accounts are
+now rejected by default, with an explicit `dup` constraint to allow them where it is
+intentional.<Cite src="anchor-account-constraints" /><Cite src="anchor-repo-changelog" /> The
+constraint only applies to mutable account types that serialize on exit; `UncheckedAccount`,
+`Signer`, `SystemAccount`, `AccountLoader`, `Program` and `Interface` allow duplicates naturally
+because they do not write data back.<Cite src="anchor-account-constraints" /> The failure is
+`ConstraintDuplicateMutableAccount`, 2040.<Cite src="anchor-lang-error-docsrs" /> If you have met
+[duplicate mutable accounts](/c/duplicate-mutable-accounts) as a vulnerability class, this is the
+framework closing it by default and handing you a keyword to reopen it.
+</Aside>
+
+## Reading the number
+
+Anchor partitions the `u32` error space so that the number alone tells you who rejected you. The
+scheme, from the framework's own documentation and from the `ErrorCode` enum:<Cite src="anchor-docs-errors" /><Cite src="anchor-lang-error-docsrs" />
+
+<Matrix
+  corner="Range"
+  cols={['Category', 'Reading']}
+  rows={[
+    { label: '≥ 100', cells: ['Instruction errors', 'The payload did not dispatch or decode'] },
+    { label: '≥ 1000', cells: ['IDL errors', 'Something about the on-chain IDL machinery'] },
+    { label: '≥ 1500', cells: ['Event instruction stub', 'Compiled without the event CPI feature'] },
+    {
+      label: '≥ 2000',
+      cells: [
+        { v: <strong>Constraint errors</strong>, tone: 'accent' },
+        <>A generated <code>#[account(...)]</code> check failed</>,
+      ],
+    },
+    { label: '≥ 2500', cells: [<><code>require!</code> violations</>, 'One of the require macros failed'] },
+    {
+      label: '≥ 3000',
+      cells: [
+        { v: <strong>Account errors</strong>, tone: 'accent' },
+        'Owner, discriminator, deserialization, mutability',
+      ],
+    },
+    { label: '≥ 4100', cells: ['Misc', 'Program id mismatch, numeric conversion'] },
+    { label: '= 5000', cells: ['Deprecated', ''] },
+    {
+      label: '≥ 6000',
+      cells: [
+        { v: <strong>Your errors</strong>, tone: 'good' },
+        <>Defined by your <code>#[error_code]</code> enum</>,
+      ],
+    },
+  ]}
+  caption="Anchor spends the whole u32 on provenance: the band a code falls in names the layer that rejected the call."
+  alt="Anchor's u32 error space partitioned by range: 100 instruction errors, 1000 IDL, 1500 event stub, 2000 constraint, 2500 require, 3000 account, 4100 misc, 5000 deprecated, 6000 and above your own error enum."
+/>
+
+The user base is not folklore: `ERROR_CODE_OFFSET` is a public constant equal to
+6000.<Cite src="anchor-error-code-offset" />
+
+The constraint band is the one to learn by sight, because it maps one-to-one onto the attributes
+above:<Cite src="anchor-lang-error-docsrs" />
+
+<Matrix
+  corner="Code"
+  cols={['Variant', 'Constraint']}
+  rows={[
+    { label: '2000', cells: [<code>ConstraintMut</code>, <code>mut</code>] },
+    { label: '2001', cells: [<code>ConstraintHasOne</code>, <code>has_one</code>] },
+    { label: '2002', cells: [<code>ConstraintSigner</code>, <code>signer</code>] },
+    { label: '2003', cells: [<code>ConstraintRaw</code>, <code>constraint = expr</code>] },
+    { label: '2004', cells: [<code>ConstraintOwner</code>, <code>owner = expr</code>] },
+    { label: '2005', cells: [<code>ConstraintRentExempt</code>, <code>rent_exempt</code>] },
+    { label: '2006', cells: [<code>ConstraintSeeds</code>, <><code>seeds</code> / <code>bump</code></>] },
+    { label: '2007', cells: [<code>ConstraintExecutable</code>, <code>executable</code>] },
+    { label: '2011', cells: [<code>ConstraintClose</code>, <code>close</code>] },
+    { label: '2012', cells: [<code>ConstraintAddress</code>, <code>address = expr</code>] },
+    { label: '2013', cells: [<code>ConstraintZero</code>, <code>zero</code>] },
+    {
+      label: '2040',
+      cells: [
+        <code>ConstraintDuplicateMutableAccount</code>,
+        <>duplicate <code>mut</code> account without <code>dup</code></>,
+      ],
+    },
+  ]}
+  caption="A 2000-series code names the exact word in the struct that rejected the call, which is what makes a negative test assertable on the number."
+  alt="Anchor constraint error codes 2000 to 2040 paired with their variant names and the account attribute each one belongs to."
+/>
+
+**Reading the number before reading the logs is the fastest triage step available on Solana.** A
+2000-series code says a generated check rejected you and points at exactly which attribute. A
+6000-series code says your own logic did. That single bit — framework or me — is what you want first,
+and you get it from a hex string in a wallet error without any tooling at all.
+
+<Aside kind="warn">
+The wallet shows hex. `0x1771` is 6001, `0x7d1` is 2001, `0xbbf` is 3007. Keep the conversion in
+whatever scratch tool you use for incidents, because reaching for a calculator is the difference
+between diagnosing a failure in ten seconds and in ten minutes.
+</Aside>
+
+## Your own errors, and the trap in how they are numbered
+
+`#[error_code]` on an enum generates numeric codes assigned from 6000 and the boilerplate to throw
+them, and `#[msg("...")]` attaches the human string that appears in the
+logs.<Cite src="anchor-docs-errors" />
+
+```rust
+#[error_code]
+pub enum CustomError {
+    #[msg("Amount must be greater than or equal to 10")]
+    AmountTooSmall,      // 6000
+    #[msg("Amount must be less than or equal to 100")]
+    AmountTooLarge,      // 6001
+}
+```
+
+**The trap: codes are positional.** The first variant is 6000, the second 6001, and so on in
+declaration order.<Cite src="anchor-docs-errors" /> Insert a new variant in the middle and every code
+below it shifts by one. Your program still compiles, your tests still pass if they match on names,
+and every client, dashboard, alert rule or support macro that matches on the *number* is now wrong —
+silently, and in the direction of reporting the wrong reason rather than reporting nothing. Add
+variants at the end. If you need stable bases across programs, Anchor supports an offset for custom
+error codes, which the IDL generator respects.<Cite src="anchor-repo-changelog" />
+
+<Misconception
+  belief="A given error number means the same thing wherever I see it."
+  reality="Below 6000 it does — those are framework codes, identical in every Anchor program of that version. At 6000 and above it does not: the number is an index into one program's error enum, so 6003 in a lending program and 6003 in a DEX are unrelated."
+  why="The framework codes are stable and shared, which trains the expectation that all Anchor codes are, and the two bands look identical in a wallet's error string."
+  src="anchor-error-code-offset"
+/>
+
+To raise them, `err!` constructs the error, and `require!` combines a condition with returning
+one.<Cite src="anchor-docs-errors" /> The family covers the comparisons where a hand-written `if`
+loses information: `require_eq!`, `require_neq!`, `require_gt!`, `require_gte!` for non-pubkey
+values, and `require_keys_eq!` / `require_keys_neq!` for pubkeys — the split exists because pubkey
+comparison needs its own path.<Cite src="anchor-docs-errors" /> Their failures occupy the 2500 band as
+`RequireViolated`, `RequireEqViolated`, `RequireKeysEqViolated` and
+friends.<Cite src="anchor-lang-error-docsrs" />
+
+You can also attach your own error to a generated constraint with `@`:
+`#[account(has_one = authority @ MyError::WrongAuthority)]`, which every constraint in the reference
+supports.<Cite src="anchor-account-constraints" /> This is worth doing on the constraints that
+represent real product rules, because it converts an anonymous 2001 into a named condition your
+support team can read.
+
+### What a Solidity custom error gives you that this does not
+
+You know [custom errors](/c/sol-custom-error) as a typed thing: a four-byte selector plus
+ABI-encoded parameters, so a revert can carry `InsufficientBalance(available, required)` and a client
+can decode both numbers structurally.<Cite src="anchor-docs-errors" />
+
+A Solana program returns a `u32`. That is the mechanism, and no framework can widen it. Anchor's
+`AnchorError` does carry an error name, a message, the originating file and line, and optionally the
+compared values — but it carries them into the **logs**, as text, at
+runtime.<Cite src="anchor-docs-errors" /> Three consequences follow, and they are all product
+consequences rather than trivia:
+
+- **Logs are best-effort context, not return data.** They can be truncated, and a caller that only
+  reads the transaction result gets the integer.
+- **A calling program cannot branch on your rich error.** A CPI sees the code. If a caller needs to
+  distinguish two failure modes, they must be two codes — which makes error-code design part of your
+  program's interface, not an afterthought.
+- **The message lives in the deployed binary.** Changing it is a redeploy. Localising it is not a
+  thing you do on chain.
+
+## What the checks cost, and why the unit is not gas
+
+Every constraint is code, so every constraint has a price, and the price is denominated in **compute
+units** rather than gas. The two are not comparable and no EVM number transfers: CU are a metering
+unit for a different instruction set with a different cost table.
+
+The budget you are spending against: each instruction is allocated a default of 200,000 CU, and each
+transaction is capped at 1,400,000 CU, with `SetComputeUnitLimit` available to change the
+request.<Cite src="solana-docs-compute-budget" /> That is the frame for the `2153 of 200000` in the
+opening log — a small instruction with a couple of `require!` checks used roughly one percent of its
+default allocation.
+
+Two things follow that are easy to get backwards.
+
+**The priority fee is charged on the CU limit you requested, not the CU you used.**<Cite src="solana-docs-compute-budget" />
+Leaving the default 200,000 in place on an instruction that uses 2,153 means paying priority for
+198,000 units of nothing. The documented method is to simulate the transaction to measure
+consumption and add roughly a ten percent safety margin.<Cite src="solana-docs-compute-budget" />
+This is a real difference from EVM habits, where an over-generous gas limit costs you nothing
+because unused gas is refunded.
+
+**Constraint cost is a per-invocation constant, and constants matter differently at different call
+volumes.** For an application instruction called a few thousand times a day, the compute a handful of
+constraints consume is irrelevant next to the correctness they buy. For a primitive invoked by CPI
+inside other people's transactions, the same constant is levied on every one of those transactions
+and starts to determine whether people can afford to compose with you. That distinction is the entire
+argument of the module after this one, and it is worth reaching it having understood that the
+trade-off is real in one direction only.
+
+<Check type="predict" concept="anchor-error-codes">
+Given this instruction:
+
+```rust
+#[error_code]
+pub enum LendingError {
+    #[msg("Market is paused")]
+    MarketPaused,
+    #[msg("Position is healthy")]
+    PositionHealthy,
+}
+
+#[derive(Accounts)]
+pub struct Liquidate<'info> {
+    #[account(mut, has_one = market)]
+    pub position: Account<'info, Position>,
+    #[account(constraint = !market.paused @ LendingError::MarketPaused)]
+    pub market: Account<'info, Market>,
+    pub liquidator: Signer<'info>,
+}
+```
+
+Predict the error number for each of the following calls, and say which check produced it.
+
+1. `position` is an account owned by a program the attacker deployed, with correct-looking bytes.
+2. `position` is a genuine `Position` from this program, but belongs to a different market than the
+   `market` account passed.
+3. Everything is well-formed, and the market's `paused` flag is `true`.
+4. Everything is well-formed, the market is live, and the handler decides the position is not
+   underwater.
+
+<Answer>
+**1 — 3007, `AccountOwnedByWrongProgram`.** The container's first check is ownership, and it runs
+before the discriminator, before deserialization, and before any
+constraint.<Cite src="anchor-docs-account-types" /><Cite src="anchor-lang-error-docsrs" /> The
+"correct-looking bytes" are irrelevant: an attacker can write any bytes they like into an account
+their own program owns, including a valid discriminator, which is exactly why ownership is checked
+first and separately.
+
+**2 — 2001, `ConstraintHasOne`.** The three container checks pass, so evaluation reaches the
+attributes, and `has_one = market` compares the `market` field stored inside the position against the
+key of the `market` account in this instruction.<Cite src="anchor-account-constraints" /><Cite src="anchor-lang-error-docsrs" />
+Note what this case is: not a forged account, not a wrong type — a *genuine* position of the right
+type, passed against the wrong market. It is the failure that only a relational constraint catches,
+and it is the reason the previous lesson ended by saying the three checks are a floor.
+
+**3 — 6000, `LendingError::MarketPaused`.** The `constraint = ... @ LendingError::MarketPaused` form
+overrides the generic `ConstraintRaw` (2003) with your named error, and `MarketPaused` is the first
+variant in the enum, so it takes the base value of
+`ERROR_CODE_OFFSET`.<Cite src="anchor-account-constraints" /><Cite src="anchor-docs-errors" /><Cite src="anchor-error-code-offset" />
+Without the `@` you would have got 2003, which would have told you a raw constraint failed without
+telling you which one — worth the extra clause on any constraint that encodes a product rule.
+
+**4 — 6001, `LendingError::PositionHealthy`,** assuming the handler raises it with `require!`. This
+is the case that must come from the handler rather than from a constraint, because "is this position
+underwater" is a computation over prices and balances, not a property of the account list. The number
+being in the 6000 band is the signal that you have left generated validation and entered business
+logic.<Cite src="anchor-docs-errors" />
+
+**The meta-point, which is the reason to do this exercise at all.** You predicted four different
+numbers from reading a struct, without running anything. That is the property the ordering gives
+you: generated validation is deterministic and totally ordered, so the failure mode of any malformed
+call is derivable. Write your negative tests to assert on the specific code rather than on "it
+reverted" — a test that only asserts failure will keep passing after you delete the constraint it was
+written to protect, because something else will fail first.
+
+**One caution about the numbers themselves.** 3007, 2001 and 6000 are constants in a crate, not
+protocol constants. Assert against the named variant where your test framework lets you, and confirm
+raw numbers against the `ErrorCode` enum for the version you build with.<Cite src="anchor-lang-error-docsrs" />
+</Answer>
+</Check>
+
+## What this unlocks
+
+Constraints are now a mechanism rather than a vocabulary, which is what the next two lessons need.
+
+- **`seeds` and `has_one`** get a lesson of their own next, because they are the two constraints that
+  answer "which instance", and because getting them wrong is how one user's account becomes reachable
+  through another user's parameters.
+- **`init` versus `init_if_needed`** follows, and it is the one constraint whose failure mode is not
+  a rejected transaction but an accepted one that resets your state.
+- **The IDL** carries your error codes and messages out to clients, which is what makes the numbering
+  discipline above matter beyond your own repository.<Cite src="anchor-docs" />
+- **Compute cost** returns in the final lesson with the measurement method attached, once there is
+  something worth measuring.<Cite src="anza-compute-units" />
+
+The habit to build from this lesson is small and pays immediately: when a Solana transaction fails,
+convert the hex, place the number in a band, and only then open the logs. Most of the time the band
+alone tells you whether you have a validation bug or a logic bug, and those live in different files.

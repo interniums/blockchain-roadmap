@@ -1,0 +1,317 @@
+---
+id: evm-opcodes-memory-the-tier-in-between
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    eip-1153,
+    eip-7569,
+    eip-2929,
+    eip-3529,
+    eip-214,
+    solidity-transient-storage-blog,
+    solidity-docs-storage-layout,
+    solidity-known-bugs,
+    solidity-transient-clearing-bug,
+    solidity-using-the-compiler,
+    measured-gas-constants,
+  ]
+stack:
+  solc: "0.8.36"
+  forge: "1.7.1"
+---
+
+Before Dencun, a reentrancy lock cost thousands of gas to set and clear, for a value whose entire
+useful life was the few milliseconds between one `SSTORE` and the next.
+
+It cost that much because there was nowhere else to put it. The lock has to be visible to a *different
+frame* of the same contract — that is the whole point of a lock — and of the locations you have met so
+far, exactly one is visible across frames and it is the permanent one. Memory dies with the frame.
+Calldata and return data are inputs and outputs, and an untrusted intermediate frame is under no
+obligation to relay anything through them. So the lock went into storage, at storage prices, and every
+protected function paid a permanence charge for a value that must never be permanent.
+
+EIP-1153's own motivation is that argument almost word for word: frames of the same contract can
+communicate through call inputs and outputs, which is not secure when an intermediate frame belongs to
+another untrusted contract, or through storage, which is costly — and a reentrancy lock is the notable
+example of something that cannot rely on the intermediate frame.<Cite src="eip-1153" />
+
+This lesson is about the region that closes that gap, and about why it is a new *shape* rather than a
+discount.
+
+## What it is
+
+Transient storage is a per-contract key-value store, addressed exactly like storage, whose contents
+are discarded at the end of the transaction.
+
+Two opcodes reach it. `TLOAD` is `0x5c` and `TSTORE` is `0x5d`, and they take the same stack operands
+as `SLOAD` and `SSTORE`: `TLOAD` pops an address and pushes the word stored there; `TSTORE` pops an
+address and a value and writes it. Addressing is identical — each 32-byte address names one 32-byte
+word.<Cite src="eip-1153" />
+
+It shipped in Dencun, alongside `MCOPY`, `SELFDESTRUCT`'s narrowing, and the blob
+transactions.<Cite src="eip-7569" />
+
+### The price, and why it is flat
+
+Measured on this machine with forge 1.7.1 and solc 0.8.36, optimizer off: `TSTORE` reads 114 and
+`TLOAD` reads 116 against a harness overhead of about 16 gas, giving **100 gas each** — flat, with no
+cold tier at all.<Cite src="measured-gas-constants" />
+
+The EIP sets those prices by analogy: `TSTORE` costs the same as a warm `SSTORE` to a dirty slot, and
+`TLOAD` the same as a hot `SLOAD`.<Cite src="eip-1153" /> The absence of a cold tier is the part worth
+understanding, because it is not a discount someone chose — it is a consequence. The
+[cold surcharge](/c/cold-vs-warm-access) exists because the first touch of a storage slot makes the
+client find it, which is disk work and witness bytes.<Cite src="eip-2929" /> Transient storage has no
+trie, no disk, and no original value to load; the EIP notes that the original value is always zero, so
+there is nothing to fetch and the gas accounting needs no refunds.<Cite src="eip-1153" />
+
+The EIP is also explicit about why the price cannot go all the way down to memory's three gas per
+word: transient storage interacts with reverts, and that interaction has to be paid for.<Cite src="eip-1153" />
+
+## Three properties, and only the combination is new
+
+Individually, nothing here is unprecedented. The combination had no previous home.
+
+**It is visible across frames, within one transaction.** Transient storage is private to the contract
+that owns it, in the same way persistent storage is, and every frame belonging to that contract in
+that transaction sees the same store.<Cite src="eip-1153" /> Ownership follows the same rules you
+already know for storage: under `DELEGATECALL` or `CALLCODE` the owner is the *caller* — the contract
+that issued the instruction — while under `CALL` or `STATICCALL` the owner is the
+callee.<Cite src="eip-1153" /> If you can reason about which storage a delegatecall writes, you can
+reason about which transient storage it writes, because the answer is the same.
+
+<Figure
+  caption="Ownership follows the storage rule exactly: a delegatecall writes the caller's transient store, and a plain call writes the callee's."
+  alt="Contract A calling contract B two ways. Under DELEGATECALL, B's code runs in A's frame and a TSTORE lands in A's transient store. Under CALL, B runs in its own frame and the same TSTORE lands in B's transient store."
+>
+  <Flow
+    nodes={[
+      { id: 'a', label: 'contract A', note: 'issues the call', col: 0 },
+      { id: 'dc', label: 'DELEGATECALL B', note: "runs B's code", col: 1 },
+      { id: 'c', label: 'CALL B', note: 'B gets a frame', col: 1 },
+      { id: 'ta', label: "A's transient store", col: 2, tone: 'accent' },
+      { id: 'tb', label: "B's transient store", col: 2, tone: 'accent' },
+    ]}
+    edges={[
+      { from: 'a', to: 'dc' },
+      { from: 'a', to: 'c' },
+      { from: 'dc', to: 'ta' },
+      { from: 'c', to: 'tb' },
+    ]}
+  />
+</Figure>
+
+**It participates in reverts.** If a frame reverts, every transient write that took place between
+entry to that frame and its return is rolled back, including writes made in inner
+calls.<Cite src="eip-1153" /> This deliberately mimics persistent storage, and it is the property that
+makes locks work: a reverted attempt leaves no lock behind to jam the contract for the rest of the
+transaction. Note the shape — it is not "transient storage is cleared on revert", it is
+[the same rollback semantics the rest of the frame gets](/c/three-failure-modes).
+
+**It clears itself.** All values are discarded at the end of the transaction, with no clearing write
+required.<Cite src="eip-1153" /> That is what removes the second half of the old storage lock's cost.
+It also removes a subtler cost: EIP-3529 capped total refunds at a fifth of a transaction's gas, and
+the EIP points out what that did to storage-based inter-frame communication — to get the full refund
+for a single reentrancy lock, the transaction had to spend roughly 80,000 gas on other
+things.<Cite src="eip-1153" /><Cite src="eip-3529" />
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Memory', note: 'per frame' },
+    { title: 'Transient storage', note: 'per transaction', tone: 'accent' },
+    { title: 'Persistent storage', note: 'per account, forever', tone: 'warn' },
+  ]}
+  rows={[
+    {
+      label: 'How long does a value live?',
+      cells: ['Until the frame returns', 'Until the transaction ends', 'Until someone pays to change it'],
+    },
+    {
+      label: 'Which frames can read it?',
+      cells: [
+        'Only the frame that wrote it',
+        'Every frame of the owning contract, this transaction',
+        'Every frame of the owning contract, every transaction',
+      ],
+    },
+    {
+      label: 'What does a revert undo?',
+      cells: [
+        'Nothing — the frame is gone either way',
+        'Every write since the reverting frame was entered',
+        'Every write since the reverting frame was entered',
+      ],
+    },
+    {
+      label: 'Does it have to be cleared?',
+      cells: ['No', 'No — discarded at the end of the transaction', 'Yes, and the refund for doing so is capped'],
+    },
+    {
+      label: 'What does a write cost?',
+      cells: ['3 gas per word, plus expansion', '100 gas, flat, no cold tier', '20,000 or 2,900, plus 2,100 when cold'],
+    },
+  ]}
+  caption="The gap transient storage fills is a lifetime, not a price: it is the only region that is both visible across frames and gone by the next transaction."
+  alt="Memory, transient storage and persistent storage compared. Memory lives until the frame returns and only that frame can read it. Transient storage lives until the transaction ends and every frame of the owning contract can read it. Persistent storage lives until it is changed and is readable in every later transaction. Reverts roll back both stores. Only persistent storage has to be cleared. A memory word costs 3 gas plus expansion, a transient write 100 gas flat, and a persistent write 20,000 or 2,900 plus 2,100 when the slot is cold."
+/>
+
+Put those together and the middle tier is exact: **memory's lifetime was too short and storage's was
+too long.** Transient storage is the first region whose lifetime matches the thing most locks, guards
+and running totals actually are.
+
+<Misconception
+  belief="Transient storage is just cheap storage."
+  reality="It is zeroed at the end of the transaction, so nothing written to it can be observed by any later transaction. It is a different lifetime, not a discount on the same one."
+  why="The price difference is the first thing anyone notices — 100 gas against 20,000 — and a 200-fold price cut on something that otherwise looks identical reads as a discount rather than as a different product. The addressing being identical to storage reinforces the impression."
+  src="eip-1153"
+/>
+
+<Misconception
+  belief="Transient storage is per-frame, like memory."
+  reality="It is per-transaction and per-contract. Every frame belonging to that contract within the transaction reads and writes the same store, which is precisely the property memory lacks and locks require."
+  why="Its lifetime is short, and short-lived things in this machine have so far all been frame-scoped. The name also suggests transience in the sense of 'goes away quickly' rather than in the sense of 'goes away at a specific, later boundary'."
+  src="eip-1153"
+/>
+
+<Aside kind="warn">
+The second misconception has a sharp edge that EIP-1153's security considerations call out directly.
+Because transient storage is a cheap key-value store, it is tempting as a replacement for an in-memory
+mapping — but it is **not** discarded when a call returns, the way memory is, so values written by one
+call into your contract are still there when a later call in the same transaction arrives. The EIP
+recommends preferring memory for these cases, notes that most in-memory-mapping needs are better
+served by key-sorted lists of entries, and observes that the author knows of no production use cases
+for in-memory mappings at all.<Cite src="eip-1153" />
+</Aside>
+
+## Two details that decide designs
+
+**`TSTORE` is forbidden in a static context; `TLOAD` is not.** EIP-1153 states it plainly: calling
+`TSTORE` inside a `STATICCALL` raises an exception instead of performing the modification, while
+`TLOAD` is permitted.<Cite src="eip-1153" /> This is exactly the treatment `SSTORE` gets under
+EIP-214's read-only frame,<Cite src="eip-214" /> and it means a `view` function cannot set a
+transient flag — which rules out a whole family of otherwise attractive "remember this during a
+read-only traversal" designs.
+
+**`TSTORE` is not subject to the gas stipend check.** `SSTORE` refuses to execute when the remaining
+gas is at or below the 2,300 stipend; EIP-1153 specifies that `TSTORE` carries no such
+requirement.<Cite src="eip-1153" /> That single asymmetry is the subject of the ninth lesson in this
+module, and it is the most consequential security property of the whole feature. Hold it.
+
+### Why the interface is slot-addressed
+
+A reasonable objection, which the EIP records and answers: transient storage is more like memory than
+storage in its lifecycle, so why not give it a byte-addressed, memory-like interface?
+
+Because mappings are the point. The EIP argues that a word-addressed, storage-like interface is
+preferred because transaction-scoped state is often needed under arbitrary keys — its example is a
+temporary ERC-20 approval keyed on an owner-and-spender pair — and mappings are difficult to implement
+over linear memory, which would also need dynamic gas costs and a more complicated revert
+story.<Cite src="eip-1153" />
+
+The practical consequence is that a transient slot number is derived the same way a storage slot
+number is, so everything you know about mapping-slot derivation transfers unchanged. It also means you
+can hold many independent locks at the same price, which is the basis of a pattern the next lesson
+covers.
+
+## Using it from Solidity, carefully
+
+Inline-assembly access to `TSTORE` and `TLOAD` arrived with Solidity
+0.8.24.<Cite src="solidity-transient-storage-blog" /> The language later gained a `transient` data
+location for state variables, with layout rules that follow the same slot-assignment scheme as
+storage while occupying a completely independent address space — the two layouts do not interfere, so
+storage and transient state variables can be interleaved safely. Only value types are supported in
+transient storage.<Cite src="solidity-docs-storage-layout" />
+
+<Aside kind="stop">
+**Pin at least 0.8.34.** Solidity's known-bugs list carries SOL-2026-1,
+`TransientStorageClearingHelperCollision`, rated **high** severity: a Yul helper-function name
+collision meant that a contract clearing both a storage variable and a transient variable would
+actually clear only one of them, with which one depending on the order the code generator processed
+its input. The necessary conditions were a `delete` on a transient state variable together with a
+clearing operation on persistent storage in the same bytecode, under `--via-ir` with a Cancun-or-later
+target. It was introduced in 0.8.28 and fixed in 0.8.34.<Cite src="solidity-known-bugs" /><Cite src="solidity-transient-clearing-bug" />
+
+A silent failure to clear a lock is precisely the bug class transient storage was supposed to make
+easy to avoid. Check the version before you check the logic.
+</Aside>
+
+<Misconception
+  belief="If it compiles with transient storage, it works on any EVM chain."
+  reality="It requires Cancun-equivalent support. The compiler targets an EVM version, not a chain, so it will happily emit TSTORE for a chain whose EVM does not implement it."
+  why="The compiler's EVM-version setting looks like an optimisation target rather than a compatibility contract, and its default tracks mainnet. A contract that deploys and only fails when the transient path is exercised gives no early signal."
+  src="solidity-using-the-compiler"
+/>
+
+The mechanism behind that misconception is worth being concrete about: `solc` takes an EVM version
+setting that determines which opcodes it may emit,<Cite src="solidity-using-the-compiler" /> and the
+opcodes in question entered the protocol at Dencun.<Cite src="eip-7569" /> A chain that has not
+adopted Dencun-equivalent rules will reject or mis-execute the resulting bytecode. Lower the target
+explicitly for such chains, and treat the EVM version as part of your deployment configuration rather
+than a compiler detail.
+
+<Check type="recall" concept="transient-storage-middle-tier">
+For each statement, say whether it is true of memory, of transient storage, of persistent storage, or
+of more than one — and give the reason rather than the label.
+
+1. A value written here is visible to a different call frame of the same contract later in the same
+   transaction.
+2. A value written here survives a `revert` in the frame that wrote it.
+3. A value written here must be explicitly cleared or it costs you.
+4. A `view` function can write here.
+5. The first access in a transaction costs more than later accesses.
+
+<Answer>
+**1 — transient storage and persistent storage, not memory.** Memory is created fresh and zeroed for
+each frame and dies with it, so a callee cannot see the caller's.<Cite src="eip-1153" /> Transient and
+persistent storage are both per-contract stores that every frame of that contract shares within the
+transaction. This is the property the reentrancy lock needs and the reason locks lived in persistent
+storage before Dencun.
+
+**2 — none of them.** This is a trick, and it is worth getting wrong once. Memory dies with the frame
+either way. Persistent storage writes are rolled back on revert. And transient storage writes are
+explicitly specified to roll back too: every write between entry to a reverting frame and its return is
+undone, including those made in inner calls.<Cite src="eip-1153" /> The rollback is the deliberate
+design choice that makes transient storage usable for locks rather than a hazard.
+
+**3 — persistent storage only.** Transient storage is discarded at the end of the transaction with no
+clearing write required.<Cite src="eip-1153" /> Persistent storage keeps whatever you left there
+forever unless you pay to clear it, and the refund for clearing is 4,800 against 20,000 to set,
+capped at a fifth of gas used.<Cite src="eip-3529" /> There is an important caveat on the transient
+answer, though: while the *protocol* does not require clearing, good practice does, because an
+uncleared value is visible to later calls into your contract within the same transaction. That is the
+composability hazard, and it is the ninth lesson.
+
+**4 — memory only.** `SSTORE` is forbidden in a static context by EIP-214,<Cite src="eip-214" /> and
+EIP-1153 gives `TSTORE` the same treatment: an exception rather than a modification, while `TLOAD`
+remains permitted.<Cite src="eip-1153" /> A `view` function may read both stores and write neither.
+Memory is frame-local and unobservable from outside, so writing it is not a state change at all.
+
+**5 — persistent storage only.** Cold storage reads cost 2,100 against 100 warm, and a cold slot adds
+2,100 to a write.<Cite src="eip-2929" /><Cite src="measured-gas-constants" /> Transient storage is flat
+at 100 with no cold tier, because there is no trie lookup to
+amortise.<Cite src="eip-1153" /><Cite src="measured-gas-constants" /> Memory's cost depends on the
+high-water mark rather than on access history, which is a different kind of path dependence entirely.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The patterns**, next lesson, are what this region was built for: a reentrancy guard whose overhead
+is flat and small, many independent locks at the same price, and flash accounting, where a whole
+transaction's net balance changes live transiently and settle once at the end.
+
+**Reentrancy guards** in the security track inherit the measured comparison directly. A guard's cost
+determines whether teams put one on every function or only on the ones they judged risky, and that
+judgement is where the vulnerabilities live.
+
+**Uniswap v4 and the singleton pattern** in the DeFi track are the largest production deployment of
+this region, and the architecture is not merely cheaper — it is a design that could not have been
+written before this lifetime existed.<Cite src="eip-1153" />
+
+**Cross-chain deployment** in the toolchain track picks up the portability thread. The EVM-version
+setting is a compatibility contract with the chains you deploy to, and transient storage is currently
+the sharpest example of what happens when that contract is left at its default.<Cite src="solidity-using-the-compiler" />

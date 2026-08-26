@@ -1,0 +1,370 @@
+---
+id: infra-indexer-selection-capability-first
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [sentio-obib, obib-repo, ponder-call-traces, ponder-docs, ponder-factory, ponder-indexing-overview, envio-dynamic-contracts, envio-contract-state, envio-supported-networks, goldsky-declared-eth-calls, thegraph-quick-start]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+Your analytics dashboard says the router had 427 unique users last week. A colleague pulls the same
+week from a different indexer and gets about 1,200.
+
+Neither system errored. Neither is behind. Neither has a reorg problem. Both are counting "unique
+senders of a swap through the router", both are reading the same chain, and one of them is missing two
+thirds of the answer.
+
+This is the failure mode that decides indexer selections, and it does not appear on any speed chart.
+The open benchmark measured it: on its traces workload, subgraph-style indexing returned 29,058 of
+50,191 expected records — 58% completeness — where trace-capable platforms returned all of
+them.<Cite src="sentio-obib" /> This lesson is where that number comes from, what it generalises to,
+and the four gates that follow.
+
+## The 58%, explained
+
+The benchmark gives the mechanism directly, and it is not a configuration mistake.
+
+A subgraph observes contract calls through `callHandlers`, which see **direct calls to a contract**.
+When a user's wallet calls the Uniswap V2 router, the subgraph sees it. When an aggregator or an MEV
+bot calls the router through an intermediary contract — an internal transaction — the subgraph does
+not. The post states that about 40% of V2 swaps happen that way, and that this is how the subgraph
+runtime works rather than something a config change fixes.<Cite src="sentio-obib" />
+
+The second consequence is nastier than the missing rows. Sender identification breaks: `call.from`
+returns the *calling contract*, not the original wallet. The benchmark found roughly 427 unique senders
+where trace-based indexers found roughly 1,200.<Cite src="sentio-obib" />
+
+Read what that does to a product. The row count being low is a number you might notice. The sender
+field being *populated with the wrong thing* is a value that passes every type check, every null check
+and every foreign-key constraint you would think to write. Your "top users" leaderboard is a list of
+aggregator contracts. Your retention cohorts are wrong. Your airdrop eligibility is wrong. Nothing
+anywhere reports a problem.
+
+<Figure
+  caption="A call handler records the immediate caller, so a routed swap is attributed to the intermediary and the wallet never reaches the row."
+  alt="A wallet calls an aggregator contract, which calls the router through an internal transaction; the subgraph's call handler fires with the aggregator as the sender, so the wallet does not appear in the indexed row."
+>
+  <Flow
+    nodes={[
+      { id: 'w', label: 'wallet', note: 'the original sender', col: 0 },
+      { id: 'agg', label: 'aggregator', note: 'a contract you did not write', col: 1, tone: 'warn' },
+      { id: 'r', label: 'router', note: 'the contract you index', col: 2, tone: 'accent' },
+      { id: 'row', label: 'indexed row', note: 'sender = the aggregator', col: 3, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'w', to: 'agg', label: 'direct call' },
+      { from: 'agg', to: 'r', label: 'internal transaction', tone: 'warn' },
+      { from: 'r', to: 'row', label: 'callHandler fires', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+## Value moves without logs
+
+Generalise past the one runtime, because the underlying fact is about the chain and not about any
+platform.
+
+[Logs are write-only artifacts](/c/logs-are-write-only) that a contract author chose to emit. They are
+[an API contract](/c/events-are-an-api-contract) offered to consumers, which means they are a
+*description* of what happened, authored by the same person who wrote the code. The state trie holds
+what happened. The log holds the account of it.
+
+So value can move with no event at all:
+
+- A contract forwards ETH to another address in a `call` with no accompanying `emit`.
+- A multi-hop route moves funds through three intermediate contracts, only the outermost of which
+  emits.
+- A `receive()` or `fallback()` accepts ETH — many implementations emit nothing.
+- A `selfdestruct`-style balance sweep, or a beneficiary payment inside a settlement contract.
+- Any transfer performed by a contract you did not write and whose author had no reason to announce it
+  to you.
+
+An indexer that consumes only logs cannot see any of this. Not slowly — at all.
+
+<Misconception
+  belief="A subgraph sees everything that happened on chain."
+  reality="Log-based indexing sees what contract authors chose to emit. Internal value movement frequently emits nothing, and the one open benchmark measured 58% completeness for subgraph-style trace indexing with sender attribution broken as well."
+  why="Most protocols do emit events for the things their own users care about, so within the boundary of one well-instrumented protocol logs really are close to exhaustive. The gap opens exactly where your product touches contracts you did not write."
+  src="sentio-obib"
+/>
+
+**Which products can live with this.** An engagement dashboard, a leaderboard for a game, a feed of
+recent activity — missing rows degrade the experience and nobody is harmed.
+
+**Which cannot.** Anything that reconciles balances. Anything that computes fees owed. Anything feeding
+accounting, tax reporting or a partner revenue share. Anything determining eligibility. For those, the
+missing rows are a correctness bug, and the distinguishing property of this class of bug is that **it
+is found by a user or an auditor, never by a test** — because your tests were written against the same
+incomplete model as the code.
+
+## Traces are not free, and the cost is not only yours
+
+Before treating "just use a trace-capable indexer" as the answer, price it.
+
+You already know [the two tracing namespaces](/c/trace-vs-debug-namespace) and that they are not
+interchangeable. Ponder's documentation states the practical consequence for indexing plainly: call
+traces are slower, more expensive and less widely supported than logs, and you might struggle to find
+an RPC provider that supports `debug_traceBlockByNumber` and `debug_traceBlockByHash` for new
+chains.<Cite src="ponder-call-traces" />
+
+That last clause is the part that surprises teams. **Trace capability is bounded by your provider, not
+only by your framework.** A framework that supports traces on Ethereum mainnet may be unable to
+support them on the L3 you launch on next quarter, because the node software there does not expose the
+methods. Chain coverage and data-type coverage are not independent axes; they multiply.
+
+Where the framework does support it, the shape is usually a per-contract opt-in. Ponder enables it with
+`includeCallTraces` on the contract configuration, after which each ABI function becomes available as
+an indexing function under a `"ContractName.functionName()"` naming scheme, with the trace available on
+the event:<Cite src="ponder-call-traces" />
+
+```ts
+import { ponder } from "ponder:registry"
+
+ponder.on("Router.swapExactTokensForTokens()", async ({ event }) => {
+  event.args           // decoded function arguments
+  event.trace.gasUsed  // the trace record itself
+})
+```
+
+Note what this gives you that a log cannot: the *call*, including calls that emitted nothing, with the
+arguments the caller actually passed.
+
+## The four gates
+
+Run these before any performance comparison. Each is a yes-or-no question, and a "no" removes a
+platform regardless of where it sits on any chart.
+
+### Gate one — which data types can it index
+
+Events are table stakes; everything else is where platforms differ. The benchmark's feature matrix
+reports, across Sentio, Envio, Ponder, Subsquid and Subgraph: event handlers everywhere; block handlers
+everywhere except Envio, marked limited; transaction handlers everywhere except Envio (limited) and
+Subgraph (no); and trace handlers as Sentio yes, Envio limited, Ponder no, Subsquid limited, Subgraph
+limited.<Cite src="sentio-obib" />
+
+The word "limited" is where the information is, and the post defines each instance: for Envio, blocks,
+transactions and traces require HyperSync plus manual decoding plus client-side reorg handling, and are
+not native to HyperIndex; for Subsquid, traces arrive as raw bytes you decode yourself; for Subgraph,
+traces capture only direct contract calls.<Cite src="sentio-obib" />
+
+<Matrix
+  corner={<>Platform<Cite src="sentio-obib" /></>}
+  cols={['Events', 'Blocks', 'Transactions', 'Traces', 'What "limited" means here']}
+  rows={[
+    { label: 'Sentio', cells: [
+      { v: 'Yes', tone: 'good' }, { v: 'Yes', tone: 'good' }, { v: 'Yes', tone: 'good' }, { v: 'Yes', tone: 'good' }, '—',
+    ] },
+    { label: 'Envio', cells: [
+      { v: 'Yes', tone: 'good' }, { v: 'Limited', tone: 'warn' }, { v: 'Limited', tone: 'warn' }, { v: 'Limited', tone: 'warn' },
+      'Blocks, transactions and traces need HyperSync plus manual decoding plus client-side reorg handling, and are not native to HyperIndex',
+    ] },
+    { label: 'Ponder', cells: [
+      { v: 'Yes', tone: 'good' }, { v: 'Yes', tone: 'good' }, { v: 'Yes', tone: 'good' }, { v: 'No', tone: 'danger' }, '—',
+    ] },
+    { label: 'Subsquid', cells: [
+      { v: 'Yes', tone: 'good' }, { v: 'Yes', tone: 'good' }, { v: 'Yes', tone: 'good' }, { v: 'Limited', tone: 'warn' },
+      'Traces arrive as raw bytes you decode yourself',
+    ] },
+    { label: 'Subgraph', cells: [
+      { v: 'Yes', tone: 'good' }, { v: 'Yes', tone: 'good' }, { v: 'No', tone: 'danger' }, { v: 'Limited', tone: 'warn' },
+      'Traces capture only direct contract calls',
+    ] },
+  ]}
+  caption="One open benchmark, Sentio's OBIB, reports this grid — and each Limited names a different piece of work that would become yours."
+  alt="Five indexing platforms against four data types — events, blocks, transactions and traces — with yes, no or limited for each, and the benchmark's definition of limited for the three platforms it applies to."
+/>
+
+Read those definitions and "limited" stops being a middling grade. Envio's version means *you are
+writing an ingester*, including [the reorg handling](/c/reorg-safe-indexing) the framework otherwise
+does for you — which is a substantial project, not a checkbox. Subsquid's means you own the decoding.
+Subgraph's means the 58%.
+
+<Aside kind="warn">
+A matrix cell is a summary of a definition you have not read, and this table proves it on itself. It
+marks Ponder "No" for trace handlers — yet the same post's Case 5 reports a completed Ponder trace run
+at 74.71 minutes and 88% completeness,<Cite src="sentio-obib" /> and Ponder's own documentation ships a
+call-traces guide.<Cite src="ponder-call-traces" /> Likewise "Native RPC Calls: No" for Ponder sits
+beside a Case 2 in which Ponder completed an events-plus-contract-reads workload with correct
+records,<Cite src="sentio-obib" /> and beside Ponder documentation for reading contract data inside
+indexing functions.<Cite src="ponder-indexing-overview" />
+
+These are not contradictions so much as different definitions in the same document — "native" and
+"handler" are doing work the table does not explain. The resolution is in the published
+configurations,<Cite src="obib-repo" /> and the transferable habit is: **when a summary cell and a
+results row disagree, believe neither until you have read the definition.** Do this before a
+procurement decision, not after.
+</Aside>
+
+### Gate two — can a handler read contract state
+
+Every non-trivial fold eventually needs something the event did not carry: a token's decimals, a pool's
+reserves at that block, an owner's tier. Three sub-questions, and they are usually conflated:
+
+**Can it at all?** Ponder documents reading contract data within indexing
+functions.<Cite src="ponder-indexing-overview" /> Envio documents accessing contract state in event
+handlers as its own topic.<Cite src="envio-contract-state" />
+
+**What does it cost?** A naive per-event read is a serialised round trip inside the hot path, and it is
+the single most common reason a fast indexer becomes a slow one — the benchmark's Case 2 exists to
+measure exactly this, and the times roughly double to quintuple against the events-only
+case.<Cite src="sentio-obib" /> The mitigations are batching and caching, which Envio documents
+explicitly,<Cite src="envio-contract-state" /> or moving the call into the declaration so the runtime
+can prefetch it per block, as with declared `eth_calls` in a subgraph
+manifest.<Cite src="goldsky-declared-eth-calls" />
+
+**Can you pin it to the event's block?** This is the determinism question from the first module wearing
+a capability hat. A read that resolves against the chain head during backfill produces a table that
+cannot be reproduced. If a platform cannot pin the read, its contract-read feature is a liability for
+any historical fold.
+
+### Gate three — can it follow contracts created at runtime
+
+Almost every AMM, lending market, vault system and NFT launchpad deploys child contracts from a
+factory. An indexer that cannot register those at runtime is limited to the contracts that existed when
+you wrote the config.
+
+You have seen both shapes: Ponder's `factory()` helper, resolved from the factory address, the
+announcing event and the parameter carrying the child's address;<Cite src="ponder-factory" /> Envio's
+`contractRegister` callback that adds the address during
+indexing.<Cite src="envio-dynamic-contracts" /> A subgraph's equivalent is a data-source template
+instantiated from a mapping.
+
+The benchmark records a real operational limit here worth quoting: Subsquid's template support requires
+manually updating config at fixed block numbers when new contracts are created — workable for a handful
+of contracts, impractical when a factory creates thousands.<Cite src="sentio-obib" /> That is a
+capability that exists on paper and does not scale to the shape of the thing it is for, which is the
+kind of detail a feature matrix cannot express.
+
+And recall the counting divergence: on the templates workload, against 35,039 expected records,
+platforms reported 35,039, 75,951, 33,972, 182,767, 75,951 and 35,039.<Cite src="sentio-obib" /> Even
+among platforms that *have* the capability, "what counts as a template event" is not agreed.
+
+### The failure mode inside the gates
+
+Before the fourth gate, a pattern that cuts across the first three and is worth naming on its own,
+because once you have the name you start seeing it everywhere.
+
+**A capability can be present, selected, and quietly wrong.**
+
+The benchmark's authors hit this while building the block workload. Subsquid's `.addTransaction()`
+method silently skips blocks that contain no transactions. Early Ethereum — blocks 0 to about 46,000 —
+is mostly empty blocks, so using that method instead of `.includeAllBlocks()` drops roughly 87% of the
+range with no warning at all. They record that they burned time debugging it before working out what
+was happening.<Cite src="sentio-obib" />
+
+Nothing about that is a bug. Both methods do what they say. One of them has a precondition that is
+obvious once stated and invisible in a config file, and the difference between them is 87% of your
+data.
+
+Now put that next to the 58% traces result and the template counts ranging from 33,972 to 182,767 for
+the same block range,<Cite src="sentio-obib" /> and the shape becomes clear. **The dangerous
+capability failures in indexing are not "unsupported" — unsupported is loud and you find it in an
+afternoon. They are "supported, with a semantic you did not know you were choosing".**
+
+Which gives a fifth question to ask of every gate you pass: *what would it look like if this were
+working but wrong?* If the answer is "the same as working", you need an independent check — an expected
+record count, a balance reconciliation, a hand-verified transaction — before you trust the output.
+That is the technique the benchmark itself uses, and it is the only defence against this class.
+
+### Gate four — does it cover every chain you touch
+
+Last and simplest, and worth re-running rather than trusting from memory: check the supported-network
+list of the version you would deploy, not a comparison table.<Cite src="envio-supported-networks" />
+Remember from gate one that this compounds with data types — a chain being supported does not mean
+traces are available on it.
+
+<Misconception
+  belief="Capability differences are edge cases; the mainstream platforms all do roughly the same thing and speed is what is left to decide on."
+  reality="Across the six benchmark workloads there are several 'not supported' entries and one timeout at 2.5% completion. Whether a platform can index transactions, traces or blocks at all is a categorical difference, and it eliminates candidates before minutes are consulted."
+  why="Every platform's marketing is written about the workload it does well, and every one of them does events well. Events are what the landing pages show, so events are what the field looks like from outside."
+  src="sentio-obib"
+/>
+
+## Worked example: gating a fee-reconciliation product
+
+The product: a vault protocol needs a report of fees actually received, per period, reconcilable
+against on-chain balances to the wei, feeding an accounting system. Subgoals name each step's purpose.
+
+**Subgoal — state the completeness requirement as a number before looking at any platform.** "Every
+wei that entered the fee receiver must appear in exactly one row." Writing this down first is what
+converts the later gates from preferences into tests. A product that can tolerate 98% should say so
+too — the point is that the number is a decision, not a discovery.
+
+**Subgoal — establish whether logs are sufficient, by auditing the sources of inflow.** Walk the paths
+by which value reaches the fee receiver. If any path is a contract forwarding ETH, or a router settling
+internally, or a third-party integration you do not control, logs are insufficient and gate one has
+just eliminated every log-only option. This audit takes an afternoon and is the highest-leverage
+afternoon in the project.
+
+**Subgoal — check trace availability on every chain in scope, not just the main one.** Framework
+support and provider support are separate, and the provider side is the one that fails on newer
+chains.<Cite src="ponder-call-traces" /> A platform that satisfies the requirement on mainnet and not
+on your L2 has not satisfied the requirement.
+
+**Subgoal — decide what "limited" would cost you, concretely.** If the best-fitting platform marks
+traces as limited because they require a separate data path plus manual decoding plus client-side reorg
+handling,<Cite src="sentio-obib" /> price that as the engineering project it is and compare it against
+migrating to a platform where it is native. Frequently the second is cheaper, and it is never the
+option that gets costed.
+
+**Subgoal — test the sender attribution, not just the row count.** The 427-versus-1,200 result is a
+reminder that a field can be populated and wrong.<Cite src="sentio-obib" /> Reconcile a known
+multi-hop transaction by hand and check that the attributed origin is the wallet, not the intermediary.
+
+**Subgoal — only now compare timings among survivors.** And expect the field to be small enough that
+they barely matter.
+
+<Check type="spot-bug" concept="trace-completeness-limit">
+A team indexes their protocol's fee receiver with a subgraph. The contract emits `FeeCollected(address
+payer, uint256 amount)` on every fee, and the mapping sums those amounts into a `totalFees` entity.
+
+Quarterly reconciliation has been within 0.5% for a year, and finance has accepted it as rounding. This
+quarter it is out by 4%, and the gap appeared after the protocol integrated with a third-party
+aggregator.
+
+Identify the bug, explain why the timing of its appearance is the strongest clue, and say why "within
+0.5%" was never actually evidence of correctness.
+
+<Answer>
+**The bug is that the fold measures emissions, not value.** `totalFees` is the sum of what the
+contract *announced*. The reconciliation target is what the receiver's balance actually did. Those two
+quantities agree only when every inflow passes through a path that emits, and nothing guarantees that.
+
+**Why the aggregator integration is the clue.** Before it, essentially all fee inflow came through the
+protocol's own entry points — code the team wrote, which emits, because they wrote the emit. The
+aggregator routes through its own contracts, and a contract-to-contract call that moves value need not
+emit anything the subgraph can see. This is precisely the boundary the benchmark measured: subgraph
+`callHandlers` observe direct calls, and about 40% of V2 swaps arrive through
+intermediaries.<Cite src="sentio-obib" /> The gap opened exactly where the protocol started touching
+code it did not write, which is where this gap always opens.
+
+**Why 0.5% was never evidence.** It was evidence that the *paths in use at the time* mostly emitted. It
+was not evidence that the model was complete, because the model had never been tested against a path
+that does not emit. A year of agreement measured the same assumption a year of times. Meanwhile the
+0.5% was probably itself the same bug at small scale — a handful of contract-mediated inflows,
+comfortably inside the rounding excuse, which is how a systematic error survives review: it hides
+underneath a tolerance somebody granted for a different reason.
+
+**What actually fixes it, and what does not.** Adding more events does not, because the emitting
+contracts are not yours. Increasing the tolerance does not. The fix is a trace-capable
+indexer,<Cite src="ponder-call-traces" /> with the reconciliation restated as an invariant over the
+receiver's balance rather than a sum over emissions.
+
+**And the general form, which is worth carrying past this example.** A derived total that reconciles
+against an independently observable quantity is a *tested* fold. A derived total that reconciles only
+against itself is an untested one, and it will pass every check until the world changes shape around
+it. Gate the platform on completeness before you build the fold, because afterwards the choice costs a
+migration — which is the subject of the next lesson.
+</Answer>
+</Check>
+
+## Where this goes
+
+The gates are the reusable part. Data types, contract reads, dynamic contracts, chains — asked in that
+order, answered from first-party documentation, before any number is consulted.
+
+The final lesson of this module takes the case where the gates say you chose wrong: what a migration
+actually costs, which parts are mechanical and which are a rewrite, and where the time really goes. And
+then the axis nobody prices at all — what you give up, in neutrality, by choosing whichever option is
+fastest.<Cite src="thegraph-quick-start" /><Cite src="ponder-docs" />

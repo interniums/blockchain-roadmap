@@ -1,0 +1,296 @@
+---
+id: evm-state-tries-trie-of-tries
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [execution-specs, ethereum-org-mpt, eip-1186, eip-7864, eip-2929, eip-3529, geth-dbpruning, geth-hardware, measured-gas-constants, solidity-layout-storage]
+stack: {}
+---
+
+A user sends 100 units of an ERC-20 token. From the contract's point of view almost nothing happens:
+two numbers in a mapping change. From your product's point of view it is one line of Solidity and one
+event.
+
+From the node's point of view, that transaction obliges it to recompute two chains of hashes, produce
+a new 32-byte value for the token contract's account, and then recompute a third chain of hashes to
+carry that change up to a root every other node on the network will independently arrive at or reject
+the block.
+
+That asymmetry — one line of source, three chains of keccak — is the whole subject of this lesson. You
+already know [what an MPT is](/c/mpt-four-node-types) and how its
+[branch](/c/mpt-branch-node), [extension](/c/mpt-extension-node) and [leaf](/c/mpt-leaf-node) nodes are
+shaped. What you have not yet seen is the specific way Ethereum arranges them, why that arrangement
+is nested rather than flat, and which of your engineering intuitions it invalidates.
+
+## Storage is not in the state trie's key space
+
+Start with the fact that surprises people, because everything else follows from it.
+
+There is one global state trie. Its path is always `keccak256(address)` and its value is always the
+RLP-encoded account record.<Cite src="ethereum-org-mpt" /> Contract storage is not in that trie. Each
+account with storage has **its own separate trie**, and the root of that trie is the `storageRoot`
+field sitting inside the account's leaf in the state trie.<Cite src="ethereum-org-mpt" /><Cite src="execution-specs" />
+
+So the state is not one map of size (accounts + slots). It is a map of accounts, in which some values
+contain the root of another map.
+
+<Figure
+  caption="The nesting is the whole design: a value in the outer trie is the root of an inner one."
+  alt="The state trie is keyed by keccak of the address; its leaf holds a storageRoot, which is itself the root of a separate per-account storage trie keyed by keccak of the slot."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'sr', label: 'stateRoot', note: 'one per block', col: 0, tone: 'accent' },
+      { id: 'st', label: 'state trie', note: 'path = keccak256(address)', col: 1 },
+      { id: 'acct', label: 'account leaf', note: 'rlp([nonce, balance, storageRoot, codeHash])', col: 2 },
+      { id: 'gr', label: 'storageRoot', note: 'one field of that leaf', col: 3, tone: 'accent' },
+      { id: 'gt', label: 'storage trie', note: 'path = keccak256(slot)', col: 4 },
+      { id: 'sv', label: 'slot leaf', note: 'rlp(slot value)', col: 5 },
+    ]}
+    edges={[
+      { from: 'sr', to: 'st' },
+      { from: 'st', to: 'acct', label: 'walk' },
+      { from: 'acct', to: 'gr', label: 'decode', tone: 'accent' },
+      { from: 'gr', to: 'gt' },
+      { from: 'gt', to: 'sv', label: 'walk' },
+    ]}
+  />
+</Figure>
+
+<Figure
+  caption="storageRoot is a pointer sitting in a data structure — 32 of the account record's bytes."
+  alt="The four fields of an Ethereum account record: nonce and balance are variable-length RLP integers, storageRoot and codeHash are 32 bytes each."
+>
+  <ByteLayout
+    caption="rlp([nonce, balance, storageRoot, codeHash])"
+    fields={[
+      { label: 'nonce', variable: true, note: 'RLP integer' },
+      { label: 'balance', variable: true, note: 'RLP integer' },
+      { label: 'storageRoot', size: 32, tone: 'accent', note: 'root of another trie' },
+      { label: 'codeHash', size: 32, tone: 'muted', note: 'keccak of the code' },
+    ]}
+  />
+</Figure>
+
+An account with no storage carries the **empty-trie root** — the hash of the RLP encoding of the empty
+string. On this project's toolchain, `cast keccak 0x80` returns
+`0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`, and every storage-free account on
+mainnet carries that identical value.<Cite src="measured-gas-constants" /> That is not a special case
+in the code; it is just what the recursive definition produces when the map is empty.
+
+### Why nest instead of flattening
+
+A flat design is easy to imagine: one trie, keys of the form `address ‖ slot`. It would make proofs a
+single walk. Four things fall out of the nested choice instead, and three of them are useful.
+
+**A storage proof is two proofs.** One walk from `stateRoot` to the account leaf, a decode, then a
+second walk from the extracted `storageRoot` to the slot. `eth_getProof` returns exactly that pair,
+and lesson 5 is about what it does and does not establish.<Cite src="eip-1186" />
+
+**A contract has a single 32-byte summary of all its own state.** Two nodes can settle "did anything
+in this contract change between block N and block M" by comparing two `storageRoot` values, with no
+knowledge of what the contract does. That is a genuinely cheap capability and the flat design does not
+have it.
+
+**Per-account subtrees can be handled independently.** A client can fetch, verify, prune or heal one
+account's storage without touching anyone else's, because that account's storage is a self-contained
+trie under a root it can check.
+
+**And every storage write costs two trie updates, not one.** Change one slot and the specification's
+model is: rehash the path up the storage trie, obtain a new `storageRoot`, write it into the account's
+leaf, rehash the path up the state trie. Two structures, two chains of keccak, for one number.
+
+<Figure
+  caption="One SSTORE, two rehash chains — the storage trie first, then the state trie above it."
+  alt="Changing one storage slot rehashes the path up the storage trie to a new storageRoot, writes that into the account leaf, then rehashes the path up the state trie to a new stateRoot."
+>
+  <Flow
+    lanes={['the write', 'inner trie', 'the account', 'outer trie']}
+    nodes={[
+      { id: 'w', label: 'SSTORE', note: 'one slot changes', col: 0, tone: 'warn' },
+      { id: 'h1', label: 'new storageRoot', note: 'rehash up the storage trie', col: 1, tone: 'accent' },
+      { id: 'leaf', label: 'rewrite leaf', note: 'the account record', col: 2 },
+      { id: 'sr2', label: 'new stateRoot', note: 'rehash up the state trie', col: 3, tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="note">
+The two-update model is the *semantics*, not the execution strategy. No production client recomputes a
+root after every SSTORE — they accumulate the block's writes and compute roots once at the end, which
+is why a block's state root is defined as the root *after* all of its transactions rather than as
+something a single opcode produces.<Cite src="execution-specs" /> Hold both pictures: the logical one
+tells you what a proof will look like, the implementation one tells you why per-opcode gas does not
+scale with trie depth.
+</Aside>
+
+## Hexary: shallow, and therefore wide
+
+Ethereum's trie branches sixteen ways. A branch node has sixteen child slots indexed by the next
+nibble, plus a seventeenth for a key that terminates exactly there.<Cite src="ethereum-org-mpt" />
+
+You met the depth-versus-width trade in Track 01. What matters here is where the bill actually lands,
+because it is not where most people expect.
+
+Sixteen-way branching keeps the structure **shallow**: expected depth is roughly the base-16 logarithm
+of the number of entries, so even very large maps are a handful of levels deep. Traversal is cheap.
+Disk seeks per lookup are few.
+
+The cost is paid by **proofs**, because a proof must ship whole nodes. To prove one leaf you send each
+node along the path, and a branch node carries all sixteen of its child references whether or not you
+care about them. EIP-7864 does this arithmetic against the current design and puts the expected cost of
+proving a single branch in a `2^32`-entry tree at `15 * 32 * log_16(2^32) = 3840`
+bytes.<Cite src="eip-7864" /> Roughly four kilobytes, for one value.
+
+Two consequences that show up in real systems:
+
+- **Verifying proofs on-chain is expensive**, because you pay calldata for every one of those bytes and
+  keccak for every node. Bridges that verify storage proofs in a contract are paying this per message.
+- **Statelessness is hard for exactly this reason.** A block's witness is a bundle of these proofs, and
+  the bundle is large enough that [witness size](/c/witness-size-is-the-blocker) became the headline
+  objection to the current format before the objection was reframed.
+
+<Misconception
+  belief="Extension nodes are an optimisation the specification allows you to skip."
+  reality="They are part of the canonical structure. Omit one and the RLP of some node changes, so its hash changes, so the root changes — you have built a different trie that no other node will agree with."
+  why="The word 'compression' implies optional. In a hash-committed structure there is no such thing as a representation choice: the encoding is the identity."
+  src="execution-specs"
+/>
+
+## Four tries, and only two of them are maps
+
+Ethereum runs four Merkle Patricia Tries, and lumping them together is the source of a lot of
+confusion. Two are persistent maps; two are per-block scratch structures.
+
+| Trie | Key | Lifetime |
+|---|---|---|
+| State | `keccak256(address)` | Persistent; carried forward and mutated block to block |
+| Storage (one per account) | `keccak256(slot)` | Persistent, nested inside the state trie |
+| Transactions | RLP of the index in this block | One block, then discarded |
+| Receipts | RLP of the index in this block | One block, then discarded |
+
+Notice that the persistent two hash their keys and the throwaway two do not. That is not an
+inconsistency — hashing exists to bound depth against an adversary who chooses keys, and nobody chooses
+the index of a transaction in a block. Lesson 3 makes the argument properly; lesson 4 is about the
+throwaway pair.
+
+## The trie is a commitment. It is not the database.
+
+This is the correction most likely to change how you read client documentation and debug sync problems.
+
+It is natural to read "the state trie" as a description of what a node has on disk. It is not. The trie
+defines *a function from the state to a 32-byte value*, and it defines the proof format. What clients
+actually store is up to them, and they have all moved away from storing the literal structure.
+
+Geth exposes two **state schemes**. Its own pruning documentation notes that offline pruning applies
+only to the hash-based scheme, with a path-based scheme that prunes by default alongside
+it.<Cite src="geth-dbpruning" /> Pruning itself is described in terms of a **state snapshot** — a flat
+layer that the pruner iterates to decide which trie nodes are still reachable and which are
+stale.<Cite src="geth-dbpruning" /> A flat snapshot exists precisely because answering "what is in slot
+X" by walking a trie on disk is too slow to serve.
+
+Three things follow that you will meet in practice:
+
+**Archive sizes and sync behaviour differ wildly between clients**, because they are storing different
+things. Geth's own hardware page, last edited September 2023, puts a snap-synced full node above 650 GB
+growing by about 14 GB per week, and a full archive node above 12 TB.<Cite src="geth-hardware" /> Those
+are one client's numbers with a date attached; another client's layout produces different ones, and
+quoting any of them without the client and the date is how stale infrastructure estimates propagate.
+
+**"Rebuild the trie" is not a recovery step you can reason about generically.** What a client does to
+recover depends on which representation it keeps.
+
+**The trie is still authoritative.** However the bytes are laid out, the root the client computes must
+match, or its block is rejected. The commitment is the contract; the storage layout is an
+implementation detail that can and does change between releases.
+
+<Misconception
+  belief="The Merkle Patricia Trie is how Ethereum clients store state on disk."
+  reality="It is a commitment scheme and a proof format. Modern clients keep flat databases and snapshot layers and derive trie nodes from them, which is exactly why archive sizes and sync strategies differ so much between implementations."
+  why="Every explainer describes the trie as 'where the state lives', and the specification does define state in terms of it. The specification is defining a function, not a storage engine — but nothing in the prose flags the difference."
+  src="geth-dbpruning"
+/>
+
+## Worked example: what one token transfer actually touches
+
+Take `token.transfer(bob, 100)` and follow the state changes. The token contract holds
+`mapping(address => uint256) balances` declared at slot 0.
+
+**Subgoal 1 — turn the mapping key into a slot number.** Solidity computes the slot for
+`balances[alice]` as `keccak256(abi.encode(alice, 0))`, where 0 is the declaration
+slot.<Cite src="solidity-layout-storage" /> This keccak is *inside the contract's own address space*.
+It has nothing to do with the trie yet.
+
+**Subgoal 2 — turn the slot number into a trie path.** The storage trie's path for that slot is
+`keccak256(slotNumber)`.<Cite src="ethereum-org-mpt" /> Second keccak, different purpose: this one is
+the trie's, and lesson 3 explains why it is there.
+
+**Subgoal 3 — pay for the read.** The first SLOAD of a slot in a transaction costs 2,100 gas and every
+later one costs 100, as measured on this project's toolchain.<Cite src="measured-gas-constants" /> That
+21-fold gap is EIP-2929's pricing of cold versus warm state access, and lesson 6 is about what it is
+really charging for.<Cite src="eip-2929" />
+
+**Subgoal 4 — pay for the writes.** Two slots change. Alice's balance goes from one non-zero value to
+another: 2,900 gas. Bob's, if he held none before, goes from zero to non-zero: 20,000 gas. Each carries
+an additional 2,100 when the slot is cold.<Cite src="measured-gas-constants" /> The asymmetry is not
+arbitrary — one of those writes adds an entry to a structure every node must keep forever, and the
+other does not.
+
+**Subgoal 5 — propagate the roots.** Both slots live in the same account's storage trie, so both
+rehash paths that converge. The token contract's `storageRoot` changes once. That changes the token
+contract's account leaf, which changes the path up the state trie to `stateRoot`.
+
+**Subgoal 6 — notice what did not change.** Alice's and Bob's own accounts are untouched by the token
+transfer. They hold no token balance; the token contract does. The only account whose storage moved is
+the token's. This is the point at which "my tokens are in my wallet" stops being a useful description
+of anything.
+
+<Check type="predict" concept="per-account-storage-trie">
+A single transaction does three things: sends 1 ETH from account A to account B, and calls contract C,
+which writes to two of its own storage slots and reads one slot of contract D without writing it.
+
+How many storage tries change? How many account leaves change? And what would happen to `stateRoot` if
+the two writes to C happened in the opposite order?
+
+<Answer>
+**One storage trie changes** — contract C's. D was only read, and a read changes nothing. A and B have
+no storage involved.
+
+**Four account leaves change.** A's balance drops and A's nonce increments (it sent the transaction).
+B's balance rises. C's `storageRoot` field changes because its storage trie moved. And the fee
+recipient's balance changes, which is the one people forget — every transaction pays a priority fee to
+whoever proposed the block, so their account is written on essentially every block.
+
+D's leaf does not change. Reading a slot is free of state effects, however much gas it costs.
+
+**The order of the two writes to C makes no difference to `stateRoot`.** This is the important half of
+the question. A trie is a commitment to a *set* of key-value pairs, not to a sequence of operations:
+the same final map yields the same root by construction, no matter what route the writes took to get
+there. That property is what makes the root a usable consensus check at all — two clients that execute
+the same block with different internal ordering, batching or caching must still land on the same 32
+bytes.
+
+The place where order *does* matter is gas, not the root. If both writes touch the same slot, the
+second one is warm and the transition it is priced on may differ.<Cite src="measured-gas-constants" />
+Same final state, same root, different cost — which is a good illustration of the fact that gas prices
+the work of getting there and the root prices only the destination.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Lesson 3** answers the question this lesson deliberately left open: why is there a keccak between the
+slot number and the trie path at all, and what does the design give up by putting it there.
+
+**Lesson 5** cashes in the nesting. The two-walk proof is a direct consequence of `storageRoot` being a
+field rather than a key prefix, and it is what lets a device with a header verify one slot of one
+contract.
+
+Further out: the per-account storage trie is why [clearing storage is refundable](/c/refund-cap) —
+you are shrinking something every node keeps<Cite src="eip-3529" /> — and why
+[storage is priced two to three orders of magnitude above memory](/c/storage-is-the-expensive-one).
+And the four-kilobyte proof is the number that motivates the replacement designs in
+[the binary state tree](/c/binary-state-tree) work, which lesson 6 puts in its proper, unscheduled
+place.

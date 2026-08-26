@@ -1,0 +1,392 @@
+---
+id: defi-liquidations-solvency-you-pay-for
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [aave-v3-pool-docs, aave-v3-origin-33, morpho-liquidation-docs, morpho-market-docs, morpho-bad-debt-docs, curve-crvusd-controller-docs, dss-clip-source, glassnode-makerdao-black-thursday, coindesk-19b-liquidation]
+stack: {}
+---
+
+A position on Aave crosses health factor 1 at 14:02:11. At 14:02:11 the protocol does nothing.
+
+It does nothing at 14:02:12 either. There is no timer, no cron, no privileged actor with a mandate to
+act. The `Pool` contract holds the borrower's collateral and the borrower's debt in storage and it
+has no opinion about either. What changed at 14:02:11 is that a boolean somewhere became true: a call
+that would previously have reverted will now succeed. That is the entire event.
+
+Whether anything then happens depends on a stranger with a funded wallet deciding that calling
+`liquidationCall` is worth more than it costs. The signature says as much: the caller chooses the
+`collateralAsset` to take, the `debtAsset` to repay, the `user` to liquidate and the `debtToCover`,
+and may elect with `receiveAToken` to be paid in aTokens rather than the underlying — every one of
+those is the *liquidator's* decision, not the protocol's.<Cite src="aave-v3-pool-docs" /> Aave's own
+documentation phrases the outcome in exactly those terms: the caller repays some of the debt and
+*receives a proportional amount of the collateral plus a liquidation bonus to cover market
+risk*.<Cite src="aave-v3-pool-docs" /> Morpho's is blunter still: liquidations are driven by economic
+incentives rather than absolute guarantees, and the protocol does not perform liquidations
+itself.<Cite src="morpho-liquidation-docs" /> Its documentation also states the ordering rule that
+follows — liquidations are first-come-first-served, there is no auction or bidding mechanism, and in
+competitive conditions this produces MEV and gas wars.<Cite src="morpho-liquidation-docs" />
+
+This lesson is about what follows from that. Not "liquidation is how a lender stays solvent" — you
+have that from [health factor](/c/lend-health-factor) and
+[overcollateralisation](/c/lend-overcollateralisation) — but the sharper version: **a lending protocol
+does not maintain its own solvency. It rents it, continuously, at a price it sets in advance and
+cannot change fast enough.**
+
+<Figure
+  caption="Everything a lending protocol controls happens in the first two columns. This module is about the third."
+  alt="A price move written by someone else's transaction flips a predicate inside the lending contract. From there the position is retired either by a stranger calling the liquidation function, paid out of borrower equity, or by ordinary arbitrage converting it continuously as in LLAMMA. Both routes end in either retired debt or bad debt."
+>
+  <Flow
+    lanes={['someone else', 'the contract', 'a stranger', 'the outcome']}
+    nodes={[
+      { id: 'px', label: 'price moves', col: 0, note: 'another transaction' },
+      { id: 'flag', label: 'a predicate flips', col: 1, note: 'the call now succeeds' },
+      { id: 'call', label: 'a stranger calls', col: 2, tone: 'accent', note: 'paid out of borrower equity' },
+      { id: 'arb', label: 'arbitrage converts', col: 2, dashed: true, note: 'LLAMMA: no call at all' },
+      { id: 'ok', label: 'debt retired', col: 3, tone: 'good' },
+      { id: 'bad', label: 'bad debt', col: 3, tone: 'danger', note: 'nobody arrived' },
+    ]}
+    edges={[
+      { from: 'px', to: 'flag' },
+      { from: 'flag', to: 'call' },
+      { from: 'flag', to: 'arb', dashed: true },
+      { from: 'call', to: 'ok', label: 'profitable' },
+      { from: 'call', to: 'bad', tone: 'danger' },
+      { from: 'arb', to: 'ok', dashed: true },
+      { from: 'arb', to: 'bad', dashed: true, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+## Three things a protocol does not have
+
+Start with the constraint, because every design in this module is a response to it.
+
+**A protocol has no keys.** It cannot sign a transaction. There is no `onPriceDrop` hook and there
+could not be — the EVM has no scheduler and no way to charge gas to a party that did not agree to pay
+it. You know this from the [execution loop](/c/evm-execution-loop); the consequence for lending is
+that solvency enforcement must be somebody's transaction.
+
+**A protocol has no mempool access.** Even if it could sign, it could not observe. The oracle price
+arrives as a state write in some earlier transaction; the contract sees it only when it is called.
+Between two calls the protocol is blind, and that window is exactly the window in which a position
+goes under water.
+
+**A protocol has no execution venue.** Seizing collateral is not converting it. A liquidation that
+leaves the pool holding 400 ETH has not restored anything denominated in USDC; it has swapped one
+exposure for another. Somebody has to sell, and that somebody has to be willing.
+
+The design space that remains is small. The protocol can expose a function that transfers collateral
+out at a favourable rate in exchange for debt repaid in, and it can set the rate. Everything else —
+who calls, when, how fast, at what size — belongs to people the protocol has never met.
+
+Every design in this module lives inside that box. Aave's `liquidationCall` and Morpho's liquidation
+are one function each, callable by anyone, at a rate governance or a formula
+fixed.<Cite src="aave-v3-pool-docs" /><Cite src="morpho-liquidation-docs" /> Maker's Clipper is a
+function that starts an auction plus a function that takes from it.<Cite src="dss-clip-source" />
+Curve's Controller adds a `users_to_liquidate` view so bots can find targets without indexing
+anything.<Cite src="curve-crvusd-controller-docs" /> Three philosophies, one shape: a public function
+and a hope.
+
+<Aside kind="note">
+Same shape as the keeper problem in every other on-chain system that must act on an external
+condition — withdrawal finalisation, auction settlement, funding payments, oracle updates.
+Liquidation is the version where the incentive is largest and the failure most expensive.
+</Aside>
+
+## The inequality that decides whether anything happens
+
+A liquidator repays debt worth `D` and receives collateral worth `D · b_gross`, where `b_gross > 1`
+is the gross bonus factor — Morpho calls it the Liquidation Incentive Factor and pays the whole of it
+to the liquidator, taking no protocol cut.<Cite src="morpho-liquidation-docs" /> Write `b = b_gross − 1`
+for the net premium as a fraction of debt repaid. Then the gross take is `D · b`.
+
+Against that sit four costs, and it matters that they are four rather than one.
+
+**Subgoal 1 — separate the costs that do not scale from the ones that do.** Transaction cost is
+roughly fixed per liquidation: same call path, same storage writes, whether you repay $500 or
+$500,000. Call it `G`, denominated in the debt asset. Routing and bridging overhead behaves like `G`.
+Exit slippage is the opposite — it grows with size, because selling more collateral walks further
+along the curve — and so does inventory risk, the risk of holding the seized asset if the exit is not
+atomic.
+
+**Subgoal 2 — get a usable functional form for slippage.** You derived the constant-product marginal
+price in [price impact](/c/price-impact). Selling collateral worth `V` into a venue whose reserve on
+the collateral side is worth `R`, the realised price relative to spot is `1/(1 + V/R)`, so the value
+lost to impact is `V · (V/R)/(1 + V/R)`, which for `V ≪ R` is `V²/R`. That quadratic is the whole
+story: slippage is not a percentage, it is a percentage that itself grows with size.
+
+**Subgoal 3 — write the profit function and read its shape.** Ignore inventory risk for an atomic
+liquidator (the next lesson but one earns that simplification):
+
+```text
+profit(V) = b·V  −  G  −  V²/R
+```
+
+This is a downward parabola through `−G` at the origin. It is positive on an interval and negative
+outside it, and the interval is bounded at *both* ends.
+
+**Subgoal 4 — solve for the ends.** Setting `profit(V) = 0` gives `V² − b·R·V + G·R = 0`, so
+
+```text
+V = (R/2) · ( b ± √(b² − 4G/R) )
+```
+
+Three consequences fall out immediately, and none of them is visible in the sentence "the liquidation
+bonus is 5%".
+
+**There is a minimum liquidatable size.** For small `G` the lower root is approximately `G/b`. A
+protocol that publishes a 5% bonus and sits on a chain where a liquidation costs $20 has silently
+declared that positions below roughly $400 are not worth touching. Aave's v3.3 notes make this
+arithmetic explicit in the protocol's own words: a threshold of $2,000 would mean that at a 1% bonus a
+liquidation cannot cost more than $20 before it is no longer performed by an economically reasonable
+liquidator.<Cite src="aave-v3-origin-33" />
+
+**There is a maximum liquidatable size.** For small `G` the upper root is approximately `b·R`. Past
+that, the exit trade eats the bonus before the liquidator gets out. This is why partial liquidation is
+not only a borrower-protection feature: Morpho notes that partial liquidation lets liquidators optimise
+gas cost against profit for large positions where full liquidation would cause significant market
+impact.<Cite src="morpho-liquidation-docs" />
+
+**The interval can be empty.** The discriminant `b² − 4G/R` goes negative when `b² < 4G/R`. At that
+point *no* position size is profitable — not the small ones, not the large ones. Nothing about the
+protocol changed; the chain got expensive or the venue got thin, and the function stopped being worth
+calling at any size.
+
+<Check type="predict" concept="liq-incentive">
+A market publishes a 5% net liquidation bonus. Assume a liquidation costs $20 all-in and the exit
+venue has $10M of depth on the collateral side. Compute the profitable size band. Then recompute for a
+crash in which gas is twenty times more expensive and half the depth has been consumed, and say in one
+sentence what changed that a governance parameter could not have anticipated.
+
+<Answer>
+**Calm.** `b = 0.05`, `G = 20`, `R = 10,000,000`. The discriminant is `0.0025 − 4(20)/10⁷ =
+0.0025 − 0.000008 = 0.002492`, whose root is `0.049920`. So
+
+- lower root `= (10⁷/2)(0.05 − 0.049920) = 5×10⁶ × 0.000080 ≈ $400`
+- upper root `= 5×10⁶ × 0.099920 ≈ $499,600`
+
+Profitable band: roughly **$400 to $500,000**. Sanity-check against the approximations: `G/b = 400`
+and `b·R = 500,000`. They agree, which is the point of keeping both forms.
+
+**Crash.** `G = 400`, `R = 5,000,000`. Discriminant `= 0.0025 − 1600/(5×10⁶) = 0.0025 − 0.00032 =
+0.00218`, root `0.046690`. So
+
+- lower root `= 2.5×10⁶ × (0.05 − 0.046690) = 2.5×10⁶ × 0.003310 ≈ $8,275`
+- upper root `= 2.5×10⁶ × 0.096690 ≈ $241,725`
+
+Profitable band: roughly **$8,300 to $242,000**.
+
+**What changed.** The floor rose about twentyfold and the ceiling halved, so the band narrowed from a
+1,250× range to a 29× range — at the moment the *number* of eligible positions was highest. The bonus
+is a constant; the two quantities deciding whether the constant is enough are properties of the chain
+and the market, both of which move against you during precisely the event the parameter exists to
+survive. That coupling is lesson four. Note what did *not* change: the borrower pays 5% either way.
+</Answer>
+</Check>
+
+## The bonus is not created; it is taken
+
+Here is the part that gets skipped, and it reverses the intuition that a bigger bonus is a safer
+protocol.
+
+The protocol does not mint the liquidation bonus. It is the arithmetic difference between what the
+liquidator hands over and what the liquidator walks away with, and that difference comes out of the
+collateral the borrower still owned. Morpho's own worked example makes the transfer legible: a
+borrower with $100k of collateral in an 86% LLTV market whose debt has grown to $86.01k is liquidated
+at an incentive factor of 1.05, so the liquidator repays $86.01k and seizes $90.31k of collateral. The
+borrower keeps $9.69k; the liquidator's $4.3k spread is what was left of the borrower's
+equity.<Cite src="morpho-liquidation-docs" />
+
+<Compare
+  axis="Follow the money"
+  columns={[
+    { title: 'Borrower', note: 'the position', tone: 'warn' },
+    { title: 'Liquidator', note: 'the stranger', tone: 'accent' },
+    { title: 'The market', note: 'the protocol' },
+  ]}
+  rows={[
+    {
+      label: 'What is committed?',
+      cells: [
+        '$100k of collateral, against $86.01k of debt',
+        <>$86.01k of the debt asset, repaid<Cite src="morpho-liquidation-docs" /></>,
+        'Nothing. It holds the position and exposes a function',
+      ],
+    },
+    {
+      label: 'What is received?',
+      cells: [
+        'Nothing — the debt was already theirs',
+        '$90.31k of collateral, at an incentive factor of 1.05',
+        '$86.01k of debt retired',
+      ],
+    },
+    {
+      label: 'What is the net?',
+      cells: [
+        <>Keeps $9.69k of the $100k<Cite src="morpho-liquidation-docs" /></>,
+        '+$4.30k gross, before gas and exit slippage',
+        'Zero',
+      ],
+    },
+  ]}
+  caption="The protocol's column nets to zero: the $4.30k the liquidator walks away with is $4.30k the borrower stopped owning."
+  alt="Morpho's worked liquidation followed through three parties. The borrower commits $100k of collateral against $86.01k of debt and keeps $9.69k. The liquidator repays $86.01k, receives $90.31k of collateral at an incentive factor of 1.05, and nets $4.30k gross. The protocol commits nothing, retires $86.01k of debt, and nets zero."
+/>
+
+Two protocols name the same quantity in their own vocabulary. Aave places the liquidation bonus in the
+reserve configuration bitmap at bits 32–47, alongside LTV and the liquidation
+threshold.<Cite src="aave-v3-pool-docs" /> Curve's Controller carries a `liquidation_discount` whose
+documented purpose is to discount the collateral value when computing health *in order to incentivise
+liquidators*.<Cite src="curve-crvusd-controller-docs" /> Different mechanism, same transfer.
+
+### Why "raise the bonus" is not a safety lever
+
+Hold the debt constant and vary `b_gross`. The collateral that must be sold to retire debt `D` at price
+`p` is `D · b_gross / p` — linear in `b_gross` with slope `D/p`. Raise the gross factor from 1.05 to
+1.15 and you have raised the collateral dumped on the market, per dollar of debt retired, by 9.5%.
+
+So the parameter has two effects with opposite signs during a crash: it widens the profitable band,
+retiring debt that would otherwise sit under water, and it increases sell pressure per unit of debt
+retired, pushing price down and making more positions eligible. There is a maximum, not a monotone
+improvement. Where the maximum sits depends on the density of positions near the threshold and on the
+depth available — quantities the protocol cannot observe and does not control, which is why every
+liquidation-bonus debate in a risk forum ends in a judgement call rather than a derivation.
+
+<Misconception
+  belief="A bigger liquidation bonus makes the protocol safer."
+  reality="It widens the band of position sizes that are profitable to liquidate and simultaneously increases the collateral dumped per dollar of debt retired, which pushes price further and creates the next tranche of eligible positions. Safety in this parameter is a hump, not a slope."
+  why="The bonus is the only obviously tunable knob, and it is reasoned about as an incentive in isolation rather than as a quantity that also sizes the resulting sell order."
+  src="coindesk-19b-liquidation"
+/>
+
+Morpho makes the trade-off structural rather than discretionary. Its incentive factor is not a free
+parameter at all; it is a function of the market's liquidation LTV, capped:
+
+```text
+LIF = min( 1.15 ,  1 / ( 0.3·LLTV + 0.7 ) )
+```
+
+with the constants named in the documentation as `β = 0.3` and `M = 1.15`.<Cite src="morpho-liquidation-docs" />
+The shape is worth reading rather than memorising. As `LLTV → 1` the denominator goes to 1 and the
+incentive goes to zero, because a market that liquidates at 100% LTV has no collateral left to pay a
+bonus out of. As `LLTV` falls the incentive rises, because there is more equity to draw on and the
+liquidator needs more compensation for a riskier collateral type — until the cap binds. Solve
+`1/(0.3L + 0.7) = 1.15` and you get `L ≈ 0.565`: below roughly a 56.5% liquidation LTV every Morpho
+market pays the same maximum 15%. For the 86% market in the worked example the formula returns about
+1.044, which the documentation rounds to 1.05 when it walks the numbers.<Cite src="morpho-liquidation-docs" />
+
+<Aside kind="warn">
+Do not carry "5% bonus" or "50% close factor" as facts about a protocol. They are values of deployed
+constants that governance changes and that differ per asset. Aave's docs state the close factor as
+0.5,<Cite src="aave-v3-pool-docs" /> and Aave v3.3 changed both how it is scoped and when it may be
+100%.<Cite src="aave-v3-origin-33" /> Read the constant from the deployment you are integrating with.
+The next lesson takes that apart.
+</Aside>
+
+## What the protocol is actually buying
+
+The protocol is buying **speed**. Not the liquidation itself — that would happen eventually for a large
+enough position at a low enough price — but its arrival before the collateral is worth less than the
+debt. The bonus is the price of latency, purchased in the block-ordering market, which is why
+liquidation flow is contested rather than idle.
+
+It is buying it with **borrower equity**, which is why the price cannot simply be raised. A protocol
+that guarantees liquidation by paying 30% has guaranteed that borrowers are severely punished for a
+brief wick, and will lose them to a competitor paying 5%. Maker priced the same purchase differently
+again: the Clipper pays the caller who *starts* an auction out of protocol surplus rather than out of
+collateral, using a flat fee `tip` plus a proportional `chip` of the debt being
+auctioned.<Cite src="dss-clip-source" /> That decouples the trigger incentive from the borrower's
+equity — and, as you will see next lesson, moves rather than removes the problem.
+
+And it is buying it **on a forward contract it cannot reprice**. Governance sets `b` today; the
+liquidator's costs are realised at a moment governance cannot foresee, on a chain whose gas price and
+venue depth are exogenous. The whole of the failure literature in this module is downstream of that
+mismatch. MakerDAO's March 2020 losses are the extreme illustration. ETH fell 43% in a day, from $194
+to $111.<Cite src="glassnode-makerdao-black-thursday" /> Ethereum's mean hourly gas price reached
+roughly 200 gwei on 12 March and over 400 gwei the following day, and with competing bids unable to
+get included, collateral auctions were won at bids of zero DAI: more than $8M of ETH left the system
+for nothing and at least $4.5M of DAI was left
+unbacked.<Cite src="glassnode-makerdao-black-thursday" /> The system's published liquidation penalty
+at the time was 13%, and the parameter was irrelevant — borrowers whose collateral sold for zero
+received zero, not their collateral minus 13%.<Cite src="glassnode-makerdao-black-thursday" /> The
+bonus parameter had nothing to do with the loss; the assumption underneath the bonus did.
+
+<Misconception
+  belief="The protocol liquidated my position."
+  reality="The protocol did nothing. A third party called a public function because doing so was profitable, and the contract accepted the call because a predicate returned true. Nobody decided; a stranger arrived."
+  why="Every interface phrases it in the active voice with the protocol as subject, because 'a searcher's bot won an ordering race against four other bots' does not fit in a notification."
+  src="aave-v3-pool-docs"
+/>
+
+<Check type="explain" concept="liq-why-liquidation-exists">
+A team proposes: "Our lending market will not depend on external liquidators. When a position crosses
+the threshold, the protocol itself will sell the collateral on an integrated DEX and repay the debt.
+No bonus, no MEV, no borrower penalty."
+
+Say what is wrong with this, and then say what the honest version of the proposal looks like.
+
+<Answer>
+**Three things are wrong, and only one of them is about incentives.**
+
+**It has no trigger.** "When a position crosses the threshold" names no transaction. The crossing is a
+fact about state that no contract observes until somebody calls it. Whatever mechanism you invent to
+notice it is itself a keeper, and now you have the original problem plus a custom one.
+
+**It has no gas payer.** Even granting a trigger, the sale consumes gas and the EVM charges it to the
+sender. A protocol paying its own gas needs a funded relayer with a key — a privileged actor with an
+operational dependency, not an absence of one. You have converted a permissionless incentive into a
+single point of failure that is worse under exactly the conditions that matter.
+
+**It has no counterparty.** "Sell on an integrated DEX" means "trade against liquidity providers who
+did not agree to be the buyer of last resort". At the size and moment where it matters they will not
+be there, or their price will be terrible, and the terrible price is the liquidation bonus wearing a
+different label. You have not removed the discount; you have stopped being able to see it.
+
+**What the honest version looks like.** Keep a permissionless function and change *how the discount is
+determined*, not whether one exists. That is the entire menu:
+
+- fix it by governance and race for it — Aave and Compound style, and Morpho's formula-driven
+  variant;<Cite src="aave-v3-pool-docs" /><Cite src="morpho-liquidation-docs" />
+- discover it with a descending auction so calm markets clear near zero and stressed markets clear
+  wherever someone shows up — Maker's Clipper starts at `top = val · buf / par`, above the feed price
+  by the configured `buf`, and lets it decay;<Cite src="dss-clip-source" />
+- pay it continuously to ordinary arbitrage instead of discretely to a privileged caller (Curve's
+  LLAMMA).
+
+All three still pay a stranger. The next two lessons take the first two apart; the last three take the
+third.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The next lesson** is the menu above, worked properly: what a close factor buys and what it strands,
+why a fixed discount hands the whole surplus to whoever wins the ordering fight, and what a descending
+auction does to that surplus — including why Maker rewrote its auction after the zero-bid disaster and
+what the rewrite did and did not fix.<Cite src="dss-clip-source" />
+
+**The number to produce on demand** is the profitable band for a given market: bonus, all-in
+transaction cost, exit depth, two roots. If you cannot state the lower root for a market you are
+integrating with, you do not know which of its positions are real and which are decorative.
+
+**The parameter you should now distrust** is any single quoted percentage. Bonus, close factor,
+liquidation threshold: each is a deployed constant with a per-asset value and a governance history.
+Aave's bad-debt handling in v3.3 exists because dust positions accumulated below the profitable band
+and became a permanent liability — the release notes say so directly, calling dust debt positions
+problematic precisely because there is no incentive to liquidate them while they create an
+ever-increasing liability to the protocol.<Cite src="aave-v3-origin-33" /> Morpho publishes a curator
+guide covering the same failure from the vault side.<Cite src="morpho-bad-debt-docs" /> Both are the
+lower root of the quadratic above, showing up in an accounting ledger years later.
+
+**The framing to carry into the rest of the module** is that every liquidation design is an answer to
+one question — what must we pay, and to whom, so that under-collateralised debt is retired faster than
+prices move — and that every design answers it with a promise made before the conditions are known. In
+a market whose parameters are per-asset and whose venues are permissionless,<Cite src="morpho-market-docs" />
+that promise is the only thing standing between a price move and a hole in the balance sheet. The
+10 October 2025 cascade is the reference case for what happens when the promise is tested at
+scale,<Cite src="coindesk-19b-liquidation" /> and lesson five works it through — including why the
+headline figure attached to it is a floor rather than a measurement.

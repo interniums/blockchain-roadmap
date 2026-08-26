@@ -1,0 +1,455 @@
+---
+id: solidity-contract-patterns-authorization-you-can-rotate
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [oz-docs-access-control, oz-docs-access-api, oz-contracts-5-announcement, oz-changelog, solidity-docs-contracts, solidity-abi-spec, measured-gas-constants, eip-2929, sok-root-cause-losses, solidity-docs-common-patterns]
+stack: { solidity: "0.8.36" }
+---
+
+Your protocol is six contracts. One address — call it the operator — can adjust fee parameters on
+three of them and trigger rebalances on a fourth. Someone on the team leaves. You need that address
+to stop working and a different one to start.
+
+How many transactions is that, who signs them, and what is the window during which the old key still
+works?
+
+Nothing in the answer depends on which access-control library you imported. It depends on decisions
+you made when you chose one, usually without noticing you were answering this question. This lesson
+is about making those decisions on purpose, because the library documentation is organised around
+capability — what each contract can express — and the thing that actually bites is
+**rotation and blast radius**.
+
+## The mechanism underneath all of them
+
+Every one of these libraries produces the same machine code shape: a check, a revert, and then your
+function body. The Solidity feature that packages it is the modifier, whose body runs first and
+whose `_` placeholder is replaced by the function body it wraps —
+[which you already know](/c/sol-modifier-placeholder), and which is worth restating in one specific
+form:
+
+```solidity
+modifier onlyRole(bytes32 role) {
+    _checkRole(role);   // revert here, or
+    _;                  // run the function here
+}
+```
+
+An authorization gate is nothing but a `require` that someone moved somewhere reusable. That has
+two consequences worth carrying.
+
+**Forgetting one is invisible.** A function missing its modifier compiles, deploys, passes every
+positive test, and is indistinguishable in a diff from a function that was never meant to have one.
+There is no type-level record of "this should have been gated." The absence of a line is not a
+thing a reviewer's eye is drawn to.
+
+**It costs a storage read.** `Ownable` reads one slot; `AccessControl` reads
+`_roles[role].hasRole[account]`, a nested mapping, so also one slot after the derivation. Under
+EIP-2929 that is 2,100 gas the first time the slot is touched in a transaction and 100 gas after
+that — [cold versus warm](/c/cold-vs-warm-access) — as
+measured.<Cite src="eip-2929" /><Cite src="measured-gas-constants" /> `AccessManager` costs more,
+because the check is a call into another contract: a cold account access is 2,600 before the storage
+read even starts.<Cite src="measured-gas-constants" /> That is the price of centralised permissions,
+and it is small enough that it should not decide anything — but you should know it is there rather
+than discover it in a gas report.
+
+## Rung one: Ownable, and the two ways it ends
+
+One address, one modifier.<Cite src="oz-docs-access-control" />
+
+```solidity
+contract MyContract is Ownable {
+    constructor(address initialOwner) Ownable(initialOwner) {}
+    function specialThing() public onlyOwner { }
+}
+```
+
+The constructor argument is the change most likely to trip up someone reading older material. In
+OpenZeppelin 5.x the owner is set to the provided `initialOwner` parameter — it is no longer an
+implicit `msg.sender`.<Cite src="oz-docs-access-control" /><Cite src="oz-docs-access-api" /> The 5.0
+release, October 2023, is also where require-strings became custom errors across the
+library.<Cite src="oz-contracts-5-announcement" /><Cite src="oz-changelog" /> Unauthorized calls
+revert with `OwnableUnauthorizedAccount(address account)`, and constructing with the zero address
+reverts with `OwnableInvalidOwner(address owner)`.<Cite src="oz-docs-access-api" />
+
+<Misconception
+  belief="Ownable's constructor defaults the owner to msg.sender."
+  reality="In OpenZeppelin 5.x it takes an explicit initialOwner argument. Code copied from a 4.x tutorial does not compile, and — worse — code written from memory to 'deploy then transfer' has a window where the deployer is the owner."
+  why="Four years of tutorials, examples, and Stack Overflow answers were written against 4.x, and the change is invisible in a diff that only shows the contract body."
+  src="oz-docs-access-control"
+/>
+
+Two exits from ownership, and they are not symmetric.
+
+**`transferOwnership(newOwner)`** hands the privilege to an address in one transaction. If that
+address is a typo, or a contract that cannot call your functions, the contract's administrative
+surface is gone permanently. The docs name this hazard explicitly and point at `Ownable2Step` as
+the alternative.<Cite src="oz-docs-access-control" />
+
+**`renounceOwnership()`** sets the owner to nothing. The API documentation's warning is worth
+reading as a design statement rather than a caveat: renouncing ownership will leave the contract
+without an owner, thereby disabling any functionality that is only available to the
+owner.<Cite src="oz-docs-access-api" /> It is frequently presented as a decentralisation milestone.
+It is also an irreversible decision to have no emergency response, no parameter tuning, and no
+migration path, taken at the moment you understand your protocol's failure modes least.
+
+<Aside kind="note">
+A contract can own another contract, and this is where Ownable stops being naive: the docs point out
+that the owner can be a Gnosis Safe, an Aragon DAO, or a custom contract, so instead of a single
+externally owned account you can use a 2-of-3 multisig run by your project
+leads.<Cite src="oz-docs-access-control" /> "Ownable is centralised" is a statement about the address
+you put in it, not about the library.
+</Aside>
+
+## Rung two: Ownable2Step, and the half it does not fix
+
+`Ownable2Step` splits transfer into nomination and acceptance: the current owner calls
+`transferOwnership`, which records a `pendingOwner`, and that address must itself call
+`acceptOwnership` to take over.<Cite src="oz-docs-access-api" /> The documented purpose is precisely
+the typo case — preventing transfers of ownership to incorrect accounts, or to contracts that are
+unable to interact with the permission system.<Cite src="oz-docs-access-api" /> A wrong address now
+costs one wasted transaction rather than the contract.
+
+Two details the summaries drop:
+
+**Setting `newOwner` to the zero address is allowed, and cancels an initiated
+transfer.**<Cite src="oz-docs-access-api" /> That is your undo button between the two steps, and it
+is not obvious from the function name.
+
+**`renounceOwnership` is inherited from `Ownable` unchanged, and is still one
+step.**<Cite src="oz-docs-access-api" /> The contract that carefully makes handing over control a
+two-transaction ceremony will destroy control in one. If your threat model includes a compromised
+owner key, note that the attacker's cheapest denial-of-service is not to transfer ownership to
+themselves — it is to renounce it.
+
+<Figure
+  caption="The careful route needs two signatures from two different keys. The irreversible one needs a single signature from the key you were worried about."
+  alt="The two exits from Ownable2Step. transferOwnership records a pendingOwner, who must then call acceptOwnership before ownership moves. renounceOwnership is inherited unchanged, takes one transaction, and leaves the contract with no owner and no emergency response."
+>
+  <Flow
+    lanes={['from here', 'one transaction', 'a second transaction', 'the result']}
+    nodes={[
+      { id: 'o', label: 'the owner', col: 0 },
+      { id: 't1', label: 'transferOwnership', note: 'records pendingOwner', col: 1, row: 0 },
+      { id: 'r1', label: 'renounceOwnership', note: 'still one transaction', col: 1, row: 1, tone: 'danger' },
+      { id: 't2', label: 'acceptOwnership', note: 'by the new owner', col: 2, row: 0, tone: 'good' },
+      { id: 'e2', label: 'no owner, ever', note: 'no emergency response', col: 2, row: 1, tone: 'danger' },
+      { id: 'e1', label: 'ownership moves', col: 3, row: 0, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'o', to: 't1' },
+      { from: 'o', to: 'r1', tone: 'danger' },
+      { from: 't1', to: 't2', tone: 'good' },
+      { from: 'r1', to: 'e2', tone: 'danger' },
+      { from: 't2', to: 'e1', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+## Rung three: AccessControl, and where the root key lives
+
+Roles are `bytes32` identifiers, conventionally `keccak256("MINTER_ROLE")`, checked with an
+`onlyRole` modifier.<Cite src="oz-docs-access-control" /> The structural addition over Ownable is
+that **every role has an admin role**, and only holders of that admin role may `grantRole` and
+`revokeRole` it. Holding a role does not let you hand it out; that is a separate
+capability.<Cite src="oz-docs-access-control" />
+
+The centre of gravity is one special value. `DEFAULT_ADMIN_ROLE` is the default admin for every
+role, and it is also its own admin. The documentation's own words: since it is the admin for all
+roles by default, and in fact is also its own admin, this role carries significant
+risk.<Cite src="oz-docs-access-control" /> In practice that means **whoever holds
+`DEFAULT_ADMIN_ROLE` can grant themselves every other role in one transaction.** Every other role in
+your design is a convenience layered on top of that one; the security of the system is the security
+of that key, and the decision about which kind of address holds it is yours, not the library's.
+
+OpenZeppelin ships a hardened version, `AccessControlDefaultAdminRules`, which enforces four things
+on top of `AccessControl`: only one account holds `DEFAULT_ADMIN_ROLE`; transferring it is a
+two-step process; there is a configurable delay between the two steps with the ability to cancel
+before acceptance; and no other role can be made to manage
+it.<Cite src="oz-docs-access-api" /> Its constructor takes the delay and the explicit initial
+holder — the docs' example uses three days.<Cite src="oz-docs-access-api" />
+
+<Aside kind="warn">
+`AccessControl` does not enumerate role members on-chain. To know who holds a role you rely on the
+`RoleGranted` and `RoleRevoked` events processed off-chain, or you use the
+`AccessControlEnumerable` extension, which keeps an `EnumerableSet` and adds `getRoleMemberCount`,
+`getRoleMember` and `getRoleMembers`.<Cite src="oz-docs-access-control" /> This matters more than it
+sounds: the docs frame enumeration as what lets you *prove properties* about a system — that an
+administrative account is a multisig or DAO, or that a role has been removed from all
+users.<Cite src="oz-docs-access-control" /> If your users can only take that on trust, you have
+chosen for them.
+</Aside>
+
+### The delay layer: TimelockController
+
+Access control answers "who," not "when," and the docs are direct about the gap: `Ownable` and
+`AccessControl` prevent unauthorized access, but they do not address a misbehaving administrator
+attacking their own system to the prejudice of their
+users.<Cite src="oz-docs-access-control" /> `TimelockController` is the answer — a contract governed
+by proposers and executors that, when set as owner or admin, subjects every maintenance operation to
+a delay, giving users time to review it and exit if they wish.<Cite src="oz-docs-access-control" />
+
+Three operational facts that decide whether you can live with it:
+
+- The delay is a **minimum**, not a fixed value; `getMinDelay` reads it and `updateDelay` changes it,
+  and `updateDelay` is callable only by the timelock itself — so changing the delay goes through the
+  delay.<Cite src="oz-docs-access-control" />
+- Granting the executor role to `address(0)` opens execution to **anyone** once the timelock has
+  expired. The docs call this useful and say it should be used with
+  caution.<Cite src="oz-docs-access-control" /> It is also how you stop your own operational
+  unavailability from blocking a scheduled action.
+- If the deployer renounces administrative rights so the timelock is self-administered, and the
+  accounts holding proposer or executor become unavailable, **the entire contract and any contract it
+  controls becomes locked indefinitely**.<Cite src="oz-docs-access-control" /> That is the "day the
+  key is lost" answer for timelocks, and it is severe enough to design against directly.
+
+## Rung four: AccessManager, one contract for the whole protocol
+
+`AccessManager` arrived in OpenZeppelin 5.0<Cite src="oz-contracts-5-announcement" /> and inverts the
+layout: instead of each contract storing its own permissions, one deployed contract stores all of
+them, and your contracts inherit `AccessManaged` and mark functions
+`restricted`.<Cite src="oz-docs-access-control" />
+
+The unit of permission is the pair **(target contract, function selector)**. The docs state the
+model in two clauses: roles are granted to accounts many-to-many, and access to a restricted target
+function is limited to **one** role.<Cite src="oz-docs-access-control" /> For a call to be
+authorized, the caller must bear the role assigned to that target function. Configuration looks like
+this, with the selector being the same four bytes you already know how to
+compute:<Cite src="solidity-abi-spec" />
+
+```javascript
+const MINTER = 42n;                          // roles are uint64; 0 is the ADMIN_ROLE
+await manager.grantRole(MINTER, user, 0);    // third argument: execution delay
+await manager.setTargetFunctionRole(target, ['0x40c10f19'], MINTER);
+```
+
+Four capabilities that do not exist in `AccessControl`:<Cite src="oz-docs-access-control" />
+
+**Per-member execution delays.** Each role member has an execution delay dictating how long they must
+wait to call a function requiring that role; delayed operations must be `schedule`d first and then
+executed. That is timelock behaviour without a separate timelock contract, configured per account
+rather than per system.
+
+**Grant delays.** `setGrantDelay(role, delay)` prevents adding members immediately, so an attacker who
+compromises an admin cannot mint themselves an operator in the same transaction.
+
+**Guardians.** Each role has a guardian who can cancel operations scheduled by any member with an
+execution delay. The role's admin and guardian both default to `ADMIN_ROLE` — and the docs warn that
+a misbehaved guardian can cancel operations at will.<Cite src="oz-docs-access-control" />
+
+**Target closing.** `setTargetClosed(target, true)` makes all calls to restricted functions on that
+contract revert, without altering any permission or delay. The docs describe it as an
+incident-response mode for temporarily shutting a contract down while you evaluate and
+reconfigure.<Cite src="oz-docs-access-control" /> That is a pause switch you get for free, and the
+next lesson is about why free pause switches are not free.
+
+<Aside kind="stop">
+The failure mode that makes `AccessManager` feel like it is working when it is not: the docs state
+that even if the manager defines permissions for a target function, they are not applied if the
+managed contract is not using the `restricted` modifier for that function, or if its manager is a
+different one.<Cite src="oz-docs-access-control" /> Your permission configuration can be complete,
+audited and wrong, because the enforcement lives in a file the configuration cannot see. Test the
+negative case on-chain — a call from an unauthorized address must revert — rather than reading the
+manager's state and believing it.
+</Aside>
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Ownable, Ownable2Step', note: 'one address' },
+    { title: 'AccessControl', note: 'roles, per contract' },
+    { title: 'AccessManager', note: 'one contract for all of them', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'Where do the permissions live?',
+      cells: [
+        'One slot in each contract',
+        'A role mapping in each contract',
+        'One deployed contract for the whole protocol',
+      ],
+    },
+    {
+      label: 'What is the unit of permission?',
+      cells: [
+        'The contract, entire',
+        'A role, on that contract',
+        'A target contract paired with one function selector',
+      ],
+    },
+    {
+      label: 'Who can grant themselves everything?',
+      cells: [
+        'The owner — it is already everything',
+        'DEFAULT_ADMIN_ROLE, on that contract',
+        'ADMIN_ROLE, role 0, across every managed contract',
+      ],
+    },
+    {
+      label: 'Can it impose a delay on its own?',
+      cells: [
+        'No — put a TimelockController in the owner slot',
+        'No — same, or use AccessControlDefaultAdminRules for the admin role',
+        'Yes — per-member execution delays and grant delays',
+      ],
+    },
+    {
+      label: 'What does one check cost?',
+      cells: [
+        'One storage slot: 2,100 cold, 100 warm',
+        'One storage slot: 2,100 cold, 100 warm',
+        'A call into another contract: 2,600 for the cold account access, before the read',
+      ],
+    },
+    {
+      label: 'What is the emergency stop?',
+      cells: [
+        'Something you write yourself',
+        'Something you write yourself',
+        'setTargetClosed, with no permission changed',
+      ],
+    },
+  ]}
+  caption="The library documentation compares these on capability; the row that decides which one you can operate is the third one."
+  alt="Ownable, AccessControl and AccessManager compared across where permissions are stored, the unit of permission, who holds the root key, whether delays are built in, what a single check costs in gas, and what emergency stop each provides."
+/>
+
+## The rotation arithmetic, worked
+
+Back to the opening question. Six contracts; the operator capability exists on four of them; one
+address out, one address in.
+
+**Subgoal 1 — count the transactions under each model.**
+
+| Model | Rotate one operator | Notes |
+|---|---|---|
+| `Ownable` on each contract | 4, or 8 with `Ownable2Step` | And you cannot rotate *only* the operator — the owner is every capability at once |
+| `AccessControl` per contract | 8 (grant + revoke on each of 4) | Signed by whoever holds each contract's admin role |
+| `AccessManager` | 2 (`grantRole`, `revokeRole` at the manager) | One contract, one signer, one audit trail |
+
+**Subgoal 2 — count the window.** Under per-contract models the rotation is not atomic unless you
+batch it: between transaction one and transaction eight, some contracts trust the old address and
+some the new. If the reason for rotating is compromise, that window is the incident. Under
+`AccessManager` there is a single revocation; under any model, a multicall or a Safe batch collapses
+the window, and you should have written that script before you needed it.
+
+**Subgoal 3 — count the blast radius of the root key.** This is the column that does not appear in
+feature comparisons.
+
+- `Ownable`: one key, everything, immediately.
+- `AccessControl`: `DEFAULT_ADMIN_ROLE` can grant itself every role on *that contract*, immediately.
+  Six contracts means six root keys — worse to operate, and a smaller blast radius per key.
+- `AccessManager`: `ADMIN_ROLE` (role 0) is admin and guardian of every role across every managed
+  contract.<Cite src="oz-docs-access-control" /> One key, whole protocol. The docs' own mitigation is
+  to keep a single admin address secured under a multisig or governance layer, and they suggest the
+  initial admin set everything up, assign a new admin, and renounce.<Cite src="oz-docs-access-control" />
+
+**Subgoal 4 — state the trade in one sentence.** `AccessManager` buys you cheap, atomic, auditable
+rotation and pays for it by concentrating the root key; per-contract `AccessControl` distributes the
+root key and pays for it in operational surface, which is where mistakes actually happen.
+
+<Aside kind="note">
+Which of the two dominates real deployments in 2026 is **not established**. OpenZeppelin's docs
+recommend `AccessManager` for systems of contracts — "better integrated role management," "easier to
+audit and maintain"<Cite src="oz-docs-access-control" /> — and that is a vendor recommending its own
+newer product, not adoption evidence. No dataset was found either way. Decide on the axes above,
+not on the recommendation.
+</Aside>
+
+<Check type="explain" concept="access-manager">
+You are shipping a lending protocol: a pool contract, an interest-rate model, an oracle adapter, and
+a fee collector. Privileged actions are: set the interest-rate curve, update the oracle address,
+change the protocol fee, and pause the pool. The team is four people. There is a security firm on
+retainer that you would like to be able to hit the emergency stop at 3am.
+
+Write the authorization design. For each privileged action say who may call it, through what address
+type, with what delay, and what happens the day that key is compromised and the day it is lost.
+
+<Answer>
+There is no single right answer, but there is a right *shape*, and any answer missing one of these
+rows is incomplete.
+
+**Separate the actions by reversibility, not by contract.** Updating the oracle address is
+catastrophic and instant. Changing the fee within a bounded range is minor and reversible. Pausing is
+instant, damaging while it lasts, and reversible. That axis, not "which file is it in," decides the
+delay.
+
+- **Update the oracle address** — governance, a multisig behind a timelock, delay measured in days.
+  This is the row that steals everything, so it gets the longest delay you can tolerate.
+- **Set the interest-rate curve** — governance, multisig behind a timelock, hours to days, with hard
+  bounds enforced in the contract.
+- **Change the protocol fee** — operations, a 2-of-4 multisig, no delay, **because the contract caps
+  the fee**.
+- **Pause the pool** — operations *and* the audit firm, two separate keys, either sufficient, no
+  delay.
+- **Unpause** — governance, multisig, deliberately slower than pause.
+
+**Two structural points that are the actual content of the exercise.**
+
+*Pause and unpause are different capabilities.* Give the 3am key the power to stop and not the power
+to start. An attacker who takes the security firm's key can then cost you downtime, not funds; if
+you had bundled them, they could pause, wait for you to notice, and unpause at a moment of their
+choosing. The next lesson is entirely about this asymmetry.
+
+*Bounds in code beat trust in process.* "The fee can be changed instantly by a 2-of-4" is safe only
+because the contract rejects a fee above some maximum. Encode the bound, and the delay you need on
+that action drops to zero. Every parameter you can bound is a parameter you do not have to timelock.
+
+**The two questions per row, answered.**
+
+*Compromised.* Timelocked actions give you the delay window to notice and cancel — which requires
+someone actually monitoring the timelock queue, so that monitor is part of the design, not an extra.
+Undelayed actions are gone the instant the key is; that is why only bounded, reversible actions may
+be undelayed. The `DEFAULT_ADMIN_ROLE` or `AccessManager` `ADMIN_ROLE` must be the slowest, most
+guarded thing you have, because it can grant every other role to
+itself.<Cite src="oz-docs-access-control" />
+
+*Lost.* This is the row people skip, and it has a specific trap: a self-administered
+`TimelockController` whose proposers or executors become unavailable locks the entire contract and
+everything it controls **indefinitely**.<Cite src="oz-docs-access-control" /> Multiple independent
+signers, a documented recovery path, and — for execution specifically — the option of granting the
+executor role to `address(0)` so that anyone can execute an already-scheduled
+operation.<Cite src="oz-docs-access-control" /> That last one converts "our ops lead is unreachable"
+from an outage into an inconvenience.
+
+**Which library.** With four contracts and delays that differ per action, `AccessManager` fits the
+shape well: per-role execution delays remove the separate timelock, `setTargetClosed` gives you the
+emergency stop, and rotation is two transactions. The cost is that role 0 is the root key for the
+whole protocol, so it must be the multisig and nothing else. `AccessControl` plus a
+`TimelockController` on the two dangerous actions is equally defensible and more conventional. What
+is not defensible is a single `Ownable` on four contracts, because it cannot express any row of the
+table above.
+</Answer>
+</Check>
+
+## The habit this is really teaching
+
+Write the table before you write the imports. Every privileged function, the address type that holds
+it, the delay, and the two failure days. That artifact is the module's reflection prompt, it is the
+first thing a good auditor asks for, and its blank cells are the design work you have not done yet.
+
+The empirical case for putting this ahead of everything else in the module is the next lesson's
+subject: in a 2025 systematic review of the 50 most severe attacks between 2022 and 2025, access
+control was the top category by both incident count and value, at 13 incidents and roughly $418
+million, against reentrancy's 7 incidents and roughly $118.5
+million.<Cite src="sok-root-cause-losses" /> The bugs behind those numbers are the mundane ones this
+lesson has been circling — a missing modifier, a key held by the wrong kind of address, a privilege
+nobody revoked.
+
+## Where this pays off
+
+**The next lesson** takes the loss data seriously and adds the pause switch, which is the one
+privileged action users are most likely to be surprised by.
+
+**Proxies and upgrades**, later in this track, is where the admin key stops being about parameters
+and starts being about arbitrary code. Everything on this page applies with the stakes multiplied,
+and the upgrade key is simply the most dangerous row of your table.
+
+**Governance** across the DeFi track is this pattern with the multisig replaced by a token vote — the
+same rotation and blast-radius questions, answered by a mechanism with its own failure modes.
+
+**Reading a protocol you are about to use.** The skill is reconstructing this table from the outside:
+read the deployed contracts, find the privileged functions, resolve each admin address, and check
+whether it is an EOA. The answer is public, it takes twenty minutes, and it is more informative than
+most audit reports.

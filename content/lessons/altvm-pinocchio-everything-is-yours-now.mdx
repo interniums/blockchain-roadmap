@@ -1,0 +1,420 @@
+---
+id: altvm-pinocchio-everything-is-yours-now
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [p-token-transfer-source, p-token-state-loading-source, p-token-program-manifest, spl-token-repo, solana-docs-account-modification-rules, solana-docs-account-structure, anchor-account-constraints, anchor-docs-idl, shank-idl-generator, codama-idl, simd-0266-proposal, solana-upgrades-p-token, anza-security-audits-spl, sealevel-attacks]
+stack: {}
+---
+
+In p-token's transfer processor there is a branch that looks like a mistake.
+
+```rust
+if self_transfer || amount == 0 {
+    // Validates the token accounts owner since we are not writing
+    // to these account.
+    check_account_owner(source_account_info)?;
+    check_account_owner(destination_account_info)?;
+} else {
+    // Moves the tokens.
+    source_account.set_amount(remaining_amount);
+    // ...
+}
+```
+
+<Cite src="p-token-transfer-source" />
+
+The owner check — the single most fundamental account validation on Solana, the one whose absence heads
+every vulnerability taxonomy — runs **only when the transfer moves nothing**. Transfer a real amount and
+it is skipped.
+
+It is not a mistake. It is correct, it is deliberate, it saves compute units, and understanding exactly
+why is the best possible introduction to what you take on when the framework stops writing your checks.
+
+## Why the check can be skipped
+
+The Solana runtime enforces, after every instruction, that only an account's owner program may modify
+its data or debit its lamports.<Cite src="solana-docs-account-modification-rules" /><Cite src="solana-docs-account-structure" />
+Any program may *credit* lamports to any writable account; nobody but the owner may write bytes or take
+lamports away.<Cite src="solana-docs-account-structure" />
+
+So on the branch that moves tokens, p-token writes to both token accounts. If either account were not
+owned by the token program, the runtime would reject the whole instruction after the fact. **The write
+is the check.** Performing an explicit owner comparison first would be paying compute units to learn
+something the runtime is going to enforce anyway.
+
+On the other branch nothing is written. A self-transfer updates no balance; a zero-amount transfer
+updates no balance. With no write, the runtime's ownership rule never fires, and an attacker could
+otherwise hand you two look-alike accounts owned by their own program, watch every field check pass
+against forged data, and collect a success result from an instruction that was supposed to have
+validated something. Hence the explicit `check_account_owner` on exactly that path — one
+`is_owned_by` comparison returning `IncorrectProgramId`.<Cite src="p-token-transfer-source" />
+
+<Figure
+  caption="Both branches end with ownership established. Only one of them does it in code you can grep for."
+  alt="A transfer forks on whether it moves tokens: the branch that writes both balances relies on the runtime rejecting a write by a non-owner, while the branch that writes nothing performs an explicit check_account_owner comparison. Both arrive at ownership established."
+>
+  <Flow
+    nodes={[
+      { id: 'ix', label: 'transfer', note: 'source, destination, authority', col: 0 },
+      { id: 'moves', label: 'moves tokens', note: 'writes both balances', col: 1 },
+      { id: 'still', label: 'moves nothing', note: 'self-transfer, or amount 0', col: 1, row: 1, tone: 'warn' },
+      { id: 'rt', label: 'runtime enforces', note: 'only the owner may write', col: 2, tone: 'good' },
+      { id: 'chk', label: 'explicit check', note: 'check_account_owner', col: 2, row: 1, tone: 'accent' },
+      { id: 'ok', label: 'ownership established', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'ix', to: 'moves' },
+      { from: 'ix', to: 'still' },
+      { from: 'moves', to: 'rt' },
+      { from: 'still', to: 'chk' },
+      { from: 'rt', to: 'ok' },
+      { from: 'chk', to: 'ok' },
+    ]}
+  />
+</Figure>
+
+Now hold that reasoning up and look at its shape.
+
+It is correct. It is also **entirely invisible in the type system**, depends on a runtime rule
+documented on a different page from the code, and survives only as long as nobody changes what the
+branches do. Add a `last_activity` timestamp write to the zero-amount path in a future release and the
+explicit check becomes redundant. Make the balance write conditional on something else and the implicit
+check silently disappears while the code still reads as if it were there. Neither change would fail a
+test, because both branches still behave correctly for honest inputs.
+
+Anchor's typed account wrapper would have performed the owner check unconditionally, on every path,
+because it is [generated from a constraint rather than reasoned about](/c/constraints-are-generated-code).
+It would also have cost compute units on the hot path, forever, to re-establish something the runtime
+already guarantees there. Both positions are defensible. Only one of them is defensible *without a
+reviewer*.
+
+<Misconception
+  belief="A Pinocchio program that skips an owner check has a bug."
+  reality="Skipping it can be correct where the instruction writes to the account, because the runtime rejects writes by non-owners after the instruction. What makes it dangerous is that the check's presence is now a property of control flow rather than of a declaration."
+  why="'Always check the owner' is taught as an unconditional rule, because with a framework it is one."
+  src="solana-docs-account-modification-rules"
+/>
+
+## The full inventory, from real code
+
+Here is every validation p-token's shared transfer path performs by hand, in order. Read it as the bill
+for one instruction.<Cite src="p-token-transfer-source" />
+
+**Account count and positions.** The accounts slice is destructured with a slice pattern; a short list
+returns `ProgramError::NotEnoughAccountKeys`. There is no `#[derive(Accounts)]` to say what arrives in
+what order — the pattern *is* the schema, and it differs between `transfer` and `transfer_checked`
+because the latter also takes the mint.
+
+**Account length and initialisation.** `load_mut::<Account>` performs the length check against
+`T::LEN` and then confirms the account state is not `Uninitialized`, returning
+`UninitializedAccount` otherwise.<Cite src="p-token-state-loading-source" /> This is the whole of the
+type check, as the previous lesson established.
+
+**Identity, by pointer.** `let self_transfer = source_account_info == destination_account_info;` with
+the comment that comparing the account values compares their internal raw pointers and is therefore
+faster.<Cite src="p-token-transfer-source" /> A zero-copy consequence: two accounts are the same account
+when they point at the same place in the input buffer, which the runtime arranged via the duplicate
+marker.
+
+**Frozen state.** Both accounts, on the non-self path; the source only, on the self path.
+
+**Sufficient balance.** `checked_sub`, mapped to `InsufficientFunds`. Not `-`. The function carries
+`#[allow(clippy::arithmetic_side_effects)]` at its top, meaning the lint that would have flagged bare
+arithmetic is deliberately switched off, and each unchecked arithmetic site instead carries a comment
+justifying why it cannot overflow.<Cite src="p-token-transfer-source" /> Rust's overflow checks
+[are not on by default in release builds](/c/rust-overflow-not-automatic), so this is not belt and
+braces; it is the only thing there.
+
+**Mint agreement.** Source and destination must share a mint. For `transfer_checked`, the passed mint
+account's key must equal the source account's stored mint, and the caller's `decimals` argument must
+equal the mint's.
+
+**Authority.** Either the stored delegate or the stored owner, resolved through `validate_owner`, which
+compares the expected key, and — if the authority account is `Multisig::LEN` bytes and owned by the
+token program or Token-2022 — walks the remaining accounts as
+signers.<Cite src="p-token-transfer-source" />
+
+**Ownership, conditionally**, as above.
+
+Nine categories of check, written out by hand, in the correct order, for one instruction — and this is
+the *simple* one. Now map them back onto what you would have written declaratively: `owner`, `mut`,
+`has_one`, `constraint`, `token::mint`, `token::authority`, `seeds`,
+`bump`.<Cite src="anchor-account-constraints" /> Each of those is a line. Each of the checks above is a
+paragraph that has to be right, and has to stay right through every future edit, in every instruction
+that needs it.
+
+### The translation table
+
+Write it out once and keep it, because this is the checklist a Pinocchio review runs on:
+
+<Matrix
+  corner="Anchor constraint"
+  cols={['What it generates', 'What you write instead']}
+  rows={[
+    {
+      label: <><code>Account&lt;'info, T&gt;</code> wrapper</>,
+      cells: [
+        'owner equals the declaring program, discriminator matches, data deserializes',
+        <><code>is_owned_by</code> comparison, then a length check, then your own type tag if you have one</>,
+      ],
+    },
+    {
+      label: <><code>#[account(mut)]</code></>,
+      cells: [
+        'writability assertion',
+        <>read <code>is_writable</code> from the header, or rely on the runtime rejecting the write</>,
+      ],
+    },
+    {
+      label: <><code>Signer&lt;'info&gt;</code></>,
+      cells: ['signer assertion', <>read <code>is_signer</code> from the header</>],
+    },
+    {
+      label: <><code>has_one = authority</code></>,
+      cells: [
+        "field on this account equals that account's key",
+        "explicit key comparison against the loaded struct's field",
+      ],
+    },
+    {
+      label: <><code>seeds = [...], bump</code></>,
+      cells: [
+        're-derive the PDA and compare',
+        { v: <>derive it yourself, and compare against the <strong>canonical</strong> bump</>, tone: 'warn' },
+      ],
+    },
+    {
+      label: <><code>#[account(init, payer, space)]</code></>,
+      cells: [
+        'create, fund to rent exemption, assign, write discriminator',
+        { v: 'CPI to the system program, size arithmetic, rent lookup, initialise by hand', tone: 'warn' },
+      ],
+    },
+    {
+      label: <><code>constraint = expr</code></>,
+      cells: ['arbitrary boolean, with a named error', <>an <code>if</code> and an error return</>],
+    },
+  ]}
+  caption="The right-hand column is not less code that does the same thing — it is the same assertions, moved somewhere nothing checks that they are still present."
+  alt="Anchor constraints paired with the generated checks they stand for and the hand-written equivalent a Pinocchio program must contain: owner and length checks, header flag reads, key comparisons, canonical bump derivation, manual account creation, and plain if statements."
+/>
+
+<Cite src="anchor-account-constraints" />
+
+Two rows on that list deserve more than their share of your attention.
+
+**The `seeds`/`bump` row is where hand-written code most often goes subtly wrong.** Re-deriving a
+program-derived address is easy; remembering that only the
+[canonical bump](/c/canonical-bump-matters) must be accepted is the part people miss, because a
+non-canonical bump still derives a valid address — just a different one, which an attacker can choose.
+Anchor's constraint stores and compares the canonical bump as a matter of course. Your version has to
+decide to.
+
+**The `init` row is not one check but four**, and getting the rent-exemption arithmetic wrong produces
+an account that is created, usable, and quietly reclaimable later.<Cite src="solana-docs-account-structure" />
+
+### Errors get quieter too
+
+One more thing goes away with the macros, and it shows up in production rather than in review.
+
+Anchor assigns numbered error codes and ships their names in the IDL, so a failing transaction
+surfaces a name a client can display and an on-call engineer can search
+for.<Cite src="anchor-docs-idl" /> A Pinocchio program returns a `ProgramError` or a custom `u32`, and
+what reaches the client is a number. p-token has a `ToStr` conversion for its errors and a `log_error`
+path — but the instruction-name logs it emits at all are behind a Cargo feature that is off by
+default.<Cite src="p-token-transfer-source" /><Cite src="simd-0266-proposal" />
+
+Budget for that. The interface description you now maintain by hand is also your error dictionary, and
+if it drifts, your incident response degrades before your correctness does.
+
+<Aside kind="warn">
+The order matters as much as the presence. p-token validates the source account before comparing
+mints, and compares mints before touching the authority, because each step's correctness depends on
+the previous one having established that the bytes are a real token account. A hand-written check list
+is also a hand-written *dependency* list, and reordering it during a refactor can leave every
+individual check present and the sequence unsound. This is the failure mode the
+[Solana vulnerability taxonomy](/c/three-questions-per-account) catalogues under account
+substitution.<Cite src="sealevel-attacks" />
+</Aside>
+
+## The one thing you gain
+
+It is worth being fair to the trade, because there is a genuine reviewability argument on this side.
+
+Every raw-byte access in p-token happens inside an `unsafe` block, and every one of those blocks is
+preceded by a `// SAFETY:` comment naming the invariant that makes it
+sound.<Cite src="p-token-transfer-source" /><Cite src="p-token-state-loading-source" /> "Single mutable
+borrow to this account's data, and `load_mut` validates that the account is initialized." "Scoped
+immutable borrow, and the account is guaranteed to be different from the source."
+
+That is a greppable, enumerable set of danger points with stated preconditions. An auditor can list
+them mechanically and check each one. Contrast that with a framework where the danger is a *missing*
+constraint — an absence, which nothing highlights and no search finds.
+
+So the honest comparison is not "safe versus unsafe". It is: **generated checks fail by omission, which
+is invisible; hand-written unsafe fails by a violated precondition, which is at least written down.**
+Whether that is a good trade depends entirely on whether anyone competent is going to read it.
+
+## No IDL falls out of the build
+
+The second thing the framework was doing has nothing to do with the chain.
+
+Anchor's macros describe the program's instructions and accounts, so an interface description falls out
+of the build, and clients are generated from it rather than
+hand-written.<Cite src="anchor-docs-idl" /> Pinocchio has no macros describing anything, so it emits
+nothing. There is no artifact that says what this program's instructions are.
+
+The consequence is not that writing the description is hard. It is that the description and the program
+can drift with nothing to catch it — which is the precise failure mode
+[a generated IDL exists to prevent](/c/idl-is-the-abi).
+
+What a serious project does about it is visible in the SPL Token repository. Alongside the two program
+implementations sits a `codama.mjs` configuration and a committed `idl.json`, and the clients — one
+JavaScript, one Rust — are generated from that file rather than hand-maintained.<Cite src="spl-token-repo" />
+Codama describes a Solana program in a standardised format from which clients, CLIs and documentation
+can be generated.<Cite src="codama-idl" /> The annotation-based alternative is Shank, which generates
+an IDL from annotated non-Anchor Rust programs.<Cite src="shank-idl-generator" />
+
+Two honest notes on that choice. First, which of these is "the recommended path" for Pinocchio programs
+in 2026 is not settled by any authoritative document I could find; what is checkable is that SPL Token
+itself ships a Codama IDL.<Cite src="spl-token-repo" /> Second — and this is the part that matters —
+the description being a separate committed artifact means **updating it is a code-review responsibility,
+not a build step**. A pull request that adds an instruction and forgets the IDL will compile, deploy and
+work, and only the clients will be wrong.
+
+### What that drift costs at network scale
+
+p-token makes the cost concrete in a way no toy example could.
+
+The upgrade page for the optimised token program answers "Breaking Change?" with No and "Indexing
+Changes Required?" with **Yes**.<Cite src="solana-upgrades-p-token" /> Three instructions were added:
+`withdraw_excess_lamports` with discriminator 38, `batch` with discriminator 255, and
+`unwrap_lamports` with discriminator 45.<Cite src="simd-0266-proposal" /> Anything that parses token
+instruction data has to learn them, and the page directs integrators to the IDL in the repository, plus
+a client-library version bump.<Cite src="solana-upgrades-p-token" />
+
+On top of that, the proposal removes the instruction-name logs, on the reasoning that logging the name
+costs more than 100 compute units — in some cases almost as much as executing the instruction — and
+that logs are unreliable anyway, since they can be truncated and an attacker can log-inject matching
+messages to confuse parsers.<Cite src="simd-0266-proposal" />
+
+Sit with the shape of that. Every integrator who was reading `Program log: Instruction: Transfer`
+instead of decoding the instruction data lost their signal, network-wide, in one activation. The
+proposal is right that they should not have been doing it. They were doing it anyway, because it was
+easier than maintaining a decoder, which is exactly what happens when the interface description is a
+file somebody has to remember to update.
+
+## The trade is a budget line
+
+Now put the two halves together and state the decision the way it should be stated to a team.
+
+Choosing Pinocchio moves account validation from **generated code that is correct by construction** to
+**hand-written code that is correct by review**. That is a claim about your review capacity, not about
+your taste in libraries.
+
+It is worth looking at what the reference program actually spent to make this safe, because it sets a
+calibration point.
+
+- The existing SPL Token test fixtures, run against the new implementation.<Cite src="simd-0266-proposal" />
+- Differential fuzzing with Firedancer's tooling: replaying past mainnet instructions, with and without
+  random modification, amounting to millions of individual instructions, and verifying that the complete
+  program output — result *and* account state — matches the original
+  implementation.<Cite src="simd-0266-proposal" />
+- A dedicated `Transmutable`/`load` layer whose unsafe surface is small and centralised, rather than
+  raw casts scattered through processors.<Cite src="p-token-state-loading-source" />
+- Mollusk as a test dependency for per-instruction execution.<Cite src="p-token-program-manifest" />
+- External review: a Neodyme audit dated 12 June 2025, Zellic audits dated 30 June 2025, 13 October
+  2025 and 26 March 2026, and a Certora formal-verification report dated 11 May 2026, all published in
+  Anza's security-audits repository.<Cite src="anza-security-audits-spl" />
+
+Note the discrepancy worth learning from: SIMD-0266's own security section lists formal verification as
+*in progress*.<Cite src="simd-0266-proposal" /> The audits directory now contains the completed report.
+The status line in the proposal is older than the artifact beside it — read the artifact.
+
+Four external reviews and a formal-verification effort, for a program of a few thousand lines
+reimplementing a format that already existed and whose behaviour could be checked differentially
+against a reference implementation. That is close to the easiest possible case for this style of
+programming, and it is what the easiest possible case cost.
+
+<Misconception
+  belief="We will get the program audited, so hand-written validation is fine."
+  reality="An audit is a snapshot of one commit. A framework constraint is enforced on every commit after it, including the ones written under deadline by whoever joins next year. What you gave up is a regression guarantee, and an audit does not replace it."
+  why="Audits and frameworks are both filed under 'security', so one reads as a substitute for the other."
+  src="anza-security-audits-spl"
+/>
+
+The practical rule for a team, stated plainly: **if you cannot fund a review that specifically
+enumerates the owner, signer, initialisation, type and relational checks for every instruction — and
+repeat it after every material change — the compute saving is not free. It is borrowed, and the
+repayment schedule is set by somebody else.**
+
+<Check type="spot-bug" concept="no-automatic-validation">
+A team ports a simple staking program to Pinocchio. The `claim_rewards` instruction takes three
+accounts — a `StakeState` PDA, a rewards vault, and the claimant — and does this:
+
+1. `load_mut::<StakeState>(stake_account.borrow_mut_data_unchecked())` to read the staker's accrued
+   rewards.
+2. Checks that `stake_state.owner == claimant.key()`.
+3. Checks that `claimant.is_signer()`.
+4. Transfers `stake_state.accrued` lamports from the vault to the claimant and sets `accrued` to zero.
+
+Every check they meant to write is present. Describe the attack.
+
+<Answer>
+**The missing check is that `stake_account` is owned by this program.**
+
+`load_mut` verifies exactly two things: that the byte length equals `StakeState::LEN`, and that the
+struct's initialisation flag is set.<Cite src="p-token-state-loading-source" /> Neither says anything
+about who owns the account. The bytes are simply whatever bytes were serialized into the input buffer
+at that position.
+
+**The attack.** The attacker deploys their own program, creates an account owned by it, and writes into
+it a byte pattern of exactly `StakeState::LEN` bytes: initialisation flag set, `owner` field set to
+their own public key, `accrued` set to the vault's entire balance. Then they call `claim_rewards`
+passing that account as the stake account, and sign.
+
+Now walk the checks. Length matches. Initialised, because they set the flag. Step 2 compares
+`stake_state.owner` to the claimant — and it matches, because they wrote it. Step 3 confirms they
+signed, which they did, as themselves. Step 4 drains the vault.
+
+Every check passed against data the attacker authored. This is the canonical
+[missing owner check](/c/missing-owner-check), and the reason it heads the Solana vulnerability
+taxonomy is that all downstream validation is worthless once the data is attacker-controlled: you are
+not validating state, you are validating a forgery against itself.<Cite src="sealevel-attacks" />
+
+**Why the runtime does not save them here, unlike in p-token's transfer.** The runtime's ownership rule
+would reject a *write to an account this program does not own*. Step 4 writes to
+`stake_account`, so the attack fails at the very end — the instruction reverts and no lamports
+move.<Cite src="solana-docs-account-modification-rules" />
+
+But do not take comfort from that, because it is an accident of this particular flow. Make `accrued`
+zeroing conditional on a nonzero amount, add a read-only "preview rewards" instruction, or move the
+bookkeeping into a second account, and the write to the forged account disappears while the payout
+remains. The protection was never the code; it was a side effect of which account happened to be
+mutated last.
+
+**Two fixes, and the difference between them.** The immediate fix is an explicit
+`is_owned_by(&crate::ID)` on the stake account before `load_mut`, exactly as p-token's
+`check_account_owner` does.<Cite src="p-token-transfer-source" /> The stronger fix is structural: make
+the loading helper itself take the expected owner, so that reading state without asserting ownership is
+not something the codebase provides an API for. In Anchor this is what
+[the typed account wrapper does for free](/c/account-wrapper-does-three-checks). In Pinocchio it is
+something you build once, deliberately, and then enforce in review — because nothing else will.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now read a Pinocchio program the way an auditor does: as an ordered list of hand-written
+assertions whose presence, order and interaction with the runtime's own rules you have to reconstruct
+from control flow rather than from declarations. You can also price the decision — not in taste, but in
+review hours, differential test infrastructure, and the external reports the reference program needed.
+
+The next lesson takes that reference program on its own terms. p-token is not a demo; it is the
+implementation now running at the address every wallet, DEX and token on Solana already calls. It was
+swapped in underneath all of them without any of them changing a line. The lesson covers how a
+protocol-level replacement works mechanically, what the measured savings were, what the sources disagree
+about, and one detail from its custom entrypoint that will make the input-buffer arithmetic from the
+first lesson pay off.

@@ -1,0 +1,492 @@
+---
+id: security-fuzzing-properties-worth-writing
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [measured-forge-1-7-1, blocksec-balancer-v2, crytic-medusa, crytic-building-secure-contracts, crytic-properties, tob-invariant-driven-development, bsc-echidna-optimization-mode, bsc-echidna-testing-modes, foundry-invariant-guide, oz-erc4626-inflation-defense, tob-why-fuzzing]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Here is the vault from lesson one, in full. Nothing is hidden and the bug is one character.
+
+```solidity
+function deposit(uint256 assets) external returns (uint256 minted) {
+    // rounds UP, in the depositor's favour
+    minted = (assets * totalShares + totalAssets - 1) / totalAssets;
+    shares[msg.sender] += minted;
+    totalShares  += minted;
+    totalAssets  += assets;
+}
+
+function withdraw(uint256 s) external returns (uint256 assets) {
+    require(shares[msg.sender] >= s, "SHARES");
+    assets = (s * totalAssets) / totalShares;   // rounds down, protocol's favour
+    shares[msg.sender] -= s; totalShares -= s; totalAssets -= assets;
+}
+```
+
+Seed it with 10^24 assets against 10^3 shares, so one share is worth 10^21. Then, measured on forge
+1.7.1:<Cite src="measured-forge-1-7-1" />
+
+```text
+deposit(1 wei)  ->  mints 1 share
+withdraw(1)     ->  returns 999,000,999,000,999,000,999 wei
+
+100 iterations: paid 100 wei, received 95,117,369,102,223,887,327,231
+                vault assets left 904,882,630,897,776,112,672,869
+```
+
+A hundred wei and a hundred round trips take 9.5% of the pool. Do it a thousand times and the vault
+is empty.
+
+Every step of that is solvent. The books balance after every call: shares are minted against assets
+received and burned against assets paid, and `totalAssets` is decremented by exactly what leaves. A
+solvency invariant is *true* throughout the drain, which is why the measured campaign in lesson one
+reported `invariant_solvent()` passing over 128,000 calls while a second property over the same
+sequences failed on a two-call reproducer.<Cite src="measured-forge-1-7-1" />
+
+Track 05 taught [solvency](/c/solvency-invariant) as the first property to write, and that is still
+right. This lesson is the other four.
+
+## Value, not data
+
+The distinction that organises the catalogue: most invariants people write constrain **data
+structure** — a sum matches a total, an index is in range, a mapping has no orphans. Economic bugs
+live one level up, in **value flow**: who paid what, who received what, and whether the difference is
+allowed.
+
+The vault above has no data-structure defect at all. Its accounting is internally perfect. What it
+lacks is a constraint on the relationship between what an actor put in and what they can take out.
+
+That relationship is what the four families below constrain, and it is the reason the usual
+expectation about economic bugs is backwards.
+
+<Misconception
+  belief="Economic bugs need economic simulation — agent models, price paths, liquidity assumptions."
+  reality="Most are caught by four properties with no economics in them: solvency, conservation, monotonicity and path independence. The Balancer V2 exploit of November 2025 was a rounding-direction inconsistency exploited through a crafted swap path, not a market-dynamics failure."
+  why="The word 'economic' suggests agents and prices, and the literature on agent-based simulation is more interesting to read than the literature on integer division."
+  src="blocksec-balancer-v2"
+/>
+
+### Where the four come from
+
+Not from a taxonomy someone invented. They are what falls out of asking, of each function, what must
+be true before it and what must be true after it — the split Medusa's docs draw between function-level
+invariants, which arise from executing one specific function, and system-level invariants, which hold
+across the entire execution of the system.<Cite src="crytic-medusa" /> Conservation and solvency are
+system-level. Round trip and monotonicity are function-level statements about a pair of functions.
+Path independence sits awkwardly between them, which is exactly why it gets missed.
+
+The generative question, when you are staring at a protocol and do not know what to assert, is the one
+the invariant-driven framing puts first: an invariant is a statement that must always hold regardless
+of state or execution path, so go and find the sentences in the protocol's own documentation that
+claim something always holds.<Cite src="tob-invariant-driven-development" /> Whitepapers are full of
+them — "the pool is always solvent", "shares always appreciate", "fees are always proportional" — and
+each one is a property with the word "always" already in it. The work is deleting the hedges.
+
+<Matrix
+  corner="Family"
+  cols={['What is held against what', 'Shape', 'Domain knowledge it needs']}
+  rows={[
+    { label: 'Conservation, per actor', cells: [
+      'What one actor paid, against what that actor received across the whole sequence',
+      'System-level: a boolean over committed state, backed by per-actor ghost accumulators',
+      'The entitlement — computing it from the contract turns the property into an identity',
+    ] },
+    { label: 'Round trip', cells: [
+      'An operation against its own inverse',
+      'Function-level: two calls and one inequality',
+      { v: 'None — only the names of the two operations', tone: 'accent' },
+    ] },
+    { label: 'Monotonicity', cells: [
+      'One execution against another with a larger input',
+      'Assertion-shaped: both calls arguments and both results have to be in scope',
+      'Which way the quantity is supposed to move',
+    ] },
+    { label: 'Path independence', cells: [
+      'One whole operation against the same operation split into steps',
+      'Two alternative futures from one present: snapshot, run both, compare',
+      { v: 'None — only the name of the operation', tone: 'accent' },
+    ] },
+  ]}
+  caption="What separates the four is what each holds against what — and two of them hold an operation against itself, which is why they need nothing from the whitepaper."
+  alt="The four property families - conservation per actor, round trip, monotonicity and path independence - compared across what each compares, the shape of the check, and the domain knowledge it requires."
+/>
+
+<Misconception
+  belief="Writing good properties requires deep protocol expertise, so it is the last thing a reviewer can do."
+  reality="The round-trip and path-independence families need no domain knowledge at all — only the names of the operations. They are the right thing to write in the first hour against unfamiliar code, before you understand what the protocol is for."
+  why="The properties that make a good demo are the ones expressing a system's deep intent, so property-writing gets filed under 'requires understanding'. The highest-yield ones are the boring compositional ones."
+  src="crytic-building-secure-contracts"
+/>
+
+## Family one: conservation, per actor
+
+Solvency asks whether the protocol can meet its claims in aggregate. Conservation asks a sharper
+question: **can any individual actor end a sequence better off than the sum of what they contributed
+and what they were entitled to?**
+
+The mechanism is [ghost variables](/c/ghost-variable), which Track 05 built — test-only state the
+handler maintains alongside the contract, recording what it *ought* to
+hold.<Cite src="foundry-invariant-guide" /> What changes here is what you accumulate. Not "total
+deposited" — that is an aggregate, and it hides the case where A profits at B's expense. Per actor:
+
+```solidity
+mapping(address => uint256) public ghost_paid;
+mapping(address => uint256) public ghost_received;
+
+function invariant_noActorProfits() public view {
+    for (uint256 i; i < ACTORS; ++i) {
+        address a = handler.actors(i);
+        assertLe(handler.ghost_received(a), handler.ghost_paid(a) + entitledYield(a));
+    }
+}
+```
+
+`entitledYield` is where the honesty lives. For a vault with no yield source it is zero and the
+property is exact. For a protocol that does distribute yield you have to compute the entitlement
+independently, and if you compute it by asking the contract, you have written an identity again.
+
+The aggregate version — total out never exceeds total in — is weaker and worth having anyway, because
+it is one line and it is what failed on the vault above over 128,000 calls' worth of generated
+sequences.<Cite src="measured-forge-1-7-1" />
+
+The per-actor form is what makes *fairness* expressible, which is the class the aggregate cannot
+reach: a sequence where A and B together break even, and A took the difference from B, satisfies the
+aggregate and violates the per-actor version. Foundry's own guide keeps a per-address ghost of balance
+deltas alongside its aggregate sums for exactly this reason.<Cite src="foundry-invariant-guide" />
+
+## Family two: round trip
+
+Compose an operation with its inverse and you must return to the starting point, or fail in the
+protocol's favour.
+
+```solidity
+function testFuzz_roundTripNeverProfits(uint256 assets) public {
+    assets = bound(assets, 1, 1e24);
+    uint256 minted = vault.deposit(assets);
+    uint256 back   = vault.withdraw(minted);
+    assertLe(back, assets);
+}
+```
+
+That is the entire property. It needs no knowledge of what the vault is for, no yield model, no price
+feed and no threat model. On the vault above it fails on the first generated input, and the logged
+values show why: deposit 386,939,959,150,855,759,913,659, receive back
+386,983,247,434,305,103,883,623 — a profit of roughly 43 tokens on a single
+round trip.<Cite src="measured-forge-1-7-1" />
+
+Round trips are the highest yield per minute of any property family, and that is a claim about *your*
+minutes rather than the fuzzer's. The reason is that the inverse pair is usually already named in the
+API and you do not have to think about what "correct" means. It is also why this family is the right
+first thing to write against a codebase you have never read: it needs the function names and nothing
+else.<Cite src="crytic-building-secure-contracts" />
+
+Where to look for the pairs:
+
+- `deposit` / `withdraw`, `mint` / `redeem`, `wrap` / `unwrap`, `stake` / `unstake`
+- `encode` / `decode`, and any serialisation you own — this is the same property that
+  [ABI encoding](/c/abi-encoding) work in Track 02 was implicitly relying on
+- `convertToShares` / `convertToAssets`, and any conversion pair with two directions
+- `borrow` / `repay`, where the round trip must cost the borrower interest and never less than zero
+- `swap(A→B)` / `swap(B→A)`, where the round trip must cost the trader the fee twice
+
+The direction of the inequality is a design decision and it must be written down. `assertLe(back,
+assets)` says the protocol keeps the dust. `assertEq` says the operation is exact, which is almost
+never true once division is involved and is the wrong property to write if you want a campaign that
+runs. `assertGe` says the user keeps the dust, which is the vault above and is a bug.
+
+<Aside kind="note">
+The dust direction is not a detail you can defer. Track 04's [ERC-4626 work](/c/inflation-first-depositor-attack)
+showed the same arithmetic from the other side: a conversion that rounds in the user's favour is a
+free-money path, and a conversion that rounds in the protocol's favour is a tax on small deposits
+that can round them to zero shares entirely.<Cite src="oz-erc4626-inflation-defense" /> Both
+directions have a failure mode; only one of them is exploitable at scale, which is why the standard
+convention is to round against the caller and to price the resulting small-deposit tax explicitly.
+</Aside>
+
+## Family three: monotonicity
+
+If a quantity is supposed to move only one way as an input grows, say so.
+
+- Fees never decrease as trade size increases.
+- The price a user pays never improves as the amount they take grows, in a pool with slippage.
+- A share price never falls except through an explicit loss event.
+- A borrower's health factor never improves when they borrow more.
+
+Monotonicity properties are cheap to state and awkward to test statelessly, because they compare two
+executions rather than checking one. That makes them assertion-shaped rather than
+property-shaped — the comparison needs both calls' arguments and both results in scope, none of which
+survive to a between-calls boolean.<Cite src="bsc-echidna-testing-modes" /> Two shapes work:
+
+```solidity
+// pure functions: compare directly
+function testFuzz_feeMonotone(uint256 a, uint256 b) public view {
+    a = bound(a, 1, 1e24); b = bound(b, a, 1e24);      // b >= a
+    assertGe(pool.feeOn(b), pool.feeOn(a));
+}
+
+// stateful: snapshot, run both, compare
+function testFuzz_slippageMonotone(uint256 small, uint256 large) public {
+    small = bound(small, 1e18, 1e21); large = bound(large, small, 1e22);
+    uint256 snap = vm.snapshotState();
+    uint256 rateSmall = pool.swap(small) * 1e18 / small;
+    vm.revertToState(snap);
+    uint256 rateLarge = pool.swap(large) * 1e18 / large;
+    assertLe(rateLarge, rateSmall);
+}
+```
+
+The snapshot form is worth having in your toolkit because it generalises: any property comparing two
+alternative futures from the same present is a snapshot, two executions, and one comparison. That is
+also how you test path independence, which is the next family and the one that catches the most
+expensive bugs.
+
+## Family four: path independence
+
+**Splitting an operation into steps must never beat doing it whole.**
+
+```solidity
+function testFuzz_splittingNeverMintsMore(uint256 total, uint256 parts) public {
+    total = bound(total, 1e18, 1e21);
+    parts = bound(parts, 2, 20);
+    uint256 one  = wholeVault.deposit(total);
+    uint256 many;
+    for (uint256 i; i < parts; ++i) many += splitVault.deposit(total / parts);
+    assertLe(many, one);
+}
+```
+
+Two identical vaults, the same total, one call against many. On the ceil-rounding vault this fails
+immediately, because each of the `parts` calls picks up its own rounding-up
+increment.<Cite src="measured-forge-1-7-1" />
+
+The general shape is: any operation whose result is computed with division has a per-call rounding
+term, and **repetition inside one transaction turns a per-call rounding term into a multiplier.** The
+attacker does not need the loop to be cheap in gas relative to the gain; they need it to be cheaper.
+
+Note also which invariant family this is *not*. Solvency, conservation and round trip are all
+statements about one execution. Path independence compares two alternative executions from the same
+starting state, which is why it needs a snapshot in a stateless test and a pair of identical fixtures
+in a stateful one — and why it is the family most often absent from a suite that otherwise looks
+complete.<Cite src="crytic-medusa" />
+
+### The Balancer V2 case
+
+November 2025, Balancer V2 Stable Pools plus several forks across multiple chains, losses reported as
+over $125 million by BlockSec's analysis.<Cite src="blocksec-balancer-v2" /> (Figures circulated
+between roughly $125 million and $128 million and as "over $100 million"; sources disagree because
+they price the stolen assets at different moments, and no single number is settled.)
+
+The root cause, per that analysis, was rounding inconsistency and precision loss: **the upscaling
+operation uses unidirectional rounding — always down — while the downscaling operation rounds in both
+directions.** That inconsistency produced precision loss in the invariant calculation, which distorted
+the pool token's price computation, and the attacker realised the distortion through a carefully
+crafted swap path in a single batch swap.<Cite src="blocksec-balancer-v2" />
+
+Two things to take from it, and neither is about Balancer.
+
+**The bug was in scaling, not in the AMM.** The maths that makes a stable pool a stable pool was
+fine. What was wrong was the code that converts token amounts into the pool's internal precision and
+back — the least interesting file in the repository. The comment in `_upscale` even acknowledges the
+asymmetry and judges its impact minimal: upscale rounding would not necessarily always go in the same
+direction, since in a swap the balance of token in should be rounded up.<Cite src="blocksec-balancer-v2" />
+Somebody thought about this and concluded it did not matter.
+
+**A single transaction was enough.** The exploit is a crafted path, not a long campaign. This is the
+detail that makes path independence the right property rather than an aesthetic one: the bug's
+severity comes entirely from being able to compose the operation with itself before anyone can react.
+
+<Misconception
+  belief="A one-wei rounding discrepancy is dust, not a finding."
+  reality="A per-call discrepancy that can be repeated inside one transaction is a rate, not an amount. The question is not how large the error is; it is how many times it can be applied and at what gas cost per application."
+  why="Severity intuition is calibrated on single transactions, and one wei genuinely is nothing in a single transaction. The measured vault in this lesson leaks one share per deposit and one share is worth 10^21 wei, which is the same defect with the multiplier made visible."
+  src="blocksec-balancer-v2"
+/>
+
+## Worked example: from a one-wei failure to a severity
+
+This is the part that changes how you triage, and it takes four steps.
+
+**Subgoal: get any counterexample at all, with the cheapest possible property.** A fee function
+charging 30 basis points, floored:
+
+```solidity
+function feeOn(uint256 amount) public pure returns (uint256) {
+    return (amount * 30) / 10_000;
+}
+
+function testFuzz_splitNeverPaysLessFee(uint256 a, uint256 b) public view {
+    a = bound(a, 1, 1e24); b = bound(b, 1, 1e24);
+    assertGe(v.feeOn(a) + v.feeOn(b), v.feeOn(a + b));
+}
+```
+
+On forge 1.7.1 with `--fuzz-seed 1` this fails on the first generated input, with
+a = 990,190,746,109,309,198,849,238 and b = 950,474,782,265,418,193,387,592 giving separate fees
+summing to 5,821,996,585,124,182,176,709 against a combined fee of
+5,821,996,585,124,182,176,710.<Cite src="measured-forge-1-7-1" />
+
+**Subgoal: read the size of the finding honestly.** The difference is one wei. Nobody is going to fix
+this on the strength of that number, and they are right not to.
+
+**Subgoal: turn the boolean into a rate.** The floor discards up to `10_000 / 30 − 1` — that is, 332 —
+wei of fee base per call. The interesting quantity is not the discrepancy but the discrepancy per
+unit of gas: the attacker's return is `332 × 30 / 10_000` per call against the cost of a call. On
+this fee function that is a fraction of a wei per call and the attack is worthless, and now you know
+that for a reason rather than by intuition.
+
+**Subgoal: run the same analysis on the vault and get a different answer.** The vault's per-call
+rounding term is one *share*, and one share is priced at `totalAssets / totalShares`. In the measured
+configuration that is 10^21 wei per call against a call that costs tens of thousands of gas. The
+identical property family, on a target where the discarded quantity is denominated differently, is a
+critical.
+
+The generalisation: **a rounding property tells you a defect exists; the unit the rounding is
+denominated in tells you whether it matters.** Ask what one unit of the rounded quantity is worth,
+and multiply.
+
+<Aside kind="warn">
+This is precisely the triage that [optimization mode](/c/optimization-mode) does for you in the same
+run, and the reason lesson one spent time on it. Restating the fee property as
+`echidna_opt_fee_avoided()` returning the difference makes the engine report the largest avoidable
+fee it could construct, and a maximum of 1 closes the ticket without an
+afternoon.<Cite src="bsc-echidna-optimization-mode" />
+</Aside>
+
+## What the four families do not cover
+
+Being explicit about the gaps is what makes the catalogue usable rather than reassuring.
+
+**They do not see authorisation.** "Only the owner can pause" is a property, it is worth writing, and
+it belongs to a different family — access control, tested by having the handler act as a
+non-privileged actor and asserting the call reverts.
+
+**They do not see the oracle.** Every property here treats reported prices as inputs. A protocol that
+is correct under every price and wrong about which price is real fails none of them. That is the
+threat-modelling module's territory and it is where a large share of recent losses actually
+happened.<Cite src="tob-invariant-driven-development" />
+
+**They do not price gas.** A property can hold while the operation that preserves it costs more than
+anyone will pay, which turns a correct protocol into an unusable one. That is a real finding and no
+invariant in this catalogue expresses it.<Cite src="tob-why-fuzzing" />
+
+**They do not see governance, key custody, or deployment configuration.** A campaign cannot fuzz a
+multisig policy.
+
+**They do not see anything outside the handler's reach**, which is lesson two's point restated: the
+property is an upper bound on what the campaign can find, and the harness is the other one.
+
+The honest summary of the family: these four catch value leaking through arithmetic, and arithmetic
+is where the code-level money bugs are. They do not catch the losses that come from a system doing
+exactly what it was told by someone who should not have been able to tell it.
+
+<Check type="spot-bug" concept="path-independence">
+A team ships an AMM with a 0.3% fee. Their invariant suite has solvency, conservation and a round
+trip, all green over long campaigns. They ask whether they need anything else.
+
+You add one property and it fails within seconds:
+
+```solidity
+function testFuzz_splitSwapNeverBeatsWhole(uint256 amount, uint256 parts) public {
+    amount = bound(amount, 1e18, 1e22);
+    parts  = bound(parts, 2, 50);
+    uint256 snap = vm.snapshotState();
+    uint256 whole = pool.swap(amount);
+    vm.revertToState(snap);
+    uint256 split;
+    for (uint256 i; i < parts; ++i) split += pool.swap(amount / parts);
+    assertLe(split, whole);
+}
+```
+
+Explain why the three existing properties could not have found this, and name the one thing you must
+check before calling the failure a bug.
+
+<Answer>
+**Why the three missed it — each is blind to composition in a different way.**
+
+*Solvency* is an aggregate about the pool's ability to meet claims. A split swap that extracts more
+than a whole one still leaves the pool solvent; it just leaves it with less. The property is true at
+every step of the exploit.
+
+*Conservation* compares what an actor paid against what they received across the whole sequence. In a
+pool with a fee, a trader legitimately receives less than they paid in the token they sold and more
+in the token they bought, so the conservation statement has to be denominated in a common unit — and
+the moment you use the pool's own price to do that conversion, the property becomes an identity that
+the same rounding error moves on both sides.
+
+*Round trip* composes an operation with its **inverse**. This bug composes an operation with
+**itself**. Those are different compositions, and no amount of round-tripping reaches the second one.
+This is the single most useful thing to take from the question: the inverse-pair property and the
+self-composition property are not variants, they are orthogonal.
+
+**The one thing to check before calling it a bug: gas.**
+
+Path independence in an AMM is *expected* to be violated slightly in the direction the property tests
+if the pool's price impact is convex — splitting a large trade genuinely gets a better average price
+against a curve, which is why routers do it. So the failure has to be attributed:
+
+- If `split > whole` because the fee floored to zero on small parts, that is a rounding bug and it is
+  real.
+- If `split > whole` because price impact is convex and the split trades each move the price less,
+  that is the AMM working and the property is mis-stated — it should compare against the theoretical
+  price rather than the whole-trade result, or bound `parts` so the per-part amount stays above the
+  fee's rounding floor.
+
+Distinguish them by pricing the attack: compute the profit and divide by `parts × gasPerSwap`. If the
+attacker cannot pay for the transaction out of the gain, you have found a property that needs
+restating rather than a defect.<Cite src="bsc-echidna-optimization-mode" /> This is also why the
+optimization form of the property is more useful than the boolean — it reports the profit directly,
+which is the number the gas comparison needs.
+</Answer>
+</Check>
+
+<Check type="recall" concept="round-trip-property">
+Name the inverse pair, and state the correct inequality direction with its justification, for each
+of: an ERC-4626 vault, a lending market, and a bridge that locks on one chain and mints on another.
+
+<Answer>
+**ERC-4626 vault — `deposit` / `redeem`.** Depositing `x` and immediately redeeming the resulting
+shares must return **at most** `x`: `assertLe(back, x)`. Both conversions must round against the
+caller, so the vault keeps every remainder. Rounding either one toward the caller is the free-money
+path this lesson opened with.<Cite src="oz-erc4626-inflation-defense" />
+
+**Lending market — `borrow` / `repay`.** Borrowing `x` and repaying immediately must cost **at least**
+`x`: `assertGe(repaid, x)`. In practice it must cost strictly more than `x` if any interest has
+accrued, and exactly `x` in the same block is acceptable only if the market genuinely charges no
+origination fee. The subtle version to also test is `repay` / `borrow` in the other order against an
+existing position, because interest index updates are a common place for a rounding direction to
+flip.
+
+**Bridge — `lock` / `unlock` (or `burn` / `release`).** The full round trip across both chains must
+return **at most** what was sent, and there is a second, stronger property that matters more: total
+minted on the destination chain must never exceed total locked on the source. That one is a
+conservation invariant spanning two chains and it is the property most bridge failures violate.
+
+**The pattern in all three.** The inequality points away from the caller, and the justification is
+always the same sentence: *the remainder belongs to the protocol, because a remainder that belongs to
+the caller can be harvested by repetition.* Write that sentence next to the assertion. If you cannot,
+you have not decided the rounding direction — you have inherited it from whichever way the division
+happened to be written.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Lesson four** removes the need to invent the inequality at all, for the cases where a second
+implementation already encodes it.
+
+**Lesson five** is about making the campaign construct the sequences these properties need. Path
+independence in particular needs several calls in one sequence, which puts it at the mercy of the
+depth setting.
+
+**The practice exercises** ask you to build the whole set against an ERC-4626 vault and then invert
+one rounding direction and confirm the path-independence property is the one that fires.
+
+**Trail of Bits' `properties` repository** is the shortcut for the standard cases — pre-built
+property sets for common Ethereum operations, which is the fastest way to get the token-standard
+families without writing them.<Cite src="crytic-properties" /> Use it for the boilerplate; the
+families in this lesson are what you write for the parts of your protocol that are not boilerplate,
+and those are the parts where the money is.

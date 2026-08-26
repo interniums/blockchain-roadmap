@@ -1,0 +1,342 @@
+---
+id: app-wagmi-invalidating-the-exact-key
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [wagmi-tanstack-query, wagmi-use-read-contract, wagmi-src-query-read-contract, wagmi-src-query-utils, wagmi-src-react-query-utils, tanstack-query-keys, tanstack-query-invalidation, measured-wagmi-key-hashing, viem-clients]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+This line runs without error, resolves its promise, logs nothing, and refetches nothing:
+
+```ts
+await queryClient.invalidateQueries({ queryKey: ['balance', userAddress] })
+```
+
+There is no such key in the cache. `invalidateQueries` matched zero queries, which is not an error
+condition — matching zero queries is what happens most of the time when you invalidate a prefix, and
+the API has no way to distinguish "nothing matched because nothing needed to" from "nothing matched
+because you invented the key". So it succeeds, your balance stays stale, and the bug you thought you
+fixed is still there with a green checkmark next to it.
+
+The previous lesson's invalidation snippet dodged this by taking `queryKey` straight off a hook in
+the same component. That works until the invalidation needs to happen somewhere a hook cannot go — a
+websocket message handler, a router transition, a service worker callback, a plain utility function.
+This lesson is about constructing the key deliberately, and about the two properties of those keys
+that make guessing them a losing strategy.
+
+## What a wagmi query key actually is
+
+Open the source. `readContractQueryKey` returns a two-element tuple: the literal string
+`'readContract'`, and the result of `filterQueryOptions` applied to everything you
+passed.<Cite src="wagmi-src-query-read-contract" />
+
+```ts
+return ['readContract', filterQueryOptions(options)] as const
+```
+
+Every wagmi read follows this shape — an action name, then one object. TanStack requires the top
+level to be an array and requires the key to be unique to the query's
+data.<Cite src="tanstack-query-keys" /> wagmi satisfies both by putting the entire parameter set in
+slot two.
+
+So the interesting question is not the tuple. It is **what `filterQueryOptions` keeps**. Its
+implementation is a single destructuring statement that throws away three groups of fields and
+returns the rest:<Cite src="wagmi-src-query-utils" />
+
+- **Every TanStack Query option** — `gcTime`, `staleTime`, `enabled`, `select`, `retry`,
+  `refetchInterval`, `refetchOnMount`, `refetchOnWindowFocus`, `placeholderData`, `structuralSharing`,
+  `queryFn`, `queryKey`, `queryKeyHashFn`, `meta`, `networkMode` and the rest.
+- **Four wagmi fields**: `abi`, `config`, `query`, `watch`.
+- **`connector`**, which is not simply dropped — if one was passed, it is replaced by
+  `connectorUid`.
+
+What survives, for a contract read, is `address`, `functionName`, `args`, `chainId`, `account`,
+`blockNumber`, `blockTag` and `scopeKey`.<Cite src="wagmi-use-read-contract" /><Cite src="wagmi-src-query-utils" />
+That list has three consequences, and the first is the one that will eventually cost someone a day.
+
+<Figure
+  caption="Everything in slot two is part of the question — so an extra property, or a missing one, is a key that matches nothing."
+  alt="The query key for a contract read is a two-element tuple: the literal string readContract, then one object holding address, functionName, args and chainId. The abi passed to the hook does not appear anywhere in it."
+>
+  <Anatomy
+    cols={92}
+    value="['readContract', { address: token, functionName: 'balanceOf', args: [user], chainId: 8453 }]"
+    parts={[
+      { from: 1, to: 15, label: 'slot 0', note: 'the action name', tone: 'accent' },
+      { from: 19, to: 33, label: 'which contract' },
+      { from: 35, to: 60, label: 'which question' },
+      { from: 62, to: 74, label: 'args', note: 'order matters here' },
+      { from: 76, to: 89, label: 'chainId', note: 'omit it and nothing matches' },
+    ]}
+  />
+</Figure>
+
+### The ABI is not in the key
+
+`abi` is explicitly destructured away before hashing.<Cite src="wagmi-src-query-utils" /> Two hooks
+with the same address, function name, arguments and chain therefore share one cache entry **even if
+they were given different ABIs**.
+
+That is correct almost always — the ABI is a description of the interface, not part of the question,
+and including it would put a large object in every key for nothing. It stops being correct in exactly
+one situation, and it is a situation real codebases produce: two files each declare a hand-trimmed
+ABI for the same contract, and the two declarations disagree about a return type. One says
+`outputs: [{ type: 'uint256' }]`, the other says `outputs: [{ type: 'uint8' }]`, or one omits a
+tuple field. Whichever hook fetches first writes the cache entry, and the second hook reads a value
+decoded under a schema it never agreed to — with full TypeScript confidence, because the type came
+from *its* `as const` ABI and the runtime value came from the other one.
+
+The defence is boring and total: **one ABI per contract, exported from one module.** You already do
+this for the [type inference](/c/viem-abi-const-inference); now there is a caching reason as well.
+
+### TanStack options do not fork the cache entry
+
+Because `staleTime` and friends are stripped, two components reading the same value with different
+staleness settings are **one cache entry**, not two. This surprises people who expect the options to
+be part of the identity, and the behaviour is the useful one: a value is a value, and how patiently
+each consumer tolerates it being old is a per-observer concern, not a per-entry one.
+
+It does mean a low `staleTime` anywhere wins for everyone. One aggressive component can drive
+refetches that every other consumer of that key experiences. If you want genuine isolation, that is
+what `scopeKey` is for — it *is* in the key, and the documentation describes it exactly this way:
+hooks that have identical context share the same cache.<Cite src="wagmi-use-read-contract" />
+
+### A connector becomes a uid
+
+`connector` is swapped for `connectorUid` before hashing.<Cite src="wagmi-src-query-utils" /> A uid
+belongs to a connector instance, and connector instances are created when the Config is created. So a
+key captured across two Config instances will not match, which is one more reason the single-config
+rule from the first lesson is structural rather than stylistic.
+
+## Building the key instead of guessing it
+
+wagmi exports a `get<X>QueryOptions` function for every hook, and it returns the same query key the
+hook uses.<Cite src="wagmi-tanstack-query" /> That is the supported way to get a key where no hook
+exists:
+
+```ts
+import { getBlockQueryOptions } from 'wagmi/query'
+import { config } from './config'
+
+function perform() {
+  const { queryKey } = getBlockQueryOptions(config, { chainId: config.state.chainId })
+}
+```
+
+Two things to carry from that snippet.
+
+**It takes the config as its first argument**, exactly like the vanilla `@wagmi/core` actions. This
+is the escape hatch the single-Config design buys you: a module with no React in it can address the
+same cache entries a component addresses, because both are derived from the same object.
+
+**It does not handle reactivity for you.** wagmi's documentation flags this as a warning — active
+account and chain changes, argument changes, none of it is tracked, and you must pass the arguments
+through explicitly.<Cite src="wagmi-tanstack-query" /> In the snippet, `config.state.chainId` is read
+at call time, and if that value changes a minute later the key you built is for the old chain. Inside
+a component the hook does this for you; outside one, the currency of the arguments is your problem.
+
+<Aside kind="note">
+wagmi's own docs import these helpers from two different paths on the same page — `wagmi/query` in
+the Query Keys section, `wagmi` in the fetching and prefetching examples.<Cite src="wagmi-tanstack-query" />
+Both appear in current material, so let your editor's auto-import resolve it against the installed
+package rather than copying whichever line you found first.
+</Aside>
+
+### Matching is by prefix, so the key you build can be shorter than the key you want
+
+`invalidateQueries` matches multiple queries by prefix, or one exactly.<Cite src="tanstack-query-invalidation" />
+That gives you three deliberate levels, and choosing among them is a real decision rather than a
+detail:
+
+```ts
+// Everything in the cache. A blunt instrument with a real cost.
+queryClient.invalidateQueries()
+
+// Every contract read in the app, on every chain, for every account.
+queryClient.invalidateQueries({ queryKey: ['readContract'] })
+
+// One question. Built, not guessed.
+queryClient.invalidateQueries({ queryKey })
+```
+
+Two rules govern whether a match happens, and they are asymmetric in a way worth memorising:
+**object key order does not matter, array item order does.**<Cite src="tanstack-query-keys" /> Keys
+are hashed deterministically with object properties sorted, so `{ status, page }` and
+`{ page, status }` are the same key — but `['todos', status, page]` and `['todos', page, status]` are
+not.<Cite src="tanstack-query-keys" /> Since every wagmi key is `[actionName, oneObject]`, you are
+almost always in the forgiving case, and the one array whose order matters is `args`.
+
+Add `exact: true` when you want to hit the entry with no further sub-keys and nothing
+else.<Cite src="tanstack-query-invalidation" /> Reach for it rarely; prefix matching is what makes
+"invalidate everything about this token" expressible.
+
+## BigInt, and the hash function you did not know you were using
+
+Query keys must be serialisable with `JSON.stringify`.<Cite src="tanstack-query-keys" /> wagmi's keys
+routinely contain `bigint` values — token amounts, token ids, `blockNumber` — because
+[every EVM integer crosses into JavaScript as a bigint](/c/viem-bigint-boundary). And
+`JSON.stringify` throws on one:
+
+```
+TypeError: Do not know how to serialize a BigInt
+```
+
+Measured on this machine under Node v24.10.0, which is also where the outputs below come
+from.<Cite src="measured-wagmi-key-hashing" />
+
+wagmi's answer is a custom hash function exported from `@wagmi/core/query`. It is
+`JSON.stringify` with a replacer that sorts plain-object keys and converts any `bigint` with
+`.toString()`:<Cite src="wagmi-src-query-utils" />
+
+```ts
+export function hashFn(queryKey: QueryKey): string {
+  return JSON.stringify(queryKey, (_, value) => {
+    if (isPlainObject(value)) return Object.keys(value).sort().reduce(/* ... */)
+    if (typeof value === 'bigint') return value.toString()
+    return value
+  })
+}
+```
+
+**The hooks already use it.** wagmi's internal `useQuery` wrapper forwards to TanStack's and adds
+`queryKeyHashFn: hashFn`, commented in the source as *for bigint
+support*.<Cite src="wagmi-src-react-query-utils" /> So a read hook with a `bigint` argument works
+with no configuration from you, which is precisely why the failure, when it comes, arrives somewhere
+that looks unrelated to the chain call that caused it.
+
+**Your `QueryClient` does not use it** unless you say so. That is why wagmi's Devtools instructions
+exist: the Devtools serialise keys through the client's default hash function, so you pass
+`hashFn` as `queryKeyHashFn` in the client's `defaultOptions`:<Cite src="wagmi-tanstack-query" />
+
+```tsx
+import { hashFn } from '@wagmi/core/query'
+
+const queryClient = new QueryClient({
+  defaultOptions: { queries: { queryKeyHashFn: hashFn } },
+})
+```
+
+**And any code of your own that stringifies a key throws.** A `console.log(JSON.stringify(queryKey))`
+in a debugging session, a key written into an analytics event, a cache dump in an error report —
+each is a `TypeError` raised inside your logging path, which is the least helpful stack trace
+available.<Cite src="measured-wagmi-key-hashing" />
+
+<Misconception
+  belief="A query key is just data, so I can log it, hash it, or send it anywhere I would send an object."
+  reality="Query keys routinely contain bigint, which JSON.stringify refuses to serialise. wagmi's hooks hash keys with a custom function that handles it; nothing else in your app does unless you wire it in."
+  why="Every other cache library's keys are strings or plainly serialisable objects, so the habit is decades old and correct everywhere else."
+  src="wagmi-src-query-utils"
+/>
+
+<Aside kind="warn">
+One consequence of `.toString()` is worth knowing before it confuses you. Under this hash function
+the bigint `1n` and the string `'1'` produce **the same** hash, while `1n` and the number `1` produce
+different ones.<Cite src="measured-wagmi-key-hashing" /> That is a collision between two values that
+are not equal, in a key that is supposed to be unique to the query's data.<Cite src="tanstack-query-keys" />
+It is unreachable for a `uint256` argument, because viem will not accept a decimal string there
+anyway. It is reachable in a `scopeKey` you generate, so generate those from a prefix rather than
+from a bare stringified number.
+</Aside>
+
+## Invalidating from a place with no hooks
+
+The worked case: a websocket feed tells your app that a specific token's balance changed for a
+specific account, and the handler lives in a module that never renders.
+
+**Subgoal — get the same Config the components use, not a new one.** Import the singleton from the
+module that calls `createConfig`. If this file cannot reach it, that is the finding: two configs
+means two connector uids and two chain-id states, and no key you build here will match anything the
+components created.
+
+**Subgoal — build the key from the same arguments the hook was given.** Call the exported
+`get<X>QueryOptions` for the hook in question, passing the config and the identical parameter object
+the component passes — same address, same `functionName`, same `args`, same
+`chainId`.<Cite src="wagmi-tanstack-query" /> Do not pass `abi`; it is stripped either
+way.<Cite src="wagmi-src-query-utils" /> The point of using the helper is that you cannot get the
+tuple shape or the field filtering wrong.
+
+**Subgoal — decide the breadth before you write the call.** If the message names one account and one
+token, invalidate that exact key. If it names a token and you have five reads about that token,
+build the narrowest key you can and accept a prefix match, then verify what you hit rather than
+assuming.
+
+**Subgoal — verify the match, because success proves nothing.** `invalidateQueries` returning
+cleanly is not evidence.<Cite src="tanstack-query-invalidation" /> Before invalidating, dump the
+cache's keys and check that yours is among them. `queryClient.getQueryCache().findAll()` gives you
+the live entries; compare against the key you built. Do this once, in development, per invalidation
+site. It is the only step that distinguishes a fix from a plausible-looking no-op.
+
+**Subgoal — assert it in a test, so the fix survives a refactor.** The failure mode here is not a
+crash; it is a key drifting out of alignment when someone adds a parameter to the component's hook.
+A test that renders the component, triggers the out-of-band invalidation, and asserts a second fetch
+occurred is cheap and catches exactly that drift. Without one, this bug returns silently, which is
+how it arrived the first time.
+
+<Check type="spot-bug" concept="wagmi-querykey-shape">
+A pull request adds live updates to a portfolio page. Reads are declared as
+
+```tsx
+const { data } = useReadContract({
+  abi: erc20Abi,
+  address: token,
+  functionName: 'balanceOf',
+  args: [account],
+  chainId: 8453,
+})
+```
+
+and the websocket handler, in a non-React module, does
+
+```ts
+queryClient.invalidateQueries({
+  queryKey: ['readContract', { abi: erc20Abi, address: token, functionName: 'balanceOf', args: [account] }],
+})
+```
+
+The author reports that it works in their manual test. Find every reason this is wrong, and say why
+their manual test passed anyway.
+
+<Answer>
+**Three defects, any one of which is sufficient.**
+
+**`abi` is in the key they built and is not in the key the hook built.** `filterQueryOptions`
+destructures `abi` away before the object goes into slot two.<Cite src="wagmi-src-query-utils" /> The
+constructed key therefore has an extra property, and since a wagmi key is `[name, oneObject]`, the
+mismatch is inside the object rather than at a prefix boundary — prefix matching does not save it.
+
+**`chainId` is missing.** The hook passes `chainId: 8453`, so the hook's key contains it; the
+handler's does not. Two mismatches now, in opposite directions.
+
+**The key was hand-written at all.** Even if both fields were corrected today, nothing keeps the two
+literals aligned when someone adds `blockTag` or a `scopeKey` to the component next quarter. The
+supported construction is `getReadContractQueryOptions(config, { ...sameParams })`, which produces
+whatever shape the installed version produces.<Cite src="wagmi-tanstack-query" />
+
+**Why the manual test passed.** Almost certainly the tester alt-tabbed. `refetchOnWindowFocus`
+defaults to true and `staleTime` defaults to `0`, so returning to the browser window refetches every
+rendered read regardless of whether anything was invalidated.<Cite src="wagmi-use-read-contract" />
+The observed refresh had nothing to do with the code under test. A second possibility, if the page
+already had a watched block number anywhere in the tree, is that block-driven invalidation refreshed
+it within a few seconds and the tester attributed it to the websocket.
+
+**How to review this class of PR in one question.** *Where did that key come from?* If the answer is
+a literal, request a change regardless of whether it currently matches. If the answer is
+`get<X>QueryOptions` with the same config, the remaining risk is only that the arguments drift — and
+that is the test to ask for.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The cache is now fully in your hands.** You can identify a cached question, share it deliberately,
+isolate it deliberately with `scopeKey`, and mark it stale from anywhere in the process. Together
+with the previous lesson's triggers, that is the whole of freshness in a wagmi app.
+
+**The rest of the module leaves TanStack behind.** The remaining four lessons are the parts only
+wagmi has: what a connector is and how each kind fails, why a connected address proves nothing, why
+the server cannot know your wallet, and why the chain in the wallet is not the chain in your hook.
+
+**And the practice exercises are now doable.** "Make the balance update" is this lesson plus the
+last one; "count the requests" is the key-identity content applied with a network tab open.

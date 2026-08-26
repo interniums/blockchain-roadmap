@@ -1,0 +1,367 @@
+---
+id: solidity-abi-selectors-decoding-is-validation
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solidity-abi-spec, solidity-abi-encoding-functions, solc-contractcompiler-source, solidity-0836-release, excessively-safe-call, nist-fips-202]
+stack: { solidity: "0.8.36", forge: "1.7.1" }
+---
+
+Two byte strings. Different lengths, different Keccak digests. Both decode successfully, on solc
+0.8.36, to the same value.<Cite src="solidity-0836-release" /><Cite src="nist-fips-202" />
+
+```text
+abi.decode(A, (bytes))  ->  0xaa            abi.decode(B, (bytes))  ->  0xaa
+
+A (96 bytes)                                B (128 bytes)
+  ...0020   offset -> 32                      ...0040   offset -> 64
+  ...0001   length 1                          ...0000   a 32-byte gap
+  aa00...   data                              ...0001   length 1
+                                              aa00...   data
+```
+
+`A` is what Solidity's encoder produces. `B` is what its decoder accepts. The distance between those
+two sentences is a real property of the ABI, it is documented, and it is the reason certain very
+natural-looking designs — hash the calldata, use it as an identity — do not work.
+
+This lesson is about `abi.decode` as a validator: what it checks, what it deliberately does not
+check, and what you lose when you replace it with three lines of assembly. Then it looks at the
+encoder that has no decoder at all.
+
+## `abi.decode` runs the encoding backwards, and rejects
+
+The documentation describes `abi.decode(bytes memory encodedData, (...))` as decoding the given data
+with the types supplied in parentheses.<Cite src="solidity-abi-encoding-functions" /> That
+undersells it. Decoding the head-and-tail recursion means checking, at every step, that the input
+could have come out of the encoder — and reverting when it could not.
+
+Here are four probes, each run against a hand-built byte string on solc 0.8.36 with forge
+1.7.1.<Cite src="solidity-0836-release" />
+
+```solidity
+function decodeOne(bytes memory b) external pure returns (bytes memory) {
+    return abi.decode(b, (bytes));
+}
+```
+
+**Probe 1 — an offset pointing past the end.** Offset word `0x2000`, followed by 64 bytes of data.
+The call **reverts**. The offset must land inside the data; a decoder that followed it blindly would
+read whichever memory happened to be there.
+
+**Probe 2 — a `bool` that is not 0 or 1.** `abi.decode(abi.encodePacked(uint256(2)), (bool))`
+**reverts**. `bool` is defined as a `uint8` restricted to the values 0 and 1, and the decoder
+enforces the restriction rather than truncating to it.<Cite src="solidity-abi-spec" />
+
+**Probe 3 — dirty high bits in a narrow type.** A word holding a valid 20-byte address *plus* a set
+bit at position 200 decoded as `address` **reverts**. `address` is a `uint160` in a 256-bit word,
+and the 96 high bits must be zero.<Cite src="solidity-abi-spec" />
+
+**Probe 4 — a non-minimal offset with a gap.** The `B` case above. It **succeeds**.
+
+Three of four inputs are rejected. The fourth is the subject of the next section, and it is not an
+oversight — it is written down.
+
+<Figure
+  caption="Three of the decoder's rejections are structural and one hole is deliberate: a gap costs you nothing at decode time and everything at hash time."
+  alt="Raw bytes enter abi.decode, which runs the encoding backwards. An offset past the end, a bool holding 2, and a word with dirty high bits each revert with zero bytes of return data. A non-minimal offset with a gap decodes successfully, because strict mode is not enforced."
+>
+  <Flow
+    nodes={[
+      { id: 'b', label: 'raw bytes', note: 'undecoded', col: 0, tone: 'accent' },
+      { id: 'd', label: 'abi.decode', note: 'the encoding, backwards', col: 1, tone: 'accent' },
+      { id: 'p1', label: 'offset past the end', note: 'probe 1', col: 2, tone: 'danger' },
+      { id: 'p2', label: 'bool holding 2', note: 'probe 2', col: 2, tone: 'danger' },
+      { id: 'p3', label: 'dirty high bits', note: 'probe 3', col: 2, tone: 'danger' },
+      { id: 'p4', label: 'gap before the tail', note: 'probe 4', col: 2, tone: 'warn' },
+      { id: 'rev', label: 'revert', note: 'no return data', col: 3, tone: 'danger' },
+      { id: 'ok', label: 'decodes fine', note: 'strict mode unenforced', col: 3, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'b', to: 'd' },
+      { from: 'd', to: 'p1' },
+      { from: 'd', to: 'p2' },
+      { from: 'd', to: 'p3' },
+      { from: 'd', to: 'p4' },
+      { from: 'p1', to: 'rev', tone: 'danger' },
+      { from: 'p2', to: 'rev', tone: 'danger' },
+      { from: 'p3', to: 'rev', tone: 'danger' },
+      { from: 'p4', to: 'ok', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="note">
+Probes 2 and 3 are where the decoder does work the *encoder* never had to. A value that came from
+Solidity is clean by construction; a value that came from a low-level call, an off-chain signer, or
+a contract someone else wrote is not. This is why the same `bytes` blob is safe as a function
+argument (it went through the dispatcher's decode on the way in) and unsafe as something you
+`mload`.
+</Aside>
+
+### Where the decode already happened, and where it did not
+
+You have been getting these checks for free on every external call you ever wrote, which is why the
+failure modes feel exotic. After the dispatcher matches a selector, it jumps to a per-function entry
+point that the compiler calls a **calldata unpacker** — one per interface function, generated
+alongside the dispatcher.<Cite src="solc-contractcompiler-source" /> By the time your function body
+runs, its `calldata` arguments have been through exactly the validation above.
+
+So there are precisely two places in ordinary Solidity where bytes reach you *un*decoded:
+
+- The return value of a low-level `call`, `staticcall` or `delegatecall`, which arrives as raw
+  `bytes memory`.
+- `msg.data` inside a `fallback`, and anything you slice out of it.
+
+Those two are the entire attack surface for this lesson, and both are exactly the places people
+reach for assembly.
+
+### What a decode failure looks like from outside
+
+Worth knowing before you debug one. Three failing decodes — a `bool` of 2, a `uint256` read from
+eight bytes, and an out-of-range offset — were each called through `staticcall` on solc
+0.8.36.<Cite src="solidity-0836-release" /> All three reverted with **zero bytes of return data**:
+no `Error(string)`, no `Panic(uint256)`, no custom error.
+
+The revert data an error would carry is itself an ABI encoding — a four-byte error selector followed
+by encoded arguments, exactly like a call<Cite src="solidity-abi-spec" /> — and a decode failure
+produces none of it. At the RPC boundary that is indistinguishable from any other bare revert, so a
+client shows "execution reverted" with nothing to decode against an ABI. If a call into an unfamiliar
+contract fails with empty revert data and you cannot find a `require` that explains it, a malformed
+decode is a strong candidate.
+
+## Strict encoding mode: the encoder is stricter than the decoder
+
+The specification defines **strict encoding mode** as the mode producing exactly the encoding of the
+formal specification: offsets must be as small as possible while still not creating overlaps in the
+data areas, and no gaps are allowed.<Cite src="solidity-abi-spec" /> Then it states the asymmetry
+plainly: ABI decoders are usually written by just following offset pointers, some decoders might
+enforce strict mode, and **the Solidity ABI decoder currently does not enforce strict mode, but the
+encoder always creates data in strict mode**.<Cite src="solidity-abi-spec" />
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'A', note: '96 bytes', tone: 'good' },
+    { title: 'B', note: '128 bytes', tone: 'warn' },
+  ]}
+  rows={[
+    { label: 'What does the offset word hold?', cells: ['0x20 — the smallest offset that works', '0x40 — larger than it needs to be'] },
+    { label: 'What sits between the offset and the length?', cells: ['Nothing', 'A 32-byte gap'] },
+    { label: 'Will Solidity ever produce it?', cells: ['Yes, this is strict mode', 'No encoder emits this'] },
+    { label: 'Will Solidity decode it?', cells: ['Yes', 'Yes, to the same value'] },
+    { label: 'What is its keccak digest?', cells: ['One value', 'A different value'] },
+  ]}
+  caption="The two strings differ by one gap word, and every question below the third one answers the same for both."
+  alt="Two byte strings that decode to the same value compared on their offset word, the gap between offset and length, whether Solidity's encoder produces them, whether its decoder accepts them, and whether they hash alike."
+/>
+
+So the encoding is a function — one value, one byte string — while the decoding is not injective.
+Many byte strings map to the same values.
+
+You met the general form of this idea in Track 01, comparing what
+[RLP, ABI and SSZ each reject](/c/canonical-serialization). Here is the specific, operational
+consequence for Solidity code:
+
+**Do not hash raw calldata or raw return data and treat the digest as an identity.** Concretely,
+each of these is unsound:
+
+- A replay guard keyed on `keccak256(msg.data)`. Re-encode the same call non-minimally and you get a
+  different digest for a semantically identical call.
+- A "batch already executed" set keyed on the hash of an encoded batch.
+- Any off-chain component that deduplicates operations by hashing the raw calldata it observed.
+
+The fix is the same in each case and it is one line of discipline: hash the **decoded values**,
+re-encoded by your own encoder, not the bytes you received. `keccak256(abi.encode(a, b, c))` after
+decoding is canonical because Solidity's encoder always emits strict
+encoding.<Cite src="solidity-abi-spec" /> `keccak256(msg.data)` is not, because the caller wrote
+those bytes.
+
+<Misconception
+  belief="If abi.decode succeeded, the bytes were canonically encoded."
+  reality="Solidity's decoder does not enforce strict mode. Non-minimal offsets and gaps decode successfully; only the encoder is strict, so a successful decode says the bytes were readable, not that they were canonical."
+  why="The specification defines exactly one encoding for each value, which reads like a statement about what is valid. It is a statement about what the encoder produces. The decoder's contract is looser and the specification says so in a single sentence that is easy to read past."
+  src="solidity-abi-spec"
+/>
+
+## What three lines of assembly cost you
+
+The most common way to lose every check above is to stop calling `abi.decode`.
+
+```solidity
+(bool ok, bytes memory data) = token.call(
+    abi.encodeWithSignature("balanceOf(address)", who)
+);
+require(ok);
+uint256 balance;
+assembly { balance := mload(add(data, 32)) }   // the cheap version
+```
+
+Point that at a contract whose fallback returns only **eight** bytes instead of a full word, and
+measure both readings on solc 0.8.36:<Cite src="solidity-0836-release" />
+
+```text
+callee returns 8 bytes: 0x1122334455667788
+
+  assembly mload(add(data,32))  ->  0x1122334455667788000000000000000000000000000000000000000000000000
+  abi.decode(data, (uint256))   ->  reverts
+```
+
+The assembly read did not return zero, and it did not return `0x1122334455667788`. It returned the
+eight bytes **left-aligned in a word**, padded with whatever followed them in memory — a number
+around 2¹⁹² for a function that was supposed to return a balance. Nothing reverted, nothing logged,
+and every downstream comparison against it is now meaningless.
+
+`abi.decode` reverted because the input is shorter than one word: a `uint256` needs 32 bytes and
+there were 8.<Cite src="solidity-abi-spec" /> That is the entire difference between the two lines,
+and it is the reason the rule is stated the way it is — **raw return data should be decoded, not
+`mload`ed**.
+
+There is one legitimate reason to touch return data with assembly, and it is not decoding. A hostile
+callee can return an enormous buffer, and the caller pays memory-expansion costs to copy it before
+it ever looks at it; the defence is a low-level call that bounds the copy size, which requires
+assembly to express.<Cite src="excessively-safe-call" /> Note the shape of that exception: assembly
+to control *how much* you copy, then `abi.decode` on the bounded result. Not assembly instead of
+decoding.
+
+<Misconception
+  belief="abi.decode is a convenience wrapper, so hand-written assembly does the same thing faster."
+  reality="It re-runs the encoding rules in reverse and reverts on offsets out of range, lengths past the end of the data, dirty high bits and out-of-range enums or bools. Assembly performs none of those checks."
+  why="For well-formed input the two produce the same value, so the assembly version passes every test written against a cooperative counterparty. The checks only fire against input you did not produce, which is exactly the input that never appears in your own test suite."
+  src="solidity-abi-spec"
+/>
+
+## The encoder with no decoder
+
+`abi.encodePacked` is the other half of this lesson, and Track 01 already established why
+`keccak256(abi.encodePacked(a, b))` over two dynamic arguments is a
+[forgery primitive](/c/packed-hash-collision). What is worth adding here is the *language surface*:
+what the compiler will and will not let you pack, and what it does to what it accepts.
+
+The specification gives three rules and one exclusion. Types shorter than 32 bytes are concatenated
+directly, without padding or sign extension; dynamic types are encoded in place and without the
+length; **array elements are padded, but still encoded in place**; and structs as well as nested
+arrays are not supported.<Cite src="solidity-abi-spec" />
+
+Rule three is the one that surprises everyone, and it is measurable. On solc
+0.8.36:<Cite src="solidity-0836-release" />
+
+```text
+abi.encodePacked(uint8(1), uint8(2))    ->   2 bytes
+abi.encodePacked(uint8[2] memory)       ->  64 bytes, identical to packing two uint256 values
+abi.encodePacked(uint8[2][2] memory)    -> 128 bytes, identical to packing four uint256 values
+```
+
+The same two numbers cost two bytes or sixty-four, decided by a pair of brackets. "Packed" describes
+the top level of the argument list, not the output.
+
+Two things the compiler rejects outright, both with *Type not supported in packed mode* (error
+9578): a `struct`, and a `string[2]`. And one it accepted in this test: `uint8[2][2]`, which it
+padded and flattened as shown above. The specification's sentence about nested arrays and this
+compiler's behaviour do not line up neatly, so do not reason from either alone — write the two-line
+probe against the compiler you ship with.<Cite src="solidity-abi-spec" />
+
+The specification then draws the conclusion that matters most. In general the encoding is ambiguous
+as soon as there are two dynamically-sized elements, because of the missing length field; and since
+the encoding is ambiguous, **there is no decoding function**.<Cite src="solidity-abi-spec" /> Not
+"none is provided". None can exist. Every property in the first half of this lesson — offset
+validation, length checking, dirty-bit rejection — presupposes a decoder, and packed mode has
+deleted the thing those checks would have run in.
+
+### What to reach for instead
+
+Three cases, three answers.
+
+**You want a hash used as an identity, a commitment, a mapping key or a signature digest.** Use
+`abi.encode`. It costs more bytes and it is unambiguous. If you must use packed mode, the
+specification's condition has two clauses and is usually quoted with one: always use the same types,
+*and* have at most one of them dynamic.<Cite src="solidity-abi-spec" /> "Same types" is a constraint
+across every site in your system that produces that key — not a property of one call.
+
+**You want to concatenate byte strings.** Use `bytes.concat(...)`, which concatenates a variable
+number of `bytes` and `bytes1` through `bytes32` arguments into one byte array, or
+`string.concat(...)` for strings.<Cite src="solidity-abi-encoding-functions" /> These say what they
+mean. `abi.encodePacked` used as a concatenation operator works, and then someone later feeds the
+result to `keccak256` because it is already a `bytes`, and the vulnerability arrives without anyone
+writing it.
+
+**You need a specific width.** Explicit type conversions control padding:
+`abi.encodePacked(uint16(0x12))` is `hex"0012"`.<Cite src="solidity-abi-spec" /> Since packed
+encoding is not used when calling functions, there is no special support for prepending a function
+selector — another sign of what packed mode is for.<Cite src="solidity-abi-spec" />
+
+<Check type="spot-bug" concept="abi-decode-validates">
+An operator contract accepts signed batches from an off-chain relayer.
+
+```solidity
+mapping(bytes32 => bool) public executed;
+
+function run(bytes calldata payload, bytes calldata sig) external {
+    bytes32 id = keccak256(payload);
+    require(!executed[id], "replay");
+    executed[id] = true;
+
+    require(recoverSigner(id, sig) == operator, "bad signer");
+
+    (address target, uint256 value, bytes memory data) =
+        abi.decode(payload, (address, uint256, bytes));
+
+    (bool ok, bytes memory ret) = target.call{value: value}(data);
+    require(ok);
+    uint256 result;
+    assembly { result := mload(add(ret, 32)) }
+    emit Ran(target, result);
+}
+```
+
+Three defects, all from this lesson. Find them and say which one an attacker reaches first.
+
+<Answer>
+**Defect 1 — the replay guard is keyed on non-canonical bytes, and this is the one reached first.**
+`id` is `keccak256(payload)`, and `payload` is attacker-supplied. Because Solidity's decoder does
+not enforce strict mode, a second byte string with a non-minimal offset and a gap decodes to the
+*same* `(target, value, data)` and hashes to a *different*
+`id`.<Cite src="solidity-abi-spec" /> The `executed` check passes and the batch runs again.
+
+The second half of the defect is worse: `recoverSigner(id, sig)` also recovers against the digest of
+the raw bytes, so the operator's signature over the original payload does **not** authorise the
+re-encoded one — the attacker needs a signature over the new `id`. So this alone is not a free
+replay. But it means the identity of a batch is a property of its byte representation rather than of
+its meaning, and the whole design rests on those two being the same thing.
+
+Fix: decode first, then derive the identity from the decoded values —
+`keccak256(abi.encode(target, value, data))` — so that the encoder, which is always
+strict, produces the key.<Cite src="solidity-abi-spec" />
+
+**Defect 2 — the return value is read with `mload`.** If `target` returns fewer than 32 bytes,
+`result` is those bytes left-aligned and padded with adjacent memory, and the event reports a
+number that never existed.<Cite src="solidity-abi-spec" /> If the target's return type is not a
+`uint256` at all, nothing says so. Fix: `abi.decode(ret, (uint256))`, which reverts on both.
+
+**Defect 3 — the return buffer is unbounded.** `target.call(...)` copies the whole return value into
+memory before the contract inspects it, so a hostile target can force the caller to pay for an
+enormous copy.<Cite src="excessively-safe-call" /> This is the one case where assembly is the right
+answer — a call that bounds the copy size — and it is the opposite of what the code does here: it
+uses assembly for the decode, which is unsafe, and not for the copy limit, which is where assembly
+was needed.
+
+**The ordering.** Defect 1 is a design flaw an attacker probes for; defects 2 and 3 need a hostile
+`target`, which the operator chose. So the honest ranking is: fix 1 because the guard does not do
+what it says; fix 2 because it costs one line; fix 3 when targets stop being trusted.
+</Answer>
+</Check>
+
+## Where this pays off
+
+The rule that comes out of this lesson is short enough to apply without thinking, which is the point:
+**decode before you trust, and encode before you hash.**
+
+Decoding is where an untyped byte string becomes typed values, and the reverts happen there rather
+than three calls later as a wrong number. Encoding is where values become a canonical byte string,
+and canonicity is what makes a digest an identity. Skipping either one moves a check out of your
+contract and into an assumption about your counterparty.
+
+One lesson remains in this module, and it inverts the direction: instead of decoding calldata you
+were handed, you read the raw call you are currently inside — `msg.data` and `msg.sig` — and use it
+to route, forward or re-sign. Everything above applies there with one extra hazard, because at that
+point the bytes have not been through any decoder at all.

@@ -1,0 +1,378 @@
+---
+id: defi-liquidations-soft-still-has-a-tail
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [curve-crvusd-controller-docs, curve-llamma-explainer, curve-liquidation-bands, curve-crvusd-amm-docs, darknavy-sdola-llamalend, gov-curve-sdola-postmortem, llamarisk-crvusd-incident, coindesk-curve-bad-debt, aave-price-cap-adapters, chainlink-data-feeds-docs, morpho-liquidation-docs]
+stack: {}
+---
+
+LLAMMA's hard-liquidation path is one function, and its docstring calls what it performs a "bad
+liquidation".<Cite src="curve-crvusd-controller-docs" /> That is the honest name for it: the soft path
+is the design, and this is what runs when the design has already failed for a particular position.
+
+This lesson is about that tail. It has two halves. The first is arithmetic — what health actually is,
+computed from the contract rather than from the fuel-gauge analogy, and which of its inputs moves in
+which direction. The second is adversarial: a soft-liquidation ladder is indexed to an oracle along
+its entire length, which means an attacker who can move the oracle does not merely trigger one
+threshold. They choose where every position in the market sits.
+
+## Health, from the source
+
+Curve's user-facing documentation describes health as a fuel gauge that empties to zero, with high
+health around 10 or higher, medium around 5, critical below 2, and full liquidation at
+zero.<Cite src="curve-liquidation-bands" /> Useful for a UI, useless for reasoning. The contract is
+precise:
+
+```text
+health = 10**18 − liquidation_discount
+health = get_x_down(user) · health / debt  −  10**18
+```
+
+with the docstring stating that health is normalised to 1e18, that liquidation starts when it is below
+zero, and — the clause worth stopping on — that *devaluation of collateral does not cause
+liquidation*.<Cite src="curve-crvusd-controller-docs" />
+
+**Subgoal 1 — read the formula in plain terms.** Divide through by 1e18:
+
+```text
+health  =  get_x_down · (1 − liquidation_discount) / debt  −  1
+```
+
+So health is positive exactly while
+
+```text
+get_x_down · (1 − liquidation_discount)  >  debt
+```
+
+`get_x_down` is the AMM's conservative downside valuation of the position in units of the borrowed
+asset — what the position would be worth if the price walked down through the remaining bands. The
+Controller's own parameter documentation confirms the role: `loan_discount` is described as the
+discount of the maximum loan size compared to `get_x_down()`, and `liquidation_discount` as the same
+discount "for bad liquidation purposes", used to discount the collateral value when computing health in
+order to incentivise liquidators.<Cite src="curve-crvusd-controller-docs" />
+
+**Subgoal 2 — recognise the shape.** This is the same inequality as the discrete world's bad-debt
+threshold from lesson four, `C ≥ D · LIF`, with two substitutions. `C` has become `get_x_down`, a
+band-derived valuation rather than a spot mark. And `LIF` has become `1/(1 − liquidation_discount)`,
+which is the same quantity written the other way round. LLAMMA did not invent a new solvency condition.
+It changed what goes into `C`.
+
+**Subgoal 3 — work out what that substitution buys.** Because `get_x_down` is computed from where the
+position sits in the ladder rather than from spot, a price fall *below* the range does not reduce it —
+which is exactly what the docstring means by devaluation not causing
+liquidation.<Cite src="curve-crvusd-controller-docs" /> Curve's user documentation says the same from
+the borrower's side: with the position entirely converted, you are protected from further declines
+and health only decreases from interest.<Cite src="curve-liquidation-bands" /> A fully soft-liquidated
+position is genuinely insulated from further downside, and that is a real property no discrete design
+has.
+
+**Subgoal 4 — work out what it costs.** Only two things reduce health, and Curve names both: the
+interest rate, which increases debt every block regardless of whether the loan is being liquidated at
+all, and — more importantly, in the documentation's own ranking — the losses taken when the position
+is soft- or de-liquidated.<Cite src="curve-llamma-explainer" /> Both terms are monotone. Interest only
+rises; conversion losses only accumulate. **Health has no path back up that does not involve the
+borrower repaying.**
+
+That is the whole tail in one sentence. The mechanism removed the discontinuity at a price; it did not
+remove the monotone decay of a quantity that triggers liquidation when it reaches zero.
+
+<Aside kind="note">
+The `full` flag on `health` and `health_calculator` selects whether to take into account the price
+difference above the highest user's band.<Cite src="curve-crvusd-controller-docs" /> The two answers
+can differ by an order of magnitude — the documentation's own example returns about 5.03 for one and
+about 0.041 for the other on the same position.<Cite src="curve-crvusd-controller-docs" /> If you are
+building monitoring on top of this, know which one you are reading, because one of them includes
+value that only exists while the price stays above your bands.
+</Aside>
+
+## The hard path
+
+When health goes below zero, other users may repay the debt and receive the
+collateral.<Cite src="curve-llamma-explainer" /> The documentation is emphatic about what does *not*
+determine this: the liquidation range does not reflect prices at which a loan is hard-liquidated; it
+depends only on health.<Cite src="curve-llamma-explainer" />
+
+The interface is a discrete liquidator's interface, and by now every piece of it should look familiar.
+`liquidate(user, min_x, use_eth)` takes a minimum acceptable amount of assets to receive, documented
+as protection against liquidators being sandwiched.<Cite src="curve-crvusd-controller-docs" />
+`liquidate_extended` adds a `frac` — the fraction to liquidate, with 1e18 meaning 100% — plus a
+`callbacker` and its arguments, so a caller can hand control to their own contract mid-execution and
+work capital-free.<Cite src="curve-crvusd-controller-docs" /> `tokens_to_liquidate(user)` returns the
+amount of the borrowed asset required, and `users_to_liquidate(_from, _limit)` returns a paginated
+array of positions eligible for hard liquidation.<Cite src="curve-crvusd-controller-docs" />
+
+Note the shape of the incentive: there is no separate bonus parameter on the way in. The liquidator's
+profit comes from the `liquidation_discount` already embedded in the health calculation — the position
+becomes liquidatable while its band-derived value still exceeds the debt by that discount, and the
+gap is the payment. Same trade as Aave's bonus, expressed as a haircut in a solvency test rather than
+as a markup on a seizure.
+
+### The direction that surprises people
+
+Everything so far suggests the danger is downward. It is not, and the counter-case is documented.
+
+Consider a position fully soft-liquidated: entirely in the stable asset, below its range, health
+decaying only from interest. Now the collateral price rises rapidly. De-liquidation converts the
+stable asset back into collateral — and conversion in *that* direction costs the borrower too, because
+losses happen in both directions.<Cite src="curve-liquidation-bands" /> A fast recovery re-exposes the
+position to the volatile asset while charging it for the privilege.
+
+LlamaRisk's June 2024 report states the case in exactly these terms for a large CRV position: due to
+the soft-liquidation design, the worst scenario would be if the CRV price increased *rapidly*, because
+the position would become fully exposed to CRV and simultaneously drop in health, potentially resulting
+in a hard liquidation of the full collateral amount.<Cite src="llamarisk-crvusd-incident" /> In that
+episode the price declined instead, soft liquidation transitioned exposure into crvUSD, and hard
+liquidation followed in an orderly way with the founder noting that the soft path had bought
+liquidators time to prepare funds for an OTC liquidation.<Cite src="llamarisk-crvusd-incident" />
+
+Curve's own user documentation carries the general form of the warning: full liquidation can still
+happen during a price recovery if health is already critically low inside the
+range.<Cite src="curve-liquidation-bands" />
+
+<Misconception
+  belief="LLAMMA means you cannot be liquidated or accumulate bad debt."
+  reality="A hard-liquidation path exists, is permissionless, and has been used. A LLAMMA market accumulated bad debt during the October 2025 crash, and a LlamaLend market saw mass hard liquidation in March 2026. The mechanism reshapes the loss distribution and pushes the discrete event further out; the tail remains."
+  why="Soft liquidation is presented as the whole mechanism, and 'no liquidation event' is read as 'no liquidation'."
+  src="coindesk-curve-bad-debt"
+/>
+
+<Compare
+  axis="What actually changed"
+  columns={[
+    { title: 'Discrete liquidation', note: 'a threshold at a price' },
+    { title: 'LLAMMA', note: 'a ladder and a health test', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What starts the discrete event?',
+      cells: [
+        'The collateral price reaching a level you can compute in advance',
+        <>Health below zero — and the liquidation range explicitly does not reflect the prices at which that happens<Cite src="curve-llamma-explainer" /></>,
+      ],
+    },
+    {
+      label: 'Does a further price fall make it worse?',
+      cells: [
+        'Yes. The valuation is a spot mark, so it falls with the price',
+        <>No, once the position is fully converted: devaluation of collateral does not cause liquidation<Cite src="curve-crvusd-controller-docs" /></>,
+      ],
+    },
+    {
+      label: 'Can it recover without the borrower repaying?',
+      cells: [
+        'Yes. A price recovery restores the health factor',
+        <>No. Interest and conversion losses only accumulate, and conversion losses do not reverse<Cite src="curve-liquidation-bands" /></>,
+      ],
+    },
+    {
+      label: 'What is oracle-sensitive?',
+      cells: [
+        'One price per position',
+        'The whole range. One move relocates every position in the market at once',
+      ],
+    },
+    {
+      label: 'What happens when it fails?',
+      cells: [
+        'Bad debt — a reserve deficit, or a vault share price written down',
+        <>The same permissionless hard liquidation, and bad debt anyway<Cite src="coindesk-curve-bad-debt" /></>,
+      ],
+    },
+  ]}
+  caption="Two rows are genuine removals. The rest of the discrete design is still standing, and the oracle row got bigger."
+  alt="Discrete liquidation and LLAMMA compared on five questions. LLAMMA removes the computable price trigger and removes exposure to further falls once a position is fully converted. It keeps a solvency test that only decays, since interest and conversion losses accumulate and do not reverse; it keeps a permissionless hard-liquidation path and bad debt; and it widens oracle sensitivity from one price per position to the entire band range."
+/>
+
+Two events make the point. Curve's CRV-collateral LlamaLend market accumulated bad debt during the
+10 October 2025 crash because prices moved faster than keepers could profitably act on while gas costs
+spiked, and the founder later proposed a market-based recovery pool rather than a treasury
+bailout.<Cite src="coindesk-curve-bad-debt" /> That is lesson four's coupling, arriving in a market
+that was supposed to be immune to it. The second event is the rest of this lesson.
+
+## The ladder is an oracle-indexed object
+
+Here is the structural point, and it inverts a common intuition.
+
+A discrete design has one oracle-sensitive price per position: the price at which health factor
+reaches one. Move the oracle to that price and the position becomes liquidatable; move it anywhere
+else and nothing happens.
+
+LLAMMA has no such price — and the naive conclusion is that removing the single trigger removes the
+attack target. The opposite is true. The AMM's quoted price tracks `price_oracle`, the band mechanics
+depend on arbitrageurs responding to the gap between `price_oracle` and
+`get_p`, and every position's composition is a function of where the oracle says the price
+is.<Cite src="curve-llamma-explainer" /><Cite src="curve-crvusd-amm-docs" /> There is no single
+sensitive price because **the whole range is sensitive**. An attacker who controls the oracle controls
+where in the ladder every position sits, and can therefore choose to place all of them in soft
+liquidation at once.
+
+<Misconception
+  belief="Continuous liquidation makes a market oracle-resilient, because there is no single trigger price to manipulate."
+  reality="It replaces one oracle-sensitive threshold with an oracle-sensitive range. The attacker's target is not smaller; it is larger and it is continuous, and moving the oracle moves every position in the market rather than the ones sitting at one price."
+  why="Removing a discrete trigger looks like removing the thing an attacker aims at, when it has instead spread the target across an interval."
+  src="gov-curve-sdola-postmortem"
+/>
+
+## 2 March 2026: what a controllable rate does to a ladder
+
+The demonstration is a single transaction, and its trace has been published in detail by an
+independent analysis. Handle the numbers carefully — the governance post-mortem thread itself returns
+HTTP 403 to automated retrieval, so what follows is what the transaction-level analysis reports, with
+the disagreements named rather than resolved.<Cite src="gov-curve-sdola-postmortem" />
+
+**The defect.** The sDOLA/crvUSD LlamaLend market's price oracle, a `CryptoFromPoolVaultWAgg` contract,
+computed its price by calling `VAULT.convertToAssets(10**18)` on the sDOLA vault — a spot read of an
+ERC-4626-style exchange rate.<Cite src="darknavy-sdola-llamalend" /> That rate is
+`shares × totalAssets() / totalSupply`, and `totalAssets()` derives from `DolaSavings.balanceOf(sDOLA)`,
+which changes immediately when DOLA is staked or unstaked.<Cite src="darknavy-sdola-llamalend" /> The
+oracle contract's own source describes it as suitable only for vaults that cannot be affected by a
+donation attack, and the sDOLA contract itself carries a comment warning that any protocol in which
+sudden, large and atomic increases in the value of an asset may be a security risk should not integrate
+the vault.<Cite src="darknavy-sdola-llamalend" />
+
+**The execution**, at block 24566937, 03:00:11 UTC. Two flash loans from Morpho Blue — 10,000,000 USDC
+and 15,986.108 WETH.<Cite src="darknavy-sdola-llamalend" /> The attacker opened a WETH-collateral
+crvUSD loan to borrow 25M crvUSD, routed value into the sDOLA/crvUSD LLAMMA through the AMM's own
+`exchange`, and then moved the rate: `sDOLA.redeem` of about 10,607,802 sDOLA, which unstaked about
+12,613,130 DOLA from `DolaSavings` and crashed `convertToAssets()`, followed by a re-stake of
+190,777.47 DOLA to calibrate how depressed the rate stayed.<Cite src="darknavy-sdola-llamalend" /> Then
+one call to `users_to_liquidate()` and 27 calls to `liquidate(user, 0)` from a helper contract deployed
+in the same transaction.<Cite src="darknavy-sdola-llamalend" /> The market's `n_loans` went from 30 at
+the pre-state to 4 at the post-state.<Cite src="darknavy-sdola-llamalend" /> The oracle's
+`convertToAssets` selector was called 78 times inside the one
+transaction.<Cite src="darknavy-sdola-llamalend" /> Attacker net token change: +6.737 WETH and
++227,325.57 DOLA, about $240,567.<Cite src="darknavy-sdola-llamalend" />
+
+<Figure
+  caption="The market published the target list. One rate move did the rest: 26 of 30 loans closed inside a single transaction."
+  alt="The 2 March 2026 sDOLA/crvUSD transaction in four steps: two flash loans of 10,000,000 USDC and 15,986.108 WETH; a redeem of sDOLA followed by a re-stake of DOLA to calibrate where the vault's exchange rate settled; one call to users_to_liquidate to enumerate the eligible positions; and 27 calls to liquidate from a helper contract deployed in the same transaction, taking the market's loan count from 30 to 4. Sources disagree on the direction the rate was moved, so no direction is drawn."
+>
+  <Flow
+    nodes={[
+      { id: 'fl', label: 'two flash loans', col: 0, tone: 'accent', note: '10,000,000 USDC · 15,986.108 WETH' },
+      { id: 'rate', label: 'move the sDOLA rate', col: 1, tone: 'warn', note: 'redeem, then re-stake to calibrate' },
+      { id: 'find', label: 'users_to_liquidate()', col: 2, note: 'the market names its own targets' },
+      { id: 'liq', label: '27 × liquidate()', col: 3, tone: 'danger', note: 'n_loans 30 → 4' },
+    ]}
+  />
+</Figure>
+
+**Where sources disagree, and why it matters.**
+
+*The direction of the oracle move.* The transaction-level analysis is explicit that the attacker moved
+the rate **down**, by mass-redeeming sDOLA to crash `convertToAssets()`, and notes that this is the
+opposite of the direction the sDOLA source comment warns
+about.<Cite src="darknavy-sdola-llamalend" /> Summaries of the governance thread instead describe the
+`DolaSavings.stake()` call as *inflating* the oracle.<Cite src="gov-curve-sdola-postmortem" /> Since
+sDOLA was the collateral, only a downward move makes positions liquidatable, so the trace's account is
+the mechanically coherent one — but the thread cannot be fetched to check, and you should treat the
+direction as reported-with-a-disagreement rather than settled.
+
+*The size of the borrower loss.* The figure most often repeated is 27 borrowers and roughly $10.9M of
+debt. In the published trace, a `create_loan` of approximately 8,286,547 sDOLA collateral for
+approximately 10,904,020 crvUSD appears as the **attacker's own follow-on loan** in the same market,
+after the liquidation phase.<Cite src="darknavy-sdola-llamalend" /> Whether the circulating figure is a
+coincidence or a misreading of that line cannot be established from a thread that returns 403. The 27
+liquidation calls are confirmed by selector count; the debt figure attached to them is not.
+
+**The generalisable defect.** You met it in the security track: a yield-bearing wrapper's exchange
+rate is a function of mutable state, so it is an oracle, and an oracle any caller can move in one
+transaction is an oracle an attacker can move.<Cite src="darknavy-sdola-llamalend" /> What LLAMMA adds
+is amplification. In a discrete market, moving a rate downward makes liquidatable those positions that
+happened to sit near the threshold. Here, one move relocates every position in the market along the
+ladder at once — which is why one transaction closed 26 of 30 loans.
+
+<Check type="explain" concept="llamma-oracle-coupling">
+You are reviewing a proposed LlamaLend-style market with a liquid-staking token as collateral. The
+oracle multiplies a professional USD feed for the underlying by the LST contract's own `exchangeRate()`
+view. The team argues that because soft liquidation is continuous, there is no threshold to attack and
+the design is therefore more oracle-resilient than a discrete market would be.
+
+Say whether the argument holds, and give the review findings you would write.
+
+<Answer>
+**The argument is exactly backwards, and the reason is structural rather than a matter of degree.**
+
+Continuous liquidation does not remove the oracle-sensitive point; it smears it across the whole band
+range. In a discrete market, an attacker who can move the oracle by `x%` can liquidate the positions
+whose thresholds lie within `x%` of spot. In a band market, the same move relocates *every* position
+in the market along the ladder, converting collateral for all of them and moving all of their health
+in the same direction at once. The 27-liquidation transaction is what that looks like when someone
+does it.<Cite src="darknavy-sdola-llamalend" />
+
+**Findings I would write.**
+
+*Finding one — the rate leg is an unbounded oracle.* Identify precisely what `exchangeRate()` is a
+function of and who can change those inputs in one transaction. If it reads a balance that a
+permissionless stake, unstake, deposit or reward distribution modifies, it is atomically movable and
+the professional feed on the other leg does not help, because the two legs multiply and the composite
+inherits the weaker one.<Cite src="darknavy-sdola-llamalend" />
+
+*Finding two — the oracle must not be able to jump.* This is the remediation the incident points at,
+and it is a property of the feed rather than of the collateral: a lending oracle should have no path to
+an instantaneous price change, so smoothing is required regardless of how the collateral is
+technically designed. In practice that means an EMA or time-weighted read of the rate, plus a bound on
+per-update movement — the same construction as Aave's price cap adapters, which impose a maximum
+allowed growth rate on a yield-bearing asset's price so a rate that moves faster than yield can
+possibly accrue is refused.<Cite src="aave-price-cap-adapters" />
+
+*Finding three — the oracle must be replaceable.* An immutable oracle address on a live market is a
+permanent liability, because the fix for finding two is a new oracle. Ask, before deployment, what the
+upgrade path is; if the answer is "there is none", the design decision has already been made and it
+cannot be revisited after an incident.
+
+*Finding four — consumption checks are still required.* Freshness, decimals, the behaviour of any
+fallback path.<Cite src="chainlink-data-feeds-docs" /> The professional leg being professional says
+nothing about how it is read.
+
+*Finding five — bound the blast radius.* Supply caps limit how much of the collateral the market
+accepts, which is the only control that works when the other four fail. Note the asymmetry the
+incident illustrates: because band liquidation operates per band rather than per user, one
+manipulation reaches every borrower who shares the affected range, so the exposure to bound is the
+market, not the largest position.<Cite src="curve-llamma-explainer" />
+
+**What I would not write.** A finding recommending a switch to discrete liquidation. That trades this
+failure mode for the ones in lessons four and five, and the choice between them is about which price
+paths the collateral actually takes, not about which mechanism is safer in the
+abstract.<Cite src="morpho-liquidation-docs" />
+</Answer>
+</Check>
+
+## What the module adds up to
+
+Every design in these eight lessons pays a stranger to retire debt, and every one fails when the
+stranger's arithmetic goes negative or the number it is computed from is wrong.
+
+**Fixed discount** fails silently: the function exists, calling it is a loss, nobody calls it, and the
+shortfall becomes a reserve deficit or a vault share price write-down.
+
+**Descending auction** fails loudly: it clears fairly at whatever the one reachable bidder offered.
+
+**Continuous conversion** fails slowly and then suddenly: monotone health decay ending in the same
+permissionless hard liquidation the design was built to avoid — or immediately, if somebody owns the
+oracle the ladder is indexed to.
+
+What they share is that solvency is outsourced to an incentive and to a price, and neither is under
+the protocol's control at the moment it matters.
+
+## What this unlocks
+
+**The reflection for this module** asks you to pick a design and write the conditions under which it
+produces bad debt, then sort those conditions into what a protocol can control, what it can only
+price, and what it can only observe afterwards. You now have the material for all three columns: caps
+and close factors in the first, discounts and thresholds in the second, and depth, keeper liveness and
+oracle integrity in the third.
+
+**The practice worth doing first** is the rate-oracle attack in miniature: a mock ERC-4626 vault whose
+`convertToAssets` is consumed as a lending oracle, plus a permissionless call that moves it inside one
+transaction. Make a healthy position hard-liquidatable in a single block using only unpermissioned
+calls, then add a smoothed or rate-limited read and watch the same test fail. Twenty minutes of work
+reproduces the shape of an eight-figure market's worst day.
+
+**Where this connects onward.** The oracle module treats manipulation cost as a quantity you compute
+rather than a property you assert, and the MEV module takes up the ordering market that captures the
+surplus in every fixed-discount design. Both are the other side of this module's central claim: a
+liquidation system assumes a keeper shows up and the oracle is fresh, and it is precisely when it
+matters that both assumptions fail together.

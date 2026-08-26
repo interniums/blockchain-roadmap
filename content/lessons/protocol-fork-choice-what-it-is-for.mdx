@@ -1,0 +1,328 @@
+---
+id: protocol-fork-choice-what-it-is-for
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [fork-choice-spec, fc-phase0-beacon-chain-v161, fc-config-mainnet-v161, fc-phase0-validator-v161, eth2book-fork-choice, ethereum-org-pos-attack-defense, monnot-reorg-post, 3sf-paper, fc-fast-confirmation-paper]
+stack: {}
+---
+
+Two beacon nodes in the same rack, on the same switch, running the same client at the same version.
+Your dashboard polls both for the head block root every second. At 14:02:11 they return different
+roots. At 14:02:12 they agree again.
+
+Nobody is misconfigured. Neither node is compromised. Neither client has a bug. The correct
+description of what happened is that for slightly under a second, two honest nodes computed
+different answers to the same question — and the protocol has no problem with that, because the
+question they were answering is a local one.
+
+That is the whole subject of this module, and it is worth naming the trap up front: almost every
+confused sentence about Ethereum consensus comes from treating fork choice and finality as one
+mechanism. They are two mechanisms with different jobs, different guarantees, different failure
+modes, and different time constants. You already know [LMD-GHOST](/c/lmd-ghost) and
+[Casper FFG](/c/casper-ffg) as names. This lesson makes precise what each one is *for*, and shows
+that the interesting property is neither of them alone but the way they are wired together.
+
+<Figure
+  caption="The two mechanisms are not stacked, they are a loop: FFG fixes the base of the tree, GHOST picks a head inside it, and the head is what validators attest to — which is what FFG counts."
+  alt="A node's Store feeds filter_block_tree, whose base is the justified checkpoint; the surviving branches feed get_weight, which returns a head; attestations to that head are what justify the next checkpoint, moving the base."
+>
+  <Flow
+    lanes={['local view', 'Casper FFG', 'LMD-GHOST', 'output']}
+    nodes={[
+      { id: 'store', label: 'Store', note: "one node's view", col: 0, tone: 'accent' },
+      { id: 'filt', label: 'filter_block_tree', note: 'base = justified root', col: 1 },
+      { id: 'wt', label: 'get_weight', note: 'heaviest subtree', col: 2 },
+      { id: 'head', label: 'head', note: 'recomputed each call', col: 3, tone: 'accent' },
+    ]}
+    edges={[
+      { from: 'store', to: 'filt' },
+      { from: 'filt', to: 'wt', label: 'viable branches' },
+      { from: 'wt', to: 'head' },
+      { from: 'head', to: 'filt', label: 'attest, then justify' },
+    ]}
+  />
+</Figure>
+
+## What the function actually is
+
+The fork choice is a pure function with a specific signature, and reading it that way removes most
+of the ambiguity.
+
+The consensus spec defines a `Store` object holding everything a node has heard: the blocks it
+knows, the states it computed for them, one latest message per validator, the justified and
+finalized checkpoints, the equivocating validators it has seen proof of, and the current
+time.<Cite src="fork-choice-spec" /> The annotated spec puts it the useful way: in classical
+consensus terms the `Store` is a node's *local view* — all the relevant information that node has
+about the network state — and the rule is a function from that view to a head
+block.<Cite src="eth2book-fork-choice" />
+
+```python
+def get_head(store: Store) -> Root:
+    # Get filtered block tree that only includes viable branches
+    blocks = get_filtered_block_tree(store)
+    # Execute the LMD-GHOST fork choice
+    head = store.justified_checkpoint.root
+    while True:
+        children = [root for root in blocks.keys() if blocks[root].parent_root == head]
+        if len(children) == 0:
+            return head
+        # Sort by latest attesting balance with ties broken lexicographically
+        head = max(children, key=lambda root: (get_weight(store, root), root))
+```
+
+<Cite src="fork-choice-spec" />
+
+Three things in nine lines are worth stopping on, and all three are load-bearing for the rest of the
+module.
+
+**The only argument is the store.** No network access, no clock beyond what the store already
+carries, no consultation with peers. Two nodes with identical stores compute identical heads,
+deterministically. Two nodes with different stores may compute different heads, and neither is
+wrong. The 14:02:11 disagreement is one node having received an attestation aggregate a few hundred
+milliseconds before the other.
+
+**The walk starts at `store.justified_checkpoint.root`,** not at genesis and not at the finalized
+checkpoint. Everything below that root is not under consideration. The tree the rule operates on is
+bounded, and something other than GHOST decides where its base sits.
+
+**The tie-break is lexicographic on the block root.** When two subtrees carry identical weight the
+rule picks the block with the higher root — an arbitrary but deterministic
+choice.<Cite src="fork-choice-spec" /> That matters later: a tie is not left unresolved, and an
+adversary who can engineer near-ties gets to reason about a rule with no randomness in it.
+
+## Local views are the normal case, not the failure case
+
+It is tempting to read "two honest nodes disagree" as a defect. Work out why it cannot be
+otherwise.
+
+**Subgoal 1 — establish what a node would need in order never to disagree.** It would need to know
+that it has received every message any other node has received. Nothing in a gossip network delivers
+that knowledge. Absence of a message and slowness of a message are the same observation, which is
+the [safety versus liveness](/c/safety-property) asymmetry you met in the fundamentals track wearing
+a different hat.
+
+**Subgoal 2 — establish the size of the window in which views can differ.** The slot is 12 seconds:
+the mainnet configuration sets `SLOT_DURATION_MS` to 12000, with `SECONDS_PER_SLOT` retained as a
+deprecated alias.<Cite src="fc-config-mainnet-v161" /><Cite src="fc-phase0-beacon-chain-v161" />
+Attesters are due at `ATTESTATION_DUE_BPS` = 3333 basis points of that duration, roughly 33% — about
+four seconds in — and aggregates at `AGGREGATE_DUE_BPS` = 6667, roughly
+67%.<Cite src="fc-phase0-validator-v161" /><Cite src="fc-config-mainnet-v161" /> Those deadlines
+exist to give propagation time to converge views before anyone has to commit to an opinion. They
+shrink the window. They cannot close it.
+
+**Subgoal 3 — establish what the protocol does about the residual disagreement.** It votes. Each
+attester states its own head, weight accumulates, and disagreement is resolved by accumulation
+rather than by anyone declaring the truth. That is the entire design: no node is authoritative, so
+transient divergence has to be a supported state rather than an error state.
+
+**Subgoal 4 — state the operational consequence, which is the one that costs teams money.** If your
+system reads the head from one node and treats it as *the* chain, you have built on a value that is
+locally correct and globally provisional. Every indexer, every deposit crediting flow, every
+liquidation bot has to decide what it does when that value changes underneath it. You met the
+downstream half of this as [reorg-safe indexing](/c/reorg-safe-indexing); this is the upstream
+reason it exists.
+
+<Misconception
+  belief="If two of my nodes report different heads, one of them is broken or lagging."
+  reality="For a window of hundreds of milliseconds around block arrival, disagreement between honest nodes is the expected state. The rule is a function of a local view, and views converge by vote accumulation rather than by synchronisation."
+  why="Every other database you have operated has a single authoritative answer, and monitoring tooling is built to alert on divergence. Here divergence is the mechanism working, and only sustained divergence is a signal."
+  src="eth2book-fork-choice"
+/>
+
+## Gasper: what the composition actually buys
+
+Now the part that gets taught as two topics and should be taught as one.
+
+Casper FFG operates on epoch-boundary checkpoints. It justifies and finalises them with
+supermajority links, and finality is the property that makes a reversal require destroying a large
+fraction of the stake. An epoch is `SLOTS_PER_EPOCH` = 32 slots, which the spec annotates as 6.4
+minutes.<Cite src="fc-phase0-beacon-chain-v161" /> Two epochs is the fast path to finality, and the
+3SF paper states the realistic range plainly: Gasper typically requires 64 to 95 slots to finalize,
+depending on when in the epoch a block was proposed.<Cite src="3sf-paper" /> The fast-confirmation
+paper puts the same fact in wall-clock terms — in the best case a transaction takes 13 to 19 minutes
+to confirm under FFG finalization, depending on when it is submitted.<Cite src="fc-fast-confirmation-paper" />
+
+LMD-GHOST operates every slot on the unfinalized tip and produces a head in milliseconds.
+
+<Figure
+  caption="Between a block and its finalization sits an unfinalized tip roughly two epochs deep. That tip is the arena every attack in this module works in."
+  alt="A timeline measured in slots: from slot 0 the chain is unfinalized and the head is revisable, with an epoch boundary at slot 32; finalization of a block lands somewhere between slot 64 and slot 95."
+>
+  <Timeline
+    from={0}
+    to={96}
+    unit="slots"
+    ticks={[0, 32, 64, 96]}
+    marks={[{ at: 32, label: 'epoch boundary', tone: 'muted' }]}
+    spans={[
+      { label: 'unfinalized: the head is revisable', start: 0, end: 64, tone: 'warn', note: 'a fresh answer every slot, from each node its own' },
+      { label: 'finalized: 64 to 95 slots', start: 64, end: 95, tone: 'good', note: 'earliest to latest, by position in the epoch' },
+    ]}
+  />
+</Figure>
+
+Neither is useful alone, and it is worth being concrete about why rather than accepting it.
+
+**GHOST alone has no notion of a decision.** It always has an answer, and its answer can always
+change if enough weight moves. Nothing is ever settled; there is no point at which an exchange can
+credit a deposit and stop watching.
+
+**FFG alone has nothing to vote on.** A finality gadget takes candidate checkpoints and decides
+among them. Something has to produce the candidates and keep producing them while the gadget lags.
+That is what "dynamically available" means and it is exactly GHOST's job.
+
+The composition is the interesting object, and the joint is one function call.
+
+```python
+def get_filtered_block_tree(store: Store) -> Dict[Root, BeaconBlock]:
+    """
+    Retrieve a filtered block tree from ``store``, only returning branches
+    whose leaf state's justified/finalized info agrees with that in ``store``.
+    """
+    base = store.justified_checkpoint.root
+    blocks: Dict[Root, BeaconBlock] = {}
+    filter_block_tree(store, base, blocks)
+    return blocks
+```
+
+<Cite src="fork-choice-spec" />
+
+GHOST never sees the whole block tree. It sees a tree that has already been pruned to branches whose
+justification and finalization information agrees with what the store believes. The filter runs
+first; the weight comparison runs second, on what survives. The spec's `filter_block_tree` keeps a
+leaf only if its voting source is at the store's justified epoch or not more than two epochs back,
+*and* the store's finalized checkpoint is an ancestor of it.<Cite src="fork-choice-spec" />
+
+### What the filter bounds, and what it does not
+
+State this carefully, because overclaiming here is the most common way the composition gets
+misdescribed.
+
+**What it does bound.** A branch that conflicts with the store's finalized checkpoint is not in the
+filtered tree at all, so no amount of attesting weight on that branch can make it the head. Weight
+is not a currency that can buy its way past the filter. This is the sense in which finality bounds
+fork choice: the head is always a descendant of the finalized checkpoint, structurally, before any
+weight is compared.
+
+**What it does not bound.** The filter is a statement about *this node's* store. A node that has not
+yet finalized the same checkpoint — because it is syncing, or because it is on the far side of a
+partition — has a different base and a larger tree. The bound is per-node, and it is only as strong
+as the store's contents. Weak subjectivity, which you met in the proof-of-stake track, is precisely
+the statement that a node starting from nothing cannot establish that base for itself.
+
+**And what it says nothing about.** The filter constrains *which* branch, not *whether* a branch
+wins by an honest margin. Everything in the next five lessons happens inside the filtered tree,
+among blocks that are all perfectly viable, where the only question is which one accumulates more
+weight. Finality does not help there, because finality has not arrived yet. That is the gap the
+attacks live in, and naming it precisely is the point of this lesson.
+
+<Aside kind="note">
+The reverse dependency is easy to miss: FFG's justified checkpoint decides where GHOST starts, and
+GHOST's head decides what validators attest to, which is what produces the votes FFG counts. The two
+halves are not layered, they are mutually recursive across slots. The spec handles the awkward part
+of that — a node that has seen enough attestations to justify a checkpoint but has not yet processed
+an epoch transition — with an explicit *unrealized* justification tracked per block, pulled up at
+epoch boundaries in `on_tick_per_slot`.<Cite src="fork-choice-spec" /> The existence of that
+machinery is the tell that the composition is not a clean stack.
+</Aside>
+
+## The distinction that costs the most when it is blurred
+
+Here is the sentence to keep: **fork choice decides where to build; finality decides what cannot be
+undone.** They answer different questions on different clocks and cost different amounts to attack.
+
+Reorging within the unfinalized tip costs an adversary whatever it takes to move attesting weight —
+sometimes remarkably little, as the next lessons work out. Reorging a finalized checkpoint costs a
+large fraction of the total stake, destroyed. Those are not two points on one scale. They are
+different kinds of expense, and a product that says "we wait for confirmations" without saying which
+regime it is relying on has not made a decision.
+
+The May 2022 mainnet incident is the cleanest illustration that reorgs are not theoretical. On 25
+May 2022 at 08:55 UTC a seven-block reorg occurred on the beacon chain, caused by a combination of a
+late block, an uneven rollout of a fork-choice change across clients, and a known incorrect
+implementation of *when* the fork choice is run.<Cite src="monnot-reorg-post" /> Read the next
+sentence twice: the reorg did not result in loss of finality, and finality was not even
+delayed.<Cite src="monnot-reorg-post" /> Seven blocks of the available chain were rewritten while
+the finality machinery carried on undisturbed. That is the separation, visible in a production
+incident.
+
+<Misconception
+  belief="Finality and fork choice are the same thing — both decide which chain is real."
+  reality="Fork choice runs every slot over unfinalized blocks and can change its answer freely. Finality justifies and finalises checkpoints and is what makes a reversal require slashing a large fraction of stake."
+  why="Both get described in English as 'deciding the chain', and the word 'canonical' is used for both outputs. The May 2022 incident is the counterexample: seven blocks reorged with finality untouched."
+  src="monnot-reorg-post"
+/>
+
+<Misconception
+  belief="A missed slot means someone attacked the chain."
+  reality="Most missed slots are an offline proposer, or one that published too late to be counted timely. The base rate of ordinary misses is far higher than the rate of attacks."
+  why="Every gap in a block list looks deliberate, and the attack literature is more memorable than the operational reality. Attacks and outages produce the same hole in the same dashboard."
+  src="ethereum-org-pos-attack-defense"
+/>
+
+<Check type="explain" concept="fork-choice-purpose">
+Your team runs two beacon nodes behind a load balancer. A service reads `head` from whichever
+responds first and uses it to decide when to mark a user's deposit as received.
+
+An engineer proposes a fix for the occasional inconsistency: query both nodes, and only proceed when
+they agree on the head root. Say what this does and does not fix, and what the right shape of the
+answer is.
+
+<Answer>
+**It fixes a symptom whose cause is not a defect.** Fork choice is a function of one node's `Store`,
+which is that node's local view of the network<Cite src="eth2book-fork-choice" /> — so two nodes
+differ whenever one has processed a message the other has not. Requiring agreement means waiting for
+propagation between two of your own machines. It reduces the flapping and it will look like an
+improvement on the dashboard.
+
+**It does not fix the thing that actually hurts, because agreement is not a commitment.** Both nodes
+can agree on a head root and both can move off it a moment later. `get_head` re-runs from the store
+every time; nothing about a returned root claims durability.<Cite src="fork-choice-spec" /> Two
+agreeing nodes reporting a block that is subsequently reorged is exactly what happened across
+mainnet for seven consecutive blocks in May 2022, with every participant behaving as its software
+intended.<Cite src="monnot-reorg-post" />
+
+**It also buys a liveness problem it did not need.** The service now stalls whenever the two nodes
+are momentarily out of step, which is the normal state around block arrival. You have converted a
+correctness question into an availability question and answered neither.
+
+**The right shape is to name the guarantee you need, then pick the mechanism that provides it.**
+
+*If the deposit is small and reversible in your own ledger*, use the head and accept that it moves.
+Build the compensating path — an event log you can roll back to a common ancestor — because that
+path is what makes head-following safe, not any amount of node agreement. The indexing frameworks
+you met earlier do exactly this.
+
+*If the deposit is large and irreversible*, the head is the wrong input entirely. What you want is
+finality, which is a different mechanism on a different clock: 64 to 95 slots in
+practice,<Cite src="3sf-paper" /> or 13 to 19 minutes best case in wall-clock terms depending on
+when the transaction was submitted.<Cite src="fc-fast-confirmation-paper" />
+
+*If neither is acceptable*, that gap is a real product problem with a named research answer, and the
+last lesson in this module is about it.
+
+**The one-line version for the engineer.** Node agreement measures propagation between your two
+machines. It does not measure whether the chain has decided, because at that moment the chain has
+not decided — and no query you can write against the head will tell you that it has.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You now have the frame the rest of the module hangs on.
+
+- **Two clocks, always named.** Milliseconds for the head, minutes for finality. Any sentence about
+  Ethereum consensus that does not say which clock it is on is ambiguous, including sentences in
+  your own incident postmortems.
+- **The filtered tree as the arena.** Every attack in lessons 4 through 6 happens inside
+  `get_filtered_block_tree`, among blocks that all pass the viability
+  test.<Cite src="fork-choice-spec" /> Knowing that finality cannot help there is what makes those
+  attacks make sense instead of sounding like protocol failures.
+- **The store as the object to reason about.** When you read the next lessons, the question to ask
+  of every attack is: *what does the adversary want to be in, or absent from, some honest node's
+  store, and at what moment?* Every one of them is an answer to that question.
+- **The next lesson makes `get_weight` concrete.** You have seen it called; you have not seen what it
+  sums. It is not blocks, it is not validators, and the difference from the longest-chain rule you
+  absorbed from Bitcoin is not a detail — it is the reason the attacks work the way they do.

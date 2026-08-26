@@ -1,0 +1,457 @@
+---
+id: protocol-client-architecture-three-calls-carry-every-block
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [engine-api-spec, engine-api-common, engine-api-paris, engine-api-cancun, engine-api-prague, engine-api-osaka, engine-api-amsterdam, engine-api-bogota, engine-api-visual-guide, consensus-specs-optimistic-sync, consensus-specs-mainnet-config-v161, flashbots-mev-boost-docs, besu-engine-api]
+stack: {}
+---
+
+Tail the Engine API traffic on a synced node for one minute and you will see about five conversations,
+one every twelve seconds, each of them two calls long:
+
+```text
+engine_newPayloadV4          -> {status: VALID, latestValidHash: 0x9c1f…}
+engine_forkchoiceUpdatedV3   -> {payloadStatus: {status: VALID, …}, payloadId: null}
+```
+
+That is a node following the chain. Two calls, in that order, per slot. Once every few months — or every
+few seconds, if you are a large operator — one of those conversations looks different: the
+`forkchoiceUpdated` carries a second argument, comes back with a non-null `payloadId`, and is followed by
+a third call. That is a node proposing.
+
+Three methods carry every block on Ethereum, in both directions. This lesson is what each one means,
+which one is allowed to lie to you and how, and why the third one returns a different answer depending on
+when you ask.
+
+<Figure
+  caption="Only a proposer ever reaches getPayload; every other node on the network runs the last two rows and nothing else."
+  alt="One block through the Engine API: the proposer calls forkchoiceUpdated with payload attributes, lets the build run, collects it with getPayload, then signs and gossips a beacon block, after which every other node calls newPayload and then forkchoiceUpdated."
+>
+  <Flow
+    dir="down"
+    lanes={['proposer', '', '', 'gossip', 'every node', '']}
+    nodes={[
+      { id: 'fcu1', label: 'forkchoiceUpdated', note: 'with payloadAttributes; returns a payloadId', col: 0, tone: 'accent' },
+      { id: 'build', label: 'the build runs', note: 'the payload gets more valuable while it does', col: 1 },
+      { id: 'get', label: 'getPayload', note: 'the most recent version at the time of the call', col: 2, tone: 'accent' },
+      { id: 'pub', label: 'sign and publish', note: 'a beacon block; no Engine API call here', col: 3, tone: 'muted' },
+      { id: 'np', label: 'newPayload', note: 'is this block good?', col: 4, tone: 'accent' },
+      { id: 'fcu2', label: 'forkchoiceUpdated', note: 'no attributes; adopt the head', col: 5 },
+    ]}
+  />
+</Figure>
+
+## The follower path
+
+Most of the time your node is receiving somebody else's block. The sequence has exactly two steps and
+they are not interchangeable.
+
+### `engine_newPayload` — "here is a block, is it good?"
+
+The consensus client has received a beacon block over gossip. Inside it is an execution payload. The
+consensus client cannot evaluate that payload — it has no state and no EVM — so it hands it down.
+
+`engine_newPayloadVn` takes the payload and returns a `PayloadStatusV1`, whose `status` is one of
+`VALID`, `INVALID`, `SYNCING`, `ACCEPTED` or `INVALID_BLOCK_HASH`, alongside a `latestValidHash` and an
+optional `validationError` string.<Cite src="engine-api-paris" /> The declared timeout in the Paris spec
+is 8s.<Cite src="engine-api-paris" />
+
+Two of those five are verdicts and three are something else, which is where the confusion lives.
+
+**`VALID`** means executed, and the state transition is consistent. The response carries
+`latestValidHash: payload.blockHash`.<Cite src="engine-api-paris" />
+
+**`INVALID`** means executed, and it is wrong. `latestValidHash` then points at the most recent ancestor
+that *is* valid, so the consensus client learns not just "this block is bad" but "the branch is bad from
+here down".<Cite src="engine-api-paris" /> There is a rule attached that matters for anything reading a
+node: client software **MUST NOT** surface an `INVALID` payload over any API endpoint or p2p
+interface.<Cite src="engine-api-paris" /> An invalid block is not a thing you can fetch and inspect
+through the node that rejected it.
+
+**`INVALID_BLOCK_HASH`** is narrower: the payload's `blockHash` field does not equal
+`Keccak256(RLP(header))` built from the payload's own fields.<Cite src="engine-api-paris" /> This check
+**MUST** run in all cases, even mid-sync, because it is cheap and it is self-contained.
+
+**`SYNCING`** means the execution client cannot decide. The data it would need to validate — most often
+the parent state — is missing.<Cite src="engine-api-paris" />
+
+**`ACCEPTED`** means something more specific than its name suggests. The specification lists the exact
+conditions: all transactions have non-zero length, the block hash is valid, **the payload does not extend
+the canonical chain**, it has not been fully validated, and its ancestors are known and form a well-formed
+chain.<Cite src="engine-api-paris" /> It is the answer for a structurally sound block on a side branch.
+It is not an endorsement.
+
+<Matrix
+  corner="status"
+  cols={['What the execution client is saying', 'What follows on the consensus side']}
+  rows={[
+    {
+      label: 'VALID',
+      cells: [
+        'Executed, and the state transition is consistent. latestValidHash is the payload blockHash.',
+        { v: 'The block is fully validated, and so is everything it descends from.', tone: 'good' },
+      ],
+    },
+    {
+      label: 'INVALID',
+      cells: [
+        'Executed, and it is wrong. latestValidHash names the most recent ancestor that is valid.',
+        { v: 'The branch is bad from there down, and the payload must never be surfaced over any API.', tone: 'danger' },
+      ],
+    },
+    {
+      label: 'INVALID_BLOCK_HASH',
+      cells: [
+        'blockHash does not match Keccak256(RLP(header)) built from the payload own fields.',
+        { v: 'Rejected. This check runs in all cases, including mid-sync.', tone: 'danger' },
+      ],
+    },
+    {
+      label: 'SYNCING',
+      cells: [
+        'Cannot decide. The data needed to validate — usually the parent state — is missing.',
+        { v: 'Import optimistically, and stop attesting, proposing and sync-committee duty.', tone: 'warn' },
+      ],
+    },
+    {
+      label: 'ACCEPTED',
+      cells: [
+        'Well formed, ancestors known, and it does not extend the canonical chain.',
+        { v: 'Hold it as a side branch. Nothing about it has been endorsed.', tone: 'muted' },
+      ],
+    },
+  ]}
+  caption="Two of the five are verdicts on the block; the other three are instructions about what the consensus client should do next."
+  alt="The five PayloadStatus values returned by engine_newPayload, what each one means about the payload, and what the consensus client is required to do in response."
+/>
+
+<Misconception
+  belief="A SYNCING response from newPayload means something has gone wrong."
+  reality="It means the execution client cannot evaluate that payload yet. The consensus client is expected to handle it — by importing the block optimistically and revisiting the verdict later — not to treat it as a failure."
+  why="In almost every RPC system a developer has used, a non-answer is a failure. Here it is a documented third state in a protocol built around one process waiting on another."
+  src="engine-api-paris"
+/>
+
+### What the consensus client does with a non-answer
+
+This is where the interesting behaviour lives, and it is specified on the consensus side rather than in
+the Engine API.
+
+The optimistic sync document describes importing beacon blocks *without* verifying their execution
+payloads, so that a consensus client can keep a view of the head while its execution client catches
+up.<Cite src="consensus-specs-optimistic-sync" /> Its status vocabulary is the consensus layer's own —
+`NOT_VALIDATED`, `VALID`, `INVALIDATED` — and the rules are strict about how those move.
+
+A consensus engine **MUST** be able to retrospectively change a `NOT_VALIDATED` block to `VALID` or
+`INVALIDATED` once the execution engine answers. When a block goes to `VALID`, all its **ancestors** go
+to `VALID` too. When a block goes to `INVALIDATED`, all its **descendants**
+follow.<Cite src="consensus-specs-optimistic-sync" /> The verdict propagates in opposite directions
+depending on which way it went, and that asymmetry is exactly right: validity of a block implies validity
+of its history, while invalidity of a block condemns its future.
+
+Now the part every operator should know before it happens to them. **An optimistic node is not a full
+node.** The document is unambiguous: an optimistic validator **MUST NOT** produce a block, **MUST NOT**
+attest, and **MUST NOT** participate in sync committees.<Cite src="consensus-specs-optimistic-sync" />
+
+So `SYNCING` is not an error, and it is also not free. A validator whose execution client cannot validate
+payloads is required to sit out. It will show as missed attestations, not as an error. If you have ever
+seen a validator go quiet during an execution-client resync and found nothing wrong in either log, this
+is the mechanism — and it is correct behaviour, deliberately chosen over the alternative of attesting to
+a chain you have not verified.
+
+### `engine_forkchoiceUpdated` — "this is the chain"
+
+Having a verdict on a block is not the same as having chosen a head. The consensus client runs fork
+choice over everything it has seen, then tells the execution client the result.
+
+`engine_forkchoiceUpdatedVn` takes a `ForkchoiceStateV1` of three
+hashes:<Cite src="engine-api-paris" />
+
+- `headBlockHash` — the head of the canonical chain.
+- `safeBlockHash` — the "safe" head under certain synchrony and honesty assumptions; it **MUST** be equal
+  to or an ancestor of the head.
+- `finalizedBlockHash` — the most recent finalised block.
+
+Those three hashes are how the execution client learns everything it knows about chain structure: what to
+serve as `latest`, what it may prune behind, and what can never be reorged away. It did not compute any
+of them.
+
+Four rules from the specification are worth carrying:
+
+**The update is atomic.** All fork-choice state changes resulting from the call **MUST** be applied
+atomically.<Cite src="engine-api-paris" /> There is no window in which the head has moved and the
+finalised hash has not.
+
+**Inconsistency is an error, not a best effort.** If the head is `VALID` but the finalised or safe hash
+does not belong to the chain defined by that head, the client **MUST** return `-38002: Invalid forkchoice
+state`.<Cite src="engine-api-paris" /> You cannot describe an impossible chain and have it quietly
+normalised.
+
+**Reorg depth has a client-specific limit.** If the reorg implied by the new head is deeper than the
+client's limitation, it **MUST** return `-38006: Too deep reorg`.<Cite src="engine-api-paris" /> The
+limit is not in the specification — it is per client — which means two execution clients driven by the
+same consensus client can disagree about whether a given [reorg](/c/reorg) is acceptable to perform.
+
+**The status set here is smaller.** In the context of this method the `status` field is restricted to
+`VALID`, `INVALID` and `SYNCING` — no `ACCEPTED`.<Cite src="engine-api-paris" /> That follows from what
+the call means: you cannot set the head to a block on a side branch, because setting it makes that branch
+the canonical one.
+
+### The middle hash, which is the one nobody explains
+
+`head` and `finalized` are self-explanatory. `safe` is the interesting one, and the specification defines
+it with an unusual hedge: the safe block hash of the canonical chain **under certain synchrony and
+honesty assumptions**.<Cite src="engine-api-paris" />
+
+That phrasing is doing real work. `finalized` is a claim backed by economics — reversing it costs a third
+of the stake. `safe` is a claim backed by *conditions*: if the network is behaving and most validators
+are honest, this will not be reorged. It is stronger than the head and weaker than finality, and the
+strength of the guarantee is conditional in a way the other two are not.
+
+The specification also allows both `safeBlockHash` and `finalizedBlockHash` to be all
+zeroes.<Cite src="engine-api-paris" /> A node that has nothing finalised yet — freshly synced, or a
+devnet before its first finalisation — reports the absence rather than guessing.
+
+This is where the Engine API becomes visible from your side of the machine. When an application asks a
+node for a block at the `safe` or `finalized` tag, the answer traces back to two of these three hashes,
+computed by the consensus client and pushed down here. Those tags are not the execution client's
+judgement; they are a relay of somebody else's.
+
+### One reorg, traced through the calls
+
+Watch what a one-block reorg looks like from inside the wire. Block `A` arrived first and was adopted;
+block `B`, a sibling on the same parent, arrives late but accumulates more attestation weight.
+
+**Subgoal 1 — the late block gets evaluated on its merits, not its position.** `newPayload(B)` returns
+`ACCEPTED`, not `VALID` — `B` is well formed with known ancestors but does not extend what the execution
+client currently considers canonical.<Cite src="engine-api-paris" /> The execution client has just told
+you something precise: this block is fine, and it is not on my chain.
+
+**Subgoal 2 — fork choice runs on the consensus side, out of sight.** Attestations for `B` outweigh those
+for `A`. Nothing crosses the Engine API during this step. The evidence that decides the reorg never
+enters the execution process.
+
+**Subgoal 3 — the decision arrives as a head change.** `forkchoiceUpdated` with `headBlockHash = B`. The
+execution client re-derives what is reachable from `B`, atomically.<Cite src="engine-api-paris" />
+Transactions unique to `A` return to the mempool; receipts that referenced `A` stop resolving.
+
+**Subgoal 4 — notice what was never reported as an error.** No call in that sequence failed. `ACCEPTED`
+was informative, the forkchoice update succeeded, and an application watching the node saw a receipt
+vanish. Reorgs are not exceptions in this protocol. They are ordinary traffic with a specific shape.
+
+## The proposer path
+
+Now the second argument.
+
+`engine_forkchoiceUpdated` takes an optional `payloadAttributes`. In Paris that structure is a
+`timestamp`, a `prevRandao`, and a `suggestedFeeRecipient`.<Cite src="engine-api-paris" /> Passing it
+means: apply this fork-choice state, *and then* start building a block on top of the head you just
+adopted.
+
+The ordering is specified, not incidental. The client **MUST** process `payloadAttributes` after
+successfully applying the `forkchoiceState`, and only if the head is `VALID`. If the attributes fail
+validation — for instance the timestamp is not greater than the head block's — the client returns
+`-38003: Invalid payload attributes` and **MUST NOT** roll back the fork-choice
+update.<Cite src="engine-api-paris" /> Two operations in one call, but only one of them is transactional
+with the other in the direction you might assume.
+
+On success, the response carries a `payloadId`: 8 bytes identifying the build
+process.<Cite src="engine-api-paris" /> Every distinct set of attributes **MUST** get a uniquely
+identified build process, and if a build with the same attributes already exists the client **SHOULD NOT**
+restart it.<Cite src="engine-api-paris" />
+
+### `engine_getPayload` — and the reason the timing game exists
+
+Here is the sentence that generates an entire economy.
+
+Given a `payloadId`, client software **MUST** return **the most recent version of the payload that is
+available in the corresponding build process at the time of receiving the
+call.**<Cite src="engine-api-paris" /> The declared timeout is 1s — eight times tighter than the other
+two.<Cite src="engine-api-paris" />
+
+The build process is not a one-shot computation. The specification describes it in stages: the client
+**SHOULD** build an initial version with an empty transaction set, then **SHOULD** start a process of
+updating the payload, whose strategy is implementation dependent — the default being to keep the
+transaction set current with the local mempool.<Cite src="engine-api-paris" /> It **SHOULD** stop updating
+when either `engine_getPayload` is called for that `payloadId`, or `SLOT_DURATION_MS` has elapsed since
+the `timestamp` in the attributes.<Cite src="engine-api-paris" /> On mainnet that duration is 12,000
+milliseconds.<Cite src="consensus-specs-mainnet-config-v161" />
+
+So the call is not idempotent in value. Ask at 200 milliseconds and you get close to an empty block. Ask
+at 900 milliseconds and you get a fuller, more valuable one. **The proposer's incentive is to ask as late
+as it dares** — and the thing bounding "as late as it dares" is not this API at all. It is the attestation
+deadline on the other side of the slot, which the next lesson is about.
+
+There is one error worth knowing: `-38001: Unknown payload` if no build process exists for that
+id.<Cite src="engine-api-common" /> A client **MAY** stop the build process after serving the
+call<Cite src="engine-api-paris" />, so a second `getPayload` on the same id is not something to design
+around.
+
+<Misconception
+  belief="engine_getPayload is a read. Calling it twice, or calling it early to check, is harmless."
+  reality="It returns the most recent version of an in-progress build, so its value depends on when you call it, and the client may stop the build process after serving it. Early or duplicate calls change what you get."
+  why="The name reads like a getter, and almost every getter a developer has met is idempotent."
+  src="engine-api-paris"
+/>
+
+### The proposer's sequence, in order
+
+**Subgoal 1 — commit to a parent, and start the clock.** The consensus client calls
+`forkchoiceUpdated` with the head it has chosen *and* payload attributes for the coming slot. It gets
+back a `payloadId`.<Cite src="engine-api-paris" />
+
+**Subgoal 2 — let the build accumulate.** The execution client keeps folding mempool transactions into
+the payload, improving its value, until told to stop.<Cite src="engine-api-paris" />
+
+**Subgoal 3 — collect as late as tolerable.** `getPayload` with that id returns the best version so
+far.<Cite src="engine-api-paris" />
+
+**Subgoal 4 — wrap, sign, publish.** The consensus client puts the execution payload inside a beacon
+block, signs it, and gossips it. The Engine API is not involved in this step at all; it has no notion of
+a beacon block.
+
+**Subgoal 5 — every other node runs the follower path on it.** `newPayload`, then
+`forkchoiceUpdated`.<Cite src="engine-api-paris" />
+
+<Aside kind="note">
+On a mainnet validator using [MEV-Boost](/c/mev-boost), the payload that gets proposed usually does not
+come from this build at all — it comes from an external builder through the relay, and the local build
+started by `payloadAttributes` serves as the fallback if the relay does not
+deliver.<Cite src="flashbots-mev-boost-docs" /> The Engine API sequence above still runs; its output is
+just not the one that wins. That out-of-protocol market is a separate subject, and the reason it exists
+is the same sentence quoted above: a later call returns a more valuable block, so somebody will always be
+willing to specialise in producing the most valuable one.
+</Aside>
+
+## The relationship is asymmetric on purpose
+
+Notice what never happens in any of these sequences: the execution client does not initiate anything. It
+has no method to call. Everything it learns about the outside world arrives as an argument to a call the
+consensus client made.
+
+The specification turns that asymmetry into a deployment property directly. Because the consensus layer
+drives the execution layer, a one-to-many configuration is supported — one consensus client can drive
+several execution clients independently.<Cite src="engine-api-common" /> The reverse is not supported out
+of the box: the execution layer holds one chain head, so behaviour is undefined when several consensus
+clients control it simultaneously. The spec does describe the safe version of that shape — one consensus
+client with write authority, calling `forkchoiceUpdated`, while others may only insert payloads with
+`newPayload` and read.<Cite src="engine-api-common" />
+
+That is the whole architecture in one paragraph of a spec document, and it is why "run a candidate
+execution client next to the production one on live traffic" is a legitimate technique rather than a
+hack.
+
+The corollary for debugging: **any bug in "what chain am I on" belongs to the consensus side, whatever the
+execution client's logs say.** The execution client can only be wrong about what it was told.
+
+It also gives you a differential test you can run without writing one. Point a second execution client at
+the same consensus client, feed both the same payloads, and compare their `PayloadStatusV1` responses
+block by block. Two conformant clients must agree on `VALID` versus `INVALID` for the same payload, and on
+the `latestValidHash` that comes back with it.<Cite src="engine-api-paris" /> A divergence there is a
+consensus bug in one of them, found on live traffic rather than in a test corpus — which is exactly the
+class of bug the shared reference tests, by construction, cannot cover. The disagreements that matter are
+outside whatever the corpus happens to include.
+
+Two caveats before you build it. Only the writer may call `forkchoiceUpdated`; the observer is restricted
+to `newPayload` and reads.<Cite src="engine-api-common" /> And the observer's answers are only comparable
+once it has state — until then it will answer `SYNCING` to everything, which is not a
+disagreement.<Cite src="engine-api-paris" />
+
+## The version treadmill, and how to read it
+
+These three method names are stable; their versions are not, and each versions independently.
+
+The Cancun file added `engine_forkchoiceUpdatedV3` and `engine_getPayloadV3`, plus
+`engine_getBlobsV1`.<Cite src="engine-api-cancun" /> The Prague file added `engine_newPayloadV4` and
+`engine_getPayloadV4` and *no* new forkchoice method<Cite src="engine-api-prague" />, so `V3` remained
+current for that one. The Osaka file added `engine_getPayloadV5` returning a `BlobsBundleV2` of cell
+proofs, and both `engine_getBlobsV2` — which returns `null` if *any* requested blob is missing — and
+`engine_getBlobsV3`, which returns an array of the same length with `null` at just the missing
+positions.<Cite src="engine-api-osaka" /> Osaka also retires older methods across the boundary:
+`engine_getBlobsV1` **MUST** return `-38005: Unsupported fork` once Osaka activates, and
+`engine_getPayloadV4` **MUST** do so for payload timestamps at or after
+activation.<Cite src="engine-api-osaka" />
+
+Diffing two adjacent fork files under `src/engine` is therefore the shortest path to "what does this
+upgrade demand of my node", and it is a better source than any summary, because it is the document the
+clients implement against.<Cite src="engine-api-spec" /> A client's own Engine API reference is a useful
+cross-check on the same methods from the implementer's side, and a useful reminder that clients document
+their supported versions independently.<Cite src="besu-engine-api" />
+
+<Aside kind="warn">
+The `src/engine` directory also contains files for forks that have not shipped. Amsterdam's defines
+`engine_newPayloadV5` — which requires a `blockAccessList` field and drops the timeout to 6s — along with
+`engine_getPayloadV6` and `engine_forkchoiceUpdatedV4`.<Cite src="engine-api-amsterdam" /> A Bogota file
+exists beyond that, adding `engine_getInclusionListV1`.<Cite src="engine-api-bogota" /> These are the
+specification being written ahead of deployment, which is how the process works. Neither has an
+activation date, and neither file's existence implies one.
+</Aside>
+
+<Check type="predict" concept="engine-newpayload">
+Your team runs a beacon node paired to an execution client you have just restored from a several-day-old
+snapshot. Someone reports: "The beacon node's head is advancing and looks correct, but our validators
+have missed every attestation for twenty minutes, and neither client shows an error."
+
+Predict what the Engine API traffic looks like, and explain the missed attestations.
+
+<Answer>
+**Predicted traffic: `engine_newPayload` returning `SYNCING`, once per slot, and `forkchoiceUpdated`
+returning `SYNCING` as well.**
+
+**Why `SYNCING` and not an error.** The execution client is missing the parent state for the payloads it
+is being handed, so it cannot decide. `SYNCING` is exactly the specified answer for "requisite data for
+the payload's acceptance or validation is missing".<Cite src="engine-api-paris" /> Nothing has failed;
+the response set was designed to include this case.
+
+**Why the beacon head still advances.** The consensus client is importing blocks optimistically —
+importing beacon blocks without verifying their execution payloads, so it can keep a view of the head
+while the execution client catches up.<Cite src="consensus-specs-optimistic-sync" /> The head you are
+looking at is real, and it is marked `NOT_VALIDATED` underneath.
+
+**Why the attestations are missing, and why this is correct.** An optimistic node is not a full node. The
+spec requires that an optimistic validator **MUST NOT** attest, **MUST NOT** produce a block, and **MUST
+NOT** participate in sync committees.<Cite src="consensus-specs-optimistic-sync" /> Your validators are
+not failing to attest; they are forbidden to. The alternative would be voting for a chain whose execution
+payloads you have not verified, which is how a client with real market share converts its own sync
+problem into everybody's fork-choice problem.
+
+**Why neither log shows an error.** Both processes are doing specified things. The only signal is the
+status value flowing across the Engine API and the optimistic flag on the consensus side — which is why
+the beacon API's syncing endpoint exposes an optimistic indicator, and why a dashboard that only watches
+"is the head advancing" cannot see this.
+
+**What happens when it resolves.** Once the execution client finishes syncing and answers `VALID` for a
+block, the consensus client transitions that block from `NOT_VALIDATED` to `VALID` and **all of its
+ancestors** with it.<Cite src="consensus-specs-optimistic-sync" /> Attestation duty resumes on its own.
+No intervention is required and no keys need to move.
+
+**The one dangerous variant to rule out.** If instead you see `INVALID`, this is a different incident
+entirely. `INVALID` propagates the other way — the block and **all its descendants** become
+`INVALIDATED`<Cite src="consensus-specs-optimistic-sync" /> — and it means your execution client disagrees
+with the chain the network is building, which is either your bug or theirs. Check the status value before
+concluding this is an ordinary sync.
+
+**The monitoring change to make afterwards.** Alert on the optimistic flag, not only on head staleness. A
+node that is optimistic is silently non-participating, and head-advancement dashboards report it as
+healthy.
+</Answer>
+</Check>
+
+## What this unlocks
+
+- **The next lesson** puts these calls on a clock. `getPayload` returns more the later you ask; the
+  attestation deadline says how late that can be. Those two facts meeting is the whole timing
+  economy.<Cite src="consensus-specs-mainnet-config-v161" />
+- **The module's practice** has you write the slot handler as pseudocode and then check your ordering
+  against the spec — `forkchoiceUpdated` with attributes, then `getPayload`, then publish, then everyone
+  else's `newPayload`.<Cite src="engine-api-visual-guide" />
+- **The consensus-specs module** picks up the other half of these conversations: what the consensus
+  client was doing when it decided which head to send down, and where in an executable specification that
+  decision is written.
+
+The habit worth forming: when an API returns a status enum, find the member that means "ask me later" and
+learn what the caller is required to do about it. On the Engine API that member is `SYNCING`, the required
+behaviour is optimistic import, and the consequence — a validator that must sit out — is nowhere near the
+method that returned it.

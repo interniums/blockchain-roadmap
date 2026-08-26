@@ -1,0 +1,451 @@
+---
+id: security-fuzzing-harness-and-clamping
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [measured-forge-1-7-1, bsc-echidna-fuzzing-tips, bsc-echidna-testing-approaches, bsc-echidna-corpus, echidna-default-config, medusa-fuzzing-config, medusa-testing-config, crytic-echidna, crytic-building-secure-contracts, cyfrin-foundry-invariants, foundry-invariant-guide, foundry-cheatcode-assume, echidna-parade, crytic-properties, medusa-chain-config]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Two campaigns against the same contract, on forge 1.7.1. Both handlers are three lines long and
+differ in one number.<Cite src="measured-forge-1-7-1" />
+
+```text
+# handler clamps deposits to bound(assets, 1, 1e21)
+[PASS] invariant_capHolds() (runs: 256, calls: 128000, reverts: 0)
+Suite result: ok. 1 passed; finished in 10.89s
+
+# handler clamps deposits to bound(assets, 1, type(uint256).max / 2)
+[FAIL: assertion failed: 578960446186580977117854925043439539266349923328211096077381048082196304
+19162 > 1000000000000000000000000000]
+	[Sequence] (original: 65, shrunk: 2)
+Suite result: FAILED. 0 passed; 1 failed; finished in 130.03ms
+```
+
+The first campaign executed 128,000 calls, reverted on none of them, took eleven seconds, and proved
+nothing. The second found the bug in a tenth of a second.
+
+Track 05 taught the harness as the thing that stops a campaign from reverting its way through its
+budget. That is the failure everyone meets first, and it is loud: the metrics table shows it. This
+lesson is about the failure on the other side, which is silent — a handler that runs cleanly,
+reverts on nothing, reports healthy metrics, and has quietly excluded the region where the bug lives.
+
+The contract, in full:
+
+```solidity
+contract CappedVault {
+    uint256 public constant CAP = 1e27;
+    uint256 public totalAssets;
+
+    function deposit(uint256 assets) external {
+        require(uint128(totalAssets + assets) <= uint128(CAP), "CAP");
+        totalAssets += assets;
+    }
+}
+```
+
+The cap check truncates to `uint128` before comparing. Any deposit large enough to make
+`totalAssets + assets` exceed 2^128 wraps the left-hand side down to something small, the check
+passes, and the cap is exceeded by an arbitrary amount. The bug requires an input above roughly
+3.4 × 10^38. A clamp at 10^21 — a thousand tokens, which is what "nobody would deposit more than
+that" produces when you write it down — puts the bug seventeen orders of magnitude outside the
+search space.
+
+## Two failure modes, one knob
+
+[Clamping](/c/input-clamping) has a shape you already know: map a raw fuzzed word into a plausible
+range rather than rejecting it. Track 05 established why remapping beats rejection, and why
+`bound(x, min, max)` is the documented recommendation over `vm.assume` for range
+constraints.<Cite src="foundry-cheatcode-assume" /><Cite src="foundry-invariant-guide" /> Nothing
+about that changes here.
+
+What changes is that you now have to defend the *bounds*, not just the technique. Every clamp is two
+decisions and they fail in opposite directions:
+
+**Too loose, and the campaign spends its budget on reverts.** This is [revert
+blindness](/c/revert-blindness), it is visible in the metrics table, and it is the failure the
+previous track fixed.
+
+**Too tight, and the campaign spends its budget on states you already believed were fine.** Nothing
+in the output says so. Both campaigns at the top of this lesson report zero reverts.
+
+<Misconception
+  belief="A zero-revert campaign is a healthy campaign."
+  reality="Zero reverts means every generated call was legal. It says nothing about whether the legal calls covered anything interesting. The over-clamped campaign above reverted on none of 128,000 calls and never went near the defect."
+  why="Track 05 correctly taught that a high revert rate means the campaign is doing no work, and the natural inversion — low revert rate means it is doing work — does not follow. Reverts measure legality, coverage measures reach, and only one of them is on the summary line."
+  src="measured-forge-1-7-1"
+/>
+
+So the revert rate is a necessary diagnostic and never a sufficient one. Run it first because it is
+nearly free, then stop reading it and read coverage.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Too loose', note: 'no bound at all', tone: 'warn' },
+    { title: 'A bound you can defend', note: 'derived from the protocol', tone: 'good' },
+    { title: 'Too tight', note: 'derived from your users', tone: 'danger' },
+  ]}
+  rows={[
+    { label: 'Where does the number come from?', cells: [
+      'Nowhere — the raw fuzzed word goes straight through',
+      'A protocol fact: a balance, a cap, an array length, a timestamp window',
+      'A guess about what people would plausibly do',
+    ] },
+    { label: 'What does the budget get spent on?', cells: [
+      'Reverts',
+      'Legal calls that still contain a type boundary',
+      'States you already believed were fine',
+    ] },
+    { label: 'What did the measurement show?', cells: [
+      'Track 05: a campaign that could make no legal call failed in 45 ms under fail_on_revert, having passed in four and a half seconds without it',
+      'Clamped to type(uint256).max / 2, the truncating cap falls in a tenth of a second',
+      'Clamped to 1e21: 128,000 calls, zero reverts, eleven seconds, nothing found',
+    ] },
+  ]}
+  caption="Only the left-hand failure announces itself; the right-hand one reports the same green line as a healthy campaign."
+  alt="Three clamping choices compared: no bound, a bound derived from a protocol fact, and a bound derived from expected user behaviour, across where the number comes from, what the budget is spent on, and what each measured campaign reported."
+/>
+
+### The order to run the diagnostics in
+
+Before extending a campaign's runtime, three checks, in this order, all of them cheaper than the
+extra compute:
+
+**Is anything executing?** Flip `fail_on_revert` on for one run. Track 05's measurement makes the
+case: a campaign that could not make a single legal call failed in 45 milliseconds under that flag
+after passing in four and a half seconds without it.<Cite src="measured-forge-1-7-1" />
+
+**Is what executes reaching new code?** Coverage, per contract, from the invariant runner alone. If a
+module's lines are untouched, the property over that module is decoration regardless of the pass.
+
+**Is the reachable region the region you meant?** This is the one with no tooling. It is a review
+question, and the artefact you review is the list of bounds.
+
+## The bounds belong in the review
+
+Practically: put every clamp in one place, with a comment saying what real-world constraint it
+encodes, and review that list the way you review access control.
+
+```solidity
+// Actor wallets are minted 1e6 tokens in setUp, so this is "at most everything you have".
+assets = bound(assets, 1, token.balanceOf(actor));
+
+// Protocol enforces a 1e27 cap; deposits an order of magnitude above it are the interesting ones.
+assets = bound(assets, 1, CAP * 10);
+
+// WRONG SHAPE: this number is a guess about user behaviour, not a protocol constraint.
+assets = bound(assets, 1, 1_000e18);
+```
+
+The distinction that matters is whether the bound comes from **the protocol** or from **your model of
+users**. A bound derived from the protocol — a balance, an array length, a cap, a timestamp window —
+is a fact and can be justified. A bound derived from what you expect people to do is an assumption
+about the adversary, and the adversary is the one entity in the system with no incentive to honour
+your expectations.
+
+The `CappedVault` clamp was the second kind. So is `bound(price, 0.9e18, 1.1e18)` on an oracle input,
+and so is `bound(timeDelta, 1, 7 days)` when nothing stops a chain from being quiet for longer.
+
+<Aside kind="warn">
+The most expensive version of this mistake is clamping *away from* the boundary of a type. Bugs
+cluster at type boundaries — truncating casts, `type(uint256).max`, `2^128`, zero, one — because that
+is where the arithmetic changes behaviour. A clamp whose upper bound is a round decimal number
+excludes every one of them by construction. If you clamp at all, consider clamping to a range that
+still contains at least one boundary, or exposing a second entry point that does not clamp.
+</Aside>
+
+## Expose both the clamped and the unclamped path
+
+That last suggestion is not improvised; it is the documented Echidna idiom, and it resolves the
+tension rather than trading one failure for the other.<Cite src="bsc-echidna-fuzzing-tips" />
+
+<Figure
+  caption="The raw path is where the type boundaries live; the clamped path is where the depth comes from."
+  alt="A fuzzed word is fed to two entry points: a raw one that passes it through and may revert, reaching the type boundaries, and a clamped one that remaps it into a legal range and reaches deep state."
+>
+  <Flow
+    nodes={[
+      { id: 'w', label: 'fuzzed uint256', note: 'unconstrained', col: 0, tone: 'muted' },
+      { id: 'raw', label: 'raw entry point', note: 'passes the value through, tolerates the revert', col: 1, row: 0, tone: 'warn' },
+      { id: 'cl', label: 'clamped entry point', note: 'remapped into a legal range, always executes', col: 1, row: 1, tone: 'accent' },
+      { id: 'b', label: 'type boundaries', note: '0, 1, 2^128, type(uint256).max', col: 2, row: 0 },
+      { id: 'd', label: 'deep state', note: 'reached fast, because nothing reverts', col: 2, row: 1 },
+    ]}
+    edges={[
+      { from: 'w', to: 'raw' },
+      { from: 'w', to: 'cl' },
+      { from: 'raw', to: 'b', tone: 'warn' },
+      { from: 'cl', to: 'd', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+Trail of Bits' fuzzing tips recommend remapping with `%` rather than `require` — the same
+reject-versus-reshape argument, in a tool with no `bound` helper — and then note the cost in one
+sentence: this speeds up exploration but might prevent some code paths from being tested. Their fix
+is to provide two functions.<Cite src="bsc-echidna-fuzzing-tips" />
+
+```solidity
+function operation(uint256 balance) public {
+    // raw: the fuzzer may pass anything, including values that revert
+}
+
+function safeOperation(uint256 balance) public {
+    balance = MIN_BALANCE + (balance % (MAX_BALANCE - MIN_BALANCE));
+    // clamped: always legal, always reaches the deep code
+}
+```
+
+The engine can then use either, so it explores both safe and unsafe usage of the input
+data.<Cite src="bsc-echidna-fuzzing-tips" /> The clamped entry point buys throughput into deep state;
+the raw one keeps the boundary cases in the search space. You pay for it in budget — half the calls
+go to a function that reverts more often — and you get back the region a single clamp would have
+excluded.
+
+The same pattern transfers to a Foundry handler without modification: `deposit(uint256 seed, uint256
+assets)` clamped to the actor's wallet, alongside `depositRaw(uint256 seed, uint256 assets)` that
+passes the value through and swallows the revert. Rerunning the `CappedVault` example with both
+entry points present would have found the truncation while keeping the throughput of the clamped
+path.
+
+<Misconception
+  belief="Clamping is a workaround for a fuzzer that is not smart enough, so a better engine would need less of it."
+  reality="Clamping is how you spend a finite budget on states that exist. Coverage-guided engines reduce the need for it in code they can already reach, and do nothing about a precondition the generator cannot satisfy by construction — an approval, a balance, a role."
+  why="Clamping looks like hand-holding, and 'the fuzzer should figure it out' is a reasonable prior from other domains where the input is a byte string with no preconditions attached."
+  src="crytic-building-secure-contracts"
+/>
+
+## Where the actor model lives differs by tool
+
+Track 05 built actor selection into handler code: a fixed array, a seed, a modulo. That is the
+Foundry-native answer because Foundry has no configuration surface for
+senders.<Cite src="foundry-invariant-guide" /><Cite src="cyfrin-foundry-invariants" />
+
+Echidna puts the same decision in the config file, and knowing that changes how you port a harness.
+The defaults are three senders — `0x10000`, `0x20000`, `0x30000` — a separate `deployer` at `0x30000`
+and a `psender` at `0x10000` that is the sender for property transactions, plus a `balanceAddr` of
+`0xffffffff` given to each address.<Cite src="echidna-default-config" /> Two consequences follow that
+catch people porting from Foundry:
+
+**The deployer is one of the senders.** With defaults, `0x30000` deploys the contract *and* appears in
+the transaction sender set, so if your contract grants the deployer a privileged role, one of the
+three actors the fuzzer drives is an admin. Whether you want that is a decision; inheriting it by
+accident is not.
+
+**The property sender is fixed and separate.** Properties are evaluated from `psender`, a single
+address, so a property whose truth depends on `msg.sender` is always evaluated from that one address
+regardless of which senders the sequence used. Worth reading the annotated default file rather than
+trusting a summary of it: the comment beside `psender` says it is by default intentionally the same
+as the contract deployer, while the shipped values put `psender` at `0x10000` and `deployer` at
+`0x30000`.<Cite src="echidna-default-config" /> Check the two values on the version you run before
+assuming either.
+
+Medusa exposes an equivalent surface plus one Foundry does not have: `predeployedContracts` deploys
+contracts at chosen addresses, and a `genesisStateFile` loads real EVM state — balances, nonces,
+code, storage — produced by `cast rpc anvil_dumpState`, merged with the fuzzer's own accounts, with
+the fuzzer accounts winning on conflict.<Cite src="medusa-chain-config" /> That is a different answer
+to "how do I get the system into a realistic starting state": instead of replaying deployment logic
+in a handler constructor, dump the state once and load it.
+
+<Aside kind="note">
+Medusa's `genesisContractMappings` carries a distinction worth internalising because the same
+distinction exists unnamed in every harness. Listing a contract there binds its ABI so its functions
+resolve and can be called by other contracts; it does **not** make the fuzzer generate top-level
+calls to it — that requires adding it to `targetContracts`.<Cite src="medusa-chain-config" /> The
+docs spell out the intended split: dependencies such as tokens, oracles and registries belong in the
+mapping but not in the target list, because you want their code present and do not want the fuzzer
+flooding them with calls.<Cite src="medusa-chain-config" /> In Foundry the same choice is
+`targetContract` versus merely deploying something in `setUp`, and it is made silently.
+</Aside>
+
+## Internal, external, partial
+
+One framing from the Echidna docs is worth importing into a Foundry codebase even though Foundry has
+no name for it, because it decides what your properties are allowed to see.
+
+**Internal testing** puts properties inside the contract under test, which gives complete access to
+internal state. It suits simple contracts with a single entry point and no complex initialisation,
+and properties are easier to write because they can read private
+variables.<Cite src="bsc-echidna-testing-approaches" />
+
+**External testing** puts properties in a separate contract that reaches the system through
+external calls, so only public functions and variables are in scope. It is what you need for anything
+requiring external initialisation, and it comes with a specific trap: since the test contract defines
+no other methods, pointing the engine at it produces no code execution in the target at all — there
+is nothing to call except the properties.<Cite src="bsc-echidna-testing-approaches" /> The remedy is
+the wrapper, which is the handler you already know.
+
+The reason to prefer external testing is not mechanical. The docs put it well: it forces you to write
+properties using public data, and an essential property that cannot be expressed from public data is
+a signal that users and integrating contracts cannot easily verify the system's state
+either.<Cite src="bsc-echidna-testing-approaches" /> That is a design finding produced by a testing
+constraint, which is unusual and worth noticing.
+
+There is a cost you must plan for. With a wrapper, the sender of every transaction is the wrapper
+contract rather than one of the engine's simulated senders — so the address interacting with the
+system is the wrapper's, and it is the one that needs ETH and tokens.<Cite src="bsc-echidna-testing-approaches" />
+Foundry's `vm.prank` hides this, which is convenient and also means the Foundry harness and the
+Echidna harness are not the same program even when the Solidity looks identical.
+
+The `allContracts` alternative lets the engine call every deployed contract directly with no wrappers
+at all, at the price of unintended effects — the docs' example is a `MockERC20.mint` that is public
+for setup and becomes a fuzzer action, which is fixed with a
+blacklist:<Cite src="bsc-echidna-testing-approaches" />
+
+```yaml
+filterBlacklist: true
+filterFunctions: ["MockERC20.mint(uint256, address)"]
+```
+
+Medusa's equivalent pair is `targetFunctionSignatures` and `excludeFunctionSignatures`, in ABI form
+such as `Contract.func(uint256,bytes32)`, with the note that property and optimization tests are
+always called and cannot be excluded.<Cite src="medusa-testing-config" /> Foundry's is
+`targetSelector` and `excludeSelector`.<Cite src="foundry-invariant-guide" /> Three names, one
+mechanism, and the same hazard in all three: every exclusion is a sequence the campaign can no longer
+construct, and nothing reports which.
+
+## Worked example: reviewing a clamp
+
+The review is short enough to run over a handler in a few minutes, and it is the highest-value review
+in the module because it decides what the properties are even allowed to see.
+
+**Subgoal: separate protocol facts from behavioural guesses.** Read every `bound` call and write next
+to it where the upper limit came from. `token.balanceOf(actor)` is a fact. `1_000e18` is a guess.
+Anything you cannot trace to a `require`, a cap, an array length or a balance is a guess.
+
+**Subgoal: check each guess against the type boundaries it excludes.** For each guessed bound, ask
+which of `0`, `1`, `type(uintN).max`, and the nearest power of two the clamp has removed. In the
+`CappedVault` case the answer is 2^128, which is where the defect lives.
+
+**Subgoal: check that every action has a caller who can perform it.** Approvals granted, balances
+minted, roles assigned. This is the loose-side check and the metrics table answers it.
+
+**Subgoal: check that every action can be *reached in sequence*, not only in isolation.** A
+liquidation handler is legal only when a position is unhealthy. If nothing in the handler set can
+make a position unhealthy — no price action, no interest accrual, no time warp — then liquidation is
+unreachable regardless of its clamp. The shape to look for in the metrics table is a selector whose
+discard count is almost as large as its attempt count — Track 05's worked exercise uses a liquidation
+handler discarding 98% of its attempts, which reads as green and tests nothing.<Cite src="foundry-cheatcode-assume" />
+
+**Subgoal: check the dynamic-array bias.** Echidna restricts fuzzed dynamic arrays to 32 elements
+because deserialising them is slow and mutating them is hard, and the recommended pattern is
+`push`/`pop` handler actions instead.<Cite src="bsc-echidna-fuzzing-tips" /> That pattern has its own
+bias, stated in the same document: since `push` and `pop` are chosen with equal probability, arrays
+larger than about 64 elements are very unlikely, and the workaround is to blacklist `pop()` for a
+short campaign.<Cite src="bsc-echidna-fuzzing-tips" /> A handler with a growable collection has this
+bias whether or not anyone noticed.
+
+**Subgoal: write down what the clamps exclude, and put it in the report.** This is the deliverable.
+A fuzzing section that says "invariants held over 10 million calls" is worth less than one that says
+"invariants held over 10 million calls, with deposits bounded to 10^21 and the price oracle held
+within ±10%, so the campaign says nothing about larger deposits or an oracle failure."
+
+<Aside kind="note">
+Randomised blacklisting across many short campaigns is a real technique with a name and a tool.
+Echidna's docs describe **swarm testing** — long campaigns run under randomised configurations, each
+blacklisting a random subset of functions — and ship `echidna-parade` to run
+it.<Cite src="bsc-echidna-fuzzing-tips" /><Cite src="echidna-parade" /> It attacks exactly the bias
+above: a configuration that cannot call `pop` will build long arrays, and a configuration that cannot
+call `deposit` will explore what happens when the pool is starved. Neither behaviour is reachable
+with meaningful probability from a single uniform campaign.
+</Aside>
+
+## Reading reverts at line granularity
+
+Foundry's metrics table names the selector that reverted, and Track 05 showed why that is not enough:
+the table cannot distinguish the target refusing the call from the handler's own `bound` throwing.
+
+Echidna's coverage file gives the missing granularity, and it is worth knowing about even if you run
+Foundry, because it is a reason to reach for a second engine when a revert count is unexplained. With
+`corpusDir` set, the campaign writes a copy of the source annotated per line, where `*` marks a line
+whose execution ended in a STOP, `r` a REVERT, `o` an out-of-gas, and `e` any other error such as a
+division by zero or an assertion failure.<Cite src="crytic-echidna" /><Cite src="bsc-echidna-corpus" />
+Their own walkthrough shows a chain of three `require` statements each marked `*r`, which reads as:
+the fuzzer reaches all three and fails at them.<Cite src="bsc-echidna-corpus" />
+
+Medusa has a separate revert report, off by default: `revertReporterEnabled` is `false`, and turning
+it on writes the report into the `coverage` directory under `crytic-export/` or under
+`corpusDirectory` if one is configured.<Cite src="medusa-fuzzing-config" /> Both are the same idea —
+attribute reverts to source, not to selectors — and both are opt-in, which is why most campaigns
+never produce one.
+
+<Check type="spot-bug" concept="input-clamping">
+Review this handler function. The target is a lending pool; `borrow` requires the position to remain
+over-collateralised, and the pool has a hard debt ceiling of 10^24.
+
+```solidity
+function borrow(uint256 actorSeed, uint256 amount) external {
+    address a = _actor(actorSeed);
+    uint256 max = pool.maxBorrow(a);
+    if (max == 0) return;
+    amount = bound(amount, 1, max);
+    vm.prank(a);
+    pool.borrow(amount);
+    ghost_borrowed[a] += amount;
+}
+```
+
+The campaign reports 128,000 calls, 0 reverts, and passes. Name what this handler can never test, and
+say which of the two clamping failures it is.
+
+<Answer>
+**It can never test a rejected borrow, and it is the tight-side failure.**
+
+`bound(amount, 1, pool.maxBorrow(a))` asks the *pool* what the maximum legal borrow is and then
+never exceeds it. Every generated call is legal by construction. That is why the revert count is
+zero, and the zero is not evidence of health — it is evidence that the handler has delegated the
+question to the contract under test.
+
+**Three specific things become unreachable.**
+
+The over-collateralisation check itself is never exercised with a failing input, so a bug in
+`maxBorrow` is invisible: the handler and the pool agree because the handler asks the pool. This is
+the same defect as a ghost variable that copies the contract's own formula — the clamp has made the
+test an identity.<Cite src="foundry-invariant-guide" />
+
+The debt ceiling at 10^24 is never approached from above, so a truncation or an off-by-one at the
+ceiling cannot appear.
+
+And the boundary itself is only ever hit from below: `bound(amount, 1, max)` can produce exactly
+`max`, but never `max + 1`, which is the value that decides whether the comparison is `<` or `<=`.
+
+**The fix is the two-function pattern**, not a wider clamp.<Cite src="bsc-echidna-fuzzing-tips" />
+Keep this one — it is what gets the campaign into deep, indebted state efficiently — and add a second
+entry point that passes the raw value through and tolerates the revert:
+
+```solidity
+function borrowRaw(uint256 actorSeed, uint256 amount) external {
+    vm.prank(_actor(actorSeed));
+    try pool.borrow(amount) { ghost_borrowed[_actor(actorSeed)] += amount; } catch {}
+}
+```
+
+Now the revert count becomes nonzero and *informative*: it counts refusals by the pool, which is a
+number you can reason about, rather than counting nothing.
+
+**One thing that would still be missing.** Neither function can make a healthy position unhealthy,
+because nothing here moves a price or accrues interest. Add that action or the campaign never
+liquidates, and no clamp change fixes it.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Lesson three** assumes the harness is honest and asks what to assert. The four property families
+there are only as good as the state the handler can construct, which is why this lesson comes first.
+
+**Lesson five** turns the same question into a budget problem: given a harness that reaches the right
+region, how do you spend calls so the multi-step sequences actually get built.
+
+**Audit craft** inherits the deliverable. The list of clamps and what they exclude is the honest
+scope statement for a fuzzing section, and it is the difference between a report that says what was
+tested and one that says how long it ran.
+
+**And when you next port a harness between engines**, the thing to port carefully is not the Solidity.
+It is the actor set, the deployer's privileges, the excluded selectors and the bounds — all of which
+live in code in Foundry, in a config file in Echidna, and in a JSON project file in
+Medusa.<Cite src="echidna-default-config" /><Cite src="medusa-fuzzing-config" /> Trail of Bits'
+`properties` repository is the shortest path to a harness that already has these decisions made for
+common token standards.<Cite src="crytic-properties" />

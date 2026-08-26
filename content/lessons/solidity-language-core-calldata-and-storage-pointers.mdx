@@ -1,0 +1,346 @@
+---
+id: solidity-language-core-calldata-and-storage-pointers
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solidity-docs-types, solidity-docs-contracts, solidity-050-breaking, solidity-docs-storage-layout, measured-gas-constants]
+stack: { solidity: "0.8.36" }
+---
+
+A relayer contract exposes one function. It takes a batch of orders and, for a fee estimate, reads
+the first one.
+
+```solidity
+function quote(Order[] memory orders) external view returns (uint256) {
+    return orders[0].amount * feeBps / 10_000;
+}
+```
+
+The body reads one field of one element. The function, as compiled, first materialises the entire
+batch in memory — every order, every field — and only then runs the single multiplication. Change
+`memory` to `calldata` and the body is unchanged, the return value is unchanged, and the copy
+disappears.
+
+That is the first of this lesson's two hazards: **a data location you did not think about, doing
+work you did not ask for.** The second is its mirror image — a data location you did write down,
+doing *less* work than the code appears to say. Both are consequences of the four assignment rules
+from the previous lesson; neither is visible without looking for it.
+
+## calldata is the arguments, and only the arguments
+
+The docs define it in one sentence: calldata is "a non-modifiable, non-persistent area where
+function arguments are stored, and behaves mostly like memory."<Cite src="solidity-docs-types" />
+
+You know the region already — it is [the read-only block the caller
+handed you](/c/calldata-is-read-only), whose bytes you paid for in intrinsic gas before execution
+started. What the language adds is that you can point a typed variable straight at it and never
+copy.
+
+Three properties fall out of "non-modifiable, non-persistent", and each one shows up as a compiler
+error at some point in a normal week.
+
+**You can pass it on and return it; you cannot allocate it.** Arrays and structs with calldata
+location "can also be returned from functions, but it is not possible to allocate such
+types."<Cite src="solidity-docs-types" /> So `Order[] calldata` flows through your call graph
+freely, and `new Order[](3)` in calldata is not a thing that can exist. There is no calldata
+allocator because calldata is a message that already arrived.
+
+**Constructors are excluded.** "Constructor parameters cannot use calldata as their data
+location."<Cite src="solidity-docs-types" /> Constructor arguments arrive appended to the initcode
+rather than as a call's argument block, so the region a calldata pointer would point into is not
+there during construction. This is one of the few places where a signature that works on a normal
+function must be rewritten for a constructor.
+
+**Local calldata variables must be assigned before use, and the compiler is conservative about
+proving it.** The docs warn that arrays and structs with calldata location declared in a function
+body or as return parameters "must be assigned before being used or returned", that "there are
+certain cases in which non-trivial control flow is used and the compiler can't properly detect the
+initialization", and that a common workaround "is to assign the affected variable to itself before
+the correct initialization takes place."<Cite src="solidity-docs-types" /> If you hit that error and
+the code is demonstrably correct, the self-assignment is the sanctioned escape hatch rather than a
+hack.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Order[] memory', note: 'a parameter in memory' },
+    { title: 'Order[] calldata', note: 'a parameter in calldata', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What happens before your first line runs?',
+      cells: [
+        'The whole argument is copied in',
+        'Nothing — the variable points at the caller’s bytes',
+      ],
+    },
+    {
+      label: 'Can the body write to it?',
+      cells: ['Yes, to the copy', 'No; the region is non-modifiable'],
+    },
+    {
+      label: 'Can you allocate a fresh one?',
+      cells: ['Yes, with new T[](n)', 'No; calldata is a message that already arrived'],
+    },
+    {
+      label: 'May a constructor parameter use it?',
+      cells: ['Yes', 'No — constructor arguments arrive in initcode'],
+    },
+    {
+      label: 'What does the cost scale with?',
+      cells: [
+        'The length the caller chose, read or not',
+        'The elements you actually read',
+      ],
+    },
+  ]}
+  caption="Choosing between the two decides whether the argument is duplicated before the body executes at all."
+  alt="A memory parameter and a calldata parameter compared on what happens before the body runs, whether the body can write to it, whether it can be allocated, whether a constructor may take it, and what its cost scales with."
+/>
+
+### What the annotation actually saves
+
+The documentation's own advice is unambiguous: "If you can, try to use calldata as data location
+because it will avoid copies and also makes sure that the data cannot be
+modified."<Cite src="solidity-docs-types" />
+
+Note that it gives two reasons, and the second one is the durable one. Avoiding a copy is a gas
+argument, and gas arguments have a way of inverting when the optimiser or the fork changes.
+"The data cannot be modified" is a semantic argument: a `calldata` parameter is a value your callee
+provably did not rewrite under you, enforced by the region rather than by discipline. When you are
+handed a batch and you want the guarantee that nothing between the entry point and the accounting
+code reordered it, that is the annotation that says so.
+
+The copy you avoid is not free, and it is not a constant either. Rule 1 from the previous lesson
+applies: calldata into memory is an independent copy.<Cite src="solidity-docs-types" /> For an array
+that means [growing memory](/c/memory-expansion-quadratic), whose price rises quadratically in the
+high-water mark, plus [per-word copy costs](/c/copy-costs-are-per-word), both scaled by a length
+your caller chose. A function that reads `orders[0]` pays for `orders[499]` too.
+
+<Aside kind="note">
+The reverse direction has the reverse economics. If your function reads the same element many times
+in a loop, one copy into memory and many memory reads can beat many calldata reads. The rule is not
+"calldata is cheaper"; it is "calldata does not copy, and copies are proportional to length while
+reads are proportional to use." Which wins is a measurement, and it is the kind of measurement that
+belongs in your own repository rather than in a lesson.
+</Aside>
+
+## The `external` folklore, and its actual expiry date
+
+There is a piece of advice that still appears in style guides: mark functions `external` rather than
+`public`, because external is cheaper.
+
+That was once a real rule, and the docs record exactly what it was and when it stopped:
+
+> Prior to version 0.6.9 data location for reference-type arguments was limited to `calldata` in
+> external functions, `memory` in public functions and either `memory` or `storage` in internal and
+> private ones. Now `memory` and `calldata` are allowed in all functions regardless of their
+> visibility.<Cite src="solidity-docs-types" />
+
+So the old gap was never about the visibility keyword. It was about a restriction the language
+placed on the *data location* you were allowed to write next to it: `public` forced `memory`, which
+forced a copy. Since 0.6.9 you write the location you want at any visibility, and a `public`
+function with `calldata` parameters gets the same argument handling as an `external`
+one.<Cite src="solidity-docs-types" />
+
+<Misconception
+  belief="external is cheaper than public, so mark everything external."
+  reality="Since 0.6.9, memory and calldata are both allowed at every visibility. The historical gap came from public functions being forced to take memory parameters — which forced a copy — not from the visibility keyword itself."
+  why="The advice was correct for years, was repeated into every style guide and audit checklist, and was never retired when the underlying restriction was lifted. It also survives because the two changes look unrelated: nobody reads a note about parameter data locations as an update to visibility guidance."
+  src="solidity-docs-types"
+/>
+
+Choose visibility on the question visibility answers — whether the function is part of the contract's
+interface, and whether internal code needs to call it, given that an `external` function "cannot be
+called internally" while `this.f()` works.<Cite src="solidity-docs-contracts" /> Choose the data
+location separately, on the question of whether you want a copy. The next lesson is about the first
+of those two decisions.
+
+## The pointer that looks like data
+
+Now the mirror image. A local variable declared `T storage p` is a reference into the slot map: rule
+3 from the previous lesson, "assignments from storage to a local storage variable also only assign a
+reference."<Cite src="solidity-docs-types" /> Underneath, the compiler is tracking a slot number for
+you, derived from the layout it computed at compile time.<Cite src="solidity-docs-storage-layout" />
+
+Which means these two statements are in different categories entirely:
+
+```solidity
+p = positions[other];   // retargets the pointer. No state is touched.
+p.debt = 0;             // writes through the pointer. This is an SSTORE.
+```
+
+They differ by four characters. They are adjacent in every diff. One of them is a local variable
+assignment with no observable effect outside the frame, and the other is a state change.
+
+<Figure
+  caption="A storage pointer is a slot number held in the frame — the bare name is a local, and only a member reaches the slot map."
+  alt="From a local variable p of storage struct type, assigning to the bare name changes which slot it holds and touches no state, while assigning to p.debt performs an SSTORE at that slot."
+>
+  <Flow
+    nodes={[
+      { id: 'p', label: 'p', note: 'a slot number, tracked by the compiler', col: 0, tone: 'accent' },
+      { id: 'ret', label: 'p = positions[b]', note: 'assign to the bare name', col: 1 },
+      { id: 'wr', label: 'p.debt = 0', note: 'assign through the name', col: 1, tone: 'warn' },
+      { id: 'none', label: 'p holds a new slot', note: 'no state touched', col: 2, tone: 'muted' },
+      { id: 'ss', label: 'SSTORE', note: 'the contract’s state changes', col: 2, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'p', to: 'ret' },
+      { from: 'p', to: 'wr' },
+      { from: 'ret', to: 'none' },
+      { from: 'wr', to: 'ss', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+### Worked example: a loop that clears nothing
+
+A liquidation routine walks a list of accounts and is supposed to zero each position.
+
+```solidity
+struct Position { uint128 collateral; uint128 debt; }
+mapping(address => Position) private positions;
+address[] private queue;
+
+function clearAll() internal {
+    Position storage p = positions[queue[0]];
+    for (uint256 i = 0; i < queue.length; ++i) {
+        p = positions[queue[i]];   // A
+        p.collateral = 0;          // B
+        p.debt = 0;                // C
+    }
+}
+```
+
+**Subgoal 1 — decide, before reading the body, which lines can change state.** Only assignments
+*through* a storage reference can. Line A assigns *to* `p`. Lines B and C assign to members of what
+`p` refers to. So A cannot change state and B and C can — and that is enough to read the loop
+correctly without simulating it.
+
+**Subgoal 2 — check that the retarget is legal.** It is: rule 3 permits assigning a local storage
+variable from an existing storage object, and `positions[queue[i]]` is one.<Cite src="solidity-docs-types" />
+The compiler will not object. This code is correct — the loop really does clear every position,
+because A moves the pointer before each pair of writes.
+
+**Subgoal 3 — now delete line A and see what survives.** Without the retarget, `p` still refers to
+the position it was initialised with, so B and C rewrite the same two slots on every iteration. The
+loop runs `queue.length` times, does `2 * queue.length` `SSTORE`s, and clears exactly one account.
+Nothing reverts. The transaction succeeds. Any test that checks "position of `queue[0]` is zero"
+passes.
+
+**Subgoal 4 — price the difference, to see why the gas report will not save you either.** The
+repeated writes hit the same slot, which is warm after the first touch and already zero after the
+first clear, so they settle at the cheapest tier — a warm no-op `SSTORE` measured at 100
+gas.<Cite src="measured-gas-constants" /> The correct version instead touches a fresh, cold slot per
+account. A bug that clears one account out of fifty is therefore *dramatically cheaper* than the
+correct code, not more expensive. Gas anomalies point the wrong way here.
+
+**Subgoal 5 — extract the review heuristic.** In a function that holds a storage reference, sort the
+lines into two piles: those that assign to the bare name, and those that assign to a member or an
+index of it. The first pile changes *which* state later lines touch. The second pile changes state.
+A reviewer who does not make that split is reading the loop as if `p` were a value.
+
+<Misconception
+  belief="Assigning to a storage pointer writes storage — it is the storage version, after all."
+  reality="Assigning to the bare pointer retargets it and touches no state. Only assignments through it, to a member or an element, produce an SSTORE."
+  why="The keyword `storage` sits in the declaration, so the variable is mentally filed as 'the storage one', and every assignment to it inherits that label. Nothing in the syntax of `p = q` distinguishes retargeting a reference from overwriting a value, and in the memory case the same line really does overwrite."
+  src="solidity-docs-types"
+/>
+
+### The failure mode the language already closed
+
+There is an older version of this hazard that you will still find described in security material: an
+*uninitialized* local storage pointer, which used to default to referring at slot 0 and so turned
+an innocuous-looking write into a write over the first state variable — frequently the owner.
+
+That one is gone at the language level. Uninitialized storage variables were disallowed in
+0.5.0.<Cite src="solidity-050-breaking" /> A declaration without an initialiser is a compile error
+now, not a slot-0 alias.
+
+It is worth knowing the history for exactly one reason: it tells you which era a piece of advice
+comes from. A checklist item that says "check for uninitialized storage pointers" was written
+against a compiler nobody targets any more, and the item that replaces it is the one this lesson is
+about — a pointer that *is* initialised, and is pointing somewhere other than where the reader
+assumes.
+
+<Check type="spot-bug" concept="sol-storage-pointer-hazard">
+This function is meant to refund every depositor in a round and then close it. Two of its lines are
+doing something other than what they look like. Find both, and say what the contract's state looks
+like after a call with three depositors.
+
+```solidity
+struct Round { address[] depositors; uint256 total; bool closed; }
+Round[] private rounds;
+mapping(address => uint256) private credits;
+
+function refund(uint256 roundId, uint256[] memory amounts) internal {
+    Round storage r = rounds[roundId];
+    address[] memory who = r.depositors;
+
+    for (uint256 i = 0; i < who.length; ++i) {
+        credits[who[i]] += amounts[i];
+        r.total -= amounts[i];
+    }
+
+    who = new address[](0);
+    r = rounds[roundId + 1];
+    r.closed = true;
+}
+```
+
+<Answer>
+**Line 1 of the pair — `address[] memory who = r.depositors;` is a full copy, not a view.** Storage
+to memory crosses a location boundary, so rule 1 applies and an independent copy of the whole
+depositor array is materialised.<Cite src="solidity-docs-types" /> For three depositors that is
+cheap; for three thousand it is the dominant cost of the function, and nothing in the line says so.
+Declaring the loop over `r.depositors` directly would read each element from storage instead — which
+is the better choice only if the loop reads each element once, which here it does.
+
+Note also what the copy buys you, since it is not nothing: `who` cannot be mutated by anything the
+loop calls, because it is memory local to this frame. If `credits[...] += ...` could reenter and
+`r.depositors` could shrink, iterating the storage array directly would be reading a moving target.
+The copy is a defence that happens to also be a cost.
+
+**Line 2 of the pair — `r = rounds[roundId + 1];` retargets the pointer and closes the wrong
+round.** It is a legal rule-3 assignment from an existing storage object, so it
+compiles.<Cite src="solidity-docs-types" /> `r.closed = true` on the following line therefore writes
+into round `roundId + 1`. The round you were asked to refund stays open, and a round that has not
+been refunded is marked closed. If `roundId` is the last index, the read is out of bounds and the
+call reverts instead — so the bug's symptom depends on where in the array you are, which is the
+worst kind of intermittent.
+
+**`who = new address[](0);` is the decoy.** It is a memory-to-memory assignment, it retargets a
+local memory variable that is never read again, and it has no effect whatsoever on
+`r.depositors`.<Cite src="solidity-docs-types" /> Reviewers frequently flag this one — it looks like
+it clears the depositor list — and it is the only line in the function that is genuinely inert.
+
+**State after a call with three depositors:** three `credits` entries increased; `rounds[roundId].total`
+reduced by the sum of `amounts`; `rounds[roundId].depositors` untouched; `rounds[roundId].closed`
+still `false`; and `rounds[roundId + 1].closed` set to `true`.
+
+The pattern to take away: in a function holding a storage reference, every bare assignment to that
+reference is a control-flow statement about where later writes go, and deserves the same attention
+as an `if`.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Function visibility** is next, and this lesson has already removed the wrong reason to care about
+it. What remains is the real distinction — which callers can reach a function, and whether calling
+it from inside your own contract is a jump or a message call.
+
+**Library functions taking storage references** are the productive use of the second half of this
+lesson. An `internal` function that takes `T storage` is how you factor logic out of a contract
+without copying its state, and it is only safe to read once you can tell retargeting from writing.
+
+**Batch endpoints and L2 economics** lean on the first half. Calldata bytes are charged at the edge
+of the transaction, so on rollups the argument encoding is often the dominant cost of a call — and a
+`memory` parameter makes you pay for those bytes a second time, in memory expansion, for no
+semantic gain.
+
+**Reentrancy reasoning** needs the copy-versus-alias distinction to be automatic. "Did this array
+change under me during the external call?" has one answer for a memory copy and a different answer
+for a storage reference, and the two are one keyword apart in the declaration.

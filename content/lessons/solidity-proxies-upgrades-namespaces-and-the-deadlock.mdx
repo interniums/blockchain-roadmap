@@ -1,0 +1,433 @@
+---
+id: solidity-proxies-upgrades-namespaces-and-the-deadlock
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-7201, eip-1967, oz-issue-6362, oz-pr-4534, oz-changelog, oz-src-initializable, oz-src-uups, oz-docs-writing-upgradeable, oz-upgrades-proxy-pattern, oz-upgrades-faq, 51nodes-v4-v5-unsafe, solidity-docs-storage-layout, solidity-docs-contracts, solidity-docs-global-vars, solidity-docs-control-structures, solidity-changelog]
+stack: { solidity: "0.8.36" }
+---
+
+On BNB Smart Chain there is an ERC-20 proxy at `0x02634E559651Ac67B8a3c73B15C8CF79b31242Ec`
+holding 1,441,103,829 tokens across every holder who ever bought one. The balances are intact, the
+logic behind it is a working ERC-20, and nothing was hacked.<Cite src="oz-issue-6362" />
+
+Every transfer reverts. Every admin function reverts. `name()` reverts. The upgrade function reverts.
+The initializer that would fix the upgrade function reverts. It has been in that state since
+February 2026, and the implementation slot still holds the same address
+today.<Cite src="oz-issue-6362" />
+
+The cause is a storage layout migration. This lesson works it slot by slot, because the mechanism is
+completely comprehensible and the way it is usually described is not.
+
+## The problem ERC-1967 did not solve
+
+ERC-1967 put the proxy's own state where the implementation cannot reach it, and did nothing about
+the other collision: **implementation version N against version N+1**, both numbering from slot 0
+into the same storage.
+
+The documented rules are prohibitions with no enforcement — do not reorder state variables, change
+their types, remove them, or insert new ones before existing ones; append only at the
+end.<Cite src="oz-upgrades-proxy-pattern" /><Cite src="oz-docs-writing-upgradeable" /> The compiler
+cannot help: the two versions are separate compilations separated by months.
+
+Two mechanisms make that discipline mechanical. One is old and fragile. The other is what
+OpenZeppelin moved to, and moving between them on a live proxy is what killed the contract above.
+
+## Gaps: reserving slots you have not used yet
+
+The 4.x idiom is a trailing array of unused slots in every base contract.
+
+```solidity
+contract ERC20Upgradeable {
+    mapping(address => uint256) private _balances;   // slot 0
+    uint256 private _totalSupply;                    // slot 1
+    string  private _name;                           // slot 2
+    string  private _symbol;                         // slot 3
+    uint256[45] private __gap;                       // slots 4..48
+}
+```
+
+Storage is assigned in C3-linearized order from the most base-ward
+contract.<Cite src="solidity-docs-storage-layout" /> A derived contract's first variable therefore
+lands at slot 49, and the gap gives `ERC20Upgradeable` forty-five slots to grow into: adding
+`_decimals` means declaring it and changing `[45]` to `[44]`, and nothing below moves.
+
+It works, and it fails in ways that are all bookkeeping. Miscount the reduction and everything below
+shifts by one. Add a variable that packs, or one that does not, and the arithmetic changes. And the
+scheme depends on every library author in your dependency tree performing the same ritual correctly,
+forever, in code you do not diff.
+
+## ERC-7201: give each component its own address space
+
+The alternative stops sharing the sequential range at all. Each component's state goes into a single
+struct rooted at a slot derived from a namespace string.<Cite src="eip-7201" />
+
+```text
+namespace root =
+  keccak256(abi.encode(uint256(keccak256(bytes(id))) - 1)) & ~bytes32(uint256(0xff))
+```
+
+Two hashes and a mask, each doing a specific job.
+
+**The inner hash and the minus one** put you at a location that is unused by
+Solidity.<Cite src="eip-7201" /> Same trick as ERC-1967, same reason: nobody can exhibit a keccak
+preimage for it.
+
+**The outer hash** exists because that is not enough. A namespace holds a *struct*, which can be
+larger than one slot, so you need a region rather than a point. Hashing again gives you a fresh
+pseudorandom root you can add small offsets to.
+
+**The mask clears the low byte**, aligning every root to a multiple of 256. The specification gives
+two reasons: it stops a namespace's tail from extending into a region potentially used by Solidity,
+and it is a deliberate optimisation in anticipation of gas schedule changes after the Verkle state
+tree migration.<Cite src="eip-7201" />
+
+Derive one by hand. This is OpenZeppelin's ERC-20 namespace:
+
+```bash
+# 1. hash the namespace id
+cast keccak "openzeppelin.storage.ERC20"
+# 0xb750591399365444a618527b69a54ce09476c8bde1ecff60f5aa1fe2b52605ff
+
+# 2. subtract one; abi.encode of a uint256 is just those 32 bytes
+#    0xb750591399365444a618527b69a54ce09476c8bde1ecff60f5aa1fe2b52605fe
+
+# 3. hash again
+cast keccak 0xb750591399365444a618527b69a54ce09476c8bde1ecff60f5aa1fe2b52605fe
+# 0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bacedc
+
+# 4. clear the low byte  (…dc -> …00)
+#    0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace00
+```
+
+<Figure
+  caption="A readable string goes in and a 256-aligned root comes out, with no slot number anyone had to choose."
+  alt="The ERC-7201 derivation for openzeppelin.storage.ERC20: keccak256 of the id gives 0xb750...05ff, subtracting one gives 0xb750...05fe, hashing that again gives 0x52c6...cedc, and clearing the low byte gives the namespace root 0x52c6...bace00."
+>
+  <Flow
+    nodes={[
+      { id: 'h1', label: 'keccak256(id)', note: '0xb750…05ff', col: 0 },
+      { id: 'm1', label: 'minus one', note: '0xb750…05fe · no preimage', col: 1 },
+      { id: 'h2', label: 'keccak256 again', note: '0x52c6…cedc · a region, not a point', col: 2 },
+      { id: 'mask', label: 'clear the low byte', note: '0x52c6…bace00 · aligned to 256', col: 3, tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+That root, and the fields laid out above it, are confirmed by OpenZeppelin's own maintainer on the
+case-study thread: `_totalSupply` at root `+2`, `_name` at root `+3`, `_symbol` at root
+`+4`.<Cite src="oz-issue-6362" /> The two mappings occupy the first two offsets, because a mapping's
+declared slot holds nothing and exists only to seed its own
+derivation.<Cite src="solidity-docs-storage-layout" />
+
+<Figure
+  caption="The two mapping declarations hold no data, which is why the first value anyone can read sits at root + 2."
+  alt="The OpenZeppelin ERC-20 namespace struct laid out in words above its root: two mapping declarations occupy the first two offsets and hold no data, then _totalSupply at offset 2, _name at offset 3 and _symbol at offset 4."
+>
+  <ByteLayout
+    unit="words"
+    offsets
+    caption="the openzeppelin.storage.ERC20 struct, above its root"
+    fields={[
+      { label: 'two mappings', size: 2, note: 'declared slots hold nothing', tone: 'muted' },
+      { label: '_totalSupply', size: 1, tone: 'accent' },
+      { label: '_name', size: 1, tone: 'accent' },
+      { label: '_symbol', size: 1 },
+    ]}
+  />
+</Figure>
+
+Three other roots worth being able to recognise on sight, because they appear in every OpenZeppelin
+upgradeable deployment:
+
+```text
+openzeppelin.storage.Initializable
+  0xf0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00
+openzeppelin.storage.Ownable
+  0x9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300
+openzeppelin.storage.ERC20
+  0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace00
+```
+
+**Adding a field now shifts nothing anywhere else.** Extend the struct and it grows into its own
+region. There are no gaps to maintain, no counts to keep in sync, and no coupling between what a
+library adds and where your variables live. That is the whole argument for the scheme.
+
+The struct is marked in source with a NatSpec annotation, and the specification is precise that a
+struct carrying it outside a contract is not a namespace for any contract.<Cite src="eip-7201" />
+Since 0.8.35, released 29 April 2026, the compiler computes the formula for you through an
+`erc7201(string memory id) returns (uint)` builtin usable in compile-time context, which composes
+with the `layout at` specifier that shifts a whole inheritance tree's static variables to a chosen
+base slot.<Cite src="solidity-docs-global-vars" /><Cite src="solidity-changelog" /><Cite src="solidity-docs-contracts" />
+
+## What OpenZeppelin 5.0 actually did — and the part that gets missed
+
+Contracts 5.0.0, released 5 October 2023, moved every upgradeable contract to namespaced
+storage.<Cite src="oz-changelog" /><Cite src="oz-pr-4534" /> `Initializable` moved too, and the
+changelog says why in a clause worth quoting: to avoid putting critical variables in slot
+0.<Cite src="oz-changelog" /> The release notes flag the consequence for anyone reading state
+externally — storage locations for `Initializable` and every upgradeable contract
+changed.<Cite src="oz-changelog" />
+
+Here is the framing that makes the rest of this lesson make sense.
+
+The migration did not *reassign* the sequential range. It **vacated** it.
+
+Under 4.x, slots 0 upward were densely occupied by library base contracts: `Initializable` first,
+then whatever the inheritance chain pulled in, then gaps, then your own variables somewhere in the
+hundreds. Under 5.x every one of those lives at a pseudorandom root, and the sequential range from
+slot 0 is empty as far as the library is concerned.
+
+So the two layouts do not overlap variable-for-variable. They pass through each other. Your own
+declarations slide down toward slot 0, into slots a 4.x deployment already filled with something
+else, while the library's state moves to roots nothing has ever written. Both halves are lethal, in
+different ways, and the case study got one of each.
+
+<Misconception
+  belief="Upgrading to a newer OpenZeppelin major version is routine dependency maintenance."
+  reality="The 4.x-to-5.x change replaced the storage strategy for every upgradeable contract. On a live proxy the new code reads different slots than the old code wrote. It compiles, it deploys, the upgrade transaction succeeds — and the contract is corrupt from that block onward."
+  why="Semver reads as a dependency bump, the code compiles against the new package without complaint, and the compiler has no view of a second deployment made months earlier. Nothing in the ordinary workflow surfaces the deployment as an input to the decision."
+  src="oz-issue-6362"
+/>
+
+## The deadlock, slot by slot
+
+The reported layout, and what the v5 implementation reads
+instead:<Cite src="oz-issue-6362" />
+
+| Variable | v4 slot, and what is in it | v5 reads from | v5 sees |
+|---|---|---|---|
+| `_initialized` | slot 0 = `0x01` | `0xf0c57e16…6a00` | `0x00` |
+| `_name` | slot 101 = `"Outter Finance"` | ERC-20 namespace `+3` | `0x00` |
+| `_owner` | slot 154 = `0x4A90d19E…` | `0x9016d09d…9300` | `0x00` |
+| `_totalSupply` | slot 280 = `0x04a80d9b1c1d49785b46b7df` | ERC-20 namespace `+2` | `0x00` |
+
+That supply word is 1,441,103,829 tokens at eighteen decimals. The `_name` row uses the namespace
+offsets the OpenZeppelin maintainer published on the thread rather than the ones in the original
+report; the difference between them is the subject of a later section, and it matters.
+
+Every value in the left column is still on chain and readable by anyone. Confirm any of them
+yourself — this needs no archive node and no API key:
+
+```bash
+P=0x02634E559651Ac67B8a3c73B15C8CF79b31242Ec
+R=https://bsc-rpc.publicnode.com
+
+cast storage $P 0   --rpc-url $R   # 0x…01        the leftover v4 flag
+cast storage $P 154 --rpc-url $R   # 0x…4a90d19e… the v4 owner, intact
+cast storage $P 0x9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300 --rpc-url $R
+                                   # 0x…00        the v5 owner, never written
+```
+
+**Failure one — nobody is the owner.** `OwnableUpgradeable` reads `_owner` from the Ownable
+namespace, which no v4 transaction ever touched, so it is zero. Every `onlyOwner` function reverts
+`OwnableUnauthorizedAccount`, and that includes
+`upgradeToAndCall`.<Cite src="oz-issue-6362" /><Cite src="oz-src-uups" /> The upgrade path is closed
+for every possible caller.
+
+**Failure two — the initializer cannot run.** Setting a v5 owner requires `initialize()`, which
+reverts with `Panic(0x22)` before writing anything. The `initializer` modifier itself passes: the v5
+`_initialized` slot is genuinely empty, so `Initializable` believes this contract has never been set
+up.<Cite src="oz-issue-6362" /><Cite src="oz-src-initializable" /> The panic is in the body.
+
+The two lock together. No owner, so no upgrade. No initializer, so no owner. No upgrade, so the
+implementation that needs an owner stays.
+
+The report documents testing all 124 function selectors extractable from the implementation
+bytecode: 34 views succeed and return zeros, 21 revert on `onlyOwner`, two panic with `0x22`
+(`initialize()` and `name()`), one panics with `0x12` from dividing by the zero supply, and the rest
+revert for ordinary reasons. The only permissionless state-writing function is `approve()`, which
+cannot touch the owner slot. An `eth_call` sent `from` `address(0)` succeeds at both
+`upgradeToAndCall` and `transferOwnership`, proving the mechanism is intact and that nobody can sign
+for that address.<Cite src="oz-issue-6362" />
+
+## The invariant that turns `0x01` into a permanent revert
+
+This is the part worth working out in full, because it is a Solidity encoding rule you can carry
+everywhere, not a proxy fact.
+
+A `bytes` or `string` in storage is encoded one of two ways, and the same slot has to tell you
+which.<Cite src="solidity-docs-storage-layout" />
+
+- **At most 31 bytes**: the data sits in the higher-order bytes of the slot, left-aligned, and the
+  **lowest-order byte holds `length * 2`**.
+- **32 bytes or more**: the slot holds `length * 2 + 1`, and the data lives at `keccak256(p)`.
+
+Doubling the length frees bit 0 as the discriminator. The documentation states the test directly:
+you can distinguish a short array from a long array by checking whether the lowest bit is
+set.<Cite src="solidity-docs-storage-layout" />
+
+**A valid short string.** `"Outter Finance"` is 14 bytes, so `length * 2` is 28, which is `0x1c`:
+
+<Figure
+  caption="One byte of the thirty-two is metadata, and it is the lowest one — everything above it is the value."
+  alt="The storage word 0x4f75747465722046696e616e636500000000000000000000000000000000001c: fourteen bytes of ASCII spelling Outter Finance, left-aligned, then seventeen zero bytes of padding, then a final byte 0x1c, which is 28, which is 14 times 2."
+>
+  <Anatomy
+    value="0x4f75747465722046696e616e636500000000000000000000000000000000001c"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 30, label: '"Outter Finance"', note: '14 bytes, left-aligned' },
+      { from: 30, to: 64, label: 'padding', note: '17 zero bytes', tone: 'muted' },
+      { from: 64, to: 66, label: '0x1c', note: 'length × 2 = 28', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+That is exactly the word sitting in slot 101 today.
+
+**Now read `0x01` as a string.** Bit 0 is set, so this is the long encoding. Length is
+`(1 - 1) / 2 = 0`. A long-encoded string of length zero — but the long encoding is only ever used
+for lengths of 32 or more. The word is self-contradictory: no writer following the rules could have
+produced it.
+
+Solidity's position on that case is narrow and explicit. Handling invalidly encoded slots is
+currently not supported and may be added in the future; if you are compiling via IR, reading an
+invalidly encoded slot results in a `Panic(0x22)`.<Cite src="solidity-docs-storage-layout" /> Panic
+code `0x22` is defined as accessing a storage byte array that is incorrectly
+encoded.<Cite src="solidity-docs-control-structures" />
+
+And that is what the chain returns. Calling `name()` on the proxy today produces exactly this:
+
+```text
+execution reverted: panic: storage byte array incorrectly encoded (0x22)
+data: 0x4e487b71...0000000000000022
+```
+
+`Panic` is not a `require` you can loosen, and it is thrown on the *read* — so any function touching
+that variable dies before its first `SSTORE`.<Cite src="solidity-docs-control-structures" />
+
+## What is certain, and what the thread never settled
+
+Be careful here, because the widely repeated one-line version of this incident is wrong in a
+specific way.
+
+The report attributes the panic to `_name` mapping to "slot 0 of the ERC-7201 namespace" while
+storage slot 0 holds the leftover `0x01`. An OpenZeppelin collaborator replied to that sentence
+directly: the ERC-7201 namespace in general, and its slot 0 in particular, should not contain
+anything from the previous v4 storage. He asked twice what part of v5 accesses storage slot 0, and
+published the real ERC-20 namespace offsets — `+2`, `+3`, `+4` above `0x52c6…bace00`, nowhere near
+slot 0.<Cite src="oz-issue-6362" />
+
+The correction is right, and the distinction it turns on is worth internalising: **"slot 0 of a
+namespace" and "storage slot 0" are different slots**, and treating them as the same thing is
+mistaking an offset for an address. A namespace root is pseudorandom by construction, so no
+sequential v4 variable can ever collide with it — that is the entire point of the derivation you
+worked through above.<Cite src="eip-7201" />
+
+So what is certain:
+
+- `name()` and `initialize()` revert with `Panic(0x22)`, and that panic has exactly one documented
+  cause: reading a storage byte array that is incorrectly
+  encoded.<Cite src="solidity-docs-control-structures" />
+- Storage slot 0 holds `0x01`, left there by v4's `Initializable`, and `0x01` is a self-contradictory
+  string word.<Cite src="oz-issue-6362" />
+- The owner reads as `address(0)`, so every upgrade path is closed.
+
+What is not settled is **which declaration in the v5 implementation performs the offending read**.
+The reporter's answer cannot be right, and the maintainer asked twice without getting another. The
+most economical explanation is the vacating effect described above — this is a project contract, not
+a stock OpenZeppelin one, and any `string` it declares as its own ordinary state variable now begins
+near slot 0 because the 5.x library no longer occupies the range in front of it. The thread does not
+confirm that. The maintainer asked for the v5 implementation to be verified on the explorer so it
+could be read; all five comments on the issue are his, with no reply recorded. Treat the mechanism
+as established and the attribution as open.
+
+<Aside kind="warn">
+This is a good habit to generalise. The incident's *mechanism* is verifiable from first principles
+and from public state. The incident's *narrative* — which line of which file did it — travelled
+further and was corrected by the maintainer within hours. When you cite a post-mortem, cite the part
+you can reproduce.
+</Aside>
+
+## Recovery, and the one idea that is not a chain fork
+
+The collaborator's assessment was unambiguous. Asked whether any mechanism in v5's upgradeable
+contracts could allow state modification without passing `onlyOwner`: no. Asked whether OpenZeppelin
+would state publicly that this is unrecoverable: they could. Asked for repair tooling: once an
+incompatible upgrade has been made there is not really tooling to fix that, and the tooling is
+focused on prevention instead.<Cite src="oz-issue-6362" />
+
+One idea in the thread uses machinery you already have. The balances are still in the proxy's
+storage trie, and a storage trie is provable. Deploy a *working* token and let each holder claim by
+presenting a Merkle-Patricia proof that the frozen contract's storage held their balance at a chosen
+block — the kind of proof `eth_getProof` returns, and that OpenZeppelin's `TrieProof` library,
+shipped in 5.7.0, verifies on-chain.<Cite src="oz-issue-6362" /><Cite src="oz-changelog" /> The
+collaborator named the limit himself: it works poorly for tokens held by contracts such as an AMM
+pair, which cannot present a proof or accept a new asset on their own.
+
+That solution does not repair the contract. It abandons the address and reconstructs the ledger from
+a state proof — available precisely because storage is committed to in a header the whole network
+agrees on.
+
+<Check type="predict" concept="layout-migration-hazard">
+Your team runs an upgradeable vault deployed in 2023 against OpenZeppelin Contracts 4.9. A ticket
+proposes bumping to 5.7.0 "for the crosschain helpers and the security fixes". The vault is UUPS,
+the owner is a 3-of-5 multisig, and total value locked is eight figures.
+
+The build is green. `forge test` passes. The upgrade simulation on a *fresh* local deployment works
+perfectly. Say what will happen if you ship it, and describe the one test that would have told you.
+
+<Answer>
+**What happens.** The upgrade transaction succeeds. From that block on, every v5 library contract
+reads a namespace root your 2023 deployment never wrote, so all of it reads as zero: no owner, no
+paused flag, no roles, and no balances if the accounting lives in an inherited contract. Meanwhile
+your own variables shift down into the range the 4.9 library vacated and read whatever is there.
+
+The failure is not visible in your test suite because your test suite deploys fresh. A fresh v5
+deployment writes v5 slots and reads v5 slots and is perfectly self-consistent. **The bug is not in
+either version; it is in the pair of them applied to one storage trie.** That is why "the build is
+green" carries no information here.
+
+The most likely first symptom is `OwnableUnauthorizedAccount` on the multisig, which means you have
+already lost the ability to upgrade back. Whether the vault is merely frozen or actively wrong
+depends on which of your variables now overlaps what — a distinction that stops mattering once the
+owner is gone.
+
+**The test.** Fork mainnet at head, impersonate the multisig, perform the real upgrade against the
+real proxy, then assert against *existing* state: `owner()` still returns the multisig,
+`totalAssets()` still returns the pre-upgrade number, a known holder's balance is unchanged, and —
+critically — a second upgrade back to the current implementation still succeeds from the multisig.
+That last assertion is what distinguishes "broken" from "broken and unrecoverable". Run it every
+release, against a fork; fresh deployments cannot express this bug.
+
+**And the answer to the ticket.** The gap is not bridgeable by an upgrade. Either stay on the 4.x
+line and take fixes there, or write a v5-shaped implementation that deliberately declares the *old*
+layout, reads the legacy slots, and copies them into the new namespaces as a one-time
+`reinitializer` migration — a bespoke contract audited against the deployed storage layout, not a
+dependency bump. The plugins will refuse the naive upgrade if you use them, and that refusal is the
+correct answer.<Cite src="oz-upgrades-faq" /><Cite src="51nodes-v4-v5-unsafe" />
+</Answer>
+</Check>
+
+## What to do on Monday
+
+- **Treat the deployed storage layout as an input to every release.** `forge inspect Contract
+  storageLayout` gives you the new one, `cast storage` the old one. Diff them against each other,
+  not against your expectations.
+- **Never mix schemes on a live proxy.** Gaps and namespaces are both fine; moving between them on
+  storage that already holds values is what killed the contract above.
+- **Fork-test the upgrade against real state**, including a *round trip* — forward, then back —
+  because that is what tells you the door is still open.
+- **Keep the upgrades plugin in CI**, knowing it is a pre-flight check with no on-chain presence and
+  no repair path.<Cite src="oz-upgrades-faq" />
+- **Record the namespace roots your system depends on** alongside the ERC-1967 slots. They are
+  constants, and they belong in your monitoring.<Cite src="eip-1967" />
+
+## Where this pays off
+
+The string encoding rule is not proxy-specific. Every `bytes` and `string` in storage carries its
+length in the low byte of its slot, so any code that writes a raw slot — inline assembly, a
+migration script, a diamond's storage library — can produce a word no reader can decode. Panic
+`0x22` is the signature of that mistake wherever it appears.<Cite src="solidity-docs-storage-layout" />
+
+The larger habit is more portable still. Three lessons in this module ended on the same shape: a
+check the compiler cannot perform, because the thing being checked lives in a second deployment it
+has never seen. Selector clashes, authorisation state, storage layout — one gap, three symptoms —
+and every tool that closes it is external to the compiler and optional.
+
+Later security modules treat proxies as a class of finding rather than a pattern. The question they
+will ask of any upgradeable system is the one this module has been building toward: not "can this be
+upgraded", but **"who can upgrade it, and what is the exact transaction that makes upgrading
+impossible?"**

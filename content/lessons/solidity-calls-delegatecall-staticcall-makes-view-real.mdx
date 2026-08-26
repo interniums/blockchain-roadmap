@@ -1,0 +1,319 @@
+---
+id: solidity-calls-delegatecall-staticcall-makes-view-real
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    eip-214,
+    eip-1153,
+    solidity-docs-contracts,
+    solidity-docs-global-vars,
+    oz-reentrancy-guard-v570,
+    cyfrin-reentrancy-checklist,
+    eip-2929,
+    measured-gas-constants,
+    sok-root-cause-losses,
+  ]
+stack: { solidity: "0.8.36" }
+---
+
+You write this interface for a contract you did not write and cannot change:
+
+```solidity
+interface IOracle {
+    function price(address asset) external view returns (uint256);
+}
+```
+
+Nothing checked that. The compiler has never seen the oracle's source, has no idea whether `price`
+writes storage, and takes your word for it because there is nothing else to take. `view` here is an
+assertion about someone else's code, made by you, verified by nobody.
+
+And then the compiler does something with it that turns your unverified assertion into a rule the
+oracle cannot break. That inversion is the whole lesson: the annotation you could not justify becomes
+the constraint you can rely on.
+
+## Two different promises with the same keyword
+
+Solidity's `view` means one thing on a function you define and something else on a function you
+declare.
+
+**On a function you define**, it is a compile-time check on your own body. The docs enumerate exactly
+what counts as modifying the state: writing to state variables including transient storage, emitting
+events, creating other contracts, using `selfdestruct`, sending ether via calls, calling any function
+not marked `view` or `pure`, and using inline assembly that contains certain
+opcodes.<Cite src="solidity-docs-contracts" /> That last entry matters — the compiler does analyse
+assembly blocks for state-modifying opcodes, so `view` is not a hole you can walk through by dropping
+into Yul. Getter methods are automatically marked `view`.<Cite src="solidity-docs-contracts" />
+
+**On a function you declare in an interface**, it is a claim about a contract you have not compiled.
+The compiler propagates it into your own mutability analysis — a `view` function of yours may call
+it — and emits a different opcode for it. That is all the checking there is.
+
+The bridge between the two is one documented sentence: if the compiler's EVM target is Byzantium or
+newer, which is the default, the opcode `STATICCALL` is used when `view` functions are called, which
+enforces the state to stay unmodified as part of the EVM execution.<Cite src="solidity-docs-contracts" />
+
+So the mechanism runs in the opposite direction from the one people assume. You are not asking the
+oracle to behave. You are declining to give it the capability. If the deployed `price` does write
+storage, your call reverts — the oracle is broken, loudly, in your transaction — rather than quietly
+mutating state you were not expecting it to touch.
+
+<Aside kind="note">
+Solidity's history here is instructive. Prior to version 0.5.0 the compiler did not use `STATICCALL`
+for `view` functions, which enabled state modifications in view functions through invalid explicit
+type conversions.<Cite src="solidity-docs-contracts" /> For two years the keyword was exactly what
+people still assume it is — a comment the compiler mostly believed. The runtime flag is what made it
+a guarantee.
+</Aside>
+
+## What the flag forbids, and the one entry the EIP does not list
+
+EIP-214 introduces a `STATIC` flag on the virtual machine, initially false, whose value is always
+copied to sub-calls; `STATICCALL` is `CALL` without a value argument, calling the child with the flag
+set to true, and once the call returns the flag is reset to its value before the
+call.<Cite src="eip-214" /> Any attempt to make a state-changing operation inside an execution
+instance with `STATIC` set to true throws an exception instead of performing the modification, and
+the EIP enumerates them: `CREATE`, `CREATE2`, `LOG0` through `LOG4`, `SSTORE`, `SELFDESTRUCT`, and
+`CALL` with a non-zero value — with `CALLCODE` explicitly *not* considered state-changing even with a
+non-zero value.<Cite src="eip-214" />
+
+Read the propagation clause again, because it is the part that makes this useful. There is no opcode
+to clear the flag. Once you are inside a static frame, everything it calls and everything *those*
+contracts call is static too, to arbitrary depth, through contracts the compiler has never seen and
+whose authors never agreed to anything. The EIP states the guarantee it buys plainly: it can be
+safely assumed that the state of all accounts is the same before and after a static
+call.<Cite src="eip-214" />
+
+The list has an omission that has caused real confusion, and it is a dating problem rather than a
+design one. EIP-214 was published in February 2017 and its enumeration predates transient storage
+entirely, so `TSTORE` does not appear in it.<Cite src="eip-214" /><Cite src="eip-1153" /> The Solidity
+documentation settles the question directly: if the `TSTORE` opcode is called within the context of a
+`STATICCALL` it will result in an exception instead of performing the modification, and `TLOAD` is
+allowed within the context of a `STATICCALL`.<Cite src="solidity-docs-contracts" /> At the language
+level the same split appears in the mutability rules — any read access to transient storage is not
+`pure` and writing access is not `view`.<Cite src="solidity-docs-contracts" />
+
+Transient storage is not an escape hatch from a static context. If you see material that reasons
+"EIP-214 lists the forbidden opcodes and `TSTORE` is not among them", you are reading a correct
+observation about a nine-year-old document and an incorrect conclusion about the machine.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'CALL', note: 'a fresh context' },
+    { title: 'DELEGATECALL', note: 'borrowed code' },
+    { title: 'STATICCALL', note: 'a restriction', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'Whose storage can the callee write?', cells: ['Its own', 'The caller, by slot number', 'None — SSTORE and TSTORE throw'] },
+    { label: 'What is address(this) inside the callee?', cells: ['The callee', 'The caller', 'The callee'] },
+    { label: 'Can the frame move value?', cells: ['Yes', 'No, msg.value is propagated rather than sent', 'No — CALL with a non-zero value throws'] },
+    { label: 'Can it log or create?', cells: ['Yes', 'Yes, as the caller', 'No — LOG0 to LOG4, CREATE and CREATE2 throw'] },
+    { label: 'How far does the rule reach?', cells: ['This frame', 'This frame', 'Every frame beneath it, and no opcode clears the flag'] },
+  ]}
+  caption="Two of the three hand the callee a capability; only the third takes one away, and only the third binds contracts the compiler has never seen."
+  alt="CALL, DELEGATECALL and STATICCALL compared on whose storage the callee may write, what address(this) holds, whether value can move, whether logging and contract creation are allowed, and how far each rule propagates."
+/>
+
+## The exception with teeth: library `view` functions
+
+There is one place where Solidity emits a `view` call and the runtime guarantee is simply absent, and
+it is not obscure — it is every library you use.
+
+For library `view` functions `DELEGATECALL` is used, because there is no combined `DELEGATECALL` and
+`STATICCALL`; this means library view functions do not have run-time checks that prevent state
+modifications.<Cite src="solidity-docs-contracts" /> The docs offer a reason: this should not impact
+security negatively because library code is usually known at compile time and the static checker
+performs compile-time checks.<Cite src="solidity-docs-contracts" />
+
+That reasoning is sound and its precondition is doing all the work. "Usually known at compile time"
+holds for a library you compiled from source in your own repository. It stops holding the moment a
+`public` library function is linked to an address supplied at deployment — which is exactly how
+library linking works, and which the last lesson in this module takes apart. A `view` call into a
+library at an address you did not verify is a `DELEGATECALL` into your own storage with no runtime
+restriction whatsoever.
+
+<Misconception
+  belief="Marking a function view means the EVM will stop it from writing."
+  reality="The EVM stops it when the call is a STATICCALL. Calls to library view functions compile to DELEGATECALL and have no runtime check at all, and an internal call to a view function is a JUMP with no check either."
+  why="The keyword is the same in all three cases, and the two cases with no enforcement are the ones people write most often."
+  src="solidity-docs-contracts"
+/>
+
+The general form of that misconception is worth stating on its own. **Enforcement exists only across
+a message call.** A `view` function invoked internally is a `JUMP`; nothing is checked at runtime
+because nothing needs to be — the compiler already proved the body cannot write. The runtime flag is
+for the case where no proof was possible, which is precisely the case where you needed it.
+
+`pure` gets a weaker version of the same treatment. The docs note that `STATICCALL` is used for it
+too, which does not guarantee that the state is not read, but at least that it is not
+modified.<Cite src="solidity-docs-contracts" /> There is no opcode-level notion of "did not read".
+And reading from an `immutable` variable can be a non-pure operation, which is a small trap in its
+own right.<Cite src="solidity-docs-contracts" />
+
+## What "static" does not mean: the state you read can be a lie
+
+Here is the failure the word invites and the flag does not prevent.
+
+`STATICCALL` guarantees that nothing in the subtree *changes* state. It guarantees nothing about
+whether the state you *read* is meaningful. A view function invoked halfway through another
+function's execution reports the state as it is at that instant — which, in the middle of a
+multi-step update, is a state that satisfies none of the contract's invariants.
+
+**Subgoal — build the vulnerable shape from three ordinary decisions.** A pool holds two reserves and
+issues share tokens. `exit(shares)` burns the caller's shares, sends them their ether, and then
+updates the stored reserves. Each step is defensible: burn first so you cannot double-spend the
+shares, send before the bookkeeping so the ether transfer's failure reverts everything, update
+reserves last because you need the transfer's outcome.
+
+**Subgoal — find the window.** The ether send hands control to the caller. At that instant
+`totalShares` has already been reduced and `reserves` has not. Any function computing
+`reserves / totalShares` returns a number that is too large by exactly the fraction just burned.
+
+**Subgoal — name who the victim is, and notice it is not the pool.** The pool has a reentrancy guard
+and it works: the attacker cannot re-enter `exit`. But a *different* contract — a lending market
+pricing collateral — calls `pool.getVirtualPrice()`. That is a `view` function, so it compiles to
+`STATICCALL`, so the pool's guard does not apply to it and the lending market's guard is on a
+different contract entirely. The attacker, inside the callback, borrows against inflated collateral.
+
+<Figure
+  caption="Nothing in this subtree writes state, and every read inside the window sees a pool that has burned shares it has not yet accounted for."
+  alt="The pool burns shares, then sends ether, which hands control to the attacker. Inside that callback the attacker calls a lending market, which staticcalls the pool's virtual-price getter. The getter divides reserves that have not been updated by a share count that has, and returns a price that is too high. Only after the callback returns does the pool update its reserves."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'burn', label: 'burn shares', note: 'totalShares drops', col: 0 },
+      { id: 'send', label: 'send ether', note: 'control leaves the pool', col: 1, tone: 'warn' },
+      { id: 'cb', label: 'attacker callback', note: 'the window is open', col: 2, tone: 'danger' },
+      { id: 'mkt', label: 'lending market', note: 'prices the collateral', col: 3 },
+      { id: 'vp', label: 'getVirtualPrice()', note: 'a STATICCALL back into the pool', col: 4, tone: 'accent' },
+      { id: 'bad', label: 'reserves / totalShares', note: 'high by the burned fraction', col: 5, tone: 'danger' },
+      { id: 'upd', label: 'reserves updated', note: 'after the callback returns', col: 6, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+**Subgoal — check what the flag actually delivered.** It delivered exactly what it promised. No state
+was modified in the static subtree. The lending market's own storage was written by the lending
+market, in its own frame, on the basis of a number it was correct to trust the *shape* of and wrong
+to trust the *timing* of. This class — a `view` getter queried mid-callback while an invariant is
+temporarily broken — survives checks-effects-interactions and survives a mutex on the reading
+function.<Cite src="cyfrin-reentrancy-checklist" />
+
+The defence has to be on the *reading* path, and the standard library now ships it.
+OpenZeppelin's `ReentrancyGuard` exposes `_reentrancyGuardEntered()`, documented as returning true
+when there is a `nonReentrant` function in the call stack, along with a `nonReentrantView` modifier
+that reverts when the guard is held.<Cite src="oz-reentrancy-guard-v570" /> Applied to
+`getVirtualPrice`, the getter refuses to answer while the pool is mid-update, and the lending market
+gets a revert instead of a wrong number.
+
+<Aside kind="warn">
+Two current facts worth carrying about that guard. OpenZeppelin's storage-based `ReentrancyGuard`
+carries an explicit deprecation notice in the 5.7.0 source: it will be removed and replaced by the
+`ReentrancyGuardTransient` variant in v6.0.<Cite src="oz-reentrancy-guard-v570" /> And the cost
+difference between the two is smaller than the numbers in circulation suggest. Measured on forge
+1.7.1 and solc 0.8.36 with the optimizer off, the transient guard adds a flat ~284 gas of overhead
+while the storage guard's overhead is cold-or-warm dependent and ranges from about 3,100 to about
+7,100 — the low end measured directly at 3,104 on an already-warm
+slot.<Cite src="measured-gas-constants" /><Cite src="eip-1153" /> The widely repeated "7,100 versus
+200" pairing compares a cold storage slot against transient storage and overstates the ratio.
+</Aside>
+
+## The low-level form, and what it costs
+
+`addr.staticcall(bytes memory)` issues a low-level `STATICCALL` and returns a success condition and
+return data, forwarding all available gas subject to additional limits imposed by some EVM
+versions.<Cite src="solidity-docs-global-vars" /> It is the escape hatch for probing a contract whose
+interface you are not willing to declare, and it carries the same caveat as its siblings: no type
+checking, no function existence check, no argument packing.<Cite src="solidity-docs-global-vars" />
+
+One behavioural detail is worth predicting before you meet it. If the callee attempts a forbidden
+operation, it does not fail at compile time and it does not fail at your call site with a special
+error. The callee's frame throws, which surfaces to you as `success == false` with whatever revert
+data the exception produced — often none. So "this contract lied about being `view`" and "this
+contract reverted for its own reasons" are the same observation from outside.
+
+On cost, `STATICCALL` is in EIP-2929's `*CALL` family and pays the same account-access
+tiers as the others: 2,600 gas for an address not yet in the transaction's accessed set, 100
+afterwards.<Cite src="eip-2929" /><Cite src="measured-gas-constants" /> The flag itself is free —
+it is a bit on the frame, not an operation. As with every call instruction, the total charge layers
+the account access on top of the instruction's own price under the current EVM revision, and this
+corpus has deliberately not published a single number for that total.
+
+<Check type="predict" concept="staticcall-is-the-enforcement">
+A vault reads a price from an oracle it does not control, through this interface:
+
+```solidity
+interface IOracle {
+    function price(address asset) external view returns (uint256);
+}
+```
+
+The deployed oracle's `price` function is not `view` in its own source — it caches the latest answer
+in storage on every read.
+
+Answer three things. First: does the vault compile? Second: what happens at runtime when the vault
+calls `price`? Third: how does the answer change if the vault instead declares `IOracle.price` as
+non-view and assigns its result to a local variable?
+
+<Answer>
+**One: yes, it compiles, and it compiles without a warning.**
+
+The compiler type-checks the vault against the interface the vault declared. It has no access to the
+oracle's source, no way to fetch its bytecode, and no mechanism for verifying a mutability annotation
+against a deployed account. The declaration is an assertion, and the compiler's only job is to be
+consistent with it.
+
+**Two: at runtime the call reverts, in the oracle's frame, and the vault sees a failed call.**
+
+The `view` annotation caused the compiler to emit `STATICCALL`.<Cite src="solidity-docs-contracts" />
+The oracle's caching `SSTORE` executes inside a frame with the `STATIC` flag set, which throws
+instead of performing the modification.<Cite src="eip-214" /> The vault's typed call auto-reverts on
+the failure, so the vault's transaction fails.
+
+This is the good outcome and it is worth being explicit about why. The vault made an unverifiable
+claim; the machine converted that claim into a restriction; the restriction was violated; everything
+stopped. Nothing silently succeeded with a stale price and nothing silently wrote to storage the
+vault did not know about. A wrong `view` annotation on an interface is a liveness problem, not a
+safety problem — which is the direction you want an unverifiable assumption to fail in.
+
+**Three: declaring it non-view makes the call work, and moves the risk into the vault.**
+
+Now the compiler emits an ordinary `CALL`. The oracle's `SSTORE` succeeds. The vault gets its price
+and the whole flow works — and the vault has just given an unaudited contract the ability to write
+state and, more to the point, to *call back into the vault* mid-function. Every function that
+declared itself `view` and transitively reaches this call must also lose its `view` annotation,
+which propagates outward through the vault's own API and is usually the first sign that something has
+changed.
+
+**The design decision hiding in the third answer.** Both spellings are legitimate; they buy different
+things. `view` buys you a hard guarantee about a subtree at the cost of refusing to integrate with
+oracles that write. Non-`view` buys integration at the cost of putting an untrusted callee inside
+your control flow, where checks-effects-interactions and a reentrancy guard are now load-bearing
+rather than decorative. What you must not do is declare `view` because it is more convenient and then
+reason about the call as though it were the non-`view` version, or the reverse — the annotation is
+not documentation, it selects an opcode.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next:** the low-level forms return a boolean and a byte string. This lesson relied on typed calls
+auto-reverting; the next one is about what happens when nothing auto-reverts, what the callee's error
+bytes look like, and how to put them back on the wire so a user sees the real reason.
+
+**In the security track**, read-only reentrancy gets a full treatment with catalogued incidents. What
+this lesson gives you is the reason it is a distinct class rather than a variation: the mechanism that
+prevents state-changing reentrancy in a subtree does not, and cannot, say anything about whether the
+state being read is mid-update. Access-control and accounting failures dominate the loss-by-value
+data, and a getter that reports a broken invariant to a contract that trusts it belongs to that
+family.<Cite src="sok-root-cause-losses" />
+
+**And a review habit.** When you meet a `view` function on a contract that holds money, ask what its
+value would be if it were called from inside one of that contract's own external calls. If the answer
+is "wrong", either the getter needs a guard or the caller needs to stop trusting it — and the choice
+is architectural, not a matter of adding one more modifier.

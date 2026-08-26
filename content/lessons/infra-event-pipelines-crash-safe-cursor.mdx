@@ -1,0 +1,375 @@
+---
+id: infra-event-pipelines-crash-safe-cursor
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [postgres-transactions, postgres-insert, postgres-srf, ponder-indexing-overview, ponder-config-reference, bilinear-indexing-events, quicknode-streams-reorgs, execution-apis-block-tags, envio-reorgs, alchemy-notify-webhooks]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The deploy went out at 16:03. The orchestrator sent `SIGTERM`, the ingester ignored it because nobody
+had wired a handler, and thirty seconds later it got `SIGKILL` in the middle of writing chunk
+19,204,000–19,205,000. The new pod came up, read the cursor, and started from 19,205,000.
+
+Six weeks later somebody noticed that a treasury report was missing four transfers. All four were in
+blocks 19,204,411 through 19,204,780. Nothing else in the system had ever been wrong.
+
+The ingester had two statements at the end of every chunk:
+
+```sql
+COMMIT;                                  -- the rows
+UPDATE ingest_cursor SET last_block = 19205000;   -- the progress
+```
+
+`SIGKILL` landed between them in the other direction from the one everybody assumes. The cursor had
+been updated by the *previous* chunk's code path in a way that ran ahead of the rows, and the range in
+between was never requested by anything again, because nothing in the system was looking backwards.
+
+**A cursor written in a different transaction from the rows it describes has two failure windows, and
+one of them is permanent.** This lesson closes both, in one clause, and then deals with the harder
+version: what the cursor even means when eight workers are writing out of order.
+
+## The two windows, drawn precisely
+
+Call the rows R and the cursor C. If they commit separately, a crash can land in one of two places.
+
+**Window 1 — crash after R, before C.** On restart you re-process the range. Every row is written
+again. If your write is idempotent on the natural key, this costs one chunk's worth of time and
+nothing else; the second insert finds the rows present and does nothing.<Cite src="postgres-insert" />
+If your write is not idempotent, you double-count. Either way, **you can detect it**: the data is
+either identical or visibly doubled.
+
+**Window 2 — crash after C, before R.** On restart you resume from a cursor that claims a range is
+done, and the rows for that range do not exist. Nothing will ever revisit it. No duplicate appears, no
+error is logged, no counter increments. The only symptom is absence.
+
+<Aside kind="warn">
+The two windows are not symmetric and should not be reasoned about as "the same bug in two
+directions". Window 1 degrades to a no-op the moment your writes are idempotent. Window 2 is
+unrecoverable by any amount of downstream correctness, because the data was never fetched. Every
+design decision in this lesson is about eliminating window 2 specifically.
+</Aside>
+
+<Compare
+  columns={[
+    { title: 'Window 1', note: 'crash after the rows, before the cursor' },
+    { title: 'Window 2', note: 'crash after the cursor, before the rows', tone: 'danger' },
+  ]}
+  rows={[
+    { label: 'What does the restart do?', cells: ['Re-processes the range', 'Resumes past a range nobody wrote'] },
+    { label: 'What appears in the table?', cells: ['The same rows, written again', 'Nothing at all'] },
+    { label: 'Does idempotency neutralise it?', cells: [{ v: 'Yes — the second insert finds the rows present', tone: 'good' }, { v: 'No', tone: 'danger' }] },
+    { label: 'Can you detect it afterwards?', cells: ['Yes — the data is identical or visibly doubled', { v: 'No — the only symptom is absence', tone: 'danger' }] },
+  ]}
+  caption="Both windows exist only because two writes were allowed to commit separately."
+  alt="The crash-after-rows and crash-after-cursor windows compared on what the restart does, what appears in the table, whether idempotency neutralises it, and whether it is detectable afterwards."
+/>
+
+### Why "just update the cursor last" does not fix it
+
+The obvious patch is to order the two statements so the cursor always goes second. That removes window
+2 and leaves window 1, which idempotency handles — so it seems complete.
+
+It is not, because the two statements are not the only writers. A retry path, a manual backfill script,
+a catch-up branch and the live tailer all touch the same cursor row, and "last" is then a property of
+one code path rather than of the system. The four missing transfers in the opening scene came from
+exactly this: a catch-up branch that set the cursor to the head it had just observed, before its own
+fetch returned.
+
+## The fix is one transaction
+
+PostgreSQL's documentation puts the guarantee in one sentence: the essential point of a transaction is
+that it bundles multiple steps into a single, all-or-nothing operation, and if some failure occurs
+that prevents the transaction from completing, then none of the steps affect the database at
+all.<Cite src="postgres-transactions" />
+
+```sql
+BEGIN;
+
+INSERT INTO transfer_event (chain_id, block_number, transaction_index, log_index, ...)
+VALUES (...), (...), (...)
+ON CONFLICT (chain_id, block_number, transaction_index, log_index) DO NOTHING;
+
+UPDATE ingest_cursor
+   SET last_block = 19205000, updated_at = now()
+ WHERE chain_id = 1 AND last_block = 19204000;   -- optimistic guard
+
+COMMIT;
+```
+
+Three things are doing work here, and it is worth naming each.
+
+**Subgoal: make the two writes indivisible, so no crash can observe one without the other.** That is
+the `BEGIN`/`COMMIT` pair, and it is the whole fix for both
+windows.<Cite src="postgres-transactions" /> After this, a crash either leaves both applied or neither,
+and "neither" resumes correctly from the previous cursor.
+
+**Subgoal: make the cursor advance conditional, so two writers cannot both win.** The
+`WHERE ... last_block = 19204000` clause turns the update into a compare-and-set. If another process
+already moved the cursor, the update affects zero rows, and your code checks the row count and treats
+zero as "somebody else owns this range" rather than as success. Without it, the transaction is atomic
+and still races.
+
+**Subgoal: make the whole thing free to repeat.** The insert is idempotent on the natural key and the
+guarded update is idempotent by construction, so re-running the transaction is a no-op — which is why
+the previous lesson had to come first.
+
+The cost of all this is zero. The rows and the cursor were already writes to the same database. You
+are not adding a system; you are deleting a boundary.
+
+<Figure
+  caption="Once the two writes are indivisible, the rewind stops being a recovery path and becomes the ordinary way the loop closes."
+  alt="Fetching a chunk leads either to one transaction that commits the rows and the cursor together and on to the next chunk, or to a SIGKILL that lands mid-transaction, from which the process resumes at the last committed cursor and re-runs the same chunk."
+>
+  <Flow
+    lanes={['fetch', 'commit', 'advance']}
+    nodes={[
+      { id: 'read', label: 'fetch chunk', note: 'from the cursor + 1', col: 0 },
+      { id: 'txn', label: 'rows + cursor', note: 'one BEGIN / COMMIT', col: 1, tone: 'accent' },
+      { id: 'kill', label: 'SIGKILL', note: 'neither write lands', col: 1, tone: 'warn', dashed: true },
+      { id: 'next', label: 'next chunk', note: 'the cursor moved', col: 2, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'read', to: 'txn' },
+      { from: 'txn', to: 'next' },
+      { from: 'read', to: 'kill', dashed: true, tone: 'warn' },
+      { from: 'kill', to: 'read', label: 'resume at last cursor', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="Committing the cursor separately is fine as long as the pipeline is idempotent."
+  reality="Idempotency neutralises the crash-after-rows window. It does nothing for the crash-after-cursor window, which produces a permanent gap that no replay will visit because nothing believes the range is missing."
+  why="Idempotency is discussed as the answer to 'what if I process something twice', which is the visible failure. The invisible failure is processing something zero times, and no amount of upsert helps with that."
+  src="postgres-transactions"
+/>
+
+### When the rows and the cursor genuinely cannot share a transaction
+
+Sometimes the rows land somewhere without transactions — object storage, a warehouse, a queue. Two
+honest options, and one non-option.
+
+**Option A: move the cursor into the destination.** If the destination can store a row, store the
+cursor there, in the same commit as the data. This is usually possible and usually resisted for
+aesthetic reasons.
+
+**Option B: make the destination's own key the cursor.** If the destination is content-addressed by
+range — one object per block range, named by the range — then "what have I written" is answerable by
+listing, and the separate cursor disappears. QuickNode's guidance for object-storage destinations has
+this shape: without versioning, files for re-streamed blocks overwrite with the most recent data, and
+with versioning you watch for size discrepancies indicating a reorg
+correction.<Cite src="quicknode-streams-reorgs" />
+
+**The non-option: a cursor in Redis and rows in Postgres.** This is the arrangement that produces the
+opening scene, and it produces it reliably, because the two stores fail independently and neither
+knows about the other's commit.
+
+### The cursor you do not own
+
+If your ingester is a webhook receiver rather than a fetcher, you have no cursor — the sender has one,
+and you cannot see it. That changes the shape of the problem in two ways worth naming.
+
+**Your acknowledgement is the cursor.** Alchemy's webhook documentation describes retry logic with
+exponential backoff for non-200 response codes when it fails to reach your server, backing off up to
+10 minutes for Free and Pay-As-You-Go teams and up to 1 hour for
+Enterprise.<Cite src="alchemy-notify-webhooks" /> So the HTTP status you return *is* the commit. The
+rule follows immediately: **return 200 only after the transaction that wrote the rows has committed**,
+never before, and never from a handler that queues the work for later.
+
+**You cannot ask for a range you missed.** A fetcher that falls behind catches up by widening a query.
+A webhook receiver that was down during the sender's retry budget has no equivalent move, and the
+events are simply gone from that channel. This is the single strongest argument for treating push
+delivery as an optimisation over a pull-based backfill rather than as the pipeline itself: Alchemy
+notes that first-time webhook notifications are delivered in
+order<Cite src="alchemy-notify-webhooks" />, which is a useful property and not the same thing as a
+guarantee you can reconstruct from.
+
+**Streams are the same story with better tools.** QuickNode's Streams expose the sequence structurally:
+a `batch_start_range` that is not sequentially increasing relative to the previously processed
+`batch_end_range` is the signal that re-streaming is in progress, and their guidance is to treat the
+overlapping data as a correction and overwrite the existing records for that block
+range.<Cite src="quicknode-streams-reorgs" /> That is a cursor — it is just being maintained by you,
+from a field in someone else's payload.
+
+## The harder half: what the cursor means under parallelism
+
+Backfill runs eight workers. Worker 3 finishes blocks 19,206,000–19,207,000 while worker 1 is still
+grinding through 19,204,000–19,205,000. Bilinear's write-up names this directly: parallel tasks can
+terminate in a different order than they were issued, and you have to decide what to do about
+it.<Cite src="bilinear-indexing-events" />
+
+The resolution has two halves, and separating them is the insight.
+
+**Raw rows may land in any order.** They carry their own position in their key, so a row written early
+is not a claim about anything else. There is no correctness reason to serialise the writes.
+
+**The cursor may not.** A single number that means "everything below this is present" cannot be
+advanced by whichever worker finished most recently. Advancing it to 19,207,000 while worker 1 is
+still running asserts something false about a range nobody has written.
+
+### Contiguity is the gate, not completion
+
+Track *ranges*, not a scalar:
+
+```sql
+CREATE TABLE ingest_range (
+  chain_id     integer NOT NULL,
+  start_block  bigint  NOT NULL,
+  end_block    bigint  NOT NULL,   -- inclusive, and only inserted on success
+  PRIMARY KEY (chain_id, start_block)
+);
+```
+
+Each worker inserts its completed range **in the same transaction as its rows**. The cursor is then
+derived rather than stored: it is the largest block *N* such that every block from the pipeline's start
+to *N* is covered by some completed range. That is a query, not a variable, which means it cannot drift
+from reality and cannot be advanced by a well-meaning script.
+
+The starting edge of that range is a decision too, and it is worth getting from the deployment rather
+than from block zero. Ponder exposes it as per-contract configuration — `startBlock` defaults to 0 and
+is usually set to the contract's deployment block, and `endBlock` bounds the range, with the documented
+consequence that a contract with an `endBlock` set is not indexed in realtime at
+all.<Cite src="ponder-config-reference" /> That last clause is the framework drawing exactly the line
+this lesson draws: a bounded range and an open one are different jobs, and the cursor means something
+different in each.
+
+**Subgoal: make "is anything missing" a query you can run rather than a belief you hold.** With ranges
+recorded, the gap check falls out of the same table, using PostgreSQL's `generate_series`, which
+generates a series of values from start to stop with a step defaulting to
+1.<Cite src="postgres-srf" /> Expand the expected block numbers, subtract the covered ones, and look
+at what remains. On a healthy pipeline it returns zero rows — which is the property you want from
+every invariant check, and the subject of the last lesson in this module.
+
+### Why order matters downstream even though rows do not care
+
+Any consumer that maintains a state machine — a position, a balance, a vault share price, an auction —
+must apply events in canonical order, because applying them in a different order produces a different
+answer. Ponder's engine states the order it guarantees per chain explicitly: EVM execution order, by
+block number, transaction index and log index.<Cite src="ponder-indexing-overview" /> That is the order
+your fold has to see.
+
+So the rule is asymmetric in a way that is easy to get backwards:
+
+- **Ingestion of raw facts:** unordered, parallel, idempotent. Order is recovered from the key when
+  you read.
+- **Derivation and downstream emission:** strictly ordered, and gated on the ingested range below the
+  point being contiguous.
+
+**Emit nothing derived for block *N* until every block up to *N* is present.** Not "until the workers
+finish" — a worker finishing tells you about one range. Contiguity tells you about the prefix, which is
+the only thing a fold can consume.
+
+<Aside kind="note">
+This is also the cleanest reason to keep raw event rows at all, rather than only derived state. A raw
+table lets derivation be a pure function of a contiguous prefix, recomputable at any time. Frameworks
+make the same trade internally: Ponder keeps a trigger-based transaction log of every change so it can
+roll the database back to a common ancestor rather than reasoning about which derived values were
+affected.<Cite src="ponder-indexing-overview" />
+</Aside>
+
+## What the frameworks do, and what they do not do for you
+
+Ponder's crash recovery is a specific and instructive shape: if the process crashes and restarts with
+the same exact configuration, the engine rolls back *all* unfinalized changes — the entire transaction
+log — and then resumes indexing from the finalized block.<Cite src="ponder-indexing-overview" /> Note
+what that costs and what it buys. It discards work, sometimes a lot of it. In exchange it never has to
+reason about a partially-applied unfinalized range, because there is no such state to reason about.
+
+That is a stronger guarantee than the cursor pattern above, and it is available to you too: **on
+restart, throw away everything above the finalized block and re-fetch it.** The finalized boundary is
+directly available — the spec defines `finalized` as the most recent crypto-economically secure block
+that cannot be re-orged outside of manual intervention driven by community
+coordination<Cite src="execution-apis-block-tags" /> — and re-fetching a few minutes of blocks costs a
+few minutes of blocks.
+
+Envio takes the parallel approach: reorg handling is enabled by default, and the rollback covers all
+entities defined in your schema and all data your handlers read or write to the
+database.<Cite src="envio-reorgs" /> Same principle: the framework owns a rollback boundary, and
+everything inside it is recoverable.
+
+What neither does is manage a cursor for a destination you write to yourself from inside a handler. If
+your handler pushes to a queue, calls an API, or writes to a second database, that write is outside the
+rollback boundary — Envio's documentation lists side effects in handler code such as API calls and
+external services under what is explicitly **not** rolled back.<Cite src="envio-reorgs" /> Your cursor
+discipline has to extend to that destination or it does not cover your pipeline.
+
+<Check type="spot-bug" concept="cursor-checkpointing">
+A team fixes their gap bug by putting the rows and the cursor in one transaction. Their live tailer
+now looks like this, running every twelve seconds:
+
+```ts
+// viem 2.x
+const head = await client.getBlockNumber();
+const from = (await readCursor()) + 1n;
+const logs = await client.getLogs({ address, event, fromBlock: from, toBlock: head });
+
+await db.transaction(async (tx) => {
+  await tx.insertLogs(logs);                 // ON CONFLICT DO NOTHING on the natural key
+  await tx.setCursor(head);                  // same transaction
+});
+```
+
+The transaction is genuinely atomic and the insert is genuinely idempotent. Rows still go missing
+during incidents. Where, and what is the fix?
+
+<Answer>
+**The bug is that `head` is read from a different source than the rows, at a different moment.**
+`getBlockNumber()` returns the client's current `latest`, and the spec is explicit that `latest` may be
+re-orged out of the canonical chain even under healthy conditions.<Cite src="execution-apis-block-tags" />
+Three concrete failures follow, and only the first is about reorgs.
+
+**Failure 1 — the cursor records a block the logs query never covered.** If the provider is behind a
+load balancer, the node answering `getBlockNumber` and the node answering `getLogs` need not be the
+same node at the same height. You can be told the head is *N*, ask for logs up to *N*, and be served by
+a node that has only reached *N−2*. The transaction then atomically commits an empty result and a
+cursor of *N*. Blocks *N−1* and *N* are now permanently behind the cursor. This is window 2 rebuilt
+inside a single transaction — atomicity guarantees both writes land together, not that they agree.
+
+**Failure 2 — the cursor advances past blocks that later stop existing.** Even on one consistent node,
+committing a cursor at the tip means the rows for the top blocks came from a branch that can be
+replaced. The transaction was atomic about a claim that was true at read time and false afterwards.
+
+**The fix has three parts, in order of importance.**
+
+1. **Never advance the cursor to a block you have not proven you consumed.** Derive the cursor from the
+   fetched range — the `toBlock` you actually requested and whose response you actually validated —
+   rather than from a separately-read head. If the response is empty, that is fine; what is not fine is
+   a cursor sourced from a different call.
+2. **Keep a lag below the tip, chosen deliberately.** Bilinear lays out the options directly: index two
+   or three blocks behind the head for roughly a thirty-second delay and a much lower reorg chance, or
+   index only finalized blocks for a delay of around thirteen minutes and a very high
+   guarantee.<Cite src="bilinear-indexing-events" /> A tailer that writes rows at `latest` and a cursor
+   at `latest` has chosen zero lag by accident.
+3. **Verify continuity across polls.** Record the block hash at the cursor and check that the next
+   block's parent hash matches it — the same detection signal Streams uses to identify a
+   reorg.<Cite src="quicknode-streams-reorgs" /> Bilinear makes the same recommendation from the client
+   side: constantly verify that the next block is the previous one plus
+   one.<Cite src="bilinear-indexing-events" />
+
+**The general lesson.** Atomicity makes two writes agree with each other. It does not make either of
+them true. A cursor is a claim about what you consumed, so it must be derived from the consumption,
+never from a second observation of the world.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You now have a pipeline that survives being killed at any instant and resumes with the same table
+contents. That is the precondition for the next three lessons, which are all about the chain changing
+underneath you — and none of their remedies work on a pipeline whose own restart behaviour is
+uncertain.
+
+- **Reorg handling** is "roll back to a block and re-run from there", which is only meaningful if
+  re-running from a block is already a safe operation. It is, now.
+- **The finality gate** is a second cursor, advanced by a different rule, over the same rows. Adding it
+  is cheap once the first cursor is honest.
+- **Re-backfill** is running the bounded job again while the unbounded one keeps going. The range table
+  is what lets both write without fighting.
+- **Gap detection** is the query you can now write, because you recorded ranges rather than a scalar.
+
+The thing worth doing this week is the practice this module ends with: kill your ingester with
+`SIGKILL` at twenty random points during a backfill, restart it each time, and diff the final table
+against an uninterrupted run. If the two differ by even one row, you have found the boundary this
+lesson is about — and unlike the treasury report, you found it in an afternoon.

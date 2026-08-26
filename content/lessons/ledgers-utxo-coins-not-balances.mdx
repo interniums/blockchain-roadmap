@@ -1,0 +1,276 @@
+---
+id: ledgers-utxo-coins-not-balances
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [ethereum-whitepaper, bitcoin-whitepaper, bitcoin-devguide-transactions, bitcoin-devguide-block-chain, bitcoin-programming-survey, bitcoin-utxo-deep-dive, utxo-debt-representation, extended-utxo-model]
+stack: {}
+---
+
+Every ledger you have shipped has the same thing at its centre. A row per party, a number in it, and
+a transfer that reads
+
+```sql
+UPDATE accounts SET balance = balance - :amt WHERE id = :from;
+UPDATE accounts SET balance = balance + :amt WHERE id = :to;
+```
+
+inside a transaction that holds a lock on both rows. The correctness argument for the entire system
+is "that row is locked while I decrement it". Every other design decision — idempotency keys, the
+outbox, the reconciliation job — exists to protect that one statement.
+
+Now write the integration test you would write for a payment: send 0.3, assert that the sender's
+balance dropped by 0.3 plus fee. On Bitcoin that test cannot be written, because there is no field
+to read on either side of the subtraction. There is no row. There is no `balance` anywhere in the
+protocol, and there is no operation that decrements anything.
+
+This is not a missing feature. It is a second, complete answer to the question "what is a ledger",
+and the point of this module is to hold it in your head alongside Ethereum's so that the account
+model stops looking inevitable.
+
+## The state is a set
+
+Start with what the validating node actually keeps. Ethereum's world state is a map — you have
+already spent a module on it, on [key-value-state](/c/key-value-state) and the commitment that hangs
+over it. Bitcoin's state is a **set**: the collection of transaction outputs that have been created
+and not yet consumed.<Cite src="ethereum-whitepaper" />
+
+The developer guide says the same thing from the other end. Every output ever created is in exactly
+one of two categories — spent, or unspent — and only unspent ones may be used as inputs to a new
+payment.<Cite src="bitcoin-devguide-block-chain" /> The unspent ones are the **UTXO set**, and the
+UTXO set is the whole of the ledger state. Nothing else is stored.
+
+Each entry carries two things: an amount, and a condition under which it may later be
+consumed.<Cite src="bitcoin-devguide-transactions" /> The next lesson is entirely about that
+condition. For now, treat it as an opaque predicate — "whoever can satisfy this may spend this
+output".
+
+A transaction is a list of inputs and a list of outputs. Each input names one existing entry in the
+set, by the transaction identifier that created it and the position of that output within that
+transaction — commonly written `txid:vout`.<Cite src="bitcoin-devguide-transactions" /> Each output
+is a new entry: an amount plus a predicate.
+
+The Ethereum whitepaper, of all documents, gives the cleanest statement of the transition function,
+because it needed to define Bitcoin precisely before arguing against it. Applying a transaction to
+the state means: for each input, reject if the referenced output is not in the set; reject if the
+supplied data does not satisfy that output's owner condition; reject if the inputs sum to less than
+the outputs; otherwise remove every consumed entry and insert every created one.<Cite src="ethereum-whitepaper" />
+
+<Figure
+  caption="A transaction does not update the set. It names entries to delete and supplies entries to insert."
+  alt="The UTXO set on the left feeds a transaction. The transaction's inputs each name one existing entry by txid and index; its outputs are new entries, each an amount plus a predicate. The named entries are removed from the set and the new ones inserted, producing the set that follows."
+>
+  <Flow
+    lanes={['state', 'the transaction', 'state']}
+    nodes={[
+      { id: 'set', label: 'UTXO set', note: 'every output not yet consumed', col: 0, tone: 'accent' },
+      { id: 'in', label: 'inputs', note: 'each names one txid:vout', col: 1 },
+      { id: 'out', label: 'outputs', note: 'each an amount + a predicate', col: 1 },
+      { id: 'next', label: 'the set after', note: 'named entries gone, new ones in', col: 2, tone: 'accent' },
+    ]}
+    edges={[
+      { from: 'set', to: 'in', label: 'must be in it' },
+      { from: 'in', to: 'next', label: 'removed' },
+      { from: 'out', to: 'next', label: 'inserted' },
+    ]}
+  />
+</Figure>
+
+Read that list again with a systems eye. **Every check is local to the transaction.** There is no
+lookup keyed by identity, no read of a running total, no state that the transaction touches without
+naming. That property is the whole module in one line, and lesson three collects the consequences.
+
+## An output is atomic
+
+Here is where intuition fights back hardest.
+
+You cannot spend part of an output. The survey literature puts it plainly: once created, a UTXO is
+indivisible "just like a coin that cannot be cut in half", and if it is larger than the amount you
+want to pay, it must still be consumed in its entirety.<Cite src="bitcoin-programming-survey" />
+There is no partial-consumption operation anywhere in the protocol. Value moves only by destroying
+whole outputs and creating new ones.
+
+<Misconception
+  belief="A UTXO is like a coin in your wallet — you spend part of it and keep the rest."
+  reality="You cannot spend part of one. To pay 3 from an output worth 10 you consume the whole 10 and create two new outputs: 3 to the payee and 7 back to a key you control."
+  why="The word 'coin' imports the idea of making change from a purse. The correct analogy is making change at the mint: the old note is destroyed and two new ones are printed, one of which happens to be yours."
+  src="bitcoin-utxo-deep-dive"
+/>
+
+This is why the whitepaper's own description of a normal payment has **two** outputs: one for the
+payment, and one returning the change, if any, back to the sender.<Cite src="bitcoin-whitepaper" />
+Change is not an accounting convenience. It is structurally forced by the indivisibility of outputs,
+and it is present in almost every real transaction.<Cite src="bitcoin-programming-survey" />
+
+## Worked example: paying 0.35 from a wallet holding 0.2 and 0.25
+
+Run it once concretely. Your wallet controls two outputs, worth 0.2 and 0.25. You owe someone 0.35.
+
+**Subgoal one — find a set of outputs that covers the payment.** Not "check that the balance is
+enough". You must choose *which* entries to destroy. 0.2 alone does not cover 0.35, so you take
+both. Choosing badly here is a real cost, and we come back to it below.
+
+**Subgoal two — name the exact prior outputs.** Each input is a pointer: the txid of the earlier
+transaction and the index of the output within it. The transaction now declares, before anyone
+executes anything, precisely which two entries it intends to remove from the set.
+
+**Subgoal three — construct the outputs.** One output of 0.35 with the payee's condition on it. One
+output back to a condition you control, for the remainder. The remainder is 0.45 minus 0.35 = 0.1,
+minus whatever you decide to leave behind as fee.
+
+**Subgoal four — do not write the fee down.** There is no fee field. You set the fee by making the
+outputs sum to less than the inputs; the miner who includes the transaction may claim the
+difference.<Cite src="bitcoin-devguide-block-chain" /> If you want a fee of 0.001, your change output
+is 0.099.
+
+The result, as a diff on the set:
+
+<Figure
+  caption="Paying 0.35 destroys 0.45. The inputs are consumed whole and the remainder comes back as a new entry."
+  alt="Two prior outputs, worth 0.20 and 0.25, are consumed whole by transaction txC, which creates one output of 0.35 to the payee and one of 0.099 back to the sender. Inputs total 0.45, outputs total 0.449, and the 0.001 difference is the fee."
+>
+  <Flow
+    lanes={['consumed', 'txC', 'created']}
+    nodes={[
+      { id: 'a', label: '(txA, 1)  0.20', col: 0 },
+      { id: 'b', label: '(txB, 0)  0.25', col: 0 },
+      { id: 'tx', label: 'in 0.45, out 0.449', note: 'the 0.001 gap is the fee', col: 1, tone: 'accent' },
+      { id: 'p', label: '(txC, 0)  0.35', note: 'to the payee', col: 2 },
+      { id: 'c', label: '(txC, 1)  0.099', note: 'change, to you', col: 2 },
+    ]}
+    edges={[
+      { from: 'a', to: 'tx' },
+      { from: 'b', to: 'tx' },
+      { from: 'tx', to: 'p' },
+      { from: 'tx', to: 'c' },
+    ]}
+  />
+</Figure>
+
+Two entries out, two entries in. Nobody's total was read; nobody's total was written.
+
+<Misconception
+  belief="The fee is a field in the transaction, the way gas price is."
+  reality="The fee is inputs minus outputs and is never written down anywhere. It is defined by omission."
+  why="Every payment system you have integrated states the fee explicitly, and Ethereum does too — you set a gas limit and a fee cap and read the receipt. Here the number exists only as a subtraction someone else performs."
+  src="bitcoin-devguide-block-chain"
+/>
+
+The failure mode this creates has no analogue in an account ledger: **forget the change output and
+you have paid the whole remainder as fee.** Nothing rejects the transaction — the outputs sum to
+less than the inputs, which is exactly the valid case. A malformed transfer in your Postgres ledger
+throws a constraint violation. A malformed transfer here is a perfectly valid, permanent donation to
+whoever mines the block.
+
+## Coin selection is a product decision you have never had to make
+
+Because inputs are consumed whole, "which outputs do I spend" is a real algorithm sitting inside
+every wallet, and it has consequences your account-model instincts do not predict.
+
+**Fees scale with the size of the transaction, not the amount.** Bitcoin fees are paid per byte of
+the signed transaction, priced by demand for block space.<Cite src="bitcoin-devguide-transactions" />
+Each input carries its own authorising data, so a payment assembled from nine small outputs is a
+physically larger transaction than the same payment made from one large output, and it costs more —
+for the same amount of money moved. In an account ledger, the cost of a transfer is independent of
+how the balance was accumulated. Here it is not.
+
+**Small outputs can cost more to spend than they are worth.** Bitcoin Core's default relay policy
+declines to relay transactions creating outputs below a dust threshold, defined as a fraction of
+what it would cost to spend that output in a typical input; the developer guide gives 546 satoshis
+for a standard output at the node's default relay fee.<Cite src="bitcoin-devguide-transactions" />
+Treat that figure the way you would treat any policy constant: it is a relay rule rather than a
+consensus rule, it is derived from a configurable fee rate, and it moves. The structural point does
+not move — an output smaller than its own future spending cost is economically dead, and a model
+built from discrete chunks has a floor beneath which chunks are not worth creating.
+
+**Your available balance and your spendable balance are different numbers.** If a user holds nine
+outputs of 0.01 and wants to send 0.085, the wallet must consume nine inputs and pay for all nine.
+Whether that is affordable depends on the fee market at that moment. The sum in the display did not
+change; what changed is whether it can be moved.
+
+<Aside kind="note">
+Notice what has happened to a familiar bug class. In the account model, the classic ledger defect is
+a lost update — two concurrent transfers both read a balance of 100, both write 70, and 30 vanishes.
+That defect cannot be expressed here, because no transaction reads or writes a total. The
+corresponding defect is a **double spend**: two transactions each naming the same prior output. It
+is not a race that corrupts a number; it is two transactions competing to remove the same entry from
+a set, and whichever the network orders first wins while the other becomes permanently
+invalid.<Cite src="bitcoin-devguide-block-chain" /> Same underlying problem, moved into a place
+where the protocol can see it.
+</Aside>
+
+## This is a different trade-off, not an earlier draft
+
+Bitcoin came first, which invites reading its model as the prototype that Ethereum improved on. That
+reading is wrong, and the literature that studies both models is explicit about it.
+
+The Extended UTXO work, which set out to make UTXO more expressive, states the position from both
+sides: Ethereum chose the account model deliberately, to support more expressive contracts, and
+Bitcoin chose UTXO also for good reasons — among them that its semantics stay simple in a concurrent
+and distributed setting.<Cite src="extended-utxo-model" /> Two choices, two sets of reasons.
+
+Work on representing debt in UTXO ledgers takes the same line from the other direction. It argues
+UTXO has advantages over the account model in privacy, safety and scalability arising from the
+structure of its transactions, and identifies the specific thing it cannot natively do: represent a
+balance, and therefore a debt, without extending the model.<Cite src="utxo-debt-representation" />
+
+<Misconception
+  belief="UTXO is a more primitive version of the account model — an earlier draft that accounts fixed."
+  reality="It is a different trade-off. It buys locally checkable transactions and replay-resistance by construction, and pays for them with awkward expression of long-lived mutable state — a balance, a debt, a shared pool."
+  why="Chronology reads as progress. Bitcoin shipped in 2009 and Ethereum in 2015, so the later one gets filed as the successor rather than as a different point in the design space."
+  src="utxo-debt-representation"
+/>
+
+Keep both halves. The rest of this module spends one lesson on what the model buys and one on what it
+costs, and the fourth lesson is Ethereum's own written argument for paying that cost.
+
+<Check type="predict" concept="utxo-inputs-outputs">
+A wallet controls exactly three unspent outputs: 0.4, 0.05 and 0.05. The user pays 0.42, and the
+wallet targets a fee of 0.002.
+
+1. How many inputs does the transaction have, and why can it not have fewer?
+2. How many outputs, and what are their amounts?
+3. The user's wallet showed 0.5 before and shows 0.078 after. What single number in the ledger
+   changed from 0.5 to 0.078?
+
+<Answer>
+**1 — two inputs: the 0.4 and one of the 0.05s.** 0.4 alone is short of 0.42. Adding one 0.05 gives
+0.45, which covers the payment plus the fee. It cannot use only the 0.4 because outputs are consumed
+whole and there is no way to top up an input from elsewhere; it need not use all three, because 0.45
+is already sufficient.
+
+**2 — two outputs: 0.42 to the payee and 0.028 back to the sender.** Inputs total 0.45. Outputs must
+total 0.45 minus the fee, so 0.448. The change output is 0.448 minus 0.42 = 0.028. The fee of 0.002
+appears nowhere in the transaction; it is the gap.<Cite src="bitcoin-devguide-block-chain" />
+
+**3 — none. There is no such number.** This is the whole point of the question. Before the payment
+the set contained three entries the wallet could satisfy — 0.4, 0.05, 0.05. Afterwards it contains
+two — 0.05 and the new 0.028. The wallet displayed 0.5 and then 0.078 because it summed those
+entries itself. The protocol never computed either figure and stores neither.<Cite src="bitcoin-devguide-transactions" />
+
+A worthwhile follow-up: what happens if the wallet omits the change output? The transaction is still
+valid, the outputs still sum to less than the inputs, and the fee is 0.03 rather than 0.002. Nothing
+in the protocol flags it, which is why change handling is wallet code that gets tested hard.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** replaces the opaque predicate with a real one. "Whoever can satisfy this" turns
+out to be a small program attached to the output, and ownership stops being an identity and becomes
+a satisfiable condition — which is a genuinely different thing to model in a product.
+
+**Lesson three** collects the consequence of every check being local: no balances to read anywhere,
+a dependency graph that is knowable before execution, and a privacy default that is weaker than its
+reputation.
+
+**Lesson four** is Ethereum's own written case for abandoning this design, which reads very
+differently once you can see what was being abandoned.
+
+Beyond this module, the contrast keeps returning. When you meet the four-field account record and
+[accounts-enable-stateful-contracts](/c/accounts-enable-stateful-contracts), the question worth
+asking is not "how does this work" but "what did the set-of-outputs model make hard enough that this
+was worth building". And when you reach [sealevel](/c/sealevel) on the alternative-VM track, you will
+find a third design that keeps accounts but recovers the property this lesson has been describing:
+transactions that declare everything they touch before they run.

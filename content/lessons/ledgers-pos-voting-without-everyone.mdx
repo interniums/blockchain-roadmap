@@ -1,0 +1,295 @@
+---
+id: ledgers-pos-voting-without-everyone
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [consensus-specs-phase0-beacon-chain, consensus-specs-electra-beacon-chain, consensus-specs-validator, consensus-specs-mainnet-presets, consensus-specs-config-mainnet, consensus-specs-p2p, eip-7549, eth2book-shuffling, eth2book-randomness, eth2book-casper-ffg, ethereum-docs-pos, arxiv-pos-participation, arxiv-low-cost-attacks]
+stack: {}
+---
+
+Take the naive design seriously for a moment, because it is the one everybody pictures: every
+validator votes on every block.
+
+Now price it. The active set is in the hundreds of thousands of records, a slot is twelve seconds, and
+every vote is a signed message that must reach every other participant in time to be counted before
+the next slot begins. That is tens of thousands of signatures per second, each of which must be
+gossiped, verified and stored — forever, because the chain is a permanent record. The design does not
+fail gracefully at scale. It fails immediately.
+
+So Ethereum does not do it. **Each validator votes exactly once per epoch, not once per slot**, and
+the whole apparatus of committees exists to make that arrangement both cheap and safe. This lesson is
+about the message itself, the sampling that schedules it, and the specific security claim the
+sampling rests on.
+
+## One message, three votes
+
+Start with what a validator actually signs. `AttestationData` has five fields: a slot, a committee
+index, a beacon block root, a source checkpoint and a target
+checkpoint.<Cite src="consensus-specs-phase0-beacon-chain" />
+
+Those five fields carry votes for two different consensus mechanisms.
+
+<Figure
+  caption="One signature feeds two consensus mechanisms, which is why a rule written about checkpoints can catch head equivocation."
+  alt="AttestationData splits into three parts: a head vote carrying the beacon block root that feeds LMD GHOST, an FFG vote carrying source and target checkpoints that feeds Casper FFG, and context fields naming the slot and committee."
+>
+  <Tree
+    root={{
+      label: 'AttestationData',
+      tone: 'accent',
+      children: [
+        { label: 'head vote', note: 'LMD GHOST', children: [{ label: 'beacon_block_root' }] },
+        {
+          label: 'FFG vote',
+          note: 'Casper FFG',
+          tone: 'warn',
+          children: [
+            { label: 'source', note: 'justified', tone: 'warn' },
+            { label: 'target', note: 'this epoch', tone: 'warn' },
+          ],
+        },
+        {
+          label: 'context',
+          tone: 'muted',
+          children: [
+            { label: 'slot', note: 'when', tone: 'muted' },
+            { label: 'index', note: 'which committee', tone: 'muted' },
+          ],
+        },
+      ],
+    }}
+  />
+</Figure>
+
+
+
+**The head vote** is `beacon_block_root` — the root of the block the validator's fork choice currently
+considers the head.<Cite src="consensus-specs-validator" /> This is fuel for
+[LMD GHOST](/c/lmd-ghost): it is what decides which chain the network is building on right now.
+
+**The FFG vote** is the `source` and `target` pair. Source is set to the head state's current
+justified checkpoint; target is a checkpoint at the current epoch whose root is the block at the most
+recent epoch boundary.<Cite src="consensus-specs-validator" /> This is fuel for
+[Casper FFG](/c/casper-ffg): it is what justifies and eventually finalises.
+
+One signature, one gossip message, two mechanisms. The economy is the point — the expensive parts of a
+vote are the signature and the network round trip, and bundling means you pay for them once.
+
+But the bundling has a consequence that reaches all the way into the slashing rules, and it is worth
+naming now because it explains something that otherwise looks arbitrary.
+
+**The slashing conditions are written over source and target epochs, not over blocks.** The predicate
+`is_slashable_attestation_data` compares target epochs and source epochs; it never mentions
+`beacon_block_root` directly.<Cite src="consensus-specs-phase0-beacon-chain" /> The reason is that the
+FFG half is the half carrying a finality commitment. A head vote is a best-effort opinion about a
+race that is still running. A checkpoint vote is a claim about what is becoming irreversible, and
+that is the claim worth putting a bond behind.
+
+<Aside kind="note">
+The head vote is not exempt from consequences, though — just from being named separately. Two
+attestations that agree on source and target but disagree on the head root are still two *different*
+`AttestationData` objects with the same target epoch, which is precisely what the double-vote clause
+matches.<Cite src="consensus-specs-phase0-beacon-chain" /> The next lesson but one takes that apart;
+notice for now that a rule written about checkpoints catches head equivocation as a side effect.
+</Aside>
+
+## Committees: a partition, not a sample of volunteers
+
+Every epoch, the active validator set is partitioned. Each validator lands in exactly one committee,
+each committee is assigned to exactly one slot, and over the 32 slots of the epoch every active
+validator gets precisely one turn.<Cite src="ethereum-docs-pos" /><Cite src="consensus-specs-phase0-beacon-chain" />
+
+The sizing is set by two preset constants. `TARGET_COMMITTEE_SIZE` is 128 and `MAX_COMMITTEES_PER_SLOT`
+is 64.<Cite src="consensus-specs-mainnet-presets" /> The spec's `get_committee_count_per_slot`
+returns the active validator count divided by `SLOTS_PER_EPOCH` and then by `TARGET_COMMITTEE_SIZE`,
+clamped between 1 and the maximum.<Cite src="consensus-specs-phase0-beacon-chain" />
+
+Run the arithmetic and one number falls out that is worth carrying. 64 committees × 128 validators ×
+32 slots is 262,144. Below that many active validators, the network adds committees and keeps them at
+128 each. Above it, the committee count is pinned at 64 per slot and committees simply get larger —
+which is the regime mainnet has been in for a long
+time.<Cite src="consensus-specs-mainnet-presets" /><Cite src="arxiv-pos-participation" />
+
+So the honest description of a slot's electorate is: **one thirty-second of the active stake**, split
+across up to 64 committees, whatever that happens to be in absolute terms.
+
+<Misconception
+  belief="Every validator votes on every block."
+  reality="Validators are partitioned into committees and each committee attests in one slot. A validator attests once per epoch, which is once every 32 slots."
+  why="'Everyone votes on everything' is the intuitive picture of a voting system, and it is also what a small test network looks like — below 8,192 active validators there is exactly one committee per slot, so on a devnet the naive picture is briefly true."
+  src="ethereum-docs-pos"
+/>
+
+## Where the assignment comes from, and why it cannot be gamed cheaply
+
+A partition is only useful if nobody can choose which part they land in.
+
+Committee membership comes from a shuffle: `compute_committee` takes the active indices, a seed, and
+a slice of the shuffled ordering.<Cite src="consensus-specs-phase0-beacon-chain" /> The shuffle itself
+is a swap-or-not construction run for `SHUFFLE_ROUND_COUNT` rounds, which the mainnet preset sets to
+90.<Cite src="consensus-specs-mainnet-presets" /><Cite src="eth2book-shuffling" /> Its useful
+property is that it can be computed for a single index without shuffling the whole list, which is why
+a validator client can answer "am I in this committee" without materialising a set of hundreds of
+thousands.<Cite src="eth2book-shuffling" />
+
+The seed comes from RANDAO: `get_seed` mixes a domain separator, the epoch, and a randao mix taken
+`MIN_SEED_LOOKAHEAD` epochs back — the preset sets that lookahead to
+1.<Cite src="consensus-specs-phase0-beacon-chain" /><Cite src="consensus-specs-mainnet-presets" />
+
+That lookahead is doing security work, and it is the same work the previous lesson's asymmetry was
+doing. The honest-validator spec promises at least one epoch of lookahead for *attesting* duties, and
+explicitly no lookahead at all for *proposing*.<Cite src="consensus-specs-validator" /> An attacker
+who wants to be in a particular committee has to influence a seed that was fixed before they could
+have known what they wanted.
+
+<Aside kind="warn">
+RANDAO is not unbiasable, and this is the standard caveat. A proposer sees the randao mix its own
+block would produce and can decline to propose, which is a one-bit grind per slot it
+controls.<Cite src="eth2book-randomness" /> You met the execution-layer face of this as
+[`prevRandao`](/c/prev-randao). The claim the committee design rests on is not "the assignment is
+perfectly random" — it is "the assignment is expensive enough to bias that targeting a specific
+future committee is not cheap". Those are different claims and only the second one is true.
+</Aside>
+
+## Aggregation: how tens of thousands of votes become a handful of objects
+
+Sampling reduces how many validators speak per slot. It does not, on its own, reduce the number of
+objects that end up on chain. That is a separate mechanism.
+
+**On the wire**, attestations are split across subnets. The config sets `ATTESTATION_SUBNET_COUNT` to
+64, and a beacon node holds a long-lived subscription to `SUBNETS_PER_NODE` — 2 — of
+them.<Cite src="consensus-specs-config-mainnet" /><Cite src="consensus-specs-p2p" /> A committee's
+subnet is derived from the slot and the committee index, so the traffic for a given committee lands
+in one place rather than everywhere.<Cite src="consensus-specs-validator" />
+
+**Within a committee**, a subset of members are selected as aggregators.
+`TARGET_AGGREGATORS_PER_COMMITTEE` is 16, and selection is by a fair coin flipped with your own
+signature: `is_aggregator` hashes the validator's slot signature and checks it against a modulus of
+the committee size divided by that target.<Cite src="consensus-specs-validator" /> An aggregator
+collects every attestation it saw with identical `AttestationData`, combines the BLS signatures into
+one, and rebroadcasts a single object with a bitfield recording who
+participated.<Cite src="consensus-specs-validator" />
+
+Notice why this only works because of the message design at the top of the lesson. Signatures can be
+aggregated **only when the signed data is identical**. Every validator in a committee that agrees
+about the head and the checkpoints signs byte-identical data, so their signatures collapse into one.
+Validators that disagree cannot be aggregated together — disagreement is expensive by construction,
+and agreement is nearly free.
+
+**On chain**, EIP-7549 moved the committee index out of the signed `AttestationData` and into a
+separate `committee_bits` field on the `Attestation`
+container.<Cite src="eip-7549" /><Cite src="consensus-specs-electra-beacon-chain" /> Because the
+committee index is no longer part of what was signed, aggregates from different committees in the
+same slot — which now share identical signed data — can be merged into one object. Electra's
+`process_attestation` asserts `data.index == 0` and reads participation from the committee
+bits.<Cite src="consensus-specs-electra-beacon-chain" /> The preset shows what that bought: a block
+carries at most `MAX_ATTESTATIONS_ELECTRA` attestations, which is 8, down from
+128.<Cite src="consensus-specs-mainnet-presets" />
+
+## What sampling costs, stated honestly
+
+Committees make voting affordable. They also create a real asymmetry that you need for the finality
+module, so it is worth stating plainly rather than discovering it later.
+
+**Finality is decided by the whole set.** Justification and finalisation count FFG votes over an
+entire epoch, and over an epoch every active validator has voted exactly once. The two-thirds
+threshold behind [accountable safety](/c/accountable-safety) is two thirds of *all* active stake, not
+two thirds of a committee.<Cite src="eth2book-casper-ffg" />
+
+**The head is decided by a slice.** Fork-choice weight for a given slot comes from the validators
+scheduled in that slot, which is one thirty-second of the stake. Winning a single slot's worth of
+head votes is therefore vastly cheaper than moving anything
+finalised.<Cite src="consensus-specs-phase0-beacon-chain" />
+
+That gap is the entire reason a one-slot reorg is an ordinary event and a finality reversal is a
+catastrophe with a price tag. Same protocol, two mechanisms, two completely different denominators.
+
+### What capturing a committee would and would not buy
+
+The natural next question is what happens if an attacker does control a committee. It is worth
+answering carefully, because both the optimistic and the alarmist versions are wrong.
+
+**It buys nothing against finality.** A committee's votes are a thirty-second of one epoch's FFG
+votes. Justifying a checkpoint needs two thirds of the *total* active stake, and no single committee
+comes close.<Cite src="eth2book-casper-ffg" />
+
+**It buys real leverage over the head, briefly.** Fork-choice weight for a slot is exactly the
+validators scheduled in it, so a committee that withholds or misdirects its votes distorts the
+head-selection input for that slot — which is one of the ingredients in the reorg literature showing
+that meaningful attacks on liveness and block ordering are available well below the one-third
+threshold everyone quotes.<Cite src="arxiv-low-cost-attacks" />
+
+**And it is not something you can arrange to get.** Committee membership comes from a shuffle over a
+seed fixed an epoch in advance, so an attacker cannot choose which committee its validators land in;
+it can only own enough stake that some committee somewhere is dense with
+it.<Cite src="consensus-specs-phase0-beacon-chain" /><Cite src="consensus-specs-validator" /> With
+committees pinned at 64 per slot and sized by the active set, a given attacker's share of any one
+committee is, in expectation, its share of the whole
+network.<Cite src="consensus-specs-phase0-beacon-chain" />
+
+<Compare
+  caption="One signature carries both columns, and nothing else about them is shared."
+  alt="The head and finality compared by which part of the vote carries each, whose votes are counted, what the denominator is, how long each takes to move, what owning one committee buys, and whether contradicting yourself is slashable."
+  axis="Question"
+  columns={[
+    { title: 'The head', note: 'LMD GHOST, per slot', tone: 'warn' },
+    { title: 'Finality', note: 'Casper FFG, per epoch', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'Which part of the vote carries it?', cells: ['beacon_block_root', 'The source and target checkpoints'] },
+    { label: 'Whose votes are counted?', cells: ['Only the validators scheduled in that one slot', 'Every active validator, each having voted exactly once'] },
+    { label: 'What is the denominator?', cells: ['One thirty-second of active stake', 'Two thirds of all active stake'] },
+    { label: 'How long does it take to move?', cells: ['One slot', 'Two epochs, once every validator has had a turn'] },
+    { label: 'What does owning one committee buy?', cells: ['Real leverage over that slot’s head', 'Nothing — a committee is a thirty-second of one epoch’s votes'] },
+    { label: 'Is contradicting yourself slashable?', cells: ['Only as a side effect of the checkpoint rules', 'Yes — the conditions are written over source and target epochs'] },
+  ]}
+/>
+
+The honest summary is that sampling makes voting affordable without weakening finality, and leaves
+the head — which was always the cheap, contested, short-lived part of consensus — roughly as cheap and
+contested as it was.
+
+<Check type="explain" concept="committee">
+A team proposes a monitoring rule: "alert if fewer than two thirds of validators attested in any
+given slot." Explain why this alert can never be satisfied, what the intended quantity actually is,
+and where you would read it.
+
+<Answer>
+**It can never be satisfied because at most one thirty-second of validators are eligible to attest in
+any slot.** The rest are not absent — they are not scheduled. Their turn is in a different slot of
+the same epoch.<Cite src="consensus-specs-phase0-beacon-chain" />
+
+**The intended quantity is epoch participation**: the fraction of *active balance* whose attestations
+for that epoch were included, with correct source, target and head flags recorded during epoch
+processing.<Cite src="consensus-specs-electra-beacon-chain" />
+
+**Two refinements make the corrected rule actually useful.**
+
+First, measure balance, not count. Since effective balances range from 32 to 2048 ETH, "how many
+validators attested" and "how much stake attested" are different numbers, and only the second one is
+what any threshold in the protocol is denominated in.<Cite src="consensus-specs-mainnet-presets" />
+
+Second, an attestation for epoch *N* can be included in a block during epoch *N+1*, so participation
+for the most recent epoch is always understated at the moment you read it. An alert wired to the
+current epoch will fire every epoch. Read participation for an epoch that has already finished, and
+record which endpoint answered — until finalisation, participation is a per-node view rather than a
+fact.<Cite src="consensus-specs-phase0-beacon-chain" />
+</Answer>
+</Check>
+
+## Where this pays off
+
+The three offences in the next lessons are all defined over the fields you just met. Double proposal
+is about a slot; double vote and surround vote are about the source and target epochs of an
+attestation, and neither would be expressible if the FFG vote were not carried in the same signed
+object as the head vote.
+
+The one-thirty-second-per-slot figure is the number underneath
+[reorg depth in practice](/c/reorg-depth-in-practice) in the finality module: cheap reorgs are cheap
+because a slot's head weight is a small sample, and finality reversals are expensive because
+finalisation is not.
+
+And in the scaling track, the committee-sampling argument reappears almost unchanged as data
+availability sampling — a small random subset checking on behalf of everyone, secure because the
+subset was not knowable in advance.

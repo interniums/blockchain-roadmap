@@ -1,0 +1,458 @@
+---
+id: zk-onchain-verification-not-an-authorisation
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-8079, eip-197, privacy-pools-docs-withdrawal-circuit, privacy-pools-docs-withdrawal-flow, privacy-pools-docs-core-concepts, privacy-pools-docs-entrypoint, orbiter-verifier-gas, measured-gas-constants, barretenberg-docs, aztec-docs-state-management]
+stack: {}
+---
+
+Here is the signal list of a withdrawal circuit that is deployed, holding real money, on Ethereum
+today. It comes from Privacy Pools' own documentation, and the only thing that matters about it for
+the next twenty minutes is which side of the line each name sits on:<Cite src="privacy-pools-docs-withdrawal-circuit" />
+
+```text
+// Public inputs
+withdrawnValue, stateRoot, stateTreeDepth, ASPRoot, ASPTreeDepth, context
+
+// Private inputs
+label, existingValue, existingNullifier, existingSecret,
+newNullifier, newSecret, stateSiblings[], stateIndex, ASPSiblings[], ASPIndex
+
+// Outputs
+newCommitmentHash, existingNullifierHash
+```
+
+Six public signals. A proof against this circuit says exactly one thing: *there exist* private
+inputs consistent with those six public values under the circuit's constraints. Nothing else. Not
+"this withdrawal is legitimate". Not "pay this person". Six numbers and an existence claim.
+
+Now look at the last public signal, `context`, and at the constraint list the same documentation
+publishes for this circuit. Six constraints, and the last one is:<Cite src="privacy-pools-docs-withdrawal-circuit" />
+
+```text
+Verifies context matches on-chain data
+```
+
+That single line is the subject of this lesson. It is the seam where a mathematical object becomes
+a financial authorisation, and it is where essentially every exploitable bug in this area lives.
+
+<Figure
+  caption="The verifier's answer is about the arguments it was handed. Everything that turns it into an authorisation happens one contract to the right."
+  alt="Public inputs and a proof enter a stateless verifier, which returns true meaning only that a witness exists for those inputs; the calling contract then decides what that boolean entitles the caller to."
+>
+  <Flow
+    lanes={['what you hand it', 'the pure function', 'what comes back', 'where the money is']}
+    nodes={[
+      { id: 'pi', label: 'public inputs', note: 'from trusted state, or from the attacker', col: 0, tone: 'warn' },
+      { id: 'pf', label: 'proof', note: 'bytes, and bytes are copyable', col: 0 },
+      { id: 'ver', label: 'verifier', note: 'no storage, no msg.sender, nothing to send', col: 1, tone: 'muted' },
+      { id: 't', label: 'true', note: 'a witness exists for these inputs', col: 2, tone: 'accent' },
+      { id: 'app', label: 'calling contract', note: 'binding and replay protection live only here', col: 3, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'pi', to: 'ver' },
+      { from: 'pf', to: 'ver' },
+      { from: 'ver', to: 't' },
+      { from: 't', to: 'app' },
+    ]}
+  />
+</Figure>
+
+## A verifier is a pure function and holds nothing
+
+Strip a generated verifier down. Whatever tool produced it — snarkjs, gnark, `bb` — the shape is
+the same:
+
+```solidity
+function verifyProof(
+    uint[2] calldata pA,
+    uint[2][2] calldata pB,
+    uint[2] calldata pC,
+    uint[N] calldata pubSignals
+) public view returns (bool);
+```
+
+No storage. No `msg.sender` check. No token balance. No owner. It cannot be paused, cannot be
+drained, and cannot be tricked into sending you anything, because it has nothing to send and no
+statement to make about you. It is a `view` function that does field arithmetic and finishes with
+one `staticcall` to the pairing precompile at address `0x08`, whose input for a Groth16 proof is
+always the same 768 bytes.<Cite src="orbiter-verifier-gas" /><Cite src="eip-197" /> The proof itself
+is three curve points — two in `G1` at 64 bytes each and one in `G2` at 128 — 256 bytes
+total.<Cite src="orbiter-verifier-gas" />
+
+The consequence is organisational before it is technical. **Reading a verifier and reading the
+contract that calls it are two different audits.** The first checks that the generated code
+implements the verification equation for the embedded verification key — mechanical, usually
+generated, rarely wrong in ways your review would catch. The second checks what a `true` return is
+allowed to cause, and that is where the money is.
+
+<Misconception
+  belief="If the verifier returns true, the action is authorised."
+  reality="Verification establishes only that some witness exists for the public inputs you passed in. Whether those public inputs describe the thing you meant, and whether this particular statement has already been settled, are both the caller's responsibility."
+  why="A contract named 'verifier' that returns a boolean reads exactly like an access-control check, and every other boolean-returning check in a Solidity codebase is one."
+  src="eip-8079"
+/>
+
+### The statement, written out
+
+You met [on-chain verification](/c/onchain-verification) as the thing that makes off-chain work
+trustworthy on-chain, and [private versus public inputs](/c/private-vs-public-inputs) as the
+split between what the proof hides and what it announces. Put them together and write the
+assertion formally:
+
+```text
+∃ w :  C(x, w) = 0
+```
+
+`C` is the circuit's constraint system, `x` is the vector of public inputs, `w` is the witness. The
+verifier decides whether that existential is true for the `x` you handed it. It is a statement
+*about `x`*. Change `x` and you have asked a different question, and the answer to that different
+question may also be `true`, proved by somebody who is not you, about a situation that is not
+yours.
+
+That is the entire attack surface, and it splits cleanly in two:
+
+- **Binding.** Is `x` the thing your contract cares about, or is it whatever the transaction sender
+  said it was?
+- **Replay.** Is this the first time this particular `x` has been settled?
+
+Everything that follows is those two questions with names on them.
+
+## Binding: the caller must supply the values it trusts
+
+Take the archetypal broken contract. A rollup-ish settlement contract advances a state root when
+someone proves a valid transition:
+
+```solidity
+// BROKEN
+function settle(
+    bytes32 oldRoot,
+    bytes32 newRoot,
+    Proof calldata proof
+) external {
+    require(verifier.verifyProof(proof, [oldRoot, newRoot]), "bad proof");
+    stateRoot = newRoot;
+}
+```
+
+Read what the proof attests: *there exists a batch of transactions taking `oldRoot` to `newRoot`.*
+Perfectly true. Also completely useless, because `oldRoot` came from the attacker's calldata. They
+pick an `oldRoot` from four months ago — or one they constructed themselves and never published —
+prove a transition from it, and overwrite the live root.
+
+The fix is one word long, and it is the whole discipline:
+
+```solidity
+// BOUND
+function settle(bytes32 newRoot, Proof calldata proof) external {
+    require(verifier.verifyProof(proof, [stateRoot, newRoot]), "bad proof");
+    stateRoot = newRoot;
+}
+```
+
+`stateRoot` is now read from the contract's own storage. The attacker no longer controls half the
+statement. That is binding: **for every public input, either the contract computes it from state it
+trusts, or an attacker chooses it.** There is no third category.
+
+<Aside kind="warn">
+The broken version reads fine in review because the argument is *named* `oldRoot`, and a name is a
+promise. Verifier-calling contracts are unusually good at this failure: a signal called `recipient`
+looks like a recipient, a signal called `epoch` looks like an epoch, and neither name is enforced
+anywhere. Only the constraint system knows what the number means, and the constraint system is in
+another file, in another language, written by another person.
+</Aside>
+
+### Four things worth binding, and what happens when you do not
+
+**Subgoal: enumerate the values an attacker would most like to choose.**
+
+<Matrix
+  corner="Public input"
+  cols={['If the caller passes it through', 'The bound version']}
+  rows={[
+    { label: 'A previous state root', cells: [
+      { v: 'Prove against a stale or invented history', tone: 'danger' },
+      'Read the stored root',
+    ] },
+    { label: 'A recipient address', cells: [
+      { v: 'Steal a valid proof from the mempool, resubmit with your own address', tone: 'danger' },
+      <>Bind to <code>msg.sender</code> or to a value the proof itself commits to</>,
+    ] },
+    { label: 'An epoch, round or block number', cells: [
+      { v: "Replay an old round's proof into the current one", tone: 'danger' },
+      "Read the contract's own counter",
+    ] },
+    { label: 'A token or pool identifier', cells: [
+      { v: 'Present a proof about a cheap asset to withdraw an expensive one', tone: 'danger' },
+      'Derive from the contract being called',
+    ] },
+  ]}
+  caption="Every row is a proof that is valid, correctly verified, and about the wrong thing."
+  alt="Four public inputs — a previous state root, a recipient address, an epoch or round number, and a token or pool identifier — with what an attacker gains by choosing each and where the bound version reads it from instead."
+/>
+
+The recipient row is the one that catches teams by surprise, because it is not a logic bug — it is a
+front-running problem. Production systems treat it as a named property rather than an afterthought:
+the pool cited above lists front-running protection as a row in its own comparison of withdrawal
+modes, for both the direct and the relayed path.<Cite src="privacy-pools-docs-withdrawal-flow" /> Your proof sits in the public mempool for a few hundred milliseconds with
+`recipient = you` as a public input the contract accepts verbatim. Anyone reading the mempool copies
+the proof bytes, changes that one word, and pays more gas. The proof is still valid; it was always
+valid; it just names someone else now.
+
+### How a live system does it
+
+Privacy Pools solves exactly this, and its solution is worth reading because it is short. The
+`context` public signal is defined as:<Cite src="privacy-pools-docs-withdrawal-flow" />
+
+```solidity
+context = uint256(
+    keccak256(abi.encode(withdrawal, pool.SCOPE()))
+) % SNARK_SCALAR_FIELD;
+```
+
+**Subgoal: work out what that hash covers.** `withdrawal` is the struct carrying the processor
+address, the pool `scope`, and — for a relayed withdrawal — the ABI-encoded `FeeData` naming the
+final recipient, the relayer's fee recipient, and the fee in basis points.<Cite src="privacy-pools-docs-withdrawal-flow" />
+So one field element commits to *every parameter of this specific withdrawal, on this specific
+pool*. The circuit constrains that the proof was generated against that same `context`. Change the
+recipient in calldata and the recomputed `context` no longer matches the one the proof was made
+for, and verification fails.
+
+In the relayed path the same binding does extra work. A relayed withdrawal names the coordinating
+Entrypoint contract as the processor rather than the recipient, and the relayer verifies the proof
+locally before paying gas to submit it.<Cite src="privacy-pools-docs-withdrawal-flow" /><Cite src="privacy-pools-docs-entrypoint" />
+The relayer is therefore holding, briefly, a valid proof for somebody else's money — and the only
+reason that is safe is that the recipient and fee split are inside the hash the proof was made
+against.<Cite src="privacy-pools-docs-withdrawal-flow" />
+
+Two engineering details in that line are worth carrying away.
+
+**The modulo is not cosmetic.** A `keccak256` output is 256 bits; a public input must be an element
+of the circuit's scalar field. For BN254 that field has prime order
+`21888242871839275222246405745257275088548364400416034343698204186575808495617`, slightly under
+254 bits, and the pairing precompile's own specification pins it as the group
+order.<Cite src="eip-197" /> Reducing modulo it is what makes the hash representable at all. Get
+that reduction wrong — do it on one side and not the other — and you have a verifier that rejects
+every honest proof, which is the *good* failure mode of the two. A generated verifier also
+range-checks each public signal against that field before it does
+anything else.<Cite src="orbiter-verifier-gas" />
+
+**One field element can bind arbitrarily much.** You are not limited to one public input per thing
+you care about. Hash the whole parameter set into a single signal and the proof is bound to all of
+it at once. That has a gas consequence we will price in the next lesson, and it is the standard
+pattern for a reason.
+
+### The signals nobody thinks of as signals
+
+Go back to that circuit's public list and look past the obvious names. Alongside `stateRoot` and
+`ASPRoot` sit `stateTreeDepth` and `ASPTreeDepth`.<Cite src="privacy-pools-docs-withdrawal-circuit" />
+Tree *depths*, as public inputs.
+
+They are there because the circuit is written for a maximum depth and must be told the real one, so
+that the Merkle path check consumes the right number of siblings. Which means a depth is a value the
+proof is *about*, and therefore a value someone can choose. Hand a depth to the verifier straight
+from calldata and you have let the prover pick the shape of the tree their membership proof is
+checked against — a degree of freedom nobody put on a threat model, because "depth" does not sound
+like money.
+
+**The general form: a public input is any value the circuit had to be told.** Not just the ones that
+correspond to product concepts. Loop bounds, array lengths, version tags, chain identifiers,
+selector-like discriminants. Each is a lever, each is invisible in a wrapper that passes a struct
+through, and each needs the same two-word answer — storage, or attacker.
+
+<Aside kind="note">
+**The gap lives between two files, and both sides think the other closed it.** Circuit authors
+assume the contract checks what comes from outside; contract authors assume the circuit constrains
+what it consumes. The honest question for each public signal is not "is it checked" but "checked
+*where*, and did anyone write that down". Redundant checks on both sides cost a little gas. A
+mutual assumption costs the pool.
+</Aside>
+
+<Check type="spot-bug" concept="public-inputs-binding">
+A team ships an airdrop that pays out against a proof of eligibility. The circuit proves membership
+in an off-chain allowlist tree without revealing which member you are.
+
+```solidity
+mapping(bytes32 => bool) public claimed;
+
+function claim(
+    bytes32 merkleRoot,
+    address to,
+    uint256 amount,
+    bytes32 nullifierHash,
+    Proof calldata proof
+) external {
+    require(!claimed[nullifierHash], "already claimed");
+    require(
+        verifier.verifyProof(proof, [merkleRoot, uint256(uint160(to)), amount, nullifierHash]),
+        "bad proof"
+    );
+    claimed[nullifierHash] = true;
+    token.transfer(to, amount);
+}
+```
+
+They have a nullifier and they check it before paying. Name every remaining way to take money that
+is not yours.
+
+<Answer>
+**Three bindings are missing, and the nullifier check does not cover any of them.**
+
+**1. `merkleRoot` is attacker-supplied.** Nothing in this function ties it to a root the contract
+recognises. Build your own allowlist tree containing one leaf — yourself, for the entire token
+balance — compute its root, prove membership in it, and pass that root in. The proof is valid: you
+really are in that tree. The fix is to read the root from storage, or from a mapping of roots the
+owner has published, never from calldata.
+
+**2. `amount` is attacker-supplied unless the circuit binds it to the leaf.** If the circuit's
+constraint is "there is a leaf for address `to` in the tree" and `amount` merely rides along as a
+public signal, then an eligible user proves eligibility once and passes any `amount` they like.
+Whether this is exploitable depends entirely on constraints inside a file this contract cannot see —
+which is precisely why the verifier and its caller are two audits.
+
+**3. `to` is attacker-supplied, so this is front-runnable even if 1 and 2 are fixed.** Watch the
+mempool, copy the proof bytes, swap `to`, bid higher gas. Your victim's transaction then reverts on
+`already claimed` — they see a claimed nullifier and no tokens. Bind `to` to `msg.sender`, or fold
+it into the proof the way the `context` signal
+does.<Cite src="privacy-pools-docs-withdrawal-flow" />
+
+**What the nullifier does and does not do.** It stops the *same statement* being settled twice. It
+says nothing about whether the statement is the one the contract meant to settle. Replay protection
+and binding are orthogonal defences, and a codebase with only one of them is a codebase with a bug.
+</Answer>
+</Check>
+
+## Replay: a proof is bytes, and bytes are copyable
+
+Binding fixed, the second question stands on its own. Suppose every public input is derived from
+trusted state and the proof verifies. Submit the identical transaction again.
+
+Unless something in the system's state has moved, it verifies again. Proofs carry no serial number,
+no expiry, no notion of having been used. There is no cryptographic property of a SNARK that makes
+the second verification fail; succinct proofs are deterministic artefacts and the verifier is a pure
+function of its arguments. If a `true` return causes a payout, a mint, or a state advance, and
+nothing records that this statement is now settled, the second call pays out again.
+
+Three mechanisms fix it, and they are the same three you already use for signature replay.
+
+**A nullifier set.** Record a value uniquely determined by the statement and reject repeats. Live
+systems emit that value as a circuit *output* rather than accepting it as an argument, so the caller
+cannot choose it.<Cite src="privacy-pools-docs-withdrawal-circuit" /> This is
+the shape a shielded pool needs anyway, and the [nullifier](/c/nullifier) concept gets its full
+treatment in the privacy module. On L1 the cost is concrete: writing a fresh `bytes32 => bool` entry
+is a zero-to-non-zero `SSTORE` on a cold slot — 20,000 gas for the write plus 2,100 for the cold
+access, 22,113 measured end to end on forge 1.7.1 with solc 0.8.36 and the optimizer
+off.<Cite src="measured-gas-constants" /> Against a verifier in the low hundreds of thousands of
+gas, replay protection is a rounding error. There is never a cost argument for omitting it.
+
+**A monotonic state progression.** If the proof is *about* the transition out of the current root,
+and the contract advances that root on success, the same proof cannot apply twice — after the first
+settlement the stored root no longer matches the proof's `oldRoot`. This is the bound `settle`
+above, and it is why binding sometimes gives you replay protection for free. Sometimes. It only
+holds while the state genuinely moves on every accepted proof.
+
+**An expiring nonce or deadline inside the public inputs.** Where the statement is naturally
+repeatable — a price attestation, an identity claim — bind a deadline or a nonce into the proof and
+check it on-chain. This is the pattern from EIP-712 signature flows, transplanted.
+
+<Misconception
+  belief="Recording the proof hash is a fine nullifier — same proof, same hash, rejected."
+  reality="Some proving systems are randomised: re-proving the same statement with fresh randomness yields different bytes and therefore a different hash, while still being a valid proof of the same statement. The nullifier must be a function of the statement, not of the encoding."
+  why="Hashing the payload is the reflexive answer to any replay problem, and it happens to work for deterministic signature schemes, so it feels safe."
+  src="privacy-pools-docs-core-concepts"
+/>
+
+That misconception has a corollary worth stating plainly: **do not derive replay protection from
+anything the prover chooses freely.** Privacy Pools derives its `existingNullifierHash` as a circuit
+*output*, computed from private note material rather than accepted as an
+argument.<Cite src="privacy-pools-docs-withdrawal-circuit" /><Cite src="privacy-pools-docs-core-concepts" />
+The contract gets a value it could not have been talked into.
+
+<Aside kind="note">
+**Why "verified" and "authorised" feel like the same word.** In the two-party protocols the term
+comes from, the verifier *is* the relying party: it checks the proof because it is deciding
+something. On-chain, that role is split across two contracts, and the split is invisible in the API.
+Barretenberg's generated Solidity, like every other backend's, hands you a boolean and stops; the
+decision about what that boolean entitles anyone to is a thing you write
+yourself.<Cite src="barretenberg-docs" />
+</Aside>
+
+## The reading order that finds these bugs
+
+When you next open a system that consumes proofs — auditing it, integrating with it, or choosing
+whether to trust it — read it in this order. It is deliberately not the order the repository
+presents.
+
+**One: list the public inputs.** From the circuit source if you have it, from the generated
+verifier's `pubSignals` array length if you do not. You now know the exact vocabulary in which the
+proof can speak.
+
+**Two: for each public input, find where the caller gets it.** Storage, `msg.sender`, a computed
+hash, or calldata. Write "calldata" next to every one that comes from the transaction, and treat
+each of those as attacker-chosen for the rest of the review.
+
+**Three: for each attacker-chosen input, ask what a hostile choice buys.** Not "is this checked
+somewhere" — assume it is not, and price the consequence. A stale root buys history rewriting. A
+free recipient buys front-running. A free amount buys everything.
+
+**Four: find the replay guard and check what it keys on.** A nullifier set, a moving root, or a
+deadline. If it keys on the proof bytes, flag it. If there is none, you have found the finding.
+
+**Five: only now read the verifier itself.** Almost always generated, almost always fine. If your
+review budget runs out before step five, you have spent it correctly.
+
+<Check type="explain" concept="verifier-contract">
+A colleague proposes: "Our verifier is audited by three firms and the circuit is formally verified.
+The integration is a thin wrapper — a few dozen lines — so we can skip auditing it and put the
+budget into another circuit review." Answer them.
+
+<Answer>
+**The proposal has the risk model exactly inverted, and the thinness of the wrapper is the reason,
+not the mitigation.**
+
+*What the circuit review bought.* That the constraint system encodes the intended relation, and that
+no under-constrained signal lets a prover satisfy it with a witness that should not exist. Real
+value, and it is about the relation `C(x, w) = 0`.
+
+*What it did not buy.* Any statement about which `x` the contract will accept, where each component
+of `x` comes from, or what a `true` return is permitted to move. Those live entirely in the wrapper.
+The proof establishes an existential over witnesses; it quantifies over nothing else.
+
+*Why "a few dozen lines" makes it worse, not better.* Every one of the failure modes above fits in a
+single line. A stale root is one argument that should have been a storage read. A front-runnable
+recipient is one parameter that should have been `msg.sender`. A missing nullifier is one absent
+`SSTORE`, costing about 22,000 gas when
+present.<Cite src="measured-gas-constants" /> The wrapper is short precisely because it consists of
+decisions rather than logic, and decisions are what get audited.
+
+*The concrete ask.* Have someone produce the table from step two: every public signal, its source,
+and — for the calldata ones — the sentence beginning "an attacker who chooses this can...". That
+table is an afternoon's work and it is the actual deliverable. Then check the replay guard keys on
+the statement rather than on the proof encoding.
+
+*And the framing to leave them with.* The verifier is a pure function. It holds no funds, grants no
+permissions, and knows nothing about the application. All of the meaning — and therefore all of the
+loss — is in the contract that decides what `true` entitles the caller to.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next lesson** prices the thing you have just been told to bind to. Every public input you fold in
+has a gas cost, every hash you compute to compress several of them into one has a circuit cost, and
+the two move in opposite directions. Knowing where the gas goes turns the binding discipline from a
+rule into a design conversation, and it starts by deriving the dominant term straight out of the
+pairing precompile's own specification.<Cite src="eip-197" />
+
+**In review work**, the five-step order transfers directly to anything with an off-chain attestation
+and an on-chain consumer: oracle signatures, bridge messages, account-abstraction validators. The
+question is always the same one. Which values did the relying party choose, and which did the
+attacker?
+
+**And in the privacy module**, the nullifier stops being a replay guard bolted onto a payout and
+becomes the load-bearing element of a whole state model — where a second, entirely non-obvious
+requirement gets attached to it, and where getting that second requirement wrong leaves the
+double-spend protection perfectly intact while destroying the only property the system
+exists for.<Cite src="aztec-docs-state-management" />

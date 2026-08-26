@@ -1,0 +1,358 @@
+---
+id: solidity-calls-delegatecall-call-to-nothing-succeeds
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    solidity-docs-global-vars,
+    solidity-docs-control-structures,
+    solidity-docs-contracts,
+    solidity-docs-security,
+    solidity-external-calls,
+    oz-address-lib,
+    eip-2929,
+    eip-7702,
+    eip-1967,
+    measured-gas-constants,
+  ]
+stack: { solidity: "0.8.36" }
+---
+
+A deployment script points at a token address copied from a staging environment. On the target
+chain, nothing has ever been deployed there.
+
+```solidity
+(bool ok, ) = token.call(abi.encodeCall(IERC20.transfer, (to, amount)));
+require(ok, "transfer failed");
+```
+
+`ok` is `true`. It will be `true` every time, for every amount, for every recipient, for as long as
+the contract runs. No tokens move, because there is nothing there to move them. The `require` passes,
+the accounting updates, the event is emitted, and the protocol's internal ledger now believes it has
+paid out money it still holds — or, in the version of this that costs money, believes it has
+*received* money that never arrived.
+
+The EVM behaviour is one line long and you already know it: a call to an account with no code runs an
+empty program, which halts immediately with success and no output. This lesson is about the two
+things Solidity does with that fact — one of which protects you and one of which does not — and about
+a second construct that looks free and is a full message call.
+
+<Figure
+  caption="Nothing ran, and the only thing the caller is told is that nothing reverted."
+  alt="A low-level call to an address holding no code runs an empty program that halts immediately, pushes success, and leaves the return-data buffer empty. The caller's require on the boolean passes and the accounting proceeds as though a transfer had happened."
+>
+  <Flow
+    nodes={[
+      { id: 'c', label: 'CALL', note: 'target has no code', col: 0, tone: 'accent' },
+      { id: 'e', label: 'empty program', note: 'halts at once', col: 1, tone: 'muted' },
+      { id: 's', label: 'success = true', note: 'no return data', col: 2, tone: 'warn' },
+      { id: 'r', label: 'require(ok) passes', note: 'ledger updated', col: 3, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+## The check the compiler inserts, and where it stops
+
+The language documentation states the problem and its own remedy in the same
+paragraph. Because the EVM considers a call to a non-existing contract to always succeed, Solidity
+includes an extra check using the `extcodesize` opcode when performing external calls, ensuring that
+the contract about to be called actually exists — and the low-level calls which operate on addresses
+rather than contract instances, namely `.call()`, `.delegatecall()`, `.staticcall()`, `.send()` and
+`.transfer()`, do not include this check, which makes them cheaper in terms of gas but also less
+safe.<Cite src="solidity-docs-global-vars" />
+
+That is the version most people know. There is a second paragraph, and it changes the rule in a way
+that matters more than the first one.
+
+Since version 0.8.10, the compiler does not check `extcodesize` on high-level external calls if
+return data is expected, because an empty code will be unable to return data and the ABI decoder will
+revert.<Cite src="solidity-external-calls" /> The check is not unconditional on typed calls. It is
+present when the compiler has nothing else to catch the case, and absent when the decoder will catch
+it instead.
+
+So the real rule has three branches, and the branch you are in depends on the *return type declared
+in your interface*:
+
+| call form | existence check | what actually fails |
+|---|---|---|
+| typed call, no return value | `extcodesize` inserted | reverts before the callee runs |
+| typed call, some return value | none inserted | ABI decode of zero bytes reverts |
+| `.call` / `.delegatecall` / `.staticcall` | none | nothing — `success` is `true`, data is empty |
+
+Three different mechanisms, two of which produce a revert with entirely different error messages, and
+one of which produces silence. None of that is visible at the call site.
+
+The docs state the third row as a standalone warning, in the section on error handling rather than
+the one on address members, which is part of why it is so often met for the first time in production:
+the low-level functions `call`, `delegatecall` and `staticcall` return `true` as their first return
+value if the account called is non-existent, as part of the design of the EVM, and account existence
+must be checked prior to calling if
+needed.<Cite src="solidity-docs-control-structures" /> The same page lists the first row from the
+other direction — performing an external function call targeting a contract that contains no code is
+one of the situations in which the compiler itself generates an
+exception.<Cite src="solidity-docs-control-structures" /> One page describes the check; another
+describes its absence; the call sites are one word apart.
+
+<Aside kind="note">
+The 0.8.10 change had a second purpose the docs make explicit: it allows high-level external calls to
+precompiled contracts, which can return data despite having no code associated with their
+addresses.<Cite src="solidity-external-calls" /> Before it, the compiler considered every precompile
+non-existent and a typed call to one reverted. If you have ever seen advice to call `ecrecover` or
+`sha256` only through assembly, this is the vintage it dates from — and it also means a typed call to
+a precompile that returns *nothing* still hits the inserted check today.
+</Aside>
+
+## Re-deriving the check yourself, the way the standard library does
+
+OpenZeppelin's `Address` library exists mostly to put the missing check back on the low-level path,
+and reading its condition is worth more than reading its documentation. In version 5.7.0,
+`functionCallWithValue` performs the call and then decides:<Cite src="oz-address-lib" />
+
+```solidity
+bool success = LowLevelCall.callNoReturn(target, value, data);
+if (success && (LowLevelCall.returnDataSize() > 0 || target.code.length > 0)) {
+    return LowLevelCall.returnData();
+} else if (success) {
+    revert AddressEmptyCode(target);
+} else if (LowLevelCall.returnDataSize() > 0) {
+    LowLevelCall.bubbleRevert();
+} else {
+    revert Errors.FailedCall();
+}
+```
+
+**Subgoal — read the first condition as a cost optimisation, not as a check.** `target.code.length`
+is only consulted when the call succeeded *and* returned nothing. If any data came back, something
+executed, so the code-length query — an account access — is skipped. This is the same reasoning the
+compiler applies at 0.8.10, hand-written for the low-level path.<Cite src="solidity-external-calls" />
+
+**Subgoal — notice that the "successful" branch is where the error lives.** `AddressEmptyCode` is
+raised on `success == true`. The interesting failure in this whole lesson is a success, and a library
+whose job is safety has to spend its second branch converting that success into a revert.
+
+**Subgoal — see what the two failure branches distinguish.** A failure with return data gets bubbled;
+a failure without gets a generic `FailedCall`. Empty revert data is genuinely ambiguous — it can be a
+bare `revert()`, an out-of-gas, a stack-depth failure, or a value transfer to a contract with no
+`receive` — so the library refuses to guess. The next lesson is about that byte string in detail.
+
+**Subgoal — carry the cost note.** The code-length query is an account access: 2,600 gas cold, 100
+warm, from a set that already contains the transaction's sender and target.<Cite src="eip-2929" />
+Measured on this repository's toolchain, `EXTCODESIZE` comes in at exactly those two
+tiers.<Cite src="measured-gas-constants" /> Rearranging the condition so the query happens last is
+worth real gas on the common path, and that is why it is written the way it is.
+
+<Misconception
+  belief="Calling a contract that does not exist reverts."
+  reality="It succeeds with empty return data. Solidity inserts an extcodesize check on some typed calls, and the ABI decoder catches the rest — but neither mechanism exists on the low-level forms."
+  why="The compiler's hidden check makes the EVM behaviour invisible right up until the moment you drop to .call, which is also the moment people are writing their least type-checked code."
+  src="solidity-docs-global-vars"
+/>
+
+## The same fact, one instruction over: the proxy that cannot be repaired
+
+Take the storage collision from the previous lesson to its conclusion.
+
+A proxy's implementation pointer has been overwritten with an integer. The proxy loads it, takes the
+low twenty bytes as an address, and delegatecalls it. No contract lives there. The instruction
+succeeds. The proxy's fallback returns whatever the delegatecall returned, which is zero bytes.
+
+Now walk the consequences from the caller's side:
+
+- A caller expecting `uint256 balanceOf(address)` decodes zero bytes and reverts.
+- A caller expecting nothing gets a clean success and assumes the state changed.
+- The administrator's `upgradeTo(address)` call — which returns nothing — reports success. The
+  implementation slot is not written, because no code ran. Calling it again reports success again.
+- A block explorer reading ERC-1967's implementation slot shows the corrupted
+  address.<Cite src="eip-1967" />
+
+There is no error anywhere in that list. The contract is bricked and every interface with it is
+cheerfully reporting that things are fine. This is the difference between a bug that stops a system
+and a bug that removes the system's ability to tell you it has stopped, and it is why production
+proxy implementations check that the implementation address has code before delegating.
+
+<Aside kind="warn">
+The same shape reaches beyond proxies now. A delegation designator under EIP-7702 points an EOA at a
+contract address; if that address holds no code, the account executes nothing and every call to it
+succeeds silently.<Cite src="eip-7702" /> The designator itself is 23 bytes of code on the EOA, so
+`code.length` on the account is non-zero while the code that would actually run is
+absent.<Cite src="eip-7702" /> Two different accounts, two different code fields, one address.
+</Aside>
+
+## Where the empty call is the point
+
+It is worth being clear that this behaviour is not a defect the EVM should have avoided. Sending
+ether depends on it.
+
+`payable(recipient).call{value: amount}("")` sends value to an address that may hold no code at all —
+that is the ordinary case, since most recipients are wallets. The docs describe this form as
+essentially the same as `transfer`, only that it forwards all remaining gas, subject to additional
+limits imposed by some EVM versions such as the 63/64 rule, and returns a failure code instead of
+automatically propagating the error.<Cite src="solidity-docs-security" /> If a call to a codeless
+account reverted, there would be no way to pay anyone.
+
+So the property to internalise is not "empty calls are bad". It is that **success carries no
+information about whether anything happened**, and every place in your code where success is read as
+"it worked" is a place that needs a second fact — a return value, a balance delta, an event, a
+storage read — to mean anything.
+
+## `this.f()`: a message call with a costume on
+
+The second half of this lesson is a construct that looks like it costs nothing.
+
+The docs are explicit about what `this.` does: functions can be accessed directly or through
+`this.f`, but the latter provides an external view to the function — and especially in the
+constructor, you should not access functions externally, because the function does not exist
+yet.<Cite src="solidity-docs-contracts" /> An `external` function `f` cannot be called internally, so
+`f()` does not work but `this.f()` does.<Cite src="solidity-docs-contracts" />
+
+Four consequences, in order of how often they cause trouble.
+
+**`msg.sender` becomes `address(this)`.** The new frame's caller is your own contract. Any check of
+the form `require(msg.sender == owner)` inside `f` now compares the owner against your contract's
+address and fails. Any check of the form `require(msg.sender == address(this))` — the idiom used to
+mark a function as "reachable only through my own dispatcher" — now *passes* for anyone who can get
+your contract to route a call through `this.`.
+
+**`msg.value` becomes zero.** Value does not propagate through a `CALL` unless you attach it, and
+`this.f()` attaches nothing. A `payable` function called through `this.` sees an empty envelope.
+
+**A `view` target compiles to `STATICCALL`.** `this.someViewFunction()` is not merely a call to
+yourself; it is a call to yourself under a flag that forbids storage writes, logs and creates for the
+whole subtree.<Cite src="solidity-docs-contracts" /> That is occasionally exactly what you want — it
+is a way to invoke your own code in a sandbox you cannot escape — and the next lesson is about the
+flag.
+
+**In a constructor it fails, confusingly.** During construction the account's code field is still
+empty, so `this.f()` targets an address with no code. Which of the two failure paths you hit depends
+on whether the compiler expected return data: an inserted `extcodesize` check, or a revert inside the
+ABI decoder.<Cite src="solidity-external-calls" /> Neither error message mentions constructors. If
+you want certainty about which path a given call site takes, read the bytecode you ship rather than
+reasoning from the version number.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'f()', note: 'internal', tone: 'good' },
+    { title: 'this.f()', note: 'external', tone: 'warn' },
+  ]}
+  rows={[
+    { label: 'Is a new frame opened?', cells: ['No, a JUMP within the same code', 'Yes, a message call into your own account'] },
+    { label: 'What is msg.sender inside f?', cells: ['Whatever the current frame has', 'address(this)'] },
+    { label: 'What is msg.value inside f?', cells: ['Whatever the current frame has', 'Zero, unless you attach it'] },
+    { label: 'What runs if f is declared view?', cells: ['Ordinary code', 'A STATICCALL, binding the whole subtree'] },
+    { label: 'Does it work in a constructor?', cells: ['Yes', 'No — the account has no code yet'] },
+    { label: 'Can try/catch wrap it?', cells: ['No', 'Yes, and that is the reason to reach for it'] },
+  ]}
+  caption="Every row but the last is a cost; the last row is the only thing you are buying."
+  alt="An internal call and a self-call through this compared on whether a frame is opened, what msg.sender and msg.value hold, what runs for a view function, whether a constructor can use it, and whether try and catch can wrap it."
+/>
+
+### What it costs, stated carefully
+
+The account-access component is warm. EIP-2929 initialises the per-transaction accessed-address set
+with the sender, the transaction's target — or the address being created, for a creation transaction
+— and every precompile, and every `CALL` adds its target.<Cite src="eip-2929" /> By the time your
+contract is executing, its own address is in that set by one of those routes, so the access charge
+for `this.f()` is the warm 100, not the cold 2,600.<Cite src="eip-2929" /><Cite src="measured-gas-constants" />
+
+Everything else is not free: the arguments are ABI-encoded into memory and copied into calldata, the
+return data is copied back, a frame is allocated, and the call instruction has its own base price —
+which, as the first lesson noted, this corpus has deliberately not pinned to a number under the
+current EVM revisions. The honest statement is that `this.f()` is strictly more expensive than
+calling `f` internally, by an amount you should measure on your own build rather than quote.
+
+The reason to reach for it anyway is real: it is the only way to get a `try`/`catch` around your own
+code, because `try` works on external calls only. That is a deliberate technique and it is the
+subject of the lesson after next.
+
+<Misconception
+  belief="this.f() is a cheap way to call your own function, roughly like a virtual dispatch."
+  reality="It is a full message call into your own account. It pays an account access and the call's own cost, resets msg.sender to your contract's address, zeroes msg.value, and fails inside a constructor."
+  why="The this. prefix reads like Java or C++, where it is free and changes nothing. In Solidity it changes the frame."
+  src="solidity-docs-contracts"
+/>
+
+<Check type="spot-bug" concept="delegatecall-no-code-succeeds">
+A router batches user operations. To keep the internal steps from being callable directly, each step
+is guarded:
+
+```solidity
+contract Router {
+    function execute(bytes[] calldata steps) external {
+        for (uint256 i = 0; i < steps.length; i++) {
+            (bool ok, ) = address(this).delegatecall(steps[i]);
+            require(ok, "step failed");
+        }
+    }
+
+    function _settle(address user, uint256 amount) external {
+        require(msg.sender == address(this), "internal only");
+        _payouts[user] += amount;
+    }
+}
+```
+
+The team's reasoning: `_settle` can only be reached from inside `execute`, because anyone calling it
+directly has `msg.sender` equal to their own address, not the router's.
+
+Two independent problems are visible in ten lines. Find both, and say what an attacker sends for
+each.
+
+<Answer>
+**Problem one: `delegatecall` propagates `msg.sender` unchanged, so the guard never sees the
+router.**
+
+`DELEGATECALL` keeps the caller from the parent frame. Inside `_settle`, `msg.sender` is the user who
+called `execute` — not `address(this)`. So `require(msg.sender == address(this))` *fails* for every
+legitimate batch, and the whole thing reverts on the first step. The contract does not work at all,
+which is the merciful version of this bug.
+
+The reason it looks correct is that the same guard is correct with a plain `call`. Swap
+`address(this).delegatecall(...)` for `address(this).call(...)` and `msg.sender` inside `_settle`
+becomes the router, the guard passes, and the design works as written. One word, two opposite
+behaviours, and the difference is not visible at the guarded function.
+
+**Problem two: the guard is not a guard, once problem one is "fixed".**
+
+Suppose the team changes it to `call`. Now `_settle` is an `external` function with a check that
+`msg.sender` is the router — and `execute` will make the router call anything the caller asks for.
+An attacker sends `steps = [abi.encodeCall(Router._settle, (attacker, type(uint256).max))]`.
+`execute` dutifully calls the router's own `_settle`, `msg.sender` is the router, the guard passes,
+and the attacker credits themselves an arbitrary payout. The "internal only" marker is satisfied by
+the very mechanism that was supposed to be the only path through it.
+
+The general form: a self-call guard is only as strong as the narrowest thing that can make your
+contract call itself. A generic dispatcher that forwards user-supplied calldata to `address(this)` is
+the widest possible such thing.
+
+**What is not the bug, and is worth saying out loud.** `require(ok, "step failed")` does check the
+boolean, which is more than most versions of this code do — but it also discards whatever reason the
+step actually reverted with, so every failure in the batch is reported as the string "step failed".
+That is the subject of the next lesson.
+
+**And the fact that makes it worse.** `address(this).delegatecall(steps[i])` will succeed with empty
+return data if `steps[i]` does not match any selector *and* the contract has a fallback that returns
+nothing, or if the router were ever pointed at a codeless address. `ok` being `true` never proved a
+step ran; it proved a frame opened and closed without reverting.
+
+**The repair is structural, not a stronger check.** Make `_settle` `internal` and give `execute` an
+explicit, typed switch over a small set of operations. Once the function has no external entry point
+at all, there is no `msg.sender` to compare and no calldata an attacker can craft to reach it.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next:** `STATICCALL`, which is the only one of these instructions that adds a guarantee rather than
+removing one — and the exact list of what it forbids, including the one entry that the governing EIP
+does not mention because it predates it.
+
+**Two on:** the boolean and the byte string that a low-level call hands back, why `require(ok)` throws
+away the useful half, and how to put a callee's error back on the wire.
+
+**And a habit for reading code:** every time you see a low-level call, ask what would happen if the
+target held no code, and check whether anything downstream of `success` would notice. In a large
+fraction of real deployments the answer is that nothing would, and the fix is one line — but it has
+to be someone's job to ask.

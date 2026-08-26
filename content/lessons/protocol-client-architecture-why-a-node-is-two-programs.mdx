@@ -1,0 +1,361 @@
+---
+id: protocol-client-architecture-why-a-node-is-two-programs
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [ethereum-org-nodes-clients, engine-api-spec, engine-api-common, engine-api-paris, eip-3675, consensus-specs-beacon-chain-v161, consensus-specs-mainnet-config-v161, clientdiversity-org, go-ethereum-repo, reth-repo, lighthouse-book, prysm-docs]
+stack: {}
+---
+
+The alert fires at 03:12. **Node healthy. Head stale 41 minutes.**
+
+Somebody opens the runbook. The process is up. `eth_chainId` answers instantly. `eth_getBalance` answers
+instantly, with a balance that was correct forty-one minutes ago. `eth_syncing` returns `false`, which the
+runbook says means "fully synced". The logs scroll steadily. Nothing has crashed, nothing has restarted,
+disk and memory are unremarkable.
+
+The runbook has no next step, because the runbook was written about one program. There are two, and the
+one that is broken is not the one being examined. It is not even the one serving the API that produced
+the alert.
+
+This module is about the inside of that machine. You have run a node, or at least talked to one across
+an RPC boundary. This lesson establishes the thing every later lesson depends on: which of the two
+processes owns which question, and — the part that surprises people — which of them is allowed to decide
+what is true.
+
+## The split, stated exactly
+
+A full Ethereum node is two independently written programs running side by side on one machine, plus one
+private channel between them.<Cite src="ethereum-org-nodes-clients" />
+
+The **execution client** holds the world state, runs the EVM, keeps the public transaction mempool, and
+serves the `eth_*` JSON-RPC that your application talks to.
+
+The **consensus client** speaks the beacon-chain peer-to-peer protocol, keeps the beacon state and the
+validator registry, collects attestations, runs [fork choice](/c/fork-choice-purpose), and tracks
+justification and finality.
+
+They are different codebases by different teams in different languages. They are configured separately,
+they sync separately, they have separate ports, separate log files, separate data directories, separate
+version numbers and separate release cadences. They agree on nothing except a shared secret and a wire
+format.
+
+That is not a deployment convenience. It is the architecture, and it has been since the Merge.
+
+<Figure
+  caption="Four network surfaces, two processes, and exactly one call path between them — which only the consensus client may initiate."
+  alt="Beacon-chain libp2p peers feed the consensus client; the consensus client calls the execution client over the engine namespace; the execution client serves your application over eth JSON-RPC and gossips transactions with devp2p peers."
+>
+  <Flow
+    nodes={[
+      { id: 'libp2p', label: 'libp2p peers', note: 'beacon blocks, attestations', col: 0, tone: 'muted' },
+      { id: 'cl', label: 'consensus client', note: 'fork choice, finality, the clock', col: 1, tone: 'accent' },
+      { id: 'el', label: 'execution client', note: 'state, EVM, mempool', col: 2 },
+      { id: 'app', label: 'your application', note: 'eth_* JSON-RPC', col: 3, tone: 'muted' },
+      { id: 'devp2p', label: 'devp2p peers', note: 'transaction gossip', col: 3, tone: 'muted' },
+    ]}
+    edges={[
+      { from: 'libp2p', to: 'cl' },
+      { from: 'cl', to: 'el', label: 'engine_*', tone: 'accent' },
+      { from: 'el', to: 'app' },
+      { from: 'el', to: 'devp2p' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="A node is one program. You install it, point it at a data directory, and it syncs."
+  reality="Running a full node means running two processes. Both must be configured, both must sync, and they must share an authentication secret before either is useful. Neither one alone follows the chain."
+  why="Before the Merge, one Geth process genuinely was a full node — it did execution and consensus both. Most install guides, monitoring dashboards and mental models of 'the node' predate 2022 and describe that world."
+  src="ethereum-org-nodes-clients"
+/>
+
+## What the execution client owns, and what it does not
+
+Start with the half you already know from the inside, because you have been talking to it all along.
+
+**It owns state.** Accounts, balances, nonces, contract code, storage. Every [Merkle-Patricia
+trie](/c/merkle-patricia-trie) you learned to build a proof against lives here, and so does the
+[state root](/c/state-as-keyvalue) that commits to all of it.
+
+**It owns the machine that changes state.** The EVM, gas accounting, the precompiles, transaction
+validity rules, receipt and log generation. Everything from the EVM track happens inside this process.
+
+**It owns the public transaction mempool.** The devp2p transaction gossip network, the pending and queued
+pools, replacement rules, blob pool policy. Your `eth_sendRawTransaction` lands here.
+
+**It owns the user-facing API.** `eth_*`, `debug_*`, `trace_*` — the whole surface your indexer, your
+wallet backend and your simulation harness consume.
+
+Now the part that is easy to say and hard to feel: **it owns no opinion about which chain is real.**
+
+The execution client does not choose a head. It does not know what an attestation is. It cannot compute
+finality; it is *told* what is finalised. Handed a block, it executes it and reports a verdict — this
+extends the state consistently, or it does not. Handed a head, it adopts that head. It is a very
+sophisticated evaluator that has been deliberately stripped of authority.
+
+This is a genuine amputation, not a design that was always this way. Before the Merge the execution
+client ran fork choice itself, by total difficulty: the heaviest chain of proof-of-work won, and the
+execution client could compute that quantity from block headers it already had. EIP-3675 replaced that
+rule wholesale — the beacon chain becomes the source of the canonical view, and the execution layer's
+fork choice is driven by events pushed down from consensus rather than computed
+locally.<Cite src="eip-3675" /> The code that used to decide was removed. What is left is a process that
+answers questions and never asks one.
+
+<Misconception
+  belief="The execution client decides which chain is canonical — it has all the blocks, after all."
+  reality="It validates and executes what it is handed and adopts the head it is given. Every 'which chain is real' question is answered on the consensus side and pushed down."
+  why="Before the Merge the execution client genuinely did run fork choice, by total difficulty, and could compute the answer from data it already held. EIP-3675 removed that role."
+  src="eip-3675"
+/>
+
+## What the consensus client owns
+
+The consensus client is the process with a clock and an opinion.
+
+**It owns time.** Slots and epochs are its units. The mainnet configuration sets `SLOT_DURATION_MS` to
+12,000 — one slot every twelve seconds — and the phase0 preset sets `SLOTS_PER_EPOCH` to
+32.<Cite src="consensus-specs-mainnet-config-v161" /><Cite src="consensus-specs-beacon-chain-v161" />
+Every deadline any [validator](/c/validator) has to hit is enforced here.
+
+**It owns the beacon state.** The validator registry, effective balances, the justification and
+finalisation checkpoints, randomness, [committee](/c/committee) assignments. The whole beacon-chain
+[state transition](/c/state-machine-replication) runs in this process.
+
+**It owns the votes.** [Attestations](/c/attestation) arrive on gossip subnets, get aggregated, get
+included in blocks, and get counted.
+
+**It owns fork choice and finality.** [LMD-GHOST](/c/lmd-ghost) picks the head each slot;
+[Casper FFG](/c/casper-ffg) justifies and finalises checkpoints. This process, and only this process,
+knows what the canonical chain is.
+
+**And it owns the authority to say so.** It is the only thing on the machine that can tell the execution
+client what the head is.
+
+Note what the consensus client does *not* own. It holds no account balances. It cannot execute a
+transaction. It has never seen your contract's storage. When it needs to know whether an execution
+payload is valid, it has to ask — it has no way to find out for itself.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Execution client', note: 'Geth, Nethermind, Besu, Erigon, Reth, Ethrex' },
+    { title: 'Consensus client', note: 'Lighthouse, Prysm, Teku, Nimbus, Lodestar, Grandine, Caplin', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'Who holds balances, code and storage?',
+      cells: [
+        'All of it — the state trie, the EVM, receipts and logs.',
+        { v: 'None of it. It has never seen your contract.', tone: 'muted' },
+      ],
+    },
+    {
+      label: 'Who decides which chain is canonical?',
+      cells: [
+        { v: 'Nobody here. It adopts the head it is handed.', tone: 'muted' },
+        { v: 'Fork choice runs here, and only here.', tone: 'accent' },
+      ],
+    },
+    {
+      label: 'Who computes finality?',
+      cells: [
+        'It is told what is finalised, and prunes behind it.',
+        'Casper FFG justifies and finalises checkpoints.',
+      ],
+    },
+    {
+      label: 'Which peer network does it speak?',
+      cells: ['devp2p — transaction and block-body gossip.', 'libp2p — beacon blocks and attestations.'],
+    },
+    {
+      label: 'What does your application call?',
+      cells: ['eth_*, debug_*, trace_* — the whole public surface.', 'Nothing on this path. It has no user-facing API.'],
+    },
+    {
+      label: 'What happens if you run only this one?',
+      cells: [
+        { v: 'It has no head to sync toward, so it sits.', tone: 'warn' },
+        { v: 'It cannot validate a payload, so it cannot follow the chain.', tone: 'warn' },
+      ],
+    },
+  ]}
+  caption="The split is not two halves of one job — it is authority on one side and evaluation on the other, and no row crosses over."
+  alt="Execution and consensus clients compared across state ownership, canonical-chain decisions, finality, peer network, public API, and what each does when run alone."
+/>
+
+## Why anyone would build it this way
+
+Two processes is more operational surface than one. The reason it is worth it is that the split is drawn
+along a line where two very different kinds of correctness live.
+
+Execution correctness is *deterministic replay*. Given a pre-state and a block, there is exactly one
+right answer, and any implementation that computes a different one is wrong in a way you can demonstrate
+on a laptop.
+
+Consensus correctness is *agreement under adversarial timing*. There is no single right answer to "which
+of these two blocks is the head" that can be computed from local data alone; the answer depends on what
+other nodes saw, when they saw it, and what they voted. Its failure modes are the [safety](/c/safety-property)
+and [liveness](/c/liveness-property) failures from the fundamentals track, not "the number came out
+wrong".
+
+Splitting them lets each side be specified, implemented and tested in the terms that fit it. The
+execution layer's specification is executable Python that replays blocks. The consensus layer's is
+executable Python plus a fork-choice store plus a networking spec. Neither has to model the other.
+
+There is a second payoff, and the Engine API specification names it outright: because the consensus
+client drives and the execution client answers, one consensus client can legally drive *several*
+execution clients — the spec calls this a supported one-to-many
+configuration.<Cite src="engine-api-common" /> The reverse is not supported: the execution layer keeps
+one chain head, so two consensus clients writing to it simultaneously is undefined
+behaviour.<Cite src="engine-api-common" /> That asymmetry is a direct consequence of who holds authority,
+and it is the technique behind running a candidate execution client alongside a production one on live
+traffic.
+
+### The consequence that bites first: they sync separately, and in an order
+
+The two processes maintain separate databases and sync independently, which sounds like two parallel
+tasks and is not.
+
+The Engine API specification defines sync, from the execution client's point of view, as the process of
+obtaining the data required to validate a payload — pulling data from remote peers, and passing a
+payload's ancestors through validation to obtain a parent state.<Cite src="engine-api-paris" /> Read that
+definition for what it presupposes. Sync is *toward a payload*. The execution client syncs toward a block
+someone handed it.
+
+Post-Merge, nobody hands it one except the consensus client. An execution client started next to a
+consensus client that is not yet following the chain has no target. It is not stuck and it is not broken;
+it has not been given a destination. The dependency runs one way: **the consensus client has to be
+following the chain before the execution client can finish syncing to it.** This is why a fresh node's
+progress reads as nothing, nothing, nothing, then everything at once, and why the useful first question
+during a slow sync is what the *consensus* client thinks its head is.
+
+The exact behaviour during sync is left to implementations — the specification says so
+explicitly<Cite src="engine-api-paris" /> — so two execution clients can be at different points of the
+same sync with entirely different log output and both be conformant.
+
+## The 2026 landscape, without the stale list
+
+Both halves have more implementations than most course material admits, and the execution-layer list in
+particular has moved.
+
+On the consensus side the community dashboard lists Lighthouse (Rust), Prysm (Go), Teku (Java), Nimbus
+(Nim), Lodestar (TypeScript), Grandine (Rust) and Caplin (Go, shipped with Erigon) as stable, with
+Lambda (Elixir) marked deprecated.<Cite src="clientdiversity-org" />
+
+On the execution side it lists Geth (Go), Nethermind (.NET), Besu (Java), Erigon (Go), Reth (Rust) and
+Ethrex (Rust) as stable, Nimbus's execution client as alpha and Silkworm (C++) as pre-alpha, with Akula
+and EthereumJS deprecated.<Cite src="clientdiversity-org" /> Reth is a production execution client in
+this list, not a research project<Cite src="reth-repo" />, and "Geth, Nethermind, Besu, Erigon" is no
+longer the complete set — though Geth remains the oldest and most widely deployed of
+them.<Cite src="go-ethereum-repo" />
+
+You need one from each column. A Reth plus Lighthouse node and a Geth plus Prysm node are both full
+Ethereum nodes and neither is a hybrid of anything — the pairing is free, because the interface between
+the columns is specified.<Cite src="engine-api-spec" />
+
+<Aside kind="note">
+The consensus side splits again, into a beacon node that talks to the network and a validator client
+that holds the signing keys.<Cite src="lighthouse-book" /><Cite src="prysm-docs" /> That second split is
+a separate mechanism with its own failure modes, and it gets its own treatment in this module's fourth
+lesson. For now: when this lesson says "consensus client", read it as the beacon node.
+</Aside>
+
+## Reading the 03:12 alert
+
+Return to the incident with the split in hand.
+
+**Subgoal 1 — identify which process produced the observation.** `eth_getBalance` and `eth_chainId` are
+`eth_*` methods, served by the execution client. Everything in the alert came from the execution client,
+and the execution client is behaving correctly: it is answering questions about the last state it was
+told to adopt.
+
+**Subgoal 2 — identify which process is responsible for the head advancing.** New heads arrive because
+the consensus client received a beacon block, ran fork choice, and pushed the resulting head down. If
+the head is not advancing, either no beacon blocks are arriving, or fork choice is not running, or the
+push is failing. All three live on the consensus side or on the channel between the two.
+
+**Subgoal 3 — notice what `eth_syncing` can and cannot mean here.** It reports the execution client's own
+sync state. An execution client that has been given no new work has nothing to sync and says so. "Not
+syncing" and "up to date with the network" are different claims, and only the first one is being made.
+
+**Subgoal 4 — decide where to look.** The consensus client's logs, and the health of the channel between
+them. Nothing in the execution client's logs will explain this, which is exactly why the runbook stalled.
+
+The generalisation is the useful part: **every "which chain am I on" question belongs to the consensus
+side, whatever the execution client's logs say.** Staleness, wrong head, a head that jumped backwards,
+finality not advancing — all of them. And every "what does this state say" question belongs to the
+execution side. Sorting an incident by that one cut eliminates half the search space before you read a
+single line of logs.
+
+<Check type="explain" concept="el-cl-split">
+A teammate is debugging a service that reads from your node. They report: "The node returned a receipt
+for transaction `0xab…` with `status: 1` and a block number, and forty seconds later the same query
+returned null. The execution client has a bug — it lost a receipt."
+
+Say whether the execution client has a bug, what actually happened, and which process you would examine.
+
+<Answer>
+**The execution client almost certainly does not have a bug, and the behaviour is not a loss.** It is a
+[reorg](/c/reorg) — the block containing that transaction stopped being on the canonical chain, so the
+receipt stopped being reachable by that lookup.
+
+**Locate the decision.** The execution client did not decide to drop the block. It cannot: it has no
+fork choice, no attestations, and no view of what the rest of the network voted for.<Cite src="eip-3675" />
+It was told the head is now a different block, and it re-derived what is reachable from that head. The
+decision to change the head was made in the consensus client, by fork choice, on evidence — attestations
+— that never crosses into the execution process at all.
+
+**Why the execution client's logs will look boring.** From its side, this was a routine head update
+followed by ordinary state re-derivation. There is no error, no warning, nothing anomalous to print. A
+search through those logs for the moment the receipt "disappeared" finds nothing, which reads as a
+cover-up and is in fact an accurate report that nothing went wrong here.
+
+**Where to look.** The consensus client, for a head change at that timestamp and for its depth. If the
+new head is a sibling of the old one, this was a one-block reorg at the tip and it is unremarkable. If
+the reorg was several blocks deep, or if it crossed a finalised checkpoint, those are different and much
+more serious stories — and the consensus client is the only process that can tell you which one you are
+in, because finality is a quantity it computes and the execution client merely receives.
+
+**The product lesson underneath.** Your teammate's service treated a receipt as a fact. A receipt is a
+statement about the canonical chain, and which chain is canonical is a live decision being made in
+another process on a twelve-second clock.<Cite src="consensus-specs-mainnet-config-v161" /> The fix is
+not in the node. It is to stop treating a receipt at the head as final, which is a question about
+[confirmation depth](/c/finality-vs-confirmations) rather than about node health.
+
+**The one-line version.** The execution client answers questions about a chain; it does not choose one.
+Anything that looks like the chain changing its mind is a consensus-side event surfacing through an
+execution-side API.
+</Answer>
+</Check>
+
+## The mental model to carry
+
+Two boxes.
+
+The left box holds state, the EVM, the mempool and the public API. Arrows leave it outward to devp2p
+peers and to your application. It answers.
+
+The right box holds validators, attestations, fork choice and finality. Arrows leave it outward to
+libp2p beacon peers. It decides.
+
+Between them, exactly one arrow — private, authenticated, local, and pointing in one direction as far as
+who initiates is concerned. Everything the two halves of your node ever say to each other goes through
+it.<Cite src="engine-api-common" />
+
+That arrow is the next lesson.
+
+## What this unlocks
+
+- **The next lesson** takes the channel apart: the `engine_*` namespace, why it is served on a separate
+  port from the public API, the shared secret both processes read, and why a node whose secret does not
+  match runs happily forever without following the chain.<Cite src="engine-api-common" />
+- **Lesson three** puts the three calls that carry every block on a timeline, including the one whose
+  return value is worth more the later you ask for it.<Cite src="engine-api-paris" />
+- **The module's practice** has you pair two clients yourself and then break the pairing on purpose, so
+  that the failure has a shape in your memory rather than a paragraph.
+
+The habit worth forming: when something about a node looks wrong, ask *which process owns this question*
+before asking *what went wrong*. Half the time the answer to the first question makes the second one
+trivial, and the other half of the time it stops you reading the wrong log for an hour.

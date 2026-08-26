@@ -1,0 +1,412 @@
+---
+id: defi-lending-two-numbers-not-one
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [aave-v3-pool-docs, morpho-liquidation-docs, morpho-market-docs, morpho-irm-docs, aave-v3-origin-33]
+stack: {}
+---
+
+The interface says *78% of borrow limit used*, with a bar that is comfortably not red. A reasonable
+reader concludes there is 22% of something left.
+
+There is not. That position is liquidated by a 24% fall in the collateral price, and the number 22
+does not appear anywhere in that calculation. The gap is not a rounding artefact or a bad UI — it is
+what happens when a system with two thresholds is rendered as a system with one. This lesson derives
+both, derives the identity that connects them to the bar, and then does the thing almost nobody does:
+converts a health factor into an actual price move, correctly, in both directions.
+
+## Two parameters, sixteen bits each, one storage word
+
+Start where the values live, because the layout tells you they were designed as separate knobs rather
+than one knob with a safety margin bolted on. Aave v3 packs a reserve's entire risk configuration into
+a single `uint256`:<Cite src="aave-v3-pool-docs" />
+
+<Figure
+  caption="LTV and the liquidation threshold are adjacent 16-bit fields in one word, rewritten by one governance transaction."
+  alt="The Aave v3 reserve configuration uint256 drawn field by field: LTV in bits 0 to 15, liquidation threshold in 16 to 31, liquidation bonus, decimals, seven flag bits, the reserve factor, borrow and supply caps, the liquidation protocol fee, the unbacked mint cap, the isolation-mode debt ceiling, and the virtual accounting bit."
+>
+  <ByteLayout
+    unit="bits"
+    caption="one uint256 of reserve configuration"
+    fields={[
+      { label: 'LTV', size: 16, tone: 'accent', note: 'bits 0–15' },
+      { label: 'Liquidation threshold', size: 16, tone: 'accent', note: 'bits 16–31' },
+      { label: 'Liquidation bonus', size: 16, note: 'bits 32–47' },
+      { label: 'Decimals', size: 8, tone: 'muted', note: 'bits 48–55' },
+      { label: 'Reserve is active', size: 1, tone: 'muted', note: 'bit 56' },
+      { label: 'Reserve is frozen', size: 1, tone: 'muted', note: 'bit 57' },
+      { label: 'Borrowing is enabled', size: 1, tone: 'muted', note: 'bit 58' },
+      { label: 'Asset is paused', size: 1, tone: 'muted', note: 'bit 60' },
+      { label: 'Borrowing in isolation mode is enabled', size: 1, tone: 'muted', note: 'bit 61' },
+      { label: 'Siloed borrowing is enabled', size: 1, tone: 'muted', note: 'bit 62' },
+      { label: 'Flashloaning is enabled', size: 1, tone: 'muted', note: 'bit 63' },
+      { label: 'Reserve factor', size: 16, note: 'bits 64–79' },
+      { label: 'Borrow cap', size: 36, note: 'bits 80–115 · whole tokens · 0 ⇒ no cap' },
+      { label: 'Supply cap', size: 36, note: 'bits 116–151 · whole tokens · 0 ⇒ no cap' },
+      { label: 'Liquidation protocol fee', size: 16, note: 'bits 152–167' },
+      { label: 'Unbacked mint cap', size: 36, note: 'bits 176–211 · whole tokens · 0 ⇒ minting disabled' },
+      { label: 'Debt ceiling for isolation mode', size: 40, note: 'bits 212–251 · DEBT_CEILING_DECIMALS' },
+      { label: 'Virtual accounting is enabled', size: 1, tone: 'muted', note: 'bit 252' },
+    ]}
+  />
+</Figure>
+
+Everything a risk framework decides about an asset is in that word.<Cite src="aave-v3-pool-docs" /> No
+document, no policy PDF, no committee minutes — one word, and a governance transaction that rewrites
+it. v3.3 even flipped the bitmasks so that the common operation, *reading* the configuration, needs
+one fewer instruction than it used to.<Cite src="aave-v3-origin-33" /> That is the level at which risk
+policy is implemented.
+
+The two we care about now sit adjacent:
+
+- **Loan-to-value (LTV)**, also called the collateral factor, caps the debt a position may *open or
+  increase to* as a fraction of collateral value. An asset with an LTV of zero cannot be enabled as
+  collateral at all.<Cite src="aave-v3-pool-docs" />
+- **Liquidation threshold (LT)** is a strictly larger ratio at which the position becomes *seizable*.
+  When the health factor is below 1, a liquidator repays some `debtToCover` on the borrower's behalf
+  and receives a proportional, discounted amount of the collateral plus a liquidation bonus "to cover
+  market risk".<Cite src="aave-v3-pool-docs" />
+
+### What the band actually buys, in the right units
+
+Take an illustrative asset with LTV 0.80 and LT 0.825. Both are governance parameters and both move;
+read them from the reserve configuration rather than from a lesson.
+
+**Subgoal 1 — open at the maximum.** With collateral value `C`, the largest debt permitted is
+`D = 0.80 · C`.
+
+**Subgoal 2 — find the collateral value at which seizure becomes possible.** That is the `C'` where
+`C' · 0.825 = D`, so `C' = 0.80·C / 0.825 = 0.9697·C`.
+
+**Subgoal 3 — convert to the units a borrower thinks in.** The position survives a **3.03%** fall in
+the collateral price, not a 2.5% fall. The band is 2.5 *percentage points of ratio*, and ratio points
+are not price points. A borrower who reads "2.5% buffer" off the difference between two published
+numbers has mis-stated their own risk by twenty percent, in the safe-sounding direction.
+
+**Subgoal 4 — state what the band is for.** It is the price move a borrower who opened at maximum
+leverage may absorb before anything can be taken from them. Without it, a position could be opened and
+liquidated in consecutive blocks on a single oracle tick, which would make maximum-LTV borrowing a
+trap rather than a product.
+
+<Matrix
+  numeric
+  corner="The illustrative asset"
+  cols={['LTV 0.80', 'LT 0.825']}
+  rows={[
+    { label: 'Ratio of debt to collateral value', cells: ['0.800', '0.825'] },
+    { label: 'Collateral value at the line, from C = 1.0000', cells: ['1.0000', { v: '0.9697', tone: 'warn' }] },
+    { label: 'Health factor of a fully drawn position', cells: [{ v: '1.031', tone: 'accent' }, { v: '1.000', tone: 'danger' }] },
+    { label: 'Collateral price fall from open', cells: ['0', { v: '3.03%', tone: 'warn' }] },
+  ]}
+  caption="A fully drawn position opens at health factor 1.031, and the whole of its protection is 3.03% of the collateral price."
+  alt="The illustrative asset's LTV of 0.80 and liquidation threshold of 0.825 expressed four ways: as a debt-to-collateral ratio, as the collateral value at each line, as the health factor of a fully drawn position, and as the collateral price fall from open."
+/>
+
+There is a second, less obvious payoff, and it is the strongest argument for two numbers rather than
+one. Because LTV governs only *new* borrowing and LT governs seizure, the two can be moved
+independently. Lowering an asset's LTV — to zero, in the limit — stops it backing any further debt
+without, by itself, making a single existing position liquidatable. A single-parameter design cannot
+express "no new leverage against this asset, and no forced selling today". That is precisely the
+action a risk committee wants available on the morning it stops believing in a listing.
+
+<Misconception
+  belief="LTV and the liquidation threshold are the same number under two names."
+  reality="LTV gates borrowing at open; the threshold is a higher ratio that gates seizure. They occupy different bits of the same configuration word and are set independently, which is what lets governance stop new leverage without triggering liquidations."
+  why="Most interfaces render one borrow-limit bar and never surface the second parameter, so the two collapse into a single mental object called 'the limit'."
+  src="aave-v3-pool-docs"
+/>
+
+### The one-parameter alternative, and what it costs
+
+Two numbers is a choice, not a law. Morpho Blue markets carry a single **LLTV** — liquidation
+loan-to-value — chosen at market creation from a governance-approved set and immutable thereafter: 0,
+38.5%, 62.5%, 77%, 86%, 91.5%, 94.5%, 96.5%, 98%.<Cite src="morpho-market-docs" /> Its documentation
+is blunt about what the single number means: at an LLTV of 80%, $100 of collateral supports $80 of
+borrowing, and "if above like $80.0001, the position is liquidatable".<Cite src="morpho-market-docs" />
+
+Borrow to the limit and you are one wei of price movement from seizure. There is no band, because
+there is no second parameter to hold one.
+
+Read that as a deliberate transfer rather than an oversight. In the two-parameter design the protocol
+chooses the buffer for you and enforces it by refusing the last slice of borrowing power; in the
+one-parameter design the borrower chooses their own buffer by simply not borrowing to the limit. What
+the pool gives up is the ability to act on the two decisions separately — with one number, "stop new
+leverage against this asset" and "start seizing positions" are the same governance action, which is
+why in an immutable market neither is available at all. What it gains is that there is nothing to
+change, so nobody has to be trusted not to change it. That trade — a risk framework you must trust
+versus parameters nobody can move — is the axis the whole isolated-versus-pooled question turns on
+later in this module.
+
+<Compare
+  columns={[
+    { title: 'Two parameters', note: 'Aave v3 reserve config', tone: 'accent' },
+    { title: 'One parameter', note: 'Morpho Blue LLTV' },
+  ]}
+  rows={[
+    {
+      label: 'What gates opening a position?',
+      cells: [
+        'LTV. An asset with an LTV of zero cannot be enabled as collateral at all.',
+        'LLTV — the same number that gates seizure.',
+      ],
+    },
+    {
+      label: 'What buffer does a fully drawn borrower get?',
+      cells: [
+        'LT / LTV — 1.031 for the illustrative asset, a 3.03% price fall.',
+        <>None. At an 80% LLTV, “if above like $80.0001, the position is liquidatable”.<Cite src="morpho-market-docs" /></>,
+      ],
+    },
+    {
+      label: 'Who chooses the buffer?',
+      cells: [
+        'The protocol, and it enforces the choice by refusing the last slice of borrowing power.',
+        'The borrower, by declining to borrow to the limit.',
+      ],
+    },
+    {
+      label: 'Can new leverage be stopped without forcing liquidations?',
+      cells: [
+        'Yes. Lower the LTV — to zero, in the limit — and leave the threshold alone.',
+        <>No. One number does both, and in an immutable market neither action exists.<Cite src="morpho-market-docs" /></>,
+      ],
+    },
+    {
+      label: 'What has to be trusted?',
+      cells: [
+        'A risk framework, and its continued willingness not to move the numbers against you.',
+        'Nothing. There is nothing to change.',
+      ],
+    },
+  ]}
+  caption="The second parameter is what buys a band; giving it up buys immutability instead, and the two cannot be had together."
+  alt="A two-parameter design and a one-parameter design compared on what gates opening a position, the buffer a fully drawn borrower gets, who chooses that buffer, whether new leverage can be stopped without liquidations, and what must be trusted."
+/>
+
+## Health factor, and the identity that explains the bar
+
+Health factor is the collateral, weighted asset by asset by that asset's liquidation threshold,
+divided by total debt value:
+
+```text
+HF = Σ (collateralValue_i × liquidationThreshold_i) / totalDebtValue
+```
+
+Below 1, the position may be liquidated. Aave's `getUserAccountData` returns it directly, alongside
+`totalCollateralBase`, `totalDebtBase`, `availableBorrowsBase`, the blended
+`currentLiquidationThreshold` and the blended `ltv` — all in the base currency the price feed
+uses.<Cite src="aave-v3-pool-docs" /> Morpho Blue states the same quantity with a single parameter per
+market: `HEALTH_FACTOR = COLLATERAL_VALUE_IN_LOAN_TOKEN × LLTV / BORROWED_AMOUNT`, healthy above 1.0,
+liquidatable below.<Cite src="morpho-liquidation-docs" />
+
+Now connect it to the bar the interface draws. Let `u` be "fraction of borrow limit used", which is
+`u = D / (C · LTV)`. Substituting into the health factor for a single-collateral position:
+
+```text
+HF = C · LT / D
+   = C · LT / (u · C · LTV)
+   = (LT / LTV) / u
+```
+
+Three consequences drop straight out of that identity, and each one corrects a common reading.
+
+**At 100% of borrow limit, the health factor is not 1.** It is `LT / LTV`, which for our illustrative
+asset is `0.825 / 0.80 = 1.031`. A fully drawn position is 3.1% of *health* away from seizure, which
+is the 3.03% price move derived above.
+
+**The bar and the health factor are reciprocal, not linear.** At `u = 0.78` the health factor is
+`1.031 / 0.78 = 1.322`.
+
+**Neither number is a price distance.** For that, do the last step.
+
+### From health factor to a price move, in both directions
+
+This is the step almost every dashboard omits, and it has two different answers depending on which leg
+of the position is the volatile one.
+
+**Subgoal 1 — identify the quantity that actually has to move.** `HF = C · LT / D`. Liquidation is
+`HF = 1`. Since `LT` is constant, what must change is the *ratio* `C / D`, and it must fall by exactly
+a factor of `HF`. Nothing else in the formula matters.
+
+**Subgoal 2 — solve the volatile-collateral case.** Stable debt, so `D` is fixed and `C` must fall by
+the factor `1 / HF`. The price fall that liquidates is `1 − 1/HF`. At `HF = 1.322`: `1 − 0.7564 =
+24.4%`. At `HF = 1.5`: **33.3%**. At `HF = 1.05`: **4.76%**.
+
+**Subgoal 3 — solve the volatile-debt case.** Stable collateral, so `C` is fixed and `D` must rise by
+the factor `HF`. The price rise that liquidates is `HF − 1`. At `HF = 1.5`: **+50%**. At `HF = 1.05`:
+**+5%**.
+
+**Subgoal 4 — say precisely what differs, and resist the overclaim.** These two are the *same ratio
+move* expressed from opposite ends: a 33.3% fall and a 50% rise both take `C/D` down by a factor of
+1.5. So it is not true that one position is intrinsically closer to liquidation than the other at
+equal health factor. What *is* true, and what matters:
+
+- The two percentages differ — 33.3 against 50 — so a single sentence like "health factor 1.5 means
+  you are 50% away" is right in at most one of the two cases, and the discrepancy grows with health
+  factor (at `HF = 1.05` the two answers are 4.76% and 5%, nearly equal; at `HF = 3` they are 66.7%
+  and 200%).
+- Falls are bounded at 100% and rises are not. "The collateral halves" and "the debt asset doubles"
+  are not equally probable events for the same asset, and the second is not bounded by anything.
+- The distribution that governs your risk is the distribution of the **ratio**, not of either leg.
+  That is the entire subject of the next lesson: if you can make the two legs move together, the
+  ratio barely moves, and a much thinner buffer starts to look defensible.
+
+<Misconception
+  belief="A health factor of 1.5 means the position is 50% away from liquidation."
+  reality="It means the collateral-to-debt value ratio must fall by a factor of 1.5. Expressed as a price move that is a 33.3% fall on the collateral leg or a 50% rise on the debt leg — the same event, two different percentages, and only one of them is 50."
+  why="Health factor is taught as a scalar with an implied direction, and the question 'which leg is volatile?' is never asked."
+  src="morpho-liquidation-docs"
+/>
+
+### What the ratio form tells you about oracle risk
+
+One more consequence falls out of "only the ratio moves", and it is the reason this formula is the
+right place to start thinking about price feeds.
+
+Every term in the health factor is a *value*, produced by multiplying a token amount by a price in
+some common base currency — Aave's `getUserAccountData` returns collateral, debt and available borrows
+"in the base currency used by the price feed".<Cite src="aave-v3-pool-docs" /> Now suppose every feed
+the protocol reads is wrong by the same multiplicative factor `k`. The numerator scales by `k`, the
+denominator scales by `k`, and the health factor does not move at all. A uniform error in the base
+currency is invisible to liquidation logic, and harmlessly so.
+
+Suppose instead that one feed is wrong by `k` and the others are correct. Now the ratio moves by the
+full `k`, and every position with that asset on one side re-prices. The health factor is not exposed
+to *price* error; it is exposed to **relative** price error between the collateral leg and the debt
+leg. That is why a collateral listing's oracle is not judged on absolute accuracy but on whether it
+can diverge from the feed used for the asset borrowed against it — and it is why an oracle that prices
+an asset by a rate rather than by a market is a different kind of object from one that prices it by
+trades. Both produce a number; only one of them can report that the market disagrees with the number.
+That distinction is the hinge of the next lesson, and it gets its full treatment in
+[the oracles module](/c/orac-price-feed).
+
+## Two ways a position dies without you
+
+The health factor formula contains no user action. Both of its inputs move on their own.
+
+**Oracle updates.** `C` and `D` are *values*, so every price update recomputes them. A position opened
+at a comfortable health factor is liquidatable the instant a feed reports a number that makes it so,
+with no transaction from the borrower and no warning surface that is guaranteed to reach them.
+
+**Interest accrual.** `D` grows continuously. Morpho's interest rate model documents the borrow leg as
+a per-second rate compounded continuously — `borrowAPY = e^(borrowRate × 31,536,000) − 1`, with
+`secondsPerYear = 31,536,000`.<Cite src="morpho-irm-docs" /> Take a position sitting at `HF = 1.01`
+with a flat oracle. The debt must grow by a factor of 1.01 to reach `HF = 1`, so the time to
+liquidation is `ln(1.01) / r`:
+
+<Matrix
+  numeric
+  corner="Borrow rate on a position at HF = 1.01"
+  cols={['ln(1.01) / r', 'Time to liquidation']}
+  rows={[
+    { label: 'r = 12% / year', cells: ['0.009950 / 0.12 = 0.0829 years', { v: '≈ 30 days', tone: 'warn' }] },
+    { label: 'r = 60% / year', cells: ['0.009950 / 0.60 = 0.0166 years', { v: '≈ 6 days', tone: 'danger' }] },
+  ]}
+  caption="With a flat oracle and no transaction from anyone, the borrow rate alone sets the date of seizure."
+  alt="A position at health factor 1.01 under a flat oracle: at a 12% annual borrow rate it reaches liquidation in about 30 days, and at 60% in about 6 days."
+/>
+
+Nothing happens in the market. Nobody trades. The position is seized on a schedule set entirely by the
+borrow rate — and the borrow rate is not a constant either, which is why a position that had thirty
+days of runway can have six after a liquidity event moves utilisation. That coupling is the subject of
+the lesson after next.
+
+<Misconception
+  belief="Your position is only at risk when you interact with it."
+  reality="Both inputs to the health factor move on their own: oracle updates change the numerator and denominator, and accrued interest grows the denominator every second. Positions are liquidated in their sleep."
+  why="The interface recomputes when you open it, so the number appears to be a property of your session rather than of chain state."
+  src="aave-v3-pool-docs"
+/>
+
+## Two refinements that change the answer
+
+**Blending, and why a value-neutral rebalance can hurt you.** With multiple collaterals the numerator
+is a weighted sum, so the *composition* matters, not only the total. Take $10,000 of collateral
+against $5,000 of debt.
+
+<Matrix
+  numeric
+  corner="Collateral mix, $10,000 against $5,000 of debt"
+  cols={['Weighted collateral', 'Blended LT', 'Health factor']}
+  rows={[
+    {
+      label: 'All in asset A (LT 0.825)',
+      cells: ['10,000 × 0.825 = 8,250', '0.825', { v: '1.65', tone: 'good' }],
+    },
+    {
+      label: '$6,000 A + $4,000 B (LT 0.60)',
+      cells: ['4,950 + 2,400 = 7,350', '0.735', { v: '1.47', tone: 'warn' }],
+    },
+  ]}
+  caption="The health factor is a function of collateral composition, not only of collateral value."
+  alt="Two collateral mixes holding the same $10,000 of value against the same $5,000 of debt: all in asset A gives a weighted collateral of 8,250, a blended threshold of 0.825 and a health factor of 1.65; splitting $6,000 into asset A and $4,000 into asset B gives 7,350, 0.735 and 1.47."
+/>
+
+Same total collateral value, same debt, and the health factor moved 11%. The blended threshold — the
+`currentLiquidationThreshold` that `getUserAccountData` returns<Cite src="aave-v3-pool-docs" /> —
+fell from 0.825 to 0.735. A borrower who "diversified their collateral" without changing its value
+moved measurably closer to liquidation, and no dollar amount on their screen changed.
+
+**`HF` below 1 is necessary, not sufficient.** Aave's `ReserveData` carries a `liquidationGracePeriodUntil`
+timestamp: until it passes, liquidations are not allowed on that reserve; set it in the past and they
+are.<Cite src="aave-v3-pool-docs" /> A seizable position is not necessarily a seized one, and code
+that assumes "health factor below 1 implies liquidation is callable now" is modelling the formula
+rather than the contract. This is a small instance of a habit worth generalising: the health factor is
+a *policy* expressed as arithmetic, and the arithmetic is surrounded by switches.
+
+<Check type="predict" concept="lend-health-factor">
+A position holds $50,000 of a collateral with LTV 0.75 and liquidation threshold 0.80, and has
+borrowed $30,000 of a dollar stablecoin. The interface shows "80% of borrow limit used".
+
+(a) Compute the health factor two ways — from the definition and from the `(LT/LTV)/u` identity — and
+confirm they agree. (b) State the collateral price fall that makes the position liquidatable.
+(c) The borrower now swaps $20,000 of the collateral into a second asset with liquidation threshold
+0.55, keeping total collateral value and debt unchanged. Recompute, and say what the borrower would
+have seen on a dashboard that displays only dollar values.
+
+<Answer>
+**(a) Health factor, twice.**
+From the definition: `HF = (50,000 × 0.80) / 30,000 = 40,000 / 30,000 = 1.3333`.
+From the identity: the borrow limit is `50,000 × 0.75 = 37,500`, and `u = 30,000 / 37,500 = 0.80`,
+matching the interface. Then `HF = (LT/LTV)/u = (0.80/0.75)/0.80 = 1.0667/0.80 = 1.3333`. They agree,
+as they must — the identity is the definition rearranged.
+
+**(b) The price move.** Debt is a dollar stablecoin, so this is the volatile-collateral case and the
+fall that liquidates is `1 − 1/HF = 1 − 0.75 = 25%`. Check it directly: at a 25% fall the collateral is
+worth $37,500, and `37,500 × 0.80 = 30,000`, exactly the debt. Note what the dashboard's "80% used"
+would have suggested — 20% of something — and that the true answer is 25%.
+
+**(c) After the swap.** The blended numerator becomes `30,000 × 0.80 + 20,000 × 0.55 = 24,000 + 11,000
+= 35,000`, so `HF = 35,000 / 30,000 = 1.1667`. The blended liquidation threshold has fallen from 0.80
+to 0.70, and the liquidating price fall has tightened from 25% to `1 − 1/1.1667 = 14.3%`.
+
+**What a dollar-only dashboard shows:** $50,000 of collateral and $30,000 of debt, before and after.
+Unchanged. Every number the borrower can see is identical, and the distance to liquidation has almost
+halved. The information that moved lives in bits 16–31 of two different reserve configuration
+words.<Cite src="aave-v3-pool-docs" />
+
+**The transferable habit.** When you read a lending position, never stop at collateral value and debt
+value. Recover the weighted threshold, then convert the health factor into a price move on whichever
+leg is the volatile one. Those two steps turn a number that feels like a score into a statement about
+the market.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** takes the observation that only the *ratio* moves and turns it into a product:
+efficiency mode raises both thresholds for baskets of assets a risk framework declares correlated,
+because if the two legs move together the buffer only has to cover the tracking error between them.
+It also examines what happens on the day that declaration turns out to be a governance opinion rather
+than a market fact — when every position in the basket crosses its threshold in the same minute, and
+the collateral the liquidators must sell is the asset that just broke.
+
+**The bad-debt lesson** at the end of this module uses the same ratio arithmetic to derive the point
+past which liquidation stops being profitable at all, so the residual debt has nothing behind it. That
+threshold is a function of the liquidation incentive, and you now have every piece needed to derive it.
+
+**In [the liquidations module](/c/liq-why-liquidation-exists)** the mechanics of actually seizing the
+collateral get their own treatment — close factors, incentives, the keeper set, and why the incentive
+is smallest exactly when it needs to be largest.

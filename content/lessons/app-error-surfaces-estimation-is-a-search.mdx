@@ -1,0 +1,377 @@
+---
+id: app-error-surfaces-estimation-is-a-search
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [measured-revert-surfaces-1-7-1, geth-gasestimator-source, geth-protocol-params, geth-ethconfig-defaults, eip-150, eip-7825, viem-estimate-gas, viem-estimate-contract-gas]
+stack: { foundry: "1.7.1", solidity: "0.8.36", viem: "2.x" }
+---
+
+A call that consumes 127,400 gas will not run inside a limit of 127,400
+gas.<Cite src="measured-revert-surfaces-1-7-1" />
+
+A contract that calls itself, one `CALL` frame per level, forty levels deep. Run it on anvil 1.7.1
+and read three numbers: what a trace says it consumed, what `eth_estimateGas` returns, and the
+lowest limit at which it actually completes, found by bisecting real
+executions.<Cite src="measured-revert-surfaces-1-7-1" />
+
+<Matrix
+  numeric
+  corner="Depth"
+  cols={['Gas consumed', 'Estimate', 'Lowest limit that works', 'Headroom needed']}
+  rows={[
+    { label: '0', cells: ['43,908', '43,908', '43,908', '0.00%'] },
+    { label: '5', cells: ['54,355', '54,355', '54,355', '0.00%'] },
+    { label: '10', cells: ['64,790', '64,790', '64,790', '0.00%'] },
+    { label: '20', cells: ['85,660', '86,389', '86,389', { v: '0.85%', tone: 'warn' }] },
+    { label: '40', cells: ['127,400', '140,781', '140,781', { v: '10.50%', tone: 'warn' }] },
+  ]}
+  caption="Consumption and required limit are the same number until the call tree gets deep, and then they come apart."
+  alt="A recursive call measured at depths 0, 5, 10, 20 and 40: gas consumed, the eth_estimateGas result and the lowest working limit are identical up to depth 10, then diverge — 85,660 against 86,389 at depth 20, and 127,400 against 140,781 at depth 40, needing 10.50 percent more limit than gas."
+/>
+
+Then send it for real, twice, from the same starting state:
+
+```text
+gas limit 127,400  (what it consumes)   →  receipt status 0x0, reverted, gas burned
+gas limit 140,781  (what it needs)      →  receipt status 0x1
+```
+
+Consumption and requirement are different quantities, they diverge with call depth, and the gap is
+not a rounding error — it is 10.5% at depth forty and it
+grows.<Cite src="measured-revert-surfaces-1-7-1" /> This lesson is about what
+`eth_estimateGas` is actually computing, the assumption that computation rests on, and the
+documented rule that makes an exact estimate insufficient even when the estimate is right.
+
+## Estimation is a search for a limit, not a measurement of consumption
+
+go-ethereum's estimator states its own contract in the doc comment above `Estimate`: it "returns the
+lowest possible gas limit that allows the transaction to run successfully with the provided context
+options".<Cite src="geth-gasestimator-source" /> Read that as a definition rather than a
+description. The output is a *limit*, chosen so that execution completes. It is not the gas the
+execution consumed, and in the table above those two numbers differ at depth twenty and diverge
+sharply by depth forty.
+
+The implementation is a bisection over real executions. Stripped to its skeleton, and following the
+current source:<Cite src="geth-gasestimator-source" />
+
+**Step one — pick the ceiling.** `hi` starts at the block header's gas limit, or at the caller's
+own `gas` field when they supplied one at least as large as a plain transfer. Then it is capped
+three times over: by `params.MaxTxGas` when the target fork is Osaka and not yet Amsterdam; by what
+the sender can afford; and by the node's configured RPC gas cap.
+
+**Step two — the affordability recap, which is not a revert check.** With a non-zero fee cap the
+estimator computes `available = balance - value`, then `allowance = available / feeCap`, and lowers
+`hi` to that allowance if it is smaller. This is arithmetic on the sender's balance, performed
+before any execution. It is the origin of the message every wallet has shown you, and the next
+lesson is largely about it.
+
+**Step three — the plain-transfer short circuit.** If the call carries no data and the target holds
+no code, the estimator tries `params.TxGas` — 21,000 — once and returns it if it
+works.<Cite src="geth-protocol-params" />
+
+**Step four — one execution at the ceiling.** If the call fails at `hi` for a reason other than
+running out of gas, the estimator gives up immediately and returns the revert data. If it fails at
+`hi` because it ran out of gas, no limit can help and you get `gas required exceeds allowance`.
+
+**Step five — bracket the answer.** On success, `lo` is set to `UsedGas - 1`: consumption is a lower
+bound on the limit for almost every transaction. Then it tries an informed guess,
+`optimisticGasLimit = (MaxUsedGas + CallStipend) * 64 / 63`, and uses the outcome to move whichever
+side of the bracket that result narrows.<Cite src="geth-gasestimator-source" /> The `* 64 / 63` in
+that expression is not decoration — it is the same rule that produced the table at the top of this
+lesson, applied as a first-order correction. `CallStipend` is 2,300.<Cite src="geth-protocol-params" />
+
+**Step six — bisect.** While `lo + 1 < hi`, execute at the midpoint and move the bracket. The
+midpoint is deliberately skewed low, capped at `lo * 2`, because most transactions need a limit
+close to their consumption and the search should not waste executions exploring the top of the
+range.
+
+**Step seven — stop early if asked.** With a non-zero `ErrorRatio` the loop exits once
+`(hi - lo) / hi` falls below it. The comment explains why this is acceptable: a perfect estimate is
+pointless because changing network conditions force the caller to bump it anyway, and "wallets tend
+to use 20-25% bump".<Cite src="geth-gasestimator-source" />
+
+<Aside kind="note">
+That comment is worth keeping in your head for the rest of the module. The people who wrote the
+estimator do not expect you to use its output as the gas limit. They expect a client to add
+headroom on top, and they tuned the search's precision on that expectation. A client that sends the
+estimate unmodified is using the number in a way its authors explicitly did not design for.
+</Aside>
+
+## What that costs you
+
+Several executions of the same call against the same state, one after another. Not one. Measured on
+a local in-process anvil with no network in the path, for a two-hundred-deep recursion, twenty
+samples each:<Cite src="measured-revert-surfaces-1-7-1" />
+
+```text
+eth_call          median   3.8 ms
+eth_estimateGas   median  16.4 ms
+```
+
+Four times slower, with zero network latency and zero provider queueing in the measurement. On a
+hosted endpoint, against a heavier contract, over a real connection, this is the difference between
+a form that responds instantly and one that visibly stalls before it can enable its submit button.
+It is also why providers meter `eth_estimateGas` differently from `eth_call`: it is a genuinely
+more expensive request, and the cost scales with how many bisection steps your contract's range
+requires.
+
+Two practical consequences. Do not estimate on every keystroke — debounce, and estimate when the
+input settles. And do not estimate a call you have not already simulated: simulation is the cheaper
+request, it fails faster on a doomed call, and as the next lesson shows it is also the one that
+reliably carries the revert data.
+
+## The assumption underneath the search
+
+Bisection is only correct on a monotone predicate. Here the predicate is "does this call succeed at
+limit `L`", and bisection requires that succeeding at `L` implies succeeding at every larger limit.
+
+Contracts can break that. The estimator's own source says so, in a comment sitting right above the
+line that sets `lo`: consumption lower-bounds the required limit "for almost any transaction", and
+"one exception is those that explicitly check gas remaining in order to execute within a given
+limit".<Cite src="geth-gasestimator-source" /> Anything that reads `gasleft()` and branches on it,
+forwards a computed fraction of gas to a callback, or is written to fit inside a fixed budget can
+succeed at a small limit and fail at a larger one.
+
+Here is one, measured. A contract that takes a cheap path when `gasleft()` is at or below 100,000
+and an expensive path — forty writes to distinct cold storage slots — when it is
+above:<Cite src="measured-revert-surfaces-1-7-1" />
+
+```solidity
+function work() external {
+    if (gasleft() > 100_000) {
+        for (uint256 i = 1; i <= 40; ++i) { slots[i] = i; }
+    } else {
+        cheap = 1;
+    }
+}
+```
+
+Bisecting real executions over the gas limit gives a success set with a hole in the middle:
+
+<Figure
+  caption="A bisection cannot reach the lower region, because the predicate it assumes is monotone is not."
+  alt="A gas-limit axis divided into four regions: failure below 43,325, success on the cheap path from 43,325 to 121,181, failure from 121,182 to 915,456 where the expensive path is selected but cannot finish, and success from 915,457 upward."
+>
+  <Timeline
+    from={0}
+    to={1000000}
+    unit="gas limit"
+    caption="does the call succeed at this limit?"
+    ticks={[0, 121181, 1000000]}
+    marks={[{ at: 915457, label: 'cast estimate', tone: 'warn' }]}
+    spans={[
+      { label: 'FAIL', start: 0, end: 43324, tone: 'danger', note: 'below the cheap path' },
+      { label: 'OK · cheap path', start: 43325, end: 121181, tone: 'good' },
+      { label: 'FAIL · expensive path selected', start: 121182, end: 915456, tone: 'danger', note: 'not enough to finish it' },
+      { label: 'OK · expensive path', start: 915457, end: 1000000, tone: 'good', note: '915,457 and above' },
+    ]}
+  />
+</Figure>
+
+`cast estimate` on this contract returns **915,457**.<Cite src="measured-revert-surfaces-1-7-1" />
+
+That number is not wrong. It is a limit at which the transaction succeeds, exactly as the doc
+comment promises. It is also twenty-one times the 43,325 that would have done the job, and the
+transaction will consume most of it, because at that limit the contract genuinely takes the
+expensive branch.<Cite src="measured-revert-surfaces-1-7-1" /> The estimator's first execution runs at the block ceiling, where the expensive
+branch is taken, so `lo` is bracketed into the upper region and the entire lower region is invisible
+to the search.
+
+<Misconception
+  belief="The gas estimate is the minimum gas the transaction needs."
+  reality="It is the lowest limit found by a bisection that assumes success is monotone in the limit. On a contract that branches on gasleft(), the search can return a working limit twenty-one times larger than the smallest working limit — or, with a different branch layout, a limit at which the transaction fails."
+  why="The doc comment says 'lowest possible gas limit', and that is true within the assumption; the assumption is stated one comment further down."
+  src="geth-gasestimator-source"
+/>
+
+Reverse the branch — expensive below the threshold, cheap above — and the same mechanism produces
+the failure that actually costs money: the unconstrained execution takes the cheap path and reports
+a small consumption, the bisection brackets low, and the returned limit lands in a region where the
+contract takes the expensive path and runs out. Nothing in the RPC response distinguishes that case
+from a correct estimate. You find out from a reverted receipt.
+
+The defence is not clever client code. It is knowing whether the contracts you call read
+`gasleft()`, which is a source-level question you can answer once per integration, and it is why
+[bounding gas explicitly](/c/gas-metering-control) rather than branching on what happens to be left
+is the pattern that keeps estimation honest.
+
+## Why an exact estimate is still not a safe limit
+
+Now the other half, and this one has no exceptions — it is the rule, applied on every call in every
+transaction.
+
+EIP-150 changed gas forwarding so that a call passes on "all but one 64th" of the gas remaining in
+the current frame, with the rest retained by the caller.<Cite src="eip-150" /> You met this as
+[the 63/64 rule](/c/63-64-rule) when you learned the call semantics. On the client side it has a
+consequence that is easy to state and easy to miss: **some of the gas you pay for is structurally
+unusable by the deepest frames.**
+
+That is exactly the gap in the opening table. At depth forty the transaction consumes 127,400 gas
+and requires a limit of 140,781.<Cite src="measured-revert-surfaces-1-7-1" /> The 13,381
+difference was retained a fraction at a time on the way down and never spent by anything. It is not waste in the sense of being burned — an unused limit is
+not charged — but it *must be supplied*, because the deepest frame's share is computed from what
+remains above it, not from the top-level limit.
+
+Read the progression again with that in mind. At depth zero, ten, the requirement equals the
+consumption exactly: with one frame there is nothing to retain. At depth twenty the gap is 0.85%.
+At depth forty it is 10.5%.<Cite src="measured-revert-surfaces-1-7-1" /> The compounding is real but it is not the whole story — what makes the
+gap appear at all is that the *deepest* frame needs a fixed amount, and delivering that fixed amount
+through forty retentions requires more at the top.
+
+<Aside kind="warn">
+This is the mechanism behind a specific and common bug: taking `gasUsed` from a receipt, or from a
+trace, and reusing it as the gas limit for the same call later. Measured, that produces a reverted
+transaction at depth forty — status `0x0`, gas
+burned.<Cite src="measured-revert-surfaces-1-7-1" /> `gasUsed` is consumption. A limit is not
+consumption. They coincide for shallow calls, which is why the practice survives long enough to
+fail in production on the one code path with a deep call tree.
+</Aside>
+
+## Estimates are a function of state, and state moves
+
+One more property, because it decides how long an estimate stays valid. The same call, on the same
+contract, estimated twice with one successful execution in
+between:<Cite src="measured-revert-surfaces-1-7-1" />
+
+```text
+estimate, storage slot never written   140,781
+after one successful call              112,715
+```
+
+A twenty percent drop, with no code change and no configuration change. The first execution wrote a
+storage slot that was previously zero; every subsequent execution pays the far lower cost of
+updating a non-zero slot.
+
+The direction matters as much as the size. Here it fell, which is harmless — an over-sized limit is
+not charged. It rises just as easily: the first interaction of a new user with a contract touches
+cold slots and cold accounts, an approval that existed at estimate time can be consumed by another
+transaction before yours is included, a pool can cross a tick boundary and take a longer code path.
+Any of those makes the estimate you cached too small.
+
+So an estimate has a shelf life measured in blocks, and it is specific to the account, the
+arguments, and the state at one moment. Caching one across users is a bug. Caching one across a
+user's session is a bug with a longer fuse. Estimating fresh, immediately before the signing prompt,
+is the only version that is defensible — and it still leaves the window between the estimate and
+inclusion, which is what headroom exists to cover.
+
+## Worked example: choosing a headroom policy you can defend
+
+**Subgoal 1 — separate the three things headroom is compensating for, because they have different
+sizes.** The 63/64 retention is structural and depends on call depth: measured, zero at depth ten
+and 10.5% at depth forty.<Cite src="measured-revert-surfaces-1-7-1" /><Cite src="eip-150" /> State drift between estimate and inclusion is unbounded in principle and
+usually small. Non-monotonic contracts are a correctness problem that headroom does not fix at all
+— a multiplier cannot rescue an estimate that landed in the wrong region.
+
+**Subgoal 2 — establish what the ecosystem already does, and treat it as a floor rather than a
+rule.** geth's own source records that "wallets tend to use 20-25%
+bump".<Cite src="geth-gasestimator-source" /> That is an observation about wallet behaviour written
+into the estimator's early-exit logic, not a specification. It is a reasonable default precisely
+because it comfortably exceeds the structural component for any realistic call depth.
+
+**Subgoal 3 — measure your own call tree instead of guessing at it.** The number you need is
+specific to your contracts: run the call, take the estimate, then bisect the real minimum with
+`eth_call` at varying limits. If those two numbers are equal, your call tree is shallow and headroom
+is covering only state drift. If they differ by ten percent, you have a deep tree and you now know
+the size of the structural part.
+
+**Subgoal 4 — decide what the ceiling costs you, honestly.** An unused gas limit is not charged, so
+the direct cost of generosity is zero. The real costs are indirect and worth naming: the limit is
+part of the signed transaction and part of what the user is shown, an absurd limit looks alarming
+in a wallet prompt, and the limit must fit under the per-transaction cap — EIP-7825 sets that at
+16,777,216 gas.<Cite src="eip-7825" /><Cite src="geth-protocol-params" /> A node also applies its
+own RPC gas cap to `eth_call` and friends; geth's default is
+50,000,000.<Cite src="geth-ethconfig-defaults" />
+
+**Subgoal 5 — write the policy down as code with the reasoning attached.** viem lets you pass an
+explicit `gas` to the write action, and `estimateContractGas` gives you the number to compute it
+from.<Cite src="viem-estimate-gas" /><Cite src="viem-estimate-contract-gas" />
+
+```ts
+const estimate = await client.estimateContractGas(request)
+
+// +25% covers 63/64 retention in a call tree measured at depth ~40 (10.5%)
+// plus state drift between estimate and inclusion. It does NOT cover a
+// contract that branches on gasleft() — see the deployment notes for those.
+const gas = (estimate * 125n) / 100n
+```
+
+**Subgoal 6 — say what would make you change it.** A revert with an empty payload whose `gasUsed`
+sits at the limit is an out-of-gas, and it means the policy is too tight for that path. That is a
+measurable alert, not a judgement call, and it is the same signal the previous lesson taught you to
+triage. If it fires, the fix is a larger multiplier on that path specifically, plus a look at
+whether the call tree got deeper.
+
+<Check type="predict" concept="estimategas-63-64">
+A payments feature works in every test and fails for roughly one user in fifty in production, always
+with the same symptom: the transaction is mined, `status` is `0x0`, revert data is empty, and
+`gasUsed` equals the gas limit exactly.
+
+The client estimates gas and sends the estimate unmodified. The team's argument for that, recorded
+in review, was that the estimate already includes everything the call needs and adding a multiplier
+would overcharge users.
+
+Predict what distinguishes the failing users from the succeeding ones, and evaluate the argument.
+Then say which of two changes — adding a 25% multiplier, or switching from `estimateGas` to reading
+`gasUsed` off a successful simulation — you would make, and why the other is worse.
+
+<Answer>
+**What distinguishes the failing users.** Something about their state makes the call take a deeper
+or longer path than it took at estimate time. Concretely: a batch that iterates a per-user list and
+happens to be longer for them; a first-time interaction touching cold slots the estimator did not
+pay for because a prior user had already warmed them in the block it estimated against; a routing
+path with an extra hop. All three produce a call tree deeper than the estimate assumed, and a
+deeper tree needs proportionally more limit than gas — measured at 10.5% extra by depth
+forty.<Cite src="measured-revert-surfaces-1-7-1" /> The one-in-fifty rate is the giveaway: a
+systematic bug fails everyone, a state-dependent margin fails the tail.
+
+**Why `gasUsed` equal to the limit is conclusive.** A `revert` returns the unused remainder to the
+caller, so a deliberate revert almost never consumes the whole limit. Consumption exactly equal to
+the limit, with no revert data, is an out-of-gas. There is no other reading of those two facts
+together.
+
+**Evaluating the argument.** It is wrong on the mechanism and wrong on the economics.
+
+On the mechanism: the estimate is the lowest limit found by a bisection against *one* state at
+*one* moment, and EIP-150 retains one sixty-fourth of remaining gas at every frame, so the limit a
+call needs is structurally above the gas it
+consumes.<Cite src="eip-150" /><Cite src="geth-gasestimator-source" /> The estimator's own authors
+assume a client bump — their source records wallets using 20-25% and tunes the search's early exit
+around it.<Cite src="geth-gasestimator-source" />
+
+On the economics: an unused gas limit is not charged. The user pays for gas consumed, not gas
+authorised. The 25% headroom costs nothing in the success case and saves a fully-burned failed
+transaction in the failure case, which is the only case where money is actually lost. The argument
+protects users from a cost that does not exist, at the price of one they are really paying.
+
+**Which change to make.** Add the multiplier. It addresses the actual mechanism and it is one line.
+
+**Why the other is worse — much worse.** Reading `gasUsed` off a simulation moves in the wrong
+direction: `gasUsed` is consumption, and consumption is *below* the required limit for any call
+tree with depth. Measured at depth forty, sending with the consumed 127,400 instead of the required
+140,781 produces exactly the symptom they are already
+reporting.<Cite src="measured-revert-surfaces-1-7-1" /> That change would take the failure rate from
+one in fifty to all of them on the deep path. It is a plausible-sounding idea that inverts the very
+relationship causing the bug, which is what makes it worth being able to reject on sight.
+
+**One thing neither change fixes.** If any contract in the path branches on `gasleft()`, no
+multiplier is a guarantee — a larger limit can select a more expensive branch. That is a source-level
+property to check per integration, not a client-side parameter to tune.
+</Answer>
+</Check>
+
+## What this unlocks
+
+Estimation is a search over executions, its answer is a limit rather than a measurement, its
+correctness rests on an assumption your contracts may violate, and its result goes stale with state.
+That is enough to size a transaction and to explain most of the gas-related failures you will see.
+
+**The next lesson is about estimation failing rather than succeeding**, and it is the more common
+case in an interface. `eth_estimateGas` throws for at least four unrelated reasons: the call
+reverts, the sender cannot cover value plus gas at the searched limit — you have already seen that
+recap, three steps into the algorithm, computing an allowance before anything executes — the
+estimate runs into a cap, or the node's state moved. Measured against one node, two of those four
+came back with the *same* error code and near-identical wording while describing completely
+different problems. Then the same failure is compared across implementations, because the error you
+debug locally is not the error your users generate.

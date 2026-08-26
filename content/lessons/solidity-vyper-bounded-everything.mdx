@@ -1,0 +1,303 @@
+---
+id: solidity-vyper-bounded-everything
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [vyper-docs-index, vyper-docs-control-structures, vyper-docs-types, vyper-docs-builtins, vyper-pr-unbounded-types, vyper-pypi-json, vyper-releases-gh, eip-7825, measured-gas-constants]
+stack: { vyper: "0.4.3", solidity: "0.8.36" }
+---
+
+A rewards contract has a `distribute()` function. It loops over everyone who has ever staked and
+credits each of them. It shipped two years ago, it has been called every week since, and the gas cost
+has been creeping up in a way nobody watched because nobody had a graph for it.
+
+Last Tuesday it stopped working. Not "got expensive" — stopped. The call reverts, and it will revert
+on every future attempt, because the list it iterates over only grows.
+
+Nothing about the contract changed. Nothing about the chain changed. A counter crossed a threshold.
+
+This lesson is about the language feature that makes that failure unrepresentable, and about why it
+is a *liveness* property rather than an optimisation — which is the difference between "this costs
+more than I'd like" and "this function is gone".
+
+## The claim Vyper makes
+
+Among the features Vyper says it provides is decidability: it is possible to compute a precise upper
+bound for the gas consumption of any Vyper function call.<Cite src="vyper-docs-index" />
+
+That claim is what the two removals in this lesson buy. The documentation lists recursive calling and
+infinite-length loops together, with the same reason: both make it impossible to set an upper bound
+on gas, which opens the door to gas-limit attacks.<Cite src="vyper-docs-index" />
+
+Read "gas-limit attack" carefully. It is not "the attacker makes you pay". It is "the attacker makes
+the function impossible to call", which is a denial of service against everyone including you.
+
+## Loops carry the bound in their syntax
+
+Vyper's `for` has a small number of forms, and every one of them ends in a compile-time
+constant.<Cite src="vyper-docs-control-structures" />
+
+```python
+# 1. literal stop
+for i: uint256 in range(10):
+    ...
+
+# 2. runtime stop, compile-time ceiling
+for i: uint256 in range(n, bound=MAX_ITEMS):
+    ...
+
+# 3. runtime start and end, compile-time ceiling
+for i: uint256 in range(start, end, bound=MAX_ITEMS):
+    ...
+
+# 4. iterate a value whose type carries the bound
+for item: uint256 in self.items:      # items: DynArray[uint256, 100]
+    ...
+```
+
+**Subgoal: see what `bound=` actually promises.** In form 2, `n` may be a runtime value and `MAX_ITEMS`
+must be a compile-time constant — and if `n` turns out to be larger than the bound, execution
+**reverts at runtime**.<Cite src="vyper-docs-control-structures" /> The bound is not a silent clamp.
+It is an assertion. A contract that outgrows its declared ceiling fails loudly and at a threshold you
+chose, which is a very different object from a contract that fails when the network's gas
+accounting happens to tip over.
+
+**Subgoal: notice the idiom the documentation reaches for next.** Where you cannot guarantee `n` is
+under the bound but do not want the revert, the documented pattern is `range(min(stop, N), bound=N)`,
+and the documentation names its purpose explicitly: chunking operations on larger arrays across
+multiple transactions.<Cite src="vyper-docs-control-structures" /> The language does not merely
+forbid the unbounded loop; the escape it hands you is the pattern that actually solves the problem.
+
+**Subgoal: check the runtime condition in form 3.** With a runtime start and end, the compiler emits a
+check that `end - start` is at most the bound.<Cite src="vyper-docs-control-structures" /> Same
+promise, expressed over a window rather than a count.
+
+**Subgoal: see the constraints on iteration itself.** You may not modify a value in an array while
+iterating it, nor call a function that might modify the array being
+iterated.<Cite src="vyper-docs-control-structures" /><Cite src="vyper-docs-types" /> Iterator
+invalidation is a compile-time error rather than a class of subtle bug. You also may not iterate a
+multi-dimensional array, and the loop variable must be a base
+type.<Cite src="vyper-docs-control-structures" />
+
+Those four forms are the entire loop vocabulary — `for` is the only looping construct the language
+documents.<Cite src="vyper-docs-control-structures" /> And there is no recursion, refused for the
+same stated reason as unbounded loops: it makes the gas bound
+uncomputable.<Cite src="vyper-docs-index" />
+
+## Types carry their maximum
+
+The second half of the guarantee is in the type system. Vyper's variable-length types name their
+ceiling: `Bytes[1024]`, `String[64]`, `DynArray[uint256, 100]`.<Cite src="vyper-docs-types" /> There
+is no unbounded `bytes`, `string` or array.
+
+The consequences are worth listing separately, because they land in different places.
+
+**At compile time**, the storage layout is fully determined. A `DynArray[uint256, 100]` reserves what
+100 elements need. No allocation depends on runtime values, which is precisely what makes the gas
+bound computable.
+
+**At runtime**, exceeding the bound reverts. Appending to a full array, popping an empty one, indexing
+past the current length, or passing calldata containing an array longer than the declared bound — all
+of them `REVERT`.<Cite src="vyper-docs-types" />
+
+**At the ABI boundary**, the bound is invisible. `DynArray[int128, 3]` is `int128[]`; the maximum is
+not part of the signature.<Cite src="vyper-docs-types" /> A caller in any language can produce
+oversized calldata that decodes fine by ABI rules and reverts on the Vyper side. The bound is an
+invariant behind the interface, not a contract with the caller.
+
+**In low-level calls**, the bound shows up as an argument. `raw_call` takes `max_outsize` and returns
+`Bytes[max_outsize]`; return data longer than that is truncated rather than
+copied.<Cite src="vyper-docs-builtins" /> The [returndata bomb](/c/returndata-bomb) you have to guard
+against manually elsewhere is closed by the expression's type.
+
+<Aside kind="warn">
+One documented sharp edge: defining a dynamic array in storage whose size is significantly larger
+than 2 to the 64th can create security vulnerabilities through overflow
+risk.<Cite src="vyper-docs-types" /> "Bounded" does not mean "any bound you like is safe" — it means
+a bound exists and you had to write it.
+</Aside>
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Solidity', note: 'the bound is discovered' },
+    { title: 'Vyper', note: 'the bound is declared', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'How long can a loop run?', cells: ['As long as the condition allows. The ceiling is whatever gas runs out first.', 'To a compile-time constant. range(n, bound=N) reverts if n exceeds N.'] },
+    { label: 'How long can a dynamic array be?', cells: ['Unbounded — bytes, string and T[] declare no maximum.', 'The maximum is part of the type: DynArray[uint256, 100].'] },
+    { label: 'Can a function call itself?', cells: ['Yes.', 'No. Recursion is refused for the same reason as unbounded loops.'] },
+    { label: 'What comes back from a low-level call?', cells: ['All of it, into your memory. The returndata bomb is yours to guard.', 'Bytes[max_outsize]. Anything longer is truncated at the boundary.'] },
+    { label: 'When do you find out the loop is too long?', cells: ['On chain, once, permanently.', 'At the threshold you wrote down, at a revert you chose.'] },
+  ]}
+  caption="Vyper has not made any of these operations cheaper — it has made the ceiling something you had to write down."
+  alt="Solidity and Vyper compared on loop length, dynamic array length, recursion, low-level call return data, and when an over-long loop is discovered."
+/>
+
+## Why this is liveness, not cost
+
+Now put a number on the opening scene, because the qualitative version is the one people nod at and
+forget.
+
+**Subgoal: price one iteration honestly.** Suppose each recipient in the loop gets one fresh storage
+slot written. On forge 1.7.1 and solc 0.8.36 with the optimizer off, an `SSTORE` taking a slot from
+zero to non-zero costs 20,000, and touching a cold slot adds 2,100 — 22,100 gas per recipient before
+anything else in the loop body.<Cite src="measured-gas-constants" />
+
+**Subgoal: find the ceiling the loop is running towards.** Since EIP-7825, a single transaction is
+capped at 16,777,216 gas — 2 to the 24th — regardless of the block gas
+limit.<Cite src="eip-7825" /> That is a protocol-level maximum, not a fee-market preference, so no
+amount of willingness to pay moves it.
+
+**Subgoal: divide.** 16,777,216 divided by 22,100 is about 759. Fewer than eight hundred recipients,
+and that assumes the loop body does nothing else — no event, where each topic costs
+375,<Cite src="measured-gas-constants" /> no transfer, no read.
+
+<Matrix
+  numeric
+  corner="One recipient in the loop"
+  cols={['Gas']}
+  rows={[
+    { label: 'SSTORE, zero to non-zero', cells: ['20,000'] },
+    { label: 'cold-slot surcharge', cells: ['2,100'] },
+    { label: 'one iteration, nothing else in the body', cells: [{ v: '22,100', tone: 'accent' }] },
+    { label: 'EIP-7825 cap on a single transaction', cells: [{ v: '16,777,216', tone: 'warn' }] },
+    { label: 'recipients before distribute() is gone', cells: [{ v: '~759', tone: 'danger' }] },
+  ]}
+  caption="The ceiling was fixed before the contract was deployed; only the counter moves."
+  alt="The arithmetic behind the failure: 20,000 gas for a zero-to-non-zero SSTORE plus a 2,100 cold-slot surcharge is 22,100 per recipient, against EIP-7825's 16,777,216 gas cap on one transaction, giving roughly 759 recipients."
+/>
+
+**Subgoal: notice which way the counter moves.** Recipients are added and never removed. The loop
+length is monotonically increasing. So the contract is not "expensive at 759"; it is *correct* below
+some threshold and *permanently uncallable* above it, and it crosses that threshold exactly once, in
+the direction that has no return.
+
+**Subgoal: name the property that broke.** Nothing unsafe happened. No conflicting state, no
+double-spend, no wrong answer — the contract's [safety](/c/safety-property) is intact. What failed is
+[liveness](/c/liveness-property): the good thing no longer eventually happens. That is why the
+framing matters. A team that has categorised this as "gas optimisation, backlog it" has mis-filed a
+permanent loss of function as a cost line.
+
+This is the [push-payment DoS](/c/push-payment-dos) you met on the patterns module, with the
+mechanism spelled out. Vyper's contribution is not a better fix — the fix is the same one, [pull
+payments](/c/pattern-pull-payments) or chunking. Its contribution is that the broken version does not
+compile.
+
+<Misconception
+  belief="Bounded loops are a gas optimisation, so the bound can be set generously and forgotten."
+  reality="The bound is a liveness guarantee. An unbounded loop over a growing collection becomes permanently uncallable once the collection passes a threshold, and since EIP-7825 one of those thresholds is a hard protocol cap of 16,777,216 gas per transaction."
+  why="Gas is introduced as a price, and prices feel negotiable. A per-transaction cap is not a price — no bid clears it — so a loop that outgrows it has not become expensive, it has stopped existing."
+  src="eip-7825"
+/>
+
+## What the bound does not buy
+
+Two honest limits, because a guarantee you overstate is a guarantee you will misuse.
+
+**A static bound is not a small bound.** `bound=1000000` compiles. The language forces you to write a
+number; it does not tell you whether the number is reachable inside a transaction. The check that
+matters — bound times per-iteration cost against the cap — is still yours to do, and it is exactly
+the arithmetic in the section above.
+
+**Decidability covers the function's own instructions, not its callees'.** A Vyper function may make
+an external call, and an external call runs code the compiler has never seen. What is bounded is the
+work the compiled function performs, and — through the
+[63/64 rule](/c/63-64-rule) — how much gas can be handed onward. What a callee does with what it is
+given is not bounded by anything in your source. So "a precise upper bound for the gas consumption of
+any Vyper function call"<Cite src="vyper-docs-index" /> is a claim about the compiled body; treat a
+loop containing an `extcall` as bounded in *iterations* and open-ended in *cost per iteration*.
+
+That second point is the one to carry, because it is where the guarantee is most often assumed to
+reach further than it does. A bounded loop that calls out to an untrusted contract can still be
+made to fail: one hostile recipient consuming everything forwarded to it is
+[gas griefing](/c/gas-griefing), and the bound on the loop does not touch it.
+
+## The version-dependent part
+
+Everything above describes Vyper 0.4.3, which as of 26 August 2026 is the latest published stable
+release on PyPI.<Cite src="vyper-pypi-json" /> A 0.5.0 alpha line is open, with three alphas released
+between May and June 2026.<Cite src="vyper-releases-gh" />
+
+One of those alphas adds unbounded types, and it is flagged as a breaking language
+change.<Cite src="vyper-pr-unbounded-types" /> The detail matters more than the headline:
+
+- `T[...]` is a **wildcard length, valid only in interface declarations**, meaning "any length". It
+  exists to fix a variance bug in interface return types, where a function declared as returning
+  `Bytes[1]` could be implemented by one returning `Bytes[100]`.<Cite src="vyper-pr-unbounded-types" />
+- `T[INF]` is a genuinely **unbounded type, valid only on local variables, parameters and return
+  types — explicitly not in storage**. Its stated purpose is patterns such as forwarding, multicall,
+  and virtual machines, where a parameter's size is not known at compile
+  time.<Cite src="vyper-pr-unbounded-types" />
+
+So the storage-layout half of the guarantee is untouched by this change: nothing unbounded may live
+in storage.<Cite src="vyper-pr-unbounded-types" /> The gas-bound half is what softens, and only for
+functions that actually take or return an `INF` type, where the size is a runtime fact.
+
+Treat the bounded-types rule as version-dependent and check before relying on it under 0.5.x. That is
+not hedging for its own sake — it is the correct posture toward a language feature that exists in
+alpha releases and not in the stable one you would deploy today.
+
+<Check type="predict" concept="vyper-bounded-loops">
+A Vyper contract holds `recipients: DynArray[address, 500]` and pays them in a loop:
+
+```python
+@external
+def distribute(amount: uint256):
+    for r: address in self.recipients:
+        send(r, amount, gas=2300)
+```
+
+A colleague argues this is safe from the DoS in the opening scene, because the type bounds the array
+at 500 and the loop therefore has a static upper bound.
+
+Say whether `distribute` can become permanently uncallable, and under what conditions.
+
+<Answer>
+**Yes, it can — and the type bound is not what prevents it.**
+
+**What the bound does prevent.** `recipients` cannot exceed 500 entries; the 501st `append` reverts at
+the point of appending, not later.<Cite src="vyper-docs-types" /> So the loop count has a ceiling
+that is knowable from the source, and the failure mode where the list grows without limit is gone.
+That is real, and it is what the colleague is pointing at.
+
+**What it does not prevent: one recipient bricking the whole distribution.** `send` transfers value to
+an address that may be a contract. A recipient whose code reverts, or which consumes everything it is
+given, makes the whole call fail — and since the loop pays everyone in one transaction, everyone
+else stops being paid too.<Cite src="vyper-docs-builtins" /> This is the
+[push-payment DoS](/c/push-payment-dos) in its original form, and the array bound is orthogonal to
+it. The `gas=2300` argument limits how much a hostile recipient can burn, but a callee that
+reverts immediately costs nothing and still fails the call.
+
+**And the arithmetic can still exceed the cap.** 500 iterations, each a call with value plus an
+account access, is not evidently under 16,777,216 gas once the payload grows — and if it is over, no
+fee bid fixes it, because the cap is protocol-level.<Cite src="eip-7825" /> A static bound tells you
+the number exists. It does not tell you the number fits.
+
+**The fix is the one the module has been circling.** Record credits and let recipients withdraw:
+[pull over push](/c/pattern-pull-payments). Each withdrawal is its own transaction with its own gas
+budget, one recipient's failure is one recipient's problem, and `distribute` becomes a loop that
+writes storage rather than one that calls out.
+
+**The general form of the lesson.** A compile-time bound converts "unknown" into "known". It does not
+convert "known" into "acceptable", and it says nothing at all about who runs inside the loop body.
+Both checks are yours. The language's contribution is that it will not let you skip the first one.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** is about the other half of the same instinct: defaults. Bounded loops make the
+dangerous thing unwritable; explicit decorators and `unsafe_` builtins make it writable but
+impossible to write by accident.
+
+**On the security track**, denial of service through unbounded iteration is a standing entry in
+vulnerability taxonomies, and it is nearly always presented as a Solidity coding mistake. It is
+better understood as a missing language guarantee — which is why the fix is a pattern rather than a
+lint rule, and why a language can eliminate it by construction.
+
+**And when you next review a Solidity loop**, you have a two-line procedure: find the ceiling on the
+iteration count, and multiply it by the worst-case cost of one iteration. If either factor is
+unknown, the loop is unbounded regardless of how it looks. That is the whole transferable content of
+this lesson, and it works on code that will never be compiled by Vyper.

@@ -1,0 +1,393 @@
+---
+id: fundamentals-state-proving-a-slot
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-1186, execution-apis-eth-state, ethereum-org-mpt, execution-specs-mpt, execution-specs-state-mpt, geth-trie-proof, storage-proofs-arxiv, rfc-6962, eip-2935, consensus-specs-light-client]
+stack: {}
+---
+
+You hold one block header. That is all — no state, no chain history, no trusted node. Someone claims
+that at that block, a particular contract's storage slot held a particular value.
+
+**What would convince you?** And what would you have to trust in order to be convinced?
+
+This is the question the whole module has been building toward, because the answer is the reason the
+structure looks the way it does.
+
+## A proof is just the nodes
+
+There is no proof format. No envelope, no signature, no separate encoding. A Merkle Patricia proof
+is the ordered sequence of RLP-encoded nodes you encounter walking the key's path from the root
+down. EIP-1186 defines it exactly that way: an array of RLP-serialised trie nodes, starting with the
+state root node, following the path of the hashed key.<Cite src="eip-1186" />
+
+The verifier's job is to re-walk that path and check, at every step, that the node it was handed is
+the node the previous node was pointing at.
+
+<Figure
+  caption="Every subtree the walk does not enter reaches the verifier as a single hash inside a node that was sent."
+  alt="One path through the state trie. The root node, a branch and an extension are sent as proof entries and end at the account leaf; the sibling subtrees hanging off each of them are never sent, only their 32-byte hashes inside the nodes that were."
+>
+  <Tree
+    root={{
+      label: 'root node',
+      note: 'hashes to stateRoot',
+      tone: 'accent',
+      children: [
+        { label: 'subtree', note: 'a hash only', tone: 'muted', dashed: true },
+        {
+          label: 'branch',
+          note: 'proof node 2',
+          tone: 'accent',
+          children: [
+            { label: 'subtree', note: 'a hash only', tone: 'muted', dashed: true },
+            {
+              label: 'extension',
+              note: 'proof node 3',
+              tone: 'accent',
+              children: [{ label: 'account leaf', note: 'proof node 4', tone: 'good' }],
+            },
+          ],
+        },
+        { label: 'subtree', note: 'a hash only', tone: 'muted', dashed: true },
+      ],
+    }}
+  />
+</Figure>
+
+```python
+def verify(root, key, nodes):
+    path = to_nibbles(keccak256(key))     # the secure-trie path, lesson 7
+    expected = root                        # what the next node must hash to
+    i = 0                                  # nibbles consumed so far
+
+    for raw in nodes:
+        if len(expected) == 32:            # a hash reference: check it
+            assert keccak256(raw) == expected
+        node = rlp.decode(raw)
+
+        if len(node) == 17:                        # branch
+            if i == len(path):
+                return node[16]                    # key ends here: seventeenth item
+            expected = node[path[i]]
+            i += 1
+        else:                                      # leaf or extension
+            is_leaf, fragment = hex_prefix_decode(node[0])
+            if path[i:i + len(fragment)] != fragment:
+                return ABSENT                      # path diverges — see below
+            i += len(fragment)
+            if is_leaf:
+                return node[1] if i == len(path) else ABSENT
+            expected = node[1]
+    raise MalformedProof
+```
+
+Everything in that loop comes from an earlier lesson. Hashing the key is lesson 7. Counting items to
+find the node type is lesson 2. Reading the flag nibble is lesson 4. Handling a child reference that
+is not 32 bytes is lesson 6 — note that the hash check is skipped when the reference is an inlined
+node, because there is nothing to fetch and nothing to check.
+
+go-ethereum's verifier has the same skeleton and is worth putting alongside it, because two of its
+choices are not obvious from the specification. It keys the supplied nodes by their hash and looks
+each one up by the reference it is currently expecting, rather than consuming an array in
+order.<Cite src="geth-trie-proof" /> And when the walk finds nothing, it returns **no value and no
+error** — absence is a successful outcome, not a failure.<Cite src="geth-trie-proof" /> Both are
+covered below.
+
+Notice what is *not* in the loop. No schema. No knowledge of what kind of trie this is or what the
+values mean. The node encoding carries its own type, so the verifier needs only three things: the
+root, the key, and the nodes.
+
+<Aside kind="warn">
+**The array is not one entry per level.** A child under 32 bytes is embedded in its parent rather
+than hashed, so it never appears as its own proof entry — go-ethereum writes out only nodes of 32
+bytes or more, plus the root unconditionally.<Cite src="geth-trie-proof" /> A verifier written as a
+`for` loop that assumes each iteration descends exactly one level is correct on every account proof
+and wrong on storage proofs containing an inlined leaf. The loop above survives it only because the
+`expected` reference, not the array position, drives the walk.
+</Aside>
+
+## Why the server cannot cheat
+
+Work through what a malicious RPC provider could attempt.
+
+**Return a false value in the final leaf.** Then that leaf's RLP hashes to something other than what
+its parent's slot holds. The verifier's `assert` fires.
+
+**Also change the parent, so the slot matches.** Now the parent's hash changes, and its parent's
+slot no longer matches. The problem moves up one level.
+
+**Change everything up to the root.** Now the first node does not hash to the root — and the root
+came from the header, which the verifier already had.
+
+The only way to make the chain consistent all the way up to a root the verifier obtained
+independently is to find a keccak256 collision. That is the property lesson 1 of the crypto module
+is about, and it is the property being spent here.
+
+<Misconception
+  belief="Verifying a proof means trusting the node that served it — the data came from them, after all."
+  reality="The proof is self-checking against a root you obtained independently. A server can refuse to answer, or answer about the wrong block, but it cannot construct a proof of a value that was not there."
+  why="The bytes arrive over the provider's connection, so it feels like a trust relationship. The trust actually lives entirely in where the header came from — which is why light clients spend their effort on obtaining headers honestly and almost none on validating proofs."
+/>
+
+The honest statement of the threat model: **a server can withhold, but cannot forge.** Withholding
+is a real problem and a different one — it is a liveness failure, visible as a missing answer rather
+than a wrong one.
+
+## eth_getProof
+
+The RPC that hands you those nodes takes an address, an array of storage keys, and a block, and
+returns the account's fields together with two kinds of proof.<Cite src="eip-1186" /><Cite src="execution-apis-eth-state" />
+
+```json
+{
+  "balance":     "0x0",
+  "nonce":       "0x0",
+  "codeHash":    "0x…",
+  "storageHash": "0x…",
+  "accountProof": ["0xf90211a0…", "0xf90211a0…", "0xf90151a0…"],
+  "storageProof": [
+    { "key": "0x…", "value": "0x1", "proof": ["0xf90211a0…", "0xf90211a0…"] }
+  ]
+}
+```
+
+`accountProof` walks from the state root along the path of the hashed address.<Cite src="eip-1186" />
+Each entry of `storageProof` walks from `storageHash` along the path of the hashed storage
+key.<Cite src="eip-1186" />
+
+That is the nesting, and it is the whole reason the account record has a `storageRoot` field. **You
+verify twice.**
+
+<Figure
+  caption="Only the first walk needs an outside anchor; the second is anchored by a value the first one produced."
+  alt="Four steps: start from a state root taken from a trusted header, walk the account proof under the hashed address, decode the account leaf to extract storageRoot, then walk the storage proof under the hashed slot key against that root."
+>
+  <Flow
+    nodes={[
+      { id: 'a', label: 'a header you trust', note: 'the only anchor', col: 0, tone: 'good' },
+      { id: 'b', label: 'walk the account proof', note: 'key = keccak(address)', col: 1 },
+      { id: 'c', label: 'decode the leaf', note: 'take storageRoot', col: 2, tone: 'accent' },
+      { id: 'd', label: 'walk the storage proof', note: 'key = keccak(slot)', col: 3 },
+    ]}
+  />
+</Figure>
+
+**Subgoal 1 — anchor.** Take `stateRoot` from a header you trust. The purpose of this step is to
+establish the one value in the whole procedure that the proof cannot establish for itself; everything
+downstream is arithmetic relative to it.
+
+**Subgoal 2 — prove the account.** Run the verifier over `accountProof` with the address as key. It
+returns the leaf value, which is `rlp([nonce, balance, storageRoot, codeHash])`.<Cite src="ethereum-org-mpt" /><Cite src="execution-specs-mpt" />
+The purpose is to turn an assertion about an account into a value derived from the root.
+
+**Subgoal 3 — decode it, and check the convenience fields against it.** The purpose of decoding
+rather than reading the top-level JSON is that only the decoded bytes are covered by the proof.
+EIP-1186 notes this in its own rationale: `balance`, `nonce`, `storageHash` and `codeHash` at the top
+level are a convenience, and could be taken from the last node of the proof
+instead.<Cite src="eip-1186" /> Treat them as untrusted until they match what you decoded.
+
+**Subgoal 4 — prove the slot.** Re-run the verifier over the storage proof, using the `storageRoot`
+you just extracted as the anchor and the slot key as key. The purpose of re-anchoring is that a
+storage proof carries no connection to the state root on its own — the account proof is what supplies
+it.
+
+Two independent walks, chained by one field. A party with a header and this response learns the
+value of one storage slot at one block, and has to trust nobody about it.
+
+### Reading the empty case correctly
+
+EIP-1186's own worked example is an account with `balance` `0x0`, `nonce` `0x0`, the empty code hash
+and the empty storage root.<Cite src="eip-1186" /> Both of those constants you now recognise from
+lesson 2, and both are load-bearing for a verifier.
+
+`storageHash` being the empty-trie root means the account has no storage at all. Every storage proof
+against it will terminate in absence — correctly, and with no error. `codeHash` being the hash of the
+empty string means there is no code. Neither fact is a special case in the format; they are ordinary
+values that happen to be constants.
+
+<Aside kind="note">
+**A note on the specification's status.** EIP-1186 is marked Stagnant, was created on 24 June 2018,
+and lists no test cases — its Test Cases section says tests still need to be
+implemented.<Cite src="eip-1186" /> That is not a sign the method is deprecated: `eth_getProof` is
+implemented everywhere and is defined in the execution API specification, which is where the live
+definition lives.<Cite src="execution-apis-eth-state" /> When you need the exact parameter and return
+shapes, read execution-apis; read the EIP for the reasoning and for the exclusion-proof rule below.
+And write your own vectors, because the EIP did not.
+</Aside>
+
+## Proving that something is not there
+
+Now the property a plain Merkle tree cannot give you at all.
+
+Because position in a trie is determined by the key, absence has a shape. You supply the nodes along
+the key's path and show that the walk cannot continue: either it reaches a branch whose slot for the
+next nibble is empty, or it reaches a 2-item node whose path fragment does not match what remains of
+the key.
+
+EIP-1186 spells out what a server must send for a non-existent value: follow the path from the root
+and deliver nodes until the last matching one; if that node is a branch, the relevant slot must be
+empty, and if it is a leaf, it must point at a different relative path — which is what proves the
+requested path does not exist.<Cite src="eip-1186" /> go-ethereum states the same contract in its
+implementation: when the trie holds no value for the key, the proof contains all nodes of the longest
+existing prefix of the key — at least the root — ending with the node that proves the key's
+absence.<Cite src="geth-trie-proof" />
+
+The verifier checks the nodes exactly as it would for an inclusion proof. Same hashing, same
+matching, same anchoring to the root. Only the termination condition differs — that is the `ABSENT`
+return in the loop above.
+
+<Aside kind="warn">
+**Absence is not an error, and that is an API trap.** go-ethereum's `VerifyProof` returns `(nil, nil)`
+when the trie does not contain the key: no value, and no error.<Cite src="geth-trie-proof" /> A caller
+written as `if err != nil { fail }` treats a proven-absent key as a successful verification of a nil
+value — which, in a language where nil coerces to zero, becomes "the balance is zero" rather than
+"there is no entry". Check the value, not only the error.
+</Aside>
+
+<Misconception
+  belief="You prove a slot is unset by proving it holds zero."
+  reality="An unset slot has no entry in the trie at all. The proof shows the path terminates early or diverges, which is structurally different from producing a leaf that contains a stored zero."
+  why="At the RPC layer both read back as zero, so the distinction never surfaces. In the trie it is not a distinction at all: as lesson 8 showed, writing zero to a slot removes its entry, so 'holds zero' and 'was never written' are the same state and the same proof."
+/>
+
+This is what makes tries the right structure for state rather than a stylistic preference. The
+contrast worth carrying is Certificate Transparency, the most widely deployed Merkle log outside this
+domain: RFC 6962 defines audit paths and consistency proofs and nothing
+else,<Cite src="rfc-6962" /> so a party who wants to know that a certificate is *not* in the log has
+to obtain the log. A system that can prove absence answers the same question with a handful of nodes.
+
+## What a proof does not tell you
+
+Worth being precise about the boundaries, because each of these has been assumed in a real design.
+
+**It does not give you the code.** The account leaf holds `codeHash`, not the bytecode — the
+specification is explicit that the trie commits to accounts' code hashes and never to code
+contents.<Cite src="execution-specs-state-mpt" /> A proof establishes what the code hash is; obtaining
+the code and checking it hashes to that value is a separate fetch. Putting code inside the state
+tree, so that a proof covers it too, is one of the changes the successor design proposes — lesson 10.
+
+**It does not distinguish "empty account" from "no account".** An account with zero balance, zero
+nonce, no code and no storage may not be in the trie at all, in which case what you get is an
+exclusion proof. Code that expects an inclusion proof for every address will treat a perfectly
+normal answer as a failure.
+
+**It does not prove anything about other slots.** Each entry of `storageProof` covers exactly the
+key requested.<Cite src="eip-1186" /> Two slots means two proofs — though they will share most of
+their nodes, since they share most of their path.
+
+**It does not prove the block is real.** This is the one from the exercise below, and it is worth
+stating twice: the entire mechanism is relative to a root, and supplying the root is somebody else's
+job.
+
+## Where the root comes from
+
+Since everything reduces to the anchor, it is worth naming the mechanisms that supply one rather than
+leaving it as "a header you trust".
+
+**For a device on the network**, the consensus layer's light-client protocol is the designed answer:
+a sync-committee-based protocol that lets a client follow the chain's headers without holding
+state.<Cite src="consensus-specs-light-client" /> The proof machinery in this lesson consumes what
+that protocol produces.
+
+**For a contract reading recent history in-EVM**, EIP-2935 is now Final and stores the last 8,191
+block hashes as storage slots of a system contract, with stateless execution given as the
+motivation.<Cite src="eip-2935" /> The recursion is worth savouring: the anchors for storage proofs
+are themselves storage, and therefore themselves provable by the machinery of this lesson.
+
+**For anything older, or from another chain**, there is no protocol answer and the design space is
+the subject of active analysis. The survey of historical and multichain storage proofs compares
+Merkle Mountain Range and Merkle Patricia trie architectures for historical state, examines the
+performance problems keccak256 creates inside zero-knowledge circuits, and formalises three distinct
+architectures for cross-chain verification.<Cite src="storage-proofs-arxiv" /> That taxonomy is the
+right map to have before designing anything in this space.
+
+## What this is for
+
+**Light clients.** A device that cannot hold the state can still read specific parts of it
+verifiably, given headers. This was EIP-1186's stated motivation — enabling verification by
+applications and devices, named in the EIP as IoT devices and mobile apps, that get responses from an
+untrusted source plus a trusted block hash.<Cite src="eip-1186" />
+
+**Trustless bridges.** A contract on chain B, given a header from chain A, can verify a storage
+proof about chain A's state and act on it. The alternative is a committee attesting to what chain A
+says, which replaces a cryptographic assumption with a social one and moves the security of the
+bridge to the honesty of that committee.<Cite src="storage-proofs-arxiv" />
+
+<Misconception
+  belief="A storage proof tells you the current value of a slot."
+  reality="It tells you the value at one specific block. Freshness is a separate problem, and for cross-chain use it is the hard part."
+  why="RPC calls default to the latest block, so the block dimension is invisible in day-to-day use. It becomes very visible the moment the consumer of the proof is a contract on another chain, which only knows about the headers somebody bothered to relay to it."
+  src="storage-proofs-arxiv"
+/>
+
+The proof establishes *what was true at block N*. Establishing that block N is canonical, final, and
+recent is a different mechanism entirely, and it is where the engineering in cross-chain systems
+actually goes.<Cite src="storage-proofs-arxiv" /> EIP-1186's authors saw the seam and left a note
+about it in the EIP itself: among the changes they flagged for discussion was taking a block *hash*
+rather than a block number, precisely because the hash identifies a specific block rather than a
+position somebody else resolves.<Cite src="eip-1186" />
+
+<Check type="spot-bug" concept="storage-proof">
+A bridge contract on chain B verifies storage proofs about a token contract on chain A, to release
+funds when a deposit is proven. Its verification does all of the following, correctly:
+
+- checks each proof node hashes to the reference held by its parent
+- checks the first node hashes to a state root it was given
+- decodes the account leaf and extracts `storageRoot`
+- verifies the storage proof against that `storageRoot`
+- checks the returned value equals the expected deposit amount
+
+Every check passes on every honest input. Name what is missing, and what an attacker does with it.
+
+<Answer>
+**Nothing binds the state root to a block, and nothing binds the block to chain A's canonical
+history.** The contract verifies an internally consistent proof against *whatever root it was
+handed*.
+
+An attacker constructs their own trie. They choose the key-value pairs — including a deposit of any
+size at the slot the bridge reads. They compute its root honestly, generate a perfectly valid proof
+against it, and submit both. Every check listed passes, because every check listed is about internal
+consistency. The contract never asked where the root came from.
+
+The missing piece is the anchor. The root must be one the contract has independent reason to
+believe: obtained from a header whose validity the contract checked against chain A's consensus, at
+a block it has reason to believe is canonical and final. That is a wholly separate mechanism — a
+light-client verification of chain A's consensus,<Cite src="consensus-specs-light-client" /> or a
+relay whose header submissions are themselves verified — and it is where essentially all of the
+difficulty in a trustless bridge lives.<Cite src="storage-proofs-arxiv" />
+
+Two related gaps that fall out of the same omission:
+
+*The account was never bound to an address.* The verifier must confirm the account proof was walked
+along `keccak256(expectedTokenAddress)`.<Cite src="eip-1186" /> Otherwise the attacker proves a slot
+in some other account's storage trie that happens to hold a convenient number.
+
+*The slot was never bound to a meaning.* Likewise the storage key must be the derived position for
+the mapping entry being claimed, not an arbitrary key the caller supplied.
+
+And one that is not about the anchor at all, but will bite this contract on honest input. Nothing
+above distinguishes a proof that *terminated in a leaf holding the amount* from a proof that
+*terminated in absence*. Absence is not an error<Cite src="geth-trie-proof" /> and an unset slot reads
+back as zero,<Cite src="execution-specs-mpt" /> so a verifier that returns a default on the absent
+path and compares it to an expected amount will behave correctly only while the expected amount is
+never zero. That is a latent bug waiting for a zero-value deposit or a refactor.
+
+Restating the threat model from the top of the lesson: a proof is only as good as the root it is
+checked against. The cryptography makes forging a proof infeasible. It does nothing at all about
+being handed the wrong root — that has to be prevented somewhere else, deliberately.
+</Answer>
+</Check>
+
+## Where this pays off
+
+This is the mechanism the rest of the curriculum keeps reaching for. `eth_getProof` is the practical
+tool.<Cite src="execution-apis-eth-state" /> Storage proofs are how bridges read another chain's
+state instead of asking a committee, which is also why the bridge's header-verification path is where
+the money is lost when one fails. Exclusion proofs are how a verifier learns that something is *not*
+in a set without downloading the set.
+
+And all of it rests on the property from lesson 8: there is exactly one correct root for a given
+key-value set, so recomputing and comparing is a decision procedure rather than a heuristic.

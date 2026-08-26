@@ -1,0 +1,330 @@
+---
+id: ledgers-finality-what-a-reorg-costs
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [monnot-reorg-post, fork-choice-spec, consensus-specs, neu-tas-tse-two-attacks, casper-ex-ante-mitigation, vbuterin-lmd-ghost-mitigation, arxiv-low-cost-attacks, ethereum-org-mev, ethereum-org-pos-attack-defense, eth2book-slashing, mikeneuder-slashings, ethereum-docs-pos]
+stack: {}
+---
+
+On 25 May 2022 the Ethereum beacon chain reorganised seven blocks deep.<Cite src="monnot-reorg-post" />
+
+There was no attacker. The cause was a partial rollout: proposer boost, a fork-choice change, had
+been released as a soft change that operators could adopt at their own pace, so some validators were
+running it and some were not — and one of the implementations of *when* the boost applies was
+wrong.<Cite src="monnot-reorg-post" /> Two populations of honest validators, following two slightly
+different rules, computed two different heads. When the views merged, seven blocks that had been
+canonical stopped being canonical.
+
+Hold two facts about that incident together, because between them they contain most of what this
+lesson has to teach. First: every participant was honest, and nothing was slashed. Second: seven
+blocks of transactions that explorers had shown as included were, afterwards, not included.
+
+## What a reorg actually does to your data
+
+The mechanism is unremarkable. Fork choice selects a different branch, and the blocks on the branch
+it abandoned are no longer part of the chain.
+
+The consequences are less unremarkable, and they are routinely described wrongly.
+
+**Discarded transactions are not reversed.** Nothing compensating happens. There is no inverse
+transaction, no refund, no event. The transactions in a discarded block were never applied on
+the chain that survived — they have the same status as a transaction that was never sent.
+
+**They may or may not come back.** A discarded transaction returns to the pool of whichever nodes
+still hold it, and may be included in a later block. It may also not be: the sender may have
+replaced it at the same nonce in the meantime, its `maxFeePerGas` may no longer clear the base fee,
+or every node holding it may evict it.
+
+**If it comes back, it may do something different.** Re-inclusion happens at a different position,
+against different state, possibly with different transactions ahead of it. A swap can execute at a
+worse price. A liquidation can find the position already healthy. A `require` that passed can revert.
+Same signed bytes, different outcome — because the outcome was never a property of the transaction,
+it was a property of the transaction *and the state it ran against*.
+
+**What rolls back is narrower than what happened.** Modern indexing frameworks detect the reorg and
+roll their tables back to the common ancestor, which is correct and also the thing that makes this
+class of bug hard to see afterwards: the database ends up consistent, so the only surviving trace is
+whatever your handler did to the outside world in between. Emails sent, payouts made, files released,
+partner APIs called. None of those are covered by the rollback, and the fact that your database looks
+fine is not evidence that you are.
+
+<Misconception
+  belief="A reorg undoes transactions."
+  reality="It un-includes them. There is no compensating action and no notification; the transaction is not on the chain that survived, and if it is re-included later it runs against different state and can produce a different result."
+  why="'Reverted' and 'rolled back' are the words available, and both come from database vocabulary where an undo is an active operation with a guaranteed inverse. Here nothing is undone — a different history is selected, and the previous one stops being referenced."
+  src="ethereum-docs-pos"
+/>
+
+### One slot, walked through
+
+Abstractions about un-inclusion are easy to nod at. Trace one.
+
+**Subgoal: establish what the network believed.** At slot *n*, a proposer publishes a block
+containing, in order, a large swap by a user, an arbitrage transaction behind it, and a liquidation of
+an unrelated lending position. Every node that received the block executes it, produces the same state
+root, and serves the same receipts. Your backend's websocket delivers the logs. So does everyone
+else's.
+
+**Subgoal: introduce the disagreement without introducing an attacker.** The block was published
+late — late enough that a large share of the slot's committee had already voted for the *parent* by
+the time it arrived. Nothing is wrong with any participant. The attestation deadline sits a third of
+the way into the slot, four seconds in, and the block missed it.<Cite src="consensus-specs" />
+
+**Subgoal: let the fork choice do its job.** The proposer at slot *n+1* sees a head block carrying
+almost no attestation weight and a parent carrying a lot. It builds on the parent. Its own block is
+timely, so it receives the proposer boost, and the boost is more than enough to outweigh what the late
+block accumulated.<Cite src="fork-choice-spec" /> The chain now has a canonical branch that does not
+include slot *n*'s block.
+
+<Figure
+  caption="Every participant here is honest and no rule is broken; the transactions in slot n were simply never applied on the chain that survived."
+  alt="A fork drawn downward. Block n minus one already carries most of the committee's votes. Block n is published after the attestation deadline and collects almost no weight. The proposer at slot n plus one builds on block n minus one instead, so block n leaves the canonical chain and its transactions never ran on the surviving branch."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'p', label: 'block n−1', note: 'most of the committee has already voted for it', col: 0 },
+      { id: 'late', label: 'block n', note: 'published after the deadline', col: 1, tone: 'warn', dashed: true },
+      { id: 'next', label: 'block n+1', note: 'timely, and builds on the parent', col: 1, tone: 'accent' },
+      { id: 'gone', label: "slot n's transactions", note: 'never ran on the surviving chain', col: 2, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'p', to: 'late', label: 'late', tone: 'warn' },
+      { from: 'p', to: 'next' },
+      { from: 'late', to: 'gone', dashed: true, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+**Subgoal: follow each of the three transactions separately, because they do not share a fate.** The
+user's swap returns to the pool and is likely re-included within a slot or two — but the arbitrage
+that was behind it may now be in front of it, so the price it gets is not the price its receipt
+reported. The arbitrage transaction, if the opportunity has closed, reverts on re-execution and costs
+its sender gas for nothing. The liquidation may find that the position was already liquidated by
+somebody else on the surviving branch, in which case the transaction reverts and the liquidator
+receives nothing after having paid to compete.
+
+**Subgoal: notice what your system did in between.** Roughly twelve seconds elapsed. In that window
+your handler fired on the receipt, wrote a row, and — depending on how the handler was written — sent
+a confirmation. The row will be rolled back. The confirmation will not.
+
+**Subgoal: notice what did not happen anywhere in this trace.** No rule was broken. No validator was
+slashed. No alert fired at any node operator. The only party for whom this was an incident is the one
+that acted on the receipt.
+
+## Short reorgs are ordinary, and some are deliberate
+
+The seven-block incident was extraordinary. One- and two-slot reorgs are not: they arise from
+ordinary timing, from a block arriving after the attesters have already voted, from propagation delay
+across a network that spans the planet.
+
+What surprises people is that the specification contains a rule for producing them on purpose.
+
+A proposer may legitimately reorg the previous block if that block was *late*, and the conditions
+under which it may are enumerated precisely.<Cite src="fork-choice-spec" /> The relevant constants
+are `REORG_HEAD_WEIGHT_THRESHOLD` at 20, `REORG_PARENT_WEIGHT_THRESHOLD` at 160,
+`REORG_MAX_EPOCHS_SINCE_FINALIZATION` at 2, and `PROPOSER_REORG_CUTOFF_BPS` at 1667, which is about
+seventeen percent of the slot duration.<Cite src="fork-choice-spec" /> Read as English, the rule
+fires only when:
+
+- the head block arrived after the attestation deadline, so it is genuinely late;
+- the head has attracted very little attestation weight, below the threshold derived from the 20
+  constant, while its parent has attracted a lot, above the one derived from 160;
+- the chain has finalized within the last two epochs, so the network is healthy;
+- the proposer is itself proposing on time, inside that seventeen-percent window;
+- the reorg is exactly one slot deep, and the boost on the block being displaced has already worn
+  off.<Cite src="fork-choice-spec" />
+
+That is a great deal of guarding for one slot, and the guarding is the interesting part. The rule
+exists because a chronically late proposer degrades the chain for everyone, and orphaning its block
+is the available discipline. Every condition is there to make sure the discipline cannot be turned
+into a weapon. Note also that the specification marks this rule as one clients *may* implement, and
+its own comments call out that the weight calculation is deliberately monotonic so that arriving
+attestations can only ever move the answer from "weak" to "strong", never back.<Cite src="fork-choice-spec" />
+
+<Aside kind="note">
+This is the single best illustration in the consensus specification of a design principle worth
+carrying: when a protocol needs a mechanism that is dangerous in general, it does not add a warning.
+It adds five preconditions, each of which independently disarms the abuse, and it accepts that the
+mechanism will therefore fire rarely.
+</Aside>
+
+## The dial with two failure modes
+
+Proposer boost, the change at the centre of the 2022 incident, is worth understanding as a piece of
+engineering because it demonstrates something about this whole area: some of these parameters have no
+safe setting.
+
+`PROPOSER_SCORE_BOOST` is 40 — forty percent of one committee's weight, granted to a timely block for
+the duration of its own slot.<Cite src="fork-choice-spec" /> It was introduced to defend against
+attacks that work by splitting honest validators' views: an adversary who can time message releases
+can keep two branches within a hair of each other and stall convergence, and a proposer who withholds
+a block and then releases it with accumulated weight can displace a block that was already
+published.<Cite src="vbuterin-lmd-ghost-mitigation" /><Cite src="casper-ex-ante-mitigation" />
+
+Set the boost too low and those attacks — launched *before* the victim block exists — get cheaper.
+Set it too high and you hand every proposer enough weight to displace the block in front of it on
+demand, which is the same attack launched *after* seeing the victim. There is no value that removes
+both, and the peer-reviewed analysis showed that variants of the view-splitting attack survive the
+boost entirely.<Cite src="neu-tas-tse-two-attacks" />
+
+The practical reading for a product engineer is not that Ethereum is fragile. It is that **short
+reorgs are a permanent feature of a chain with a fork choice, not a defect being patched out.** Any
+design of yours that assumes a one-slot-deep head is stable is assuming away a parameter the protocol
+does not claim to have solved.
+
+## Two regimes, not one scale
+
+Now the part that changes how you think about depth.
+
+**Regime one: short reorgs, cheap or free.** One or two slots, no rule violated, nothing slashed.
+Peer-reviewed work has shown that reorg and liveness attacks are achievable by adversaries holding
+well under a third of the stake, and — this is the load-bearing clause — they cost nothing in
+slashing terms, because no slashing condition is violated by them.<Cite src="arxiv-low-cost-attacks" />
+There is also a standing economic incentive to produce them: if the extractable value in a block
+meaningfully exceeds the block reward, a proposer is incentivised to reorg it and take that value
+instead, which is the "time-bandit" dynamic that the canonical MEV documentation names as one of
+MEV's effects on consensus stability.<Cite src="ethereum-org-mev" />
+
+**Regime two: reverting a finalized checkpoint.** This requires validators holding at least a third
+of the total stake to sign provably contradictory messages.<Cite src="ethereum-org-pos-attack-defense" />
+At exactly that participation level the correlation penalty takes each offender's entire effective
+balance, so the attack destroys the attacking stake rather than merely risking
+it.<Cite src="mikeneuder-slashings" /><Cite src="eth2book-slashing" /> The canonical documentation
+states it from the attacker's side: an attacker who achieves double finality necessarily loses their
+whole stake.<Cite src="ethereum-org-pos-attack-defense" />
+
+Between "free" and "a third of all staked ETH destroyed" there is no smooth gradient. The two regimes
+are separated by the accountability boundary, not by depth, and the depth is a *consequence* of which
+side of the boundary you are on rather than a cause of anything.
+
+<Compare
+  axis="Question"
+  caption="Only one of the two regimes leaves evidence: a short reorg is indistinguishable from ordinary timing, and a finality reversal is a signed confession."
+  alt="Short reorgs and finality reversals compared across which rule is broken, what the attacker pays, how anyone would know it happened, how deep it reaches, and whether it occurs without an attacker."
+  columns={[
+    { title: 'A short reorg', note: 'one or two slots', tone: 'warn' },
+    { title: 'Reverting a finalized checkpoint', note: 'the other regime', tone: 'danger' },
+  ]}
+  rows={[
+    {
+      label: 'Which rule is broken?',
+      cells: [
+        'None. A late block, a timely successor, and the fork choice doing exactly its job.',
+        "A slashing condition: a double vote, or a vote whose source-to-target span surrounds one of the same validator's earlier votes.",
+      ],
+    },
+    {
+      label: 'What does it cost the attacker?',
+      cells: [
+        'Nothing in slashing terms, and it is achievable well below a third of the stake.',
+        'The entire effective balance of every offender — approximately a third of all staked ETH, destroyed rather than spent.',
+      ],
+    },
+    {
+      label: 'How would anyone know?',
+      cells: [
+        'They may not. It looks like ordinary timing, and no alert fires at any node operator.',
+        'The contradictory messages are signed, and anyone at all can publish them.',
+      ],
+    },
+    {
+      label: 'How deep does it reach?',
+      cells: [
+        'One or two slots in the ordinary case; seven blocks in the worst mainnet incident so far.',
+        'To the finalized checkpoint, however far back that sits.',
+      ],
+    },
+    {
+      label: 'Does it happen without an attacker?',
+      cells: [
+        'Routinely. The May 2022 reorg had no attacker in it at all.',
+        'It needs a third of the stake to sign contradictions; the penalty does not ask whether that was deliberate.',
+      ],
+    },
+  ]}
+/>
+
+<Misconception
+  belief="A deep reorg is a long version of a shallow one, so waiting more blocks buys proportionally more safety."
+  reality="They are two different objects. Short reorgs violate no rule and are unslashable; reversing a finalized checkpoint requires signed contradictions from a third of the stake and destroys it. The risk curve is a step at the finality boundary, not a slope."
+  why="Depth is the only lever proof-of-work exposed, so 'more confirmations' became the universal safety dial. Under proof of stake the meaningful boundary is whether a reversal is attributable, and depth is only correlated with that boundary, not the same as it."
+  src="arxiv-low-cost-attacks"
+/>
+
+<Misconception
+  belief="Reorgs on Ethereum are theoretical."
+  reality="A seven-block reorg happened on mainnet in May 2022 with no attacker involved, and short reorgs of late blocks are routine enough that the fork-choice specification defines a rule for producing them deliberately."
+  why="The word 'finality' is heard as a property of the whole chain rather than of checkpoints, and the head is where almost every application actually reads. The visible layer is the reorg-able one."
+  src="monnot-reorg-post"
+/>
+
+<Check type="spot-bug" concept="reorg-depth-in-practice">
+A payments service processes on-chain deposits like this:
+
+```ts
+// on every new block from the websocket subscription
+for (const log of block.logs.filter(isDepositEvent)) {
+  await db.insert('deposits', { txHash: log.transactionHash, amount: log.amount })
+  await creditUserBalance(log.from, log.amount)
+  await notify(log.from, `Deposit of ${log.amount} confirmed`)
+}
+// a separate worker reconciles against `finalized` once an hour
+```
+
+The team's defence is that the hourly reconciler catches any reorg, so acting on the head block is
+safe. Name every distinct thing that is wrong here, in order of how much it costs.
+
+<Answer>
+**1 — the notification is unrecoverable, and it is the cheapest line to fix.** `notify` leaves the
+system. An hourly reconciler cannot un-send it. The user has been told their deposit is confirmed and
+will act on that. This is the general rule: a reconciler repairs *state*, and a notification is not
+state.
+
+**2 — `creditUserBalance` is only recoverable if nothing spends it.** Between the credit and the
+hourly reconcile there is up to an hour in which the user can withdraw, trade, or otherwise convert
+the credited balance into something that leaves. The reconciler will then correctly discover the
+deposit is gone and produce a negative balance, which is a support ticket at best and a loss at worst.
+The window is not "one hour of risk"; it is "one hour during which the credit is spendable".
+
+**3 — the deposit row is keyed on `txHash`, which survives a reorg.** The same transaction can be
+re-included in a later block, at which point the insert either collides or double-credits depending on
+the constraint. It can also be re-included with a *different result* — for a plain transfer that is
+unlikely, but this loop filters logs, and a log's presence depends on execution succeeding against
+the state it ran in.
+
+**4 — the reconciler's cadence is unrelated to anything.** An hour is neither the finalization
+interval nor a risk-derived number. The two epochs to finalization are roughly 12.8
+minutes,<Cite src="consensus-specs" /> and finalization can also stall indefinitely, in which case the
+reconciler runs against a `finalized` marker that has not moved and reports everything as fine while
+the exposure grows.
+
+**5 — the framing is wrong, not only the code.** "A reconciler catches reorgs" treats a reorg as an
+error to be repaired. It is a normal output of the fork choice. The fix is not a better reconciler; it
+is to move the irreversible actions — the notification and the spendable credit — to a marker whose
+reversal has a price, and to leave only reversible actions on the head.
+
+A defensible rewrite reads the head to show a *pending* state that no user action can spend, and
+gates `creditUserBalance` and `notify` on the deposit's block being under a finalized checkpoint.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Confirmation policy**, next lesson, is this lesson turned into a decision. You now know the two
+regimes and their prices; the remaining question is which one a given action in your product needs to
+be on the right side of, and how to argue for that in a review.
+
+**Extractable value** is the reason regime one has an economic pull behind it rather than being pure
+timing noise. The last three lessons of this module are about the machinery that grew up to handle
+that pull, and about what it did to the shape of Ethereum block production.
+
+**Indexers and event pipelines** in the infrastructure track deal with the data side properly: what
+reorg-safe indexing looks like, why the rollback boundary and the side-effect boundary have to be the
+same line, and what "at least once" really means when the underlying log can be withdrawn.
+
+**Fork choice** in Track 11 goes after the mechanisms themselves — the attacks that survived proposer
+boost, the proposed replacements, and the confirmation rules that let a client say something useful
+about a block long before it finalizes.<Cite src="neu-tas-tse-two-attacks" />

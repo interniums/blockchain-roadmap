@@ -1,0 +1,367 @@
+---
+id: altvm-token-2022-hooks
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [solana-token-2022-extensions-ref, solana-program-transfer-hook-spec, solana-program-transfer-hook-extra-accounts, neodyme-token-2022, spl-token-2022-docsrs-extensiontype, offside-token-2022-part1, chainstack-token-2022-hooks]
+stack: {}
+---
+
+The name gives you a model immediately, and the model is wrong in an instructive way.
+
+"Transfer hook" reads like ERC-777's `tokensReceived`, or the `onERC721Received` callback whose
+reentrancy consequences the [token-callbacks](/c/token-callbacks-are-the-vector) material spent so
+long on. In those, the token contract calls into code the counterparty controls, *while the caller's
+frame is still open*, with `msg.sender` still set and state changes possibly still pending — which is
+why [callback reentrancy](/c/erc721-callback-reentrancy) is the archetypal defect and CEI ordering
+the archetypal fix.
+
+Token-2022's transfer hook is genuinely a third-party program invoked inside your transfer, and it is
+genuinely a hazard. But almost every specific thing you know about callback reentrancy fails to
+transfer, because the runtime hands the hook a deliberately impoverished position. Neodyme's summary
+of what the hook actually receives is the sentence to hold on to: **all involved accounts are
+converted to read-only, and the sender's signer privileges are
+dropped**.<Cite src="neodyme-token-2022" />
+
+So the question is not "can the hook reenter and drain me". It is a different set of questions — what
+can it *deny*, what can it *cost*, what can it *see*, and what can it be made to do when it is not
+running inside a transfer at all. This lesson works through the mechanism precisely enough to answer
+those, from both sides: what a hook does to you as an integrator, and what you must check if you are
+the one writing it.
+
+## What the extension actually does
+
+The motivation is stated plainly, and it is worth reading because it explains why this exists rather
+than something simpler. Token creators wanted more control over transfers, most prominently for NFT
+royalties: when a token moves, the creator should be entitled to a payment, and the original Token
+program makes it impossible to stop a transfer at the protocol level. The existing workaround was to
+**perpetually freeze tokens** and route every interaction through a proxy layer that wallets and
+marketplaces have to know about — and since each royalty system had its own proxy, the result harmed
+composability and made development harder.<Cite src="solana-token-2022-extensions-ref" />
+
+The extension's answer: a token creator develops and deploys a program implementing the transfer-hook
+interface, then configures the mint to use it. During a transfer, Token-2022 calls into that program
+with the accounts specified at a well-defined program-derived address for that mint and program id.
+**This call happens after all other transfer logic, so the accounts reflect the end state of the
+transfer.**<Cite src="solana-token-2022-extensions-ref" />
+
+Two details from that paragraph do real work.
+
+**The hook runs last, on the finished state.** It is not a pre-transfer veto that inspects a proposed
+change; it observes the completed one and decides whether the transaction as a whole survives. If it
+returns an error, the transfer is unwound with everything else in the transaction. Compare that with
+CEI, whose entire purpose is to ensure the callee sees settled state — here the ordering is not a
+convention you have to maintain, it is what the program does.
+
+**It is not called on self-transfers.** The guide notes explicitly that the transfer-hook program is
+not invoked where the source and destination accounts are the
+same.<Cite src="solana-token-2022-extensions-ref" /> A hook that counts transfers, meters volume or
+enforces per-period limits has a hole in it that costs the attacker one transaction, and hook authors
+consistently miss it.
+
+The mint carries `TransferHook` and every token account of that mint carries `TransferHookAccount`,
+which is where the per-account `transferring` flag lives.<Cite src="spl-token-2022-docsrs-extensiontype" />
+That paired structure is also why plain `transfer` fails on these mints: the check for the hook
+extension is made on the source account, and with no mint passed the program cannot resolve the hook's
+accounts, so it returns `MintRequiredForTransfer`.<Cite src="offside-token-2022-part1" />
+
+## The interface, and the account list nobody wrote down
+
+The specification is small enough to hold in your head, and holding it is the difference between
+reasoning about hooks and guessing.
+
+`Execute` is the one required instruction. Its discriminator is the first 8 bytes of the hash of the
+string literal `spl-transfer-hook-interface:execute`; its data is a single `u64` amount; and it
+receives five accounts before any extras — **source token account, mint, destination token account,
+source token account authority, and the validation account** — followed by *n* additional accounts
+written into the validation account.<Cite src="solana-program-transfer-hook-spec" />
+
+<Figure
+  caption="The hook is handed a position it cannot act from — so its powers are to cost you compute and to refuse, and refusing takes the whole transaction with it."
+  alt="A transfer_checked resolves the mint's validation account, which supplies the extra accounts for the hook's Execute instruction. Execute receives every account read-only; returning Ok leaves the transfer standing and returning an error reverts the entire transaction."
+>
+  <Flow
+    lanes={['the transfer', 'the account list', 'the hook program', 'the outcome']}
+    nodes={[
+      { id: 'xfer', label: 'transfer_checked', note: 'all transfer logic first', col: 0 },
+      { id: 'val', label: 'validation account', note: '"extra-account-metas" + mint', col: 1 },
+      { id: 'exec', label: 'Execute', note: 'every account read-only', col: 2, tone: 'accent' },
+      { id: 'ok', label: 'returns Ok', note: 'the transfer stands', col: 3, tone: 'good' },
+      { id: 'err', label: 'returns Err', note: 'the transaction reverts', col: 3, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'xfer', to: 'val', label: 'resolve' },
+      { from: 'val', to: 'exec' },
+      { from: 'exec', to: 'ok' },
+      { from: 'exec', to: 'err' },
+    ]}
+  />
+</Figure>
+
+Two optional instructions manage that validation account. `InitializeExtraAccountMetaList` takes a
+`Vec<ExtraAccountMeta>` and the accounts validation account (writable), mint, mint authority (signer)
+and system program; `UpdateExtraAccountMetaList` takes the same list with validation account, mint and
+mint authority.<Cite src="solana-program-transfer-hook-spec" />
+
+Stop on the authority in those two. **The mint authority signs for the extra-account list.** The set
+of accounts your transaction will be required to include is configuration owned by the token's issuer,
+and it has an update path.
+
+### Where the extra accounts come from
+
+The validation account is a PDA off the transfer hook program, derived from the seeds
+`"extra-account-metas" + <mint-address>` — one validation account per mint, so the additional required
+accounts are customisable per mint.<Cite src="solana-program-transfer-hook-extra-accounts" /> Neodyme
+names the same PDA from the integrator's side, seeded from `[b"extra-account-metas" + mint.key]` and
+laid out per the TLV Account Resolution library.<Cite src="neodyme-token-2022" />
+
+Its contents are TLV, the same encoding idea as the account extensions in the previous lesson: the
+type is the `Execute` instruction discriminator, the length is a `u32` giving the size of the data
+buffer, and the data is a list of fixed-size configuration objects, sliced by dividing the length by
+the fixed entry size.<Cite src="solana-program-transfer-hook-extra-accounts" />
+
+Each entry is an `ExtraAccountMeta`, serialised into exactly **35 bytes**: a `u8` discriminator, a
+32-byte `address_config`, `is_signer` and `is_writable`.<Cite src="solana-program-transfer-hook-extra-accounts" />
+The discriminator says how to interpret those 32 bytes:
+
+<Matrix
+  corner="discriminator"
+  cols={['meaning']}
+  rows={[
+    { label: '0', cells: ['a static address; address_config IS the 32-byte pubkey'] },
+    { label: '1', cells: ['a PDA off the transfer hook program itself'] },
+    { label: '(1 << 7) + i', cells: [{ v: "a PDA off another program, where i is that program's index in the Execute accounts list (e.g. 128 + 9 = 137)", tone: 'accent' }] },
+  ]}
+  caption="The account list your transaction must carry is written nowhere in your code — it is computed per mint from a record the mint authority can update."
+  alt="The three ExtraAccountMeta discriminator values and what address_config means for each: 0 is a static 32-byte pubkey, 1 is a PDA off the transfer hook program itself, and (1 << 7) + i is a PDA off another program named by index i in the Execute accounts list, for example 128 + 9 = 137."
+/>
+
+<Cite src="solana-program-transfer-hook-extra-accounts" />
+
+For the PDA cases the 32 bytes cannot hold real seeds, so they hold a description of **where to find
+them**. The `Seed` enum supports a `Literal` (the bytes themselves), `InstructionData` (a slice of the
+instruction data at a given index and length), `AccountKey` (the address of an account at a given
+index in the list), and `Account Data` — a slice of *another account's data*, named by
+`account_index`, `data_index` and length.<Cite src="solana-program-transfer-hook-extra-accounts" />
+
+Read that last one carefully, because it is the crux of the whole design. **An account your
+transaction must include can be derived from the contents of a different account, read at
+transaction-build time.** The interface calls this dynamic account resolution, and its stated benefit
+is real: no client or program needs to know the specific accounts a hook requires, since they resolve
+automatically from the validation account's data, and the interface ships on-chain and off-chain
+helpers to do the resolution.<Cite src="solana-program-transfer-hook-extra-accounts" /><Cite src="solana-token-2022-extensions-ref" />
+
+## What that means for you as an integrator
+
+You now have enough mechanism to answer the question the module cares about. A mint with a transfer
+hook does four things to a program that accepts it, and only one of them is the one people expect.
+
+**1. It puts arbitrary code in your transfer path, on your compute budget.** The hook is chosen by the
+mint authority, executes inside your instruction, and its cost is charged to your transaction. There
+is no bound on that cost that you set. A swap that fits comfortably today is a swap whose margin
+against the compute limit is now controlled by someone else.
+
+**2. It can fail your transaction whenever it likes.** That is the *point* of the extension —
+allowlists, blocklists, compliance gates and royalty enforcement are all "make the transfer fail
+unless". As an integrator, it means every operation you build on this mint has a liveness dependency
+on a third party, including your liquidation path, your withdrawal path, and your emergency
+shutdown. Ask that question specifically: *if the hook starts rejecting everything, what in my
+protocol stops working, and can users get out?*
+
+**3. It changes the account list your transactions must carry.** The extra accounts are resolved from
+on-chain data and can include writable accounts. Under [declared account access](/c/declared-account-access),
+a writable account in your transaction is a write lock, so a hook that requires one shared writable
+account serialises every transfer of that mint against every other — the same contention argument
+that put the transfer fee inside the recipient's account, arriving here as a cost the mint imposes on
+you rather than a cost the protocol avoided.
+
+**4. It can be replaced after you listed the mint.** The extension guide documents
+`set-transfer-hook`, which updates the transfer-hook program in the
+mint.<Cite src="solana-token-2022-extensions-ref" /> Neodyme's authority table records the same: the
+transfer hook extension's mint authority can update the transfer hook
+program.<Cite src="neodyme-token-2022" /> The code you reviewed is not the code that will run.
+
+What is *not* on the list is the thing an EVM engineer arrives braced for. Because all involved
+accounts are read-only inside the hook and the sender's signer privileges are
+dropped,<Cite src="neodyme-token-2022" /> the hook cannot use the position it has been handed to move
+your tokens. It is a spectator with a veto, not a delegate.
+
+That reduces the listing decision to four reads, in order.
+
+**Subgoal: establish whether a hook exists at all.** Unpack the mint and look for `TransferHook` in
+its extension types.<Cite src="spl-token-2022-docsrs-extensiontype" /> Absent, this whole lesson is
+irrelevant to that mint and cannot become relevant later.
+
+**Subgoal: identify the code.** The extension names a program id. Fetch that program, and then fetch
+its **upgrade authority**, because the program is mutable unless that authority is none.
+
+**Subgoal: identify who can point the mint somewhere else.** The transfer hook extension's mint
+authority can update the transfer hook program,<Cite src="neodyme-token-2022" /> so a second party
+can replace the code without touching the program you just reviewed.
+
+**Subgoal: read the deployed validation account.** Derive `"extra-account-metas" + mint` off the hook
+program and decode what is actually
+there,<Cite src="solana-program-transfer-hook-extra-accounts" /> because the extra accounts — and in
+particular any writable ones — are what your transactions will be obliged to carry.
+
+<Misconception
+  belief="A transfer hook is ERC-777's tokensReceived with different syntax, so the defence is a reentrancy guard and careful CEI ordering."
+  reality="The hook receives every involved account as read-only and does not inherit the sender's signer privileges, so it cannot act as the sender. The runtime also invokes it after all transfer logic, on end state. The realistic hazards are denial of service, compute cost, and the fact that the program invoked can be swapped by the mint authority."
+  why="Both are 'the token calls someone else's code during a transfer', and on the EVM that sentence implies inherited authority and unsettled state — neither of which holds here."
+  src="neodyme-token-2022"
+/>
+
+## Writing one: the four checks, and why each exists
+
+If you are on the other side — implementing a hook for your own mint — the interface hands you a
+program that anybody can call with any accounts. Neodyme's write-up gives four checks, and they are
+best learned as a sequence in which each one closes the hole the previous one leaves open.
+
+**Check 1 — verify the mints.** Transfer hook programs can be called by any mint, so restrict which
+mints you support by checking the mints named in the source and destination
+accounts.<Cite src="neodyme-token-2022" /> Without this, **any mint can use your hook and reach the
+data in your PDAs** — and if you intend to support multiple mints, the mint's public key must be part
+of your PDA seeds so that one mint's state cannot be addressed while processing
+another's.<Cite src="neodyme-token-2022" /> That is [PDA seed collision](/c/pda-seed-collision)
+arriving with a new caller.
+
+**Check 2 — verify the transferring state.** The token program always sets the `transferring` flag to
+true in all token accounts involved in a transfer, and checking it is what ensures a threat actor
+cannot call your hook outside a transfer.<Cite src="neodyme-token-2022" />
+
+```rust
+let source_account_extension = source_account.get_extension::<TransferHookAccount>()?;
+let destination_account_extension = destination_account.get_extension::<TransferHookAccount>()?;
+
+if !bool::from(source_account_extension.transferring)
+    || !bool::from(destination_account_extension.transferring) {
+    return err!(TransferError::IsNotCurrentlyTransferring);
+}
+```
+
+<Cite src="neodyme-token-2022" />
+
+This is the check whose absence produces the most surprising bugs, because the name of the extension
+lies to you. A hook program is an ordinary Solana program at an ordinary address with a public
+entrypoint. Nothing in the runtime restricts who invokes it. Every piece of state your hook maintains
+— a transfer counter, a per-period volume cap, an allowance it decrements, a "last seen" timestamp
+that gates something else — can be advanced by anyone, for free, with no transfer occurring, unless
+you check the flag.
+
+**Check 3 — verify the token accounts belong to the mint.** Checks 1 and 2 together still leave a gap:
+an attacker can create their own mint *and their own hook*, then call your hook from theirs, passing
+a supported mint account alongside token accounts that do not belong to
+it.<Cite src="neodyme-token-2022" /> The fix is to compare each token account's `mint` field against
+the mint account that was passed.<Cite src="neodyme-token-2022" /> This is
+[accounts-are-untrusted-input](/c/accounts-are-untrusted-input) one layer deeper than most reviews
+look — the relationships *between* the accounts are as forgeable as the accounts themselves.
+
+**Check 4 — verify the caller is Token-2022, if you can afford to.** The most restrictive measure is
+to confirm that the program invoking you is the Token-2022 program, using `get_instruction_relative`
+against the instructions sysvar and comparing the resulting `program_id` to Token-2022's
+id.<Cite src="neodyme-token-2022" /> Neodyme is careful about the trade-off: for most hooks the first
+two checks are sufficient, and this one **prevents a transfer from happening within a CPI**, because
+the relative instruction is then some other program's, not Token-2022's. If your token needs to be
+transferable by other protocols — which is to say, if you want composability at all — this check
+disables that.<Cite src="neodyme-token-2022" />
+
+<Aside kind="warn">
+Notice the shape of check 4. It is the [arbitrary-CPI](/c/arbitrary-cpi) defence — confirm who is
+calling you — and here it is in direct tension with the feature. A hook that is maximally safe about
+its caller is a token that cannot be used inside anyone else's program. That trade is a *product*
+decision disguised as a security control, and it should be made by the people who decide what the
+token is for, not silently in a pull request.
+</Aside>
+
+<Misconception
+  belief="A transfer hook only runs during transfers — the name says so and the token program is the only thing that calls it."
+  reality="It is an ordinary program with a public entrypoint. Anyone can invoke it directly with accounts of their choosing. Only an explicit check of the transferring flag on the involved token accounts establishes that a transfer is actually in progress."
+  why="The name describes the intended call site rather than an enforced one, and the interface documentation describes the token program invoking it, which reads as an exclusive relationship."
+  src="neodyme-token-2022"
+/>
+
+<Check type="spot-bug" concept="hook-must-verify-transferring-flag">
+A team ships a transfer hook enforcing a per-wallet daily transfer cap for a regulated token. The
+`Execute` handler is below. The `ExtraAccountMetaList` correctly declares the `day_state` PDA, and
+the client resolves it. Find what an attacker does with this.
+
+```rust
+pub fn execute(ctx: Context<Execute>, amount: u64) -> Result<()> {
+    let day = Clock::get()?.unix_timestamp / 86_400;
+    let st = &mut ctx.accounts.day_state;
+
+    if st.day != day {
+        st.day = day;
+        st.moved = 0;
+    }
+
+    st.moved = st.moved.checked_add(amount).ok_or(E::Overflow)?;
+    require!(st.moved <= DAILY_CAP, E::CapExceeded);
+    Ok(())
+}
+```
+
+<Answer>
+**Attack 1 — call the hook directly and burn the victim's cap without moving a token.** Nothing here
+checks the `transferring` flag, and a hook program is an ordinary program anyone can
+invoke.<Cite src="neodyme-token-2022" /> The attacker invokes `execute` with the victim's `day_state`
+PDA and `amount = DAILY_CAP`, and the victim is frozen out of transfers for the rest of the day at the
+cost of one transaction fee. The fix is the transferring check on **both** the source and destination
+token account extensions.<Cite src="neodyme-token-2022" />
+
+**Attack 2 — supply someone else's accounts.** Even with the flag checked, the handler never verifies
+that the token accounts it was handed belong to the mint it thinks it is protecting, so an attacker
+can create their own mint and hook and call this one from theirs with a supported mint account and
+unrelated token accounts.<Cite src="neodyme-token-2022" /> Both the mint allowlist check and the
+"token accounts belong to this mint" check are missing.<Cite src="neodyme-token-2022" />
+
+**Attack 3 — reset the cap with a self-transfer.** The hook is **not called during self-transfers,
+where the source and destination accounts are the
+same**.<Cite src="solana-token-2022-extensions-ref" /> That does not reset `moved` by itself, but it
+does mean any accounting the hook does about "all movement of this token" is wrong: value can be
+shuffled within a wallet's own accounts with no hook invocation at all, and any design that assumes
+the hook observes every movement is unsound from the start.
+
+**Attack 4 — the state is keyed to the wrong thing, and the review will not show it.** The declared
+seeds live in the `ExtraAccountMetaList`, whose `Seed` options include deriving a PDA from a slice of
+*another account's data*.<Cite src="solana-program-transfer-hook-extra-accounts" /> If `day_state` is
+derived from, say, the source token account's owner field, then whether two transfers share a cap
+depends on data outside this file. And `UpdateExtraAccountMetaList` lets the **mint authority** change
+that derivation later.<Cite src="solana-program-transfer-hook-spec" /> Reviewing the hook's Rust
+without reading the deployed validation account tells you almost nothing about which state a given
+transfer will touch.
+
+**The structural finding, which is the one to write up.** This hook maintains security-relevant state
+and validates none of its context. Ordered by what each check closes: verify the transferring flag on
+both accounts, verify the mint is one you support, verify the token accounts belong to that mint, and
+put the mint's key in the PDA seeds so no other mint can address this state — then decide
+consciously whether to require the caller be Token-2022, knowing it costs you every CPI-based
+integration.<Cite src="neodyme-token-2022" />
+</Answer>
+</Check>
+
+## What this unlocks
+
+**A correct threat model for third-party code inside a transfer, on a machine with explicit
+privileges.** The EVM makes authority ambient: whoever is called inherits a context and can call back
+into you. Solana makes it explicit, and the transfer hook is the clearest demonstration in the track
+— privileges are dropped and accounts made read-only at the boundary, so the whole reentrancy family
+closes and a different family opens: denial, cost, and injected accounts.
+
+**A listing question with a specific answer.** Read `TransferHook` off the mint. If it is set, you are
+not evaluating a token, you are evaluating a token *and a program whose upgrade authority you must
+also check*, which the mint authority can swap for a different program at
+will.<Cite src="solana-token-2022-extensions-ref" /> For most protocols that is enough to move the
+mint into the "reject or handle explicitly" bucket rather than the "supported" one — a walkthrough
+with working code is the fastest way to build the intuition before making that
+call.<Cite src="chainstack-token-2022-hooks" />
+
+**And a checklist you can apply to any interface built this way.** Dynamic account resolution is
+spreading beyond transfer hooks, and the questions generalise: who signs for the account list, whose
+data do the seeds read, what does the callee verify about its caller, and what does the callee verify
+about the relationships between the accounts it was handed.<Cite src="solana-program-transfer-hook-extra-accounts" />
+
+The next lesson leaves behaviour that runs during a transfer and takes the extensions that need no
+transfer at all: an address that can move tokens out of any account of the mint whenever it likes,
+tokens that cannot be moved by anyone, and accounts that arrive frozen.

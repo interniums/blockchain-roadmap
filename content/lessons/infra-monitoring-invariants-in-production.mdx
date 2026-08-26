@@ -1,0 +1,403 @@
+---
+id: infra-monitoring-invariants-in-production
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [foundry-invariant-testing, tenderly-invariant-monitoring, acm-invariant-effectiveness, trace2inv-fse24, houston-ndss, seal-frameworks-monitoring, seal-frameworks-monitoring-guidelines, seal-frameworks-monitoring-tools, oz-monitor-docs, viem-multicall, viem-fallback-transport, eth-pos-finality, measured-gas-constants, oz-defender-docs]
+stack: { viem: "2.x" }
+---
+
+Two files. One statement.
+
+```solidity
+// test/Vault.invariants.t.sol
+function invariant_sharesAreBacked() public view {
+    assertGe(vault.totalAssets(), vault.totalSupply() * vault.pricePerShare() / 1e18);
+}
+```
+
+```ts
+// monitor/predicates/sharesAreBacked.ts
+export const sharesAreBacked = (s: VaultState) =>
+  s.totalAssets >= (s.totalSupply * s.pricePerShare) / 10n ** 18n;
+```
+
+Those assert the same thing about the same system. The only difference is where the three numbers
+came from: in the first, a [handler](/c/handler-pattern) generated them over a randomised call
+sequence; in the second, they were read off mainnet at a specific block.
+
+That is the whole idea of this lesson, and it has a consequence teams routinely miss. **You are not
+starting monitoring from zero.** If your protocol has an [invariant test suite](/c/invariant-testing),
+you have already done the hard part — deciding what must always be true and writing it down precisely
+enough that a machine can falsify it. What remains is plumbing a second state source into a statement
+that already exists.
+
+Teams that treat production monitoring as a separate project from the test suite end up with a
+smaller, vaguer set of production checks than the set they had already proved they could express,
+because writing the predicate is the expensive step and they paid for it twice.
+
+## Why the state layer is where the strongest alert lives
+
+An alert's usefulness is a product of two things: how often it is right, and how early it fires.
+A broken protocol invariant is unusually good on both.
+
+**On rightness.** When `totalAssets` drops below what the outstanding shares are owed, there is no
+interpretation under which that is a busy Tuesday. It is not a heuristic that the situation looks
+unusual; it is the protocol's own accounting contradicting itself. That is what makes a state-level
+predicate safe to page a human on at 3am, and it is the property no threshold alert has.
+
+**On earliness.** Accounting usually breaks before the funds finish leaving. An exploit that
+manipulates a rate, mints against it and then withdraws crosses the invariant at the mint, not at the
+withdrawal — which means the predicate is *leading* while a withdrawal-size alert is *lagging*. That
+gap is your response window, and it is the only reason the rest of this module has anything to
+respond with.<Cite src="tenderly-invariant-monitoring" />
+
+There is empirical work on how far this goes, and it is more useful than enthusiasm in either
+direction. A study of 23 prevalent invariants across 8 categories, either deployed in high-profile
+protocols or endorsed by leading auditing firms, evaluated them against 42 contracts that fell victim
+to 27 distinct exploits on Ethereum.<Cite src="trace2inv-fse24" /><Cite src="acm-invariant-effectiveness" />
+The most effective single invariant guard blocked 18 of the 27 exploits with minimal gas overhead;
+combining multiple guards reached up to 23 of the 27, with false-positive rates as low as
+0.32%.<Cite src="trace2inv-fse24" />
+
+<Figure
+  caption="Both halves of this benchmark matter: the height of the bars, and the gap above them."
+  alt="Against 27 distinct exploits, the most effective single invariant guard blocked 18, combining multiple guards reached up to 23, and 4 were caught by no combination in the study."
+>
+  <Bars
+    axisLabel="exploits, out of the 27 in the benchmark"
+    items={[
+      { label: 'Best single guard', value: 18, display: '18 of 27', tone: 'good', note: 'minimal gas overhead' },
+      { label: 'Guards combined', value: 23, display: 'up to 23 of 27', tone: 'good', note: 'false positives as low as 0.32%' },
+      { label: 'Caught by no combination', value: 4, display: '4 of 27', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+Hold all three numbers together. A single well-chosen predicate covering two thirds of a real exploit
+benchmark is a stronger result than most defensive techniques can show. And four of the twenty-seven
+were not caught by any combination in the study, which is the honest ceiling: **an invariant
+constrains the states you thought to constrain.** That ceiling is why lesson three exists and why the
+economic layer, for all its noise, is not optional.
+
+### Which invariants, when you cannot monitor all of them
+
+You will not deploy forty predicates on day one, so the selection question is real. Three properties
+make a candidate worth deploying first, and they are ordered by how much they change the alert's
+value rather than by how hard the predicate is to write.
+
+**It must be false only when something is wrong.** A predicate that legitimately breaks during a
+harvest, a rebalance or a fee accrual is not a monitor, it is a scheduled false positive. Either
+write the pre-condition into it explicitly — which usually means emitting an event you were not
+emitting — or do not deploy it. This is the same design consequence the threat-modeling track
+warned about, arriving from the operational side: deciding to monitor a property is deciding to
+instrument it.
+
+**It must break before the value finishes leaving.** Accounting identities do. Balance thresholds do
+not. If the only way your predicate becomes false is that the funds are already gone, you have built
+a notification rather than a detector.
+
+**It must be readable from state you can actually query.** A predicate over the sum of every user
+balance is a good fuzz target and a bad monitor, because no bounded read gives you the sum. Maintain
+the accumulator on chain, or reformulate the claim. The invariant-effectiveness work groups its 23
+invariants into 8 categories precisely because they differ in what they need to evaluate, not only in
+what they catch.<Cite src="acm-invariant-effectiveness" />
+
+<Misconception
+  belief="Monitor for large withdrawals — that is where the money leaves."
+  reality="Withdrawal size is a lagging, low-precision signal: it fires after the value has moved and it fires constantly on legitimate activity, because 'large' is a property of your user base rather than of an attack. A broken protocol invariant is leading and high-precision, because it is false by construction rather than by comparison to a baseline."
+  why="Withdrawal size is trivial to instrument. It requires no understanding of the protocol, so it is the first alert every team writes and often the only one."
+  src="tenderly-invariant-monitoring"
+/>
+
+## Taking one invariant to production
+
+Here is the work, with each step's purpose named rather than just its action. The example is a vault
+with a solvency invariant, but the shape transfers unchanged to a lending market's borrow index, an
+AMM's curve equation or a bridge's mint-versus-locked accounting.
+
+### Subgoal — give the predicate exactly one definition, so the two deployments cannot drift
+
+The failure this prevents is common: six months from now somebody adds a fee to the share price
+calculation, updates the Solidity test, and does not know the TypeScript monitor exists. Now the
+monitor asserts a statement the protocol no longer makes, and it alerts either forever or never —
+both of which end with somebody turning it off.
+
+The cheap version of "one definition" is a shared versioned module that the test harness and the
+monitor both import, so a change fails CI in both places. The expensive version generates one from
+the other. The cheap version is enough; what matters is that **a review fails when they diverge**.
+
+Write the statement with its tolerance included. `totalAssets >= backing` is rarely the real claim;
+`totalAssets >= backing - dust` usually is, where `dust` is a stated rounding allowance rather than a
+number somebody tuned until the alerts stopped. A tolerance you cannot justify is a silenced alert
+with extra steps.
+
+### Subgoal — read every term of the predicate at one block, or the predicate is meaningless
+
+This is the step where hand-rolled monitors are usually wrong, and the bug is invisible in testing
+because it only appears under load.
+
+A predicate over three storage values is only a statement about the protocol if all three come from
+the same state root. Read them with three separate `eth_call` requests and you are comparing
+`totalAssets` at block N against `totalSupply` at block N+1, which manufactures violations during
+exactly the busy periods when you most need the alert to mean something.
+
+The fix is to batch the reads and pin the block:
+
+```ts
+import { createPublicClient, fallback, http } from 'viem';
+import { mainnet } from 'viem/chains';
+
+const client = createPublicClient({
+  chain: mainnet,
+  transport: fallback([http(PRIMARY), http(SECONDARY)]),
+});
+
+async function readState(blockNumber: bigint) {
+  const [totalAssets, totalSupply, pricePerShare] = await client.multicall({
+    contracts: [
+      { address: VAULT, abi, functionName: 'totalAssets' },
+      { address: VAULT, abi, functionName: 'totalSupply' },
+      { address: VAULT, abi, functionName: 'pricePerShare' },
+    ],
+    allowFailure: false,
+    blockNumber,        // pin: every term reads the same state root
+    batchSize: 0,       // do not let viem split this into several eth_calls
+  });
+  return { totalAssets, totalSupply, pricePerShare };
+}
+```
+
+Two parameters there are doing real work and both are easy to omit.
+
+`blockNumber` is the pin. Without it the read defaults to the `latest` block tag, and `latest` is a
+moving target between requests.<Cite src="viem-multicall" />
+
+`batchSize` is the one nobody expects. viem chunks a multicall's calldata and its default maximum
+chunk size is 1024 bytes, because some providers cap the calldata accepted in a single `eth_call`
+request.<Cite src="viem-multicall" /> A predicate with enough terms therefore becomes *several*
+`eth_call` requests — and if you left the block unpinned, those chunks can land on different blocks
+and you are back to the bug you thought batching solved. Setting `batchSize: 0` disables the size
+limit; pinning `blockNumber` is what actually makes it safe.<Cite src="viem-multicall" />
+
+<Aside kind="note">
+`multicall` routes through the Multicall3 contract, so the reads execute inside one EVM call
+frame.<Cite src="viem-multicall" /> That gives you atomicity for free *within* a chunk, which is why
+the chunking behaviour matters so much: the guarantee you are relying on has a boundary, and the
+boundary is a byte count in your client library rather than anything about the chain.
+</Aside>
+
+### Subgoal — choose a block tag and be explicit about what that choice costs
+
+The pinned block has to come from somewhere, and the options are a real tradeoff rather than a
+default.
+
+Evaluating at the head gives the earliest detection and accepts that a
+[reorg](/c/reorg-definition) can retroactively un-happen the state you alerted on. Evaluating at the
+`finalized` checkpoint gives a state that cannot be rewritten, roughly two epochs behind — minutes you
+do not have during an exploit.<Cite src="eth-pos-finality" />
+
+For an invariant monitor the answer is head: a false alert from a one-block reorg costs one triage,
+while thirteen minutes of latency costs the entire response window. But take the second half too —
+**re-evaluate at finality and reconcile.** A predicate that broke at the head and holds at finality is
+a reorg artifact and should close itself; one that still breaks at finality is a confirmed incident
+and should escalate rather than repeat. The pair is a better alert than either alone and costs one
+extra evaluation per checkpoint.
+
+<Aside kind="warn">
+Do not reuse your indexer's [finality boundary](/c/finality-vs-confirmations) for this. The indexer
+delays because [side effects are not rollbackable](/c/side-effects-are-unrollbackable); the monitor
+must not delay, because its whole value is being early. They are different systems with opposite
+latency requirements and sharing a config value between them silently gives one of them the wrong
+behaviour.
+</Aside>
+
+### Subgoal — make "could not evaluate" a third outcome, distinct from pass and fail
+
+An invariant check has three results, not two: the predicate held, the predicate is false, or **you
+do not know**, because the RPC timed out, the node was mid-reorg, a call reverted, or your process
+was restarting.
+
+Collapse `UNKNOWN` into `PASS` and you have built a monitor that goes quiet exactly when
+infrastructure is under stress — which, during a real incident, is exactly when it is under stress.
+Collapse it into `FAIL` and you have built a monitor that pages on every RPC hiccup, and lesson three
+explains precisely what that does to the people receiving it.
+
+So: three states, three routes. `FAIL` pages. `UNKNOWN` increments a counter and pages only when it
+persists past a window, with alert text that says *the monitor cannot see* rather than *the protocol
+is broken* — because those two sentences have different first actions. `PASS` writes a heartbeat,
+which [lesson five](/c/monitoring-the-monitor) turns into the thing that makes silence interpretable.
+
+<Compare
+  columns={[
+    { title: 'PASS', tone: 'good' },
+    { title: 'FAIL', tone: 'danger' },
+    { title: 'UNKNOWN', tone: 'warn' },
+  ]}
+  rows={[
+    { label: 'What has the monitor established?', cells: ['The predicate held', 'The predicate is false', 'Nothing — an RPC timeout, a mid-reorg read, a reverted call, a restart'] },
+    { label: 'Where does it route?', cells: ['A heartbeat', 'It pages', 'A counter, and it pages only if it persists past a window'] },
+    { label: 'What does the alert text have to say?', cells: ['Nothing; it is a heartbeat', 'The protocol is broken', 'The monitor cannot see'] },
+  ]}
+  caption="Three outcomes, three routes, three different first actions — and only one of them is about the protocol."
+  alt="The three results of an invariant evaluation compared on what each establishes, where it routes, and what its alert text has to say."
+/>
+
+A `fallback` transport helps here and also hides something. viem's fallback ranks its transports
+every 10 seconds by pinging each one, scores the last 10 pings on stability and latency with weights
+of 0.7 and 0.3, and routes to the best.<Cite src="viem-fallback-transport" /> That keeps the monitor
+running when one provider degrades — and it means your primary provider can be broken for a week
+without anyone finding out. Fail over *and* alert on the failover; the resilience feature is not the
+observability feature.
+
+### Subgoal — report which term moved, not that the predicate is false
+
+`invariant_sharesAreBacked violated` is a true statement and a useless page. The person reading it at
+3am now has to open a console and re-derive everything the detector already computed.
+
+Emit the terms. All of them, with the block number, the previous evaluation's values, and the
+delta:
+
+```
+FAIL  sharesAreBacked  block 23,914,882
+  totalAssets      412,904.11e18   (was 511,203.77e18,  -19.2%)
+  totalSupply      508,110.02e18   (was 508,110.02e18,   0.0%)
+  pricePerShare      1.00612e18    (was   1.00611e18,   +0.0%)
+  shortfall         98,299.66e18
+  last PASS        block 23,914,879
+```
+
+Four lines of arithmetic the detector had anyway, and they turn "something is wrong" into "assets
+left, shares did not, three blocks ago". That is the difference between an alert and a decision, and
+it is the cheapest improvement available to a stack that already fires correctly — a point
+[lesson six](/c/alert-enrichment) develops into a full triage payload.
+
+There is a second-order reason enrichment matters that is easy to miss. The HOUSTON authors argue
+that explainability — showing directly which calls were anomalous or which invariants were violated —
+is what lets human analysts determine root cause and *discard potential false
+positives*.<Cite src="houston-ndss" /> Dismissing an alert is a decision, and a decision made without
+evidence is a guess. Lesson three shows what happens when an adversary is counting on that guess.
+
+### Subgoal — close the loop, so the invariant you write after an incident is worth three artifacts
+
+The last step is procedural and it is the one that compounds. When a post-mortem produces a new
+invariant — and a good post-mortem always does — it lands in the shared predicate module. From there
+it is automatically a regression test in the fuzz campaign, automatically a production detector, and
+automatically part of the review checklist, because all three consume the same statement.
+
+Teams that maintain the two separately get one of the three, usually the test, and rediscover the
+same class of failure in production eighteen months later.
+
+## What this does not replace
+
+Two boundaries, stated plainly so you do not oversell this internally.
+
+**A state-level monitor is not an on-chain guard.** It detects; it does not prevent. Putting the
+predicate in the contract as a post-condition prevents, and costs gas on every honest call forever —
+a cold storage read alone is 2,100 gas against 100 warm, so a multi-term check is a five-figure tax
+before any arithmetic.<Cite src="measured-gas-constants" /> The placement argument was made properly
+back in [the threat-modeling track](/c/invariant-as-spec); what matters here is not repeating it
+under a new name. Monitoring buys detection and pays in log gas and off-chain compute. On-chain
+enforcement buys prevention and pays on every call.
+
+**An invariant monitor does not cover privileged actions.** If your admin key is stolen and used to
+call a legitimate parameter setter within its legitimate range, no accounting predicate is violated
+and no monitor built on this lesson says a word. That is not a gap you close with a better predicate;
+it is a different category, and it is [the next-but-one lesson](/c/admin-action-alerting).
+
+<Misconception
+  belief="Putting the invariant in production means enforcing it on chain as a post-condition."
+  reality="Those are two different deployments of one statement with opposite cost profiles. An off-chain monitor evaluates the predicate for free on unbounded state and produces an alert; an on-chain post-condition evaluates it inside every honest call, pays storage reads at 2,100 gas cold and 100 warm each time, and produces a revert. Most predicates worth monitoring are not worth enforcing, and a few are worth both."
+  why="Both are described as 'invariants in production', and the on-chain version sounds more rigorous because it is the one that can actually stop the transaction."
+  src="measured-gas-constants"
+/>
+
+<Check type="spot-bug" concept="invariant-monitoring">
+This monitor loop shipped and ran quietly for four months. During that period the protocol had one
+genuine two-block accounting break that nobody was paged for, and the on-call was woken twice by
+alerts that turned out to be nothing. Find the four defects.
+
+```ts
+setInterval(async () => {
+  try {
+    const totalAssets   = await client.readContract({ ...vault, functionName: 'totalAssets' });
+    const totalSupply   = await client.readContract({ ...vault, functionName: 'totalSupply' });
+    const pricePerShare = await client.readContract({ ...vault, functionName: 'pricePerShare' });
+
+    const backing = (totalSupply * pricePerShare) / 10n ** 18n;
+    if (totalAssets < backing) {
+      await page('Vault invariant violated');
+    }
+  } catch (e) {
+    console.error(e);
+  }
+}, 60_000);
+```
+
+<Answer>
+**Defect 1 — three unpinned reads, so the predicate is not a statement about any single state.**
+Each `readContract` is its own `eth_call` at the default `latest` tag, and `latest` advances between
+them.<Cite src="viem-multicall" /> During busy periods `totalAssets` and `totalSupply` come from
+different blocks, and a deposit landing between the two reads manufactures an apparent shortfall.
+**This is the source of both 3am false alarms**, and it is why they were unreproducible the next
+morning — the state they described never existed. Fix: one `multicall` with an explicit
+`blockNumber`, and `batchSize: 0` so viem's 1024-byte chunking cannot silently re-split
+it.<Cite src="viem-multicall" />
+
+**Defect 2 — a 60-second poll on a 12-second block time, so it samples about one block in five.**
+The genuine break lasted two blocks and the loop was not looking. Note that this is *not*
+fixed by polling faster in a naive loop: at any interval you are sampling, and the accounting can
+break and be repaired between samples. The correct shape is to drive evaluation off new-block events
+and evaluate every block, so the loop is a fold over blocks rather than a clock.
+
+**Defect 3 — the `catch` block swallows failure into a log line, which collapses UNKNOWN into
+silence.** An RPC outage, a rate limit or a reverting `pricePerShare` all produce a monitor that
+looks identical to a healthy protocol. This is the single most dangerous line in the file, because it
+converts every infrastructure failure into a clean bill of health. Fix: three explicit outcomes, with
+`UNKNOWN` routed to a channel that says the monitor cannot see, and a persistent `UNKNOWN` escalating
+on its own timer.
+
+**Defect 4 — the alert carries no evidence.** `'Vault invariant violated'` forces a twenty-minute
+investigation and makes an incorrect dismissal likely — explainability is what lets an analyst discard
+a false positive on grounds rather than on vibes.<Cite src="houston-ndss" /> Fix: emit all three
+terms, the shortfall, the block number and the last passing block.
+
+**A fifth, if you spotted it: no `setInterval` overlap guard.** If one evaluation takes longer than
+60 seconds — which it will during exactly the RPC degradation you care about — evaluations pile up
+concurrently, multiply the load on an already-struggling endpoint, and can page several times for one
+condition. Drive it from a block subscription with an explicit in-flight flag, or await the previous
+run before starting the next.
+
+**What all five have in common.** Not one is a mistake about the *predicate*. The invariant in this
+file is correct. Every defect is in how state was acquired, how often, and what was done when it
+could not be. That is the actual engineering content of invariant monitoring, and it is why "we
+already have invariant tests, so monitoring is a weekend" is optimistic by about a sprint.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The predicate you now have running is the highest-precision alert in your catalogue**, which makes
+it the reference point for everything that follows. Lesson three is about the alerts that cannot be
+this good and belong on a different channel because of it, and lesson four is about the category this
+one structurally cannot see.
+
+**Operationally, do not run only one.** The framework recommends that critical systems run two
+independent providers monitoring the same invariants in parallel, ideally one self-hosted and one
+managed, because no provider has perfect uptime or perfect
+detection.<Cite src="seal-frameworks-monitoring" /><Cite src="seal-frameworks-monitoring-tools" /> The
+shared predicate module makes that cheap: the same statement, deployed a third time.
+
+**On tooling, check what still exists before following any tutorial.** The pattern most guides
+describe — a hosted monitor triggering a hosted serverless action — was OpenZeppelin Defender's, and
+that platform's hosted era has ended; the successor is the open-source OpenZeppelin
+Monitor.<Cite src="oz-defender-docs" /><Cite src="oz-monitor-docs" /> Lesson six covers the migration.
+It does not change this lesson, because the predicate was never the vendor's: it was always yours,
+sitting in `test/`.<Cite src="foundry-invariant-testing" />
+
+**And the practice** takes exactly this path end to end: a Foundry invariant for a vault, a script
+evaluating the same predicate against a live fork every block, then corrupting the accounting on the
+fork and measuring how many blocks pass before the predicate notices. That number is your response
+window, and it is the first honest measurement most teams ever take of their own
+detection.<Cite src="seal-frameworks-monitoring-guidelines" />

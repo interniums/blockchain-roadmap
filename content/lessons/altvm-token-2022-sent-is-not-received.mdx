@@ -1,0 +1,352 @@
+---
+id: altvm-token-2022-sent-is-not-received
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [solana-token-2022-extensions-ref, solana-program-confidential-zkps, neodyme-token-2022, offside-token-2022-part1, spl-token-2022-docsrs-extensiontype, solana-docs-token-extensions, quicknode-transfer-fees, chainstack-token-2022-hooks]
+stack: {}
+---
+
+You have seen this bug before, on another chain, in another language, and you already know the fix.
+That is the reason to spend sixteen minutes on it here rather than four: the defect is one you can
+recognise instantly, and the *mechanism* underneath it is different enough that half your instincts
+about detecting it are wrong.
+
+Start with the shape. A vault program accepts a deposit. It builds a transfer of 1,000,000 raw units
+from the user into its own token account, the transfer succeeds, and it credits the user with
+1,000,000. Every accounting identity the program maintains is now off by the fee, in the same
+direction, on every deposit, forever — and the deficit is paid by whoever withdraws last.
+
+On Ethereum this is the [fee-on-transfer](/c/fee-on-transfer-tokens) class, and the canonical answer
+is the [balance-delta pattern](/c/balance-delta-pattern): read your own balance before and after,
+credit the difference. That answer is still right here. What is different is where the missing tokens
+go, who can see them, what happens to your account while they sit there, and the fact that the
+instruction you have been using for years now **fails outright** on exactly these mints.
+
+## Three destinations, not two
+
+The ERC-20 fee-on-transfer tokens you catalogued in Track 04 implement the fee inside their own
+`transfer` function. The mechanism varies but the accounting does not: the sender's balance falls by
+the full amount, the recipient's rises by less, and the remainder lands in some other account the
+token chose. Two credits. Once the call returns, `balanceOf(recipient)` is the truth, and the delta
+pattern reads that truth directly.
+
+Token-2022's transfer fee splits it differently. The extension guide's phrasing is precise: on every
+transfer, **some amount is withheld on the recipient account, untouchable by the recipient**, and
+those tokens can be withheld by a separate authority on the
+mint.<Cite src="solana-token-2022-extensions-ref" /> The money does not leave for a fee wallet. It
+stays where it landed, in a compartment of the recipient's own account that the recipient cannot
+spend.
+
+<Figure
+  caption="Collecting the fee is two further instructions run later by other people; the transfer itself moves nothing to a treasury."
+  alt="A transfer of 1,000,000 raw units splits inside the recipient's token account: 995,000 into the spendable amount and 5,000 into withheld_amount. A permissionless harvest moves withheld tokens from the account to the mint, and the withdraw withheld authority then moves them from the mint to a fee recipient."
+>
+  <Flow
+    lanes={['the sender', 'the recipient account', 'the mint', 'the fee recipient']}
+    nodes={[
+      { id: 'src', label: 'sender', note: 'transfer_checked 1,000,000', col: 0 },
+      { id: 'amt', label: 'amount', note: '+995,000 · spendable', col: 1, tone: 'good' },
+      { id: 'wh', label: 'withheld_amount', note: '+5,000 · not spendable', col: 1, tone: 'warn' },
+      { id: 'mint', label: 'mint', note: 'anyone may call it', col: 2 },
+      { id: 'fee', label: 'fee recipient', note: 'the authority only', col: 3 },
+    ]}
+    edges={[
+      { from: 'src', to: 'amt' },
+      { from: 'src', to: 'wh' },
+      { from: 'wh', to: 'mint', label: 'harvest', tone: 'warn' },
+      { from: 'mint', to: 'fee', label: 'withdraw' },
+    ]}
+  />
+</Figure>
+
+That figure uses a 50-basis-point fee, which the guide illustrates as: with 50 basis points, a
+transfer of 1,000 tokens yields 5 tokens.<Cite src="solana-token-2022-extensions-ref" />
+
+The configuration has four fields, and every one of them is a thing an integrator has to look at: the
+**fee in basis points** assessed on each transfer, a **maximum fee** capping it in absolute terms — a
+maximum of 5,000 tokens means even a transfer of 10,000,000,000,000 yields only 5,000 — the
+**transfer fee authority** that can modify the fees, and the **withdraw withheld authority** that can
+move tokens withheld on the mint or on token accounts.<Cite src="solana-token-2022-extensions-ref" />
+
+The fee arithmetic is specified exactly, in the same documentation set that describes the
+confidential variant. The basis-point parameter `bp` is a percentage rate two decimal places to the
+right, so `bp = 1` is 0.01%, `bp = 100` is 1%, and `bp = 10000` is 100%; the computed fee is capped
+by `max_fee`; and **the transfer fee is always rounded up to the nearest positive
+integer**.<Cite src="solana-program-confidential-zkps" /> The worked cases given there are worth
+copying into a test file verbatim:
+
+<Matrix
+  numeric
+  corner="amount"
+  cols={['bp', 'max_fee', 'fee', 'what decided it']}
+  rows={[
+    { label: '200', cells: ['100', '3', { v: '2', tone: 'accent' }, '1% of 200'] },
+    { label: '200', cells: ['200', '3', { v: '3', tone: 'warn' }, '2% is 4, capped'] },
+    { label: '100', cells: ['110', '3', { v: '2', tone: 'warn' }, '1.1% is 1.1, rounded up'] },
+  ]}
+  caption="Two rules override the percentage — the cap and the rounding — and the third row is the one a plain division gets wrong."
+  alt="Three worked transfer-fee cases. Amount 200 at 100 basis points with max_fee 3 yields a fee of 2. Amount 200 at 200 basis points yields 3 because the cap binds. Amount 100 at 110 basis points yields 2 because the fee rounds up."
+/>
+
+<Cite src="solana-program-confidential-zkps" />
+
+Rounding up matters more than it looks. It means there is no transfer amount small enough to be
+fee-free, which removes a whole family of "dust the vault" tricks and also means your minimum deposit
+size can never be one raw unit.
+
+## Why the fee sits in the recipient's account
+
+This is the part that has no Ethereum analogue at all, and it is a direct consequence of the machine
+you spent the first four modules of this track learning.
+
+The documentation states the reason outright: **the design of pooling transfer fees at the recipient
+account is meant to maximise parallelization of transactions. Otherwise, one configured fee recipient
+account would be write-locked between parallel transfers, decreasing throughput of the
+protocol.**<Cite src="solana-token-2022-extensions-ref" />
+
+Read that against [declared account access](/c/declared-account-access). Every Solana transaction
+names the accounts it will touch and whether each is writable, and a write lock on an account is
+exclusive. A fee design that credited one central treasury account on every transfer would name that
+account as writable in **every transfer of that mint**, which serialises all of them against each
+other. The token would have a throughput ceiling set by a single account's write lock, no matter how
+many cores were available.
+
+So the fee is not withheld at the recipient because that is a natural place for it. It is withheld
+there because the recipient's account is already write-locked by the transfer, and using it costs no
+additional contention. The extension's most confusing property for an integrator is a **scheduling
+optimisation**, and once you see that, the rest of the lifecycle follows: the fees have to be swept
+up later, out of band, by someone willing to pay for it.
+
+<Aside kind="note">
+This is a good place to notice what the module's contrast is actually for. An EVM engineer reads
+"fee withheld inside the recipient's account" as a baroque choice. It is a forced move on a machine
+with pessimistic account-level locking — the same machine property that gives Solana its
+parallelism. Nearly every Token-2022 design decision that looks odd has a constraint like this behind
+it, and finding the constraint is more useful than cataloguing the oddity.
+</Aside>
+
+## The harvest lifecycle, and the part that will break your close path
+
+Because the fees are scattered across every account that ever received a transfer, collecting them is
+a search, not a read. The guide is explicit: before withdrawing, the authority must **find which
+accounts have withheld tokens by iterating over all accounts for the
+mint**.<Cite src="solana-token-2022-extensions-ref" />
+
+Three instructions cover the lifecycle. `withdraw_withheld_tokens_from_accounts` lets the withdraw
+withheld authority pull directly from token accounts. `harvest_withheld_tokens_to_mint` moves the
+withheld amounts from an account into the mint and is **permissionless** — anyone may call it.
+`withdraw_withheld_tokens` with the mint included then moves what has accumulated on the mint to a
+destination of the authority's choosing.<Cite src="solana-token-2022-extensions-ref" /> A vendor
+walkthrough of the whole cycle, mint creation through withdrawal, is worth doing once with a devnet
+mint before you integrate.<Cite src="quicknode-transfer-fees" /><Cite src="chainstack-token-2022-hooks" />
+
+Now the consequence that turns up as an incident. **An account cannot be closed while it holds any
+tokens, including withheld ones**, which is why the permissionless harvest exists at all: a user who
+wants to close an account must first clear the withheld
+amount.<Cite src="solana-token-2022-extensions-ref" /> Neodyme states the same in terms of the account
+state — fees accumulate in the `withheld_amount` property of the token account extension, and the
+account cannot be closed until they are harvested to the
+mint.<Cite src="neodyme-token-2022" />
+
+Offside Labs supplies the exact failure. A program that closes a token account after checking only
+`amount == 0` will hit `AccountHasWithheldTransferFees`, whose message reads that an account can only
+be closed if its withheld fee balance is zero and that you should harvest fees to the mint and try
+again.<Cite src="offside-token-2022-part1" /> Their remedy is to stop hand-rolling the precondition:
+the extensions expose `closable()` helpers — `TransferFeeAmount::closable()`,
+`ConfidentialTransferAccount::closable()`, `ConfidentialTransferFeeAmount::closable()` — and the CPI
+Guard case has its own check.<Cite src="offside-token-2022-part1" />
+
+Take the general lesson from that, because it recurs: **when an extension adds state, it adds
+preconditions to operations that previously had none**, and the extension usually ships the predicate
+you need. Reconstructing the precondition from the documentation is how you get it 80% right.
+
+<Misconception
+  belief="A transfer fee is paid by the sender, so a vault that transfers in the full amount receives the full amount."
+  reality="The fee is withheld inside the recipient's token account. The vault's spendable balance rises by less than the amount transferred, and the shortfall sits in the vault's own account where the vault cannot spend it and cannot close around it."
+  why="Every fee an engineer has paid — gas, exchange fees, card fees — comes off the payer's side, so 'fee' reads as a sender-side deduction rather than a recipient-side withholding."
+  src="neodyme-token-2022"
+/>
+
+## `transfer` does not merely become unfashionable; it fails
+
+This is the difference that most surprises people arriving from ERC-20, where a fee-on-transfer token
+still satisfies the standard interface and `transfer` still returns.
+
+The extension guide flags it as an important note: **transferring tokens with a transfer fee requires
+using `transfer_checked` or `transfer_checked_with_fee` instead of `transfer`. Otherwise, the transfer
+will fail.**<Cite src="solana-token-2022-extensions-ref" />
+
+Offside Labs traced why, in the program's own source. `transfer` in Token-2022 is marked deprecated
+since version 4.0.0 with a note recommending `transfer_checked` or `transfer_checked_with_fee`. The
+two replacements take extra arguments — `transfer_checked` adds `mint_pubkey` and `decimals`;
+`transfer_checked_with_fee` adds `mint`, `decimals` and `fee`.<Cite src="offside-token-2022-part1" />
+Inside `process_transfer`, when `expected_decimals` is `None` — which is what calling plain `transfer`
+means — the code takes a branch that has no mint account to work with, and in that branch, **if the
+source account carries the transfer hook extension or the transfer fee amount extension, it returns
+`TokenError::MintRequiredForTransfer`**.<Cite src="offside-token-2022-part1" />
+
+That mechanism is worth reading twice, because it explains both the good news and a subtlety you will
+meet again in two lessons.
+
+**The good news.** The failure is structural rather than conventional. The program cannot compute a
+fee or resolve a hook's accounts without the mint, so it refuses instead of guessing. Requiring the
+mint and the decimals forces the caller to have *looked at the mint*, which is the single most useful
+thing an integrator can be forced to do. An interface that fails loudly on the mints whose rules you
+did not account for is a gift.
+
+**The subtlety.** The check that triggers it is made **on the source account**, not on the mint. That
+is fine when every account of the mint carries the paired `TransferFeeAmount` extension, which is
+what happens when accounts are created for a mint that already had
+`TransferFeeConfig`.<Cite src="spl-token-2022-docsrs-extensiontype" /> It stops being fine when
+accounts exist that were created *before* the fee did — and Neodyme's write-up of the close-and-reinit
+hazard names exactly that scenario, noting the fee bypass is possible **because the check for the
+Transfer Fee extension only happens on the source account**.<Cite src="neodyme-token-2022" /> Park it;
+lesson six is about nothing else.
+
+<Misconception
+  belief="`transfer` is deprecated in Token-2022, so switching to `transfer_checked` is a lint-level cleanup I can schedule."
+  reality="On a mint with a transfer fee or a transfer hook, plain `transfer` returns `MintRequiredForTransfer` and the transaction fails. It is a runtime break on exactly the mints you have not handled, not a style warning."
+  why="Deprecation in most ecosystems means 'still works, will be removed later', so the annotation is read as advisory rather than as a description of a hard error path."
+  src="offside-token-2022-part1"
+/>
+
+## Two correct ways to credit, and when each one is right
+
+Neodyme names both fixes and states a preference, which is worth reproducing exactly because the
+preference runs against the EVM habit.
+
+> **First, precalculate the fee amount and use the new `TransferCheckedWithFee` instruction. Second,
+> calculate the difference in your balance before and after the transfer** — with the first
+> recommended as the cleaner solution.<Cite src="neodyme-token-2022" />
+
+Both are correct. They fail differently, and the choice is about what you want to happen when your
+model of the mint is stale.
+
+**Precalculation with `transfer_checked_with_fee`.** You read the fee configuration, compute the fee
+yourself, and pass it. The instruction **only succeeds if the fee is correctly calculated, in order
+to avoid any surprises during the transfer**.<Cite src="solana-token-2022-extensions-ref" /> So a
+wrong expectation is not silently absorbed; the transaction fails. That is a strong property: your
+accounting can never be quietly wrong, because a disagreement between your model and the program's
+becomes an aborted transaction.
+
+It also means you have taken on a live dependency. The transfer fee authority can modify the
+fees,<Cite src="solana-token-2022-extensions-ref" /> so a fee you read at listing time, or cached at
+the start of a batch, is a value that can move underneath you. With this approach that shows up as
+failed user transactions — visible, annoying, and safe.
+
+**Measuring the delta.** Read your own token account before and after, credit the difference. This
+does not require you to model the fee at all, which is precisely its virtue: it is correct for a fee
+you misread, a fee that changed between your read and the transfer, a max-fee cap you did not apply,
+and the rounding-up rule you forgot.<Cite src="solana-program-confidential-zkps" />
+
+Say the rule as a rule, because it is the most reusable sentence in this module:
+
+**Credit what arrived, never what you asked for.** Read the vault's own balance before and after the
+transfer and credit the difference. Crediting the amount named in the instruction is correct for
+exactly the tokens that take no fee, and it fails in the direction that makes you insolvent rather
+than the direction that makes you rich.
+
+The two approaches compose, and in a vault they should. Use `transfer_checked_with_fee` so that a
+disagreement fails loudly, and still credit the measured delta so that the number you write into your
+ledger comes from the chain rather than from your arithmetic. This is the same argument as
+[internal accounting versus `balanceOf`](/c/internal-accounting-vs-balanceof) with the conclusion
+inverted for the deposit step specifically: internal accounting is right for what you *owe*, and a
+measurement is right for what you *received*.
+
+<Aside kind="warn">
+One thing the delta does not solve: the amount you measure is your account's spendable `amount`, and
+the withheld tokens are also *in your account*, in a compartment you cannot spend. If your protocol's
+solvency check compares liabilities against a figure that includes withheld tokens, it will believe
+it is solvent by exactly the amount it cannot pay out. Whichever field you use, use the same one in
+the deposit path and the solvency check, and know which one it is.
+</Aside>
+
+<Check type="spot-bug" concept="amount-sent-is-not-amount-received">
+This deposit path was written for SPL Token, then updated for Token-2022 by someone who had read
+about transfer fees. It is closer to right than most, and it is still insolvent. Find the defects.
+
+```rust
+pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+    let mint = PodStateWithExtensions::<PodMint>::unpack(&ctx.accounts.mint.data.borrow())?;
+
+    let fee = match mint.get_extension::<TransferFeeConfig>() {
+        Ok(cfg) => amount * (cfg.transfer_fee_basis_points as u64) / 10_000,
+        Err(_)  => 0,
+    };
+
+    transfer_checked(ctx.accounts.transfer_ctx(), amount, ctx.accounts.mint.decimals)?;
+
+    ctx.accounts.position.shares += amount - fee;
+    Ok(())
+}
+```
+
+<Answer>
+**Defect 1 — the fee formula is wrong in three ways at once, and every one is in the protocol's
+disfavour.** It ignores `max_fee`, so for large transfers it subtracts far more than was actually
+withheld and under-credits the depositor. It divides, which truncates, while the program **rounds the
+fee up to the nearest positive integer** — so for the documented case of amount 100 at `bp = 110` the
+real fee is 2 and this computes 1.<Cite src="solana-program-confidential-zkps" /> And it reads the
+basis points at the moment of the deposit while the transfer fee authority can modify
+them,<Cite src="solana-token-2022-extensions-ref" /> so even a correct formula is a snapshot. Note the
+direction of the third error: it under-credits some users and over-credits others, so the ledger
+drifts in both directions and never reconciles.
+
+**Defect 2 — it computed a fee and then did not tell the program about it.** `transfer_checked` takes
+mint and decimals only. The instruction that accepts an expected fee is
+`transfer_checked_with_fee`,<Cite src="offside-token-2022-part1" /> and it succeeds only if the fee is
+correctly calculated, specifically to avoid surprises during the
+transfer.<Cite src="solana-token-2022-extensions-ref" /> Passing the fee would have converted defect 1
+from silent mis-accounting into a failed transaction — which is the entire value of the with-fee
+variant.
+
+**Defect 3 — the credit is derived rather than measured.** The vault's own balance before and after
+the transfer is the only figure that is true regardless of the fee configuration, the cap, the
+rounding, or a change made between reading and
+transferring.<Cite src="neodyme-token-2022" /> Replace `amount - fee` with the delta and defects 1
+and 3 both disappear.
+
+**Defect 4 — nothing in this path handles the account it is transferring into.** Two problems live
+there. If the mint sets `DefaultAccountState = Frozen`, a vault account created on demand is frozen
+and cannot receive anything. And once fees start accumulating, the vault's own account carries a
+non-zero `withheld_amount`, so any close path that checks `amount == 0` will fail with
+`AccountHasWithheldTransferFees` rather than closing — the extensions' `closable()` helpers are the
+correct precondition.<Cite src="offside-token-2022-part1" />
+
+**Defect 5 — a `u64` multiplication before division.** `amount * basis_points` overflows for large
+`amount`. In release builds Rust wraps rather than panicking unless overflow checks are enabled,
+which turns an arithmetic bug into a wrong fee rather than an abort. The correct fee is not computed
+this way at all, but the habit is worth naming.
+
+**The version that is actually right** is shorter than the wrong one: unpack the mint, refuse the
+deposit if it carries any extension you have not handled, transfer with
+`transfer_checked_with_fee` when a fee is configured, and credit `balance_after - balance_before`.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**A defect class you can now recognise in a second ecosystem.** The ERC-20 fee-on-transfer bug and
+the Token-2022 transfer fee bug are the same defect — crediting a requested amount instead of a
+received one — and the fact that it survived a complete change of virtual machine, language, state
+model and token standard is the strongest evidence available that it is a *design* error rather than
+an implementation one. When you meet a third ecosystem, this is the first question to ask of its
+transfer primitive.
+
+**A concrete reason the extension model is not merely ERC-20's problem in new clothes.** You can read
+`TransferFeeConfig` off the mint before you list it, get the basis points and the cap, and know that
+a mint without the extension will never grow one.<Cite src="solana-docs-token-extensions" /> That is
+strictly more than ERC-20 offers. What you cannot read off the mint is what the fee will be *later*,
+because the transfer fee authority can change it,<Cite src="solana-token-2022-extensions-ref" /> and
+what you cannot read at all is whether the mint itself will be replaced.
+
+**And the working habit.** Prefer the instruction that fails when your model is wrong over the one
+that proceeds, and derive nothing you can measure. Both halves matter: the first turns silent drift
+into a visible error, and the second means you were never depending on the model in the first place.
+
+The next lesson replaces the fee with something considerably less predictable. With the transfer hook
+extension, the thing that runs inside your transfer is not an arithmetic rule the program applies —
+it is **a program of the mint authority's choosing**, executing in your transaction, spending your
+compute budget, and able to fail your instruction whenever it likes.

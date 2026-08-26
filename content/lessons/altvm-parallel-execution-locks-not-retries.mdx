@@ -1,0 +1,394 @@
+---
+id: altvm-parallel-execution-locks-not-retries
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solana-docs-transaction-structure, solana-sealevel-note, eip-7928, agave-greedy-scheduler, agave-thread-aware-account-locks, agave-validator-block-production, agave-banking-stage-source, solana-docs-transactions, solana-docs-fees]
+stack: {}
+---
+
+Here are two transactions. Tell me whether they can run at the same time.
+
+The first calls a swap program. The second calls the same swap program. Both are signed, both are
+valid, both are sitting in front of the same block producer at the same instant.
+
+On Ethereum you cannot answer. Not because you lack information about these two transactions — because
+the answer does not exist until they execute. The first one's `SLOAD` might read a pool address that
+depends on a router's internal mapping, which depends on a value written by a transaction three slots
+earlier in the same block. Whether the second one touches that pool is a fact produced by running it.
+You can guess well. You cannot decide.
+
+On Solana you can answer in microseconds, without reading a line of either program's code, without
+knowing what a swap is. You read two arrays of 32-byte public keys, intersect them, and check a
+handful of flag bits. That is the whole computation. It is the same computation the block producer
+does, and it is the reason Solana can hand transactions to four worker threads at once while Ethereum
+runs them one after another.
+
+This lesson is about that arithmetic: what a transaction has to declare, exactly how the declaration
+is turned into a scheduling decision, and — the part almost everyone gets wrong — what happens to the
+transactions that *do* conflict.
+
+<Figure
+  caption="A conflict costs a lane, not a rerun. The transaction that cannot be placed goes back to the queue untouched."
+  alt="A flow: transactions pop from one priority queue; each transaction's account array is split into writable and read-only key sets; the lock table answers which worker threads may take it; if any thread remains the transaction is dispatched to a worker, possibly behind the thread already holding the lock, and if the permitted set is empty it joins an unschedulables list that is pushed back into the priority queue at the end of the pass, with nothing executed and nothing rolled back."
+>
+  <Flow
+    nodes={[
+      { id: 'q', label: 'priority queue', note: 'one buffer, one ordering', col: 0 },
+      { id: 'arr', label: 'account array', note: 'writable keys | read-only keys', col: 1, tone: 'accent' },
+      { id: 'lock', label: 'lock table', note: 'which threads may take it', col: 2 },
+      { id: 'run', label: 'a worker thread', note: 'perhaps behind the lock holder', col: 3, tone: 'good' },
+      { id: 'back', label: 'unschedulables', note: 'nothing ran, nothing rolled back', col: 3, tone: 'warn', dashed: true },
+    ]}
+    edges={[
+      { from: 'q', to: 'arr' },
+      { from: 'arr', to: 'lock' },
+      { from: 'lock', to: 'run', label: 'a thread remains', tone: 'good' },
+      { from: 'lock', to: 'back', label: 'empty set', tone: 'warn', dashed: true },
+      { from: 'back', to: 'q', label: 'requeued when the pass ends', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+## The declaration is not metadata; it is the message
+
+Start with what a Solana transaction physically is, because the shape of the wire format is the
+argument.
+
+A transaction has two top-level fields: a `signatures` array and a `message`.<Cite src="solana-docs-transaction-structure" />
+The message contains a three-byte header, an array of every account address the transaction will
+touch, a recent blockhash, and the instructions.<Cite src="solana-docs-transaction-structure" /> The
+instructions do not carry addresses. They carry `u8` **indices** into the account array, plus a
+`program_id_index` that is also an index into that same array.<Cite src="solana-docs-transaction-structure" />
+
+So the account array is not a hint attached to the transaction. It is the only place addresses exist.
+An instruction cannot name an account that is absent from the array, because an instruction has no
+way to name an account at all except by index into it.
+
+Now the part worth admiring. Where are the read/write flags?
+
+There are none. The header has three `u8` counts — `num_required_signatures`,
+`num_readonly_signed_accounts`, `num_readonly_unsigned_accounts` — and the account array is required
+to be sorted into four groups in a fixed order: signer-writable, signer-readonly, non-signer-writable,
+non-signer-readonly.<Cite src="solana-docs-transaction-structure" /> Three counts plus a strict
+ordering partition the array into the four permission classes, which is why the format stores no
+per-account metadata flags at all.<Cite src="solana-docs-transaction-structure" />
+
+Three bytes. That is the entire cost of telling the network your complete read/write set. Sit with
+that for a moment against the [access list](/c/access-list) you know from EIP-2930 — a separately
+priced, per-entry, *optional*, *advisory* structure that a transaction may attach and that changes
+nothing about what the transaction is permitted to touch. Solana's equivalent is three header bytes
+and it is the permission system.
+
+<Aside kind="note">
+The design note that introduced the parallel runtime made the same point from the other end: the
+runtime can sort transactions by the programs and accounts they reference precisely because the
+transaction has already told it, so non-overlapping work runs concurrently across
+cores.<Cite src="solana-sealevel-note" /> The name for the whole idea, [Sealevel](/c/sealevel), is
+older than most of the mechanism this lesson describes; the mechanism has changed several times, the
+declaration requirement never has.
+</Aside>
+
+### You have already met this idea coming the other way
+
+Track 03 covered [EIP-7928 block-level access lists](/c/block-level-access-list): a proposal to have
+a block declare, in the block itself, every account and storage slot the block will read and write,
+so that a client can [schedule non-conflicting transactions concurrently](/c/bal-enables-parallelism).<Cite src="eip-7928" />
+
+Notice what that is. It is this. Ethereum spent years discovering that parallel execution requires
+knowing the access set in advance, could not obtain it from transactions written under a model that
+never demanded it, and is now proposing to have the *builder* compute the access set and publish it
+alongside the block so everyone else can skip the discovery step.
+
+Solana made the transaction carry it from the start. Same insight, two routes, and the routes explain
+the rest of both systems:
+
+- **Ethereum put the burden on the block.** Individual transactions stay convenient — follow any
+  pointer, touch anything — and somebody downstream reconstructs the access set.
+- **Solana put the burden on the transaction, which means on the client, which means on you.** The
+  runtime's job becomes trivial. Yours becomes considerably harder, which is the whole subject of the
+  next lesson.
+
+Neither is the "correct" answer. But once you see that the two designs are answering the same
+question, the EVM stops looking like the default shape of a blockchain and starts looking like one
+particular resolution of a tradeoff you can now name.
+
+## From two arrays to a scheduling decision
+
+Now the mechanism. The block producer's scheduler holds a buffer of transactions, pops them in
+priority order, and for each one asks a single question: can I put this on a worker thread right now?
+
+The code that answers is small enough to hold in your head. For each transaction, it splits the
+account keys by writability — every index for which `is_writable(index)` is true becomes a write lock
+request, every other index a read lock request — and calls `try_lock_accounts` with those two
+iterators.<Cite src="agave-greedy-scheduler" />
+
+The lock table itself keeps, per account, an optional write lock (a single thread id plus a count)
+and an optional set of read locks (a bitset of threads plus per-thread counts).<Cite src="agave-thread-aware-account-locks" />
+And the rule that decides which threads an account permits is stated exactly, in the source, as five
+cases:<Cite src="agave-thread-aware-account-locks" />
+
+```text
+If there are no locks, then all threads are schedulable.
+If only write-locked, then only the thread holding the write lock is schedulable.
+If a mix of locks, then only the write thread is schedulable.
+If only read-locked, the only write-schedulable thread is if a single thread
+  holds all read locks. Otherwise, no threads are write-schedulable.
+If only read-locked, all threads are read-schedulable.
+```
+
+Read those five lines twice, because they are not the rules you were expecting.
+
+## The rules you were expecting are wrong
+
+The mental model most people arrive with is: a write lock is exclusive, so a conflicting transaction
+is *rejected* and has to come back later. That is the textbook reader/writer lock, and it is not what
+the scheduler does.
+
+**A conflict does not eliminate threads to zero. It narrows the set to one.**
+
+Look at line two. If account `A` is write-locked by thread 2, a new transaction that also writes `A`
+is not unschedulable. It is schedulable — *on thread 2, and only on thread 2*. The struct's own
+documentation says why: these are "thread-aware account locks which allows for scheduling on threads
+that already hold locks on the account… useful for allowing queued transactions to be scheduled on a
+thread while the transaction is still being executed on the thread."<Cite src="agave-thread-aware-account-locks" />
+
+So the scheduler's response to a conflict is **serialization, not rejection**. Two transactions that
+both write the same pool account get queued behind each other on one worker while the other three
+workers carry on with unrelated traffic. Conflict costs you concurrency. It does not cost you a
+scheduling round.
+
+The intersection is taken across *all* the transaction's accounts, and it is the intersection that
+can empty out. `accounts_schedulable_threads` starts with every thread allowed and intersects the
+permitted set account by account, bailing out the moment the set is empty.<Cite src="agave-thread-aware-account-locks" />
+An empty set surfaces as `TryLockError::MultipleConflicts` — the name is the definition: the
+transaction has outstanding conflicts with **more than one thread at once**, so there is no single
+worker that can legally take it.<Cite src="agave-thread-aware-account-locks" />
+
+That is the real conflict condition, and it is stricter than "touches a busy account". A transaction
+touching one busy account is fine. A transaction touching two accounts busy on two *different*
+threads is the one that cannot be placed.
+
+<Misconception
+  belief="Two transactions calling the same program cannot run in parallel."
+  reality="The program account is passed as a read-only, non-signer entry in the account array. Read locks are compatible with each other on every thread, so any number of transactions can invoke the same program simultaneously. Parallelism is decided by the writable data accounts."
+  why="On Ethereum the contract is the unit of state — its storage lives inside it — so 'the same contract' feels like the unit of contention. On Solana programs are stateless and state is externalized into separate accounts, so the program address is one of the least contended keys in the array."
+  src="agave-thread-aware-account-locks"
+/>
+
+### What happens to the ones that cannot be placed
+
+Here is the property this module is named for.
+
+When `try_schedule_transaction` returns `UnschedulableConflicts` or `UnschedulableThread`, the
+scheduler pushes that transaction's id onto an `unschedulables` vector and moves on to the next
+candidate. At the end of the scheduling pass, every id in that vector is pushed back into the
+priority queue.<Cite src="agave-greedy-scheduler" />
+
+Nothing executed. Nothing was rolled back. No state was read speculatively and then invalidated. The
+transaction was looked at, found unplaceable *right now*, and put back.
+
+This is **pessimistic** concurrency control, and it is the opposite of the strategy you may have
+heard described under the same marketing phrase. In an optimistic scheme — Aptos's
+[Block-STM](/c/aptos-block-stm) is the canonical example — transactions execute speculatively in
+parallel, their reads are validated against what was actually committed, and the ones that read stale
+data are thrown away and re-executed. Both are "parallel execution". Under contention they behave
+nothing alike:
+
+- **Pessimistic (Solana).** Contention costs *latency*. Conflicting work serializes onto one thread
+  or waits for the next pass. Wasted CPU: none. The cost lands on the transactions that were not
+  scheduled.
+- **Optimistic (Block-STM).** Contention costs *work*. Conflicting transactions run, get invalidated,
+  and run again. Wasted CPU: real and proportional to conflict rate. The cost lands on the validator.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Pessimistic', note: 'Sealevel locks', tone: 'accent' },
+    { title: 'Optimistic', note: 'Block-STM' },
+  ]}
+  rows={[
+    { label: 'When is a conflict detected?',
+      cells: ['Before execution, from the declared account sets', 'During execution, by validating reads against what committed'] },
+    { label: 'What happens to a conflicting transaction?',
+      cells: ['Placed on the thread already holding the lock, or returned to the queue', 'Executed, invalidated, executed again'] },
+    { label: 'What does contention consume?',
+      cells: [{ v: 'Latency, paid by the transactions that were not scheduled', tone: 'warn' }, { v: 'CPU, paid by the validator', tone: 'warn' }] },
+    { label: 'What must the developer supply?',
+      cells: ['Every account the transaction touches, before signing', 'Nothing'] },
+  ]}
+  caption="Both ship under the phrase parallel execution. One spends latency and demands a declaration; the other spends CPU and demands nothing."
+  alt="Pessimistic Sealevel locking and optimistic Block-STM compared on four questions: when a conflict is detected, what happens to a conflicting transaction, what contention consumes, and what the developer must supply."
+/>
+
+The reason Solana can afford the pessimistic strategy is precisely the declaration. You can only
+avoid conflicts in advance if you know about them in advance.
+
+<Misconception
+  belief="Solana achieves parallelism by executing optimistically and re-running transactions that conflict."
+  reality="There is no abort-and-retry path for state conflicts anywhere in the scheduler. Conflicting transactions are never co-scheduled in the first place — they are either placed on the single thread already holding the lock or pushed back into the priority queue untouched."
+  why="Block-STM and Sealevel are both sold as 'parallel execution', and optimistic concurrency is the more familiar pattern from databases. The word 'parallel' hides the entire difference."
+  src="agave-greedy-scheduler"
+/>
+
+## Working an example
+
+Four accounts and three transactions, on a leader with four worker threads. Take the accounts as: `P`
+(the swap program), `POOL` (an AMM's state), `ALICE` and `BOB` (two token accounts).
+
+| | writes | reads |
+|---|---|---|
+| **T1** | `POOL`, `ALICE` | `P` |
+| **T2** | `POOL`, `BOB` | `P` |
+| **T3** | `ALICE` | `P` |
+
+**Subgoal 1 — establish what the scheduler is allowed to look at.** The account arrays and the header
+counts. Not the instruction data, not the program's code, not the current pool
+reserves.<Cite src="solana-docs-transaction-structure" /> Everything below follows from twelve
+public keys and three bytes per transaction.
+
+**Subgoal 2 — place the highest-priority transaction.** Say T1 pops first. No account has any lock, so
+every account returns "all threads schedulable", the intersection is all four threads, and the thread
+selector picks one — call it thread 0. `POOL` and `ALICE` are now write-locked by thread 0; `P` is
+read-locked by thread 0.<Cite src="agave-thread-aware-account-locks" />
+
+**Subgoal 3 — place a transaction that conflicts on exactly one account.** T2 pops next. `POOL` is
+write-locked by thread 0, so `POOL` permits only thread 0. `BOB` is unlocked and permits everything.
+`P` is read-locked by thread 0 and read requests are compatible with all threads, so `P` permits
+everything. Intersection: `{thread 0}`. Non-empty — so T2 is scheduled, on thread 0, behind
+T1.<Cite src="agave-thread-aware-account-locks" /> It runs. It just does not run *concurrently*.
+
+**Subgoal 4 — notice which transaction actually gets stuck.** T3 pops. `ALICE` is write-locked by
+thread 0 and permits `{thread 0}`; `P` permits everything. Intersection `{thread 0}`, non-empty, so T3
+also lands on thread 0. All three end up serialized — and the other three workers stayed idle for this
+particular batch, which is exactly what "these transactions conflict" costs you.
+
+**Subgoal 5 — construct the case that is genuinely unschedulable.** Now suppose T1 went to thread 0
+and an unrelated T4 writing `BOB` went to thread 1. A fifth transaction writing both `POOL` and `BOB`
+intersects `{thread 0}` with `{thread 1}` and gets the empty set: `MultipleConflicts`.<Cite src="agave-thread-aware-account-locks" />
+Onto `unschedulables`, back into the queue at the end of the pass, tried again next
+pass.<Cite src="agave-greedy-scheduler" />
+
+**Subgoal 6 — state the general rule you can now apply without the code.** *Your transaction is
+delayed when it shares a writable account with in-flight work; it is deferred entirely only when its
+accounts are spread across work already running on two or more different threads.* Which means:
+adding one more writable account to an instruction does not slightly increase contention. It
+multiplies the number of threads that can veto you.
+
+### Reading it off a real transaction
+
+You can perform the scheduler's classification by hand on any confirmed transaction, and doing it once
+makes the format permanent.
+
+Fetch a block with `getBlock` and look at one transaction's `message`. You get a `header` with the
+three counts and an `accountKeys` array; the instructions carry only `accounts` index arrays and a
+`programIdIndex`.<Cite src="solana-docs-transaction-structure" /> Let `n` be the length of
+`accountKeys`, and let the header supply `s = num_required_signatures`,
+`rs = num_readonly_signed_accounts`, `ru = num_readonly_unsigned_accounts`. Then:
+
+- indices `0 .. s − rs − 1` are **signer and writable** — index 0 is always the fee payer;
+- indices `s − rs .. s − 1` are **signer and read-only**;
+- indices `s .. n − ru − 1` are **non-signer and writable**;
+- the last `ru` indices are **non-signer and read-only** — where the program ids live.
+
+The write set is the union of the first and third groups. That set, and nothing else, is what the
+scheduler intersected against its lock table.<Cite src="agave-thread-aware-account-locks" /> Do this
+for a hundred transactions from a busy slot and count how often each key appears in a write set, and
+you have measured your application's contention directly rather than inferring it from latency
+graphs — which is what the practice exercise for this module asks for.
+
+<Aside kind="warn">
+Two traps when you do this. A v0 transaction resolves additional addresses from address lookup
+tables, so `accountKeys` in the raw message is not the full set — the resolved keys arrive separately
+and you must request a supported transaction version to see them.<Cite src="solana-docs-transaction-structure" />
+And a legacy message's first byte is `num_required_signatures`, whereas a versioned message's first
+byte is a version prefix with the three header bytes starting after it; parse the wrong one and every
+count is off by one position.<Cite src="solana-docs-transaction-structure" />
+</Aside>
+
+## What is not decidable this way
+
+Two honest limits, because a mechanism this clean invites over-claiming.
+
+**Locks are taken on account keys, not on the data inside them.** Two transactions writing different
+fields of one account still conflict, completely. The EVM's [storage slot](/c/storage-slot) granularity
+is finer than Solana's account granularity. Solana buys scheduling simplicity by making the lock unit
+large, and the price shows up as false conflicts — the entire subject of lesson five.
+
+**The scheduler is client software, not protocol.** The five-case rule above is Agave's implementation
+at the version this lesson was checked against; the block that results is what consensus validates,
+not the algorithm that produced it. Agave itself ships two `--block-production-method` values,
+`central-scheduler` and `central-scheduler-greedy`, and at tag v4.2.0 the greedy one is the `#[default]`
+while the other logs a deprecation warning saying it "is deprecated and will be removed in a future
+release".<Cite src="agave-validator-block-production" /> In the same release both variants route to
+the same `GreedyScheduler` regardless.<Cite src="agave-banking-stage-source" /> Lesson three returns
+to this properly.
+
+<Check type="predict" concept="account-lock-semantics">
+You are designing an on-chain order book. Every trade must update the market's global state and both
+traders' balances.
+
+Design A gives the market one `MARKET` account holding the full order book, and each user a `BALANCE`
+account. A trade declares `MARKET` writable, both `BALANCE` accounts writable, and the program
+read-only.
+
+Design B splits the book into 64 `BUCKET` accounts by price band. A trade declares one `BUCKET`
+writable, both `BALANCE` accounts writable, and the program read-only.
+
+Four unrelated trades arrive at once, in different price bands, between eight distinct users. On a
+leader with four worker threads: how many run concurrently under each design, and what is the
+difference actually buying you?
+
+<Answer>
+**Design A: one at a time. Design B: potentially all four.**
+
+**Design A.** The first trade write-locks `MARKET` on whichever thread it lands on — say thread 0.
+Every subsequent trade requests a write lock on `MARKET`, and an account under a write lock permits
+only the thread that holds it.<Cite src="agave-thread-aware-account-locks" /> So trades two, three
+and four each intersect down to `{thread 0}` and are scheduled *there*, behind the first. All four
+execute; three worker threads sit idle for this batch. Note what this is not: nothing was rejected,
+nothing re-ran, and nobody paid for wasted work. The cost is pure serialization.
+
+**Design B.** Four different `BUCKET` accounts, eight distinct `BALANCE` accounts, no overlap
+anywhere. Each trade's intersection starts as all four threads and never narrows, so the thread
+selector is free to spread them.<Cite src="agave-thread-aware-account-locks" /> Four-way concurrency.
+
+**What it is actually buying.** Two things that are easy to conflate:
+
+*Concurrency*, which is what the example shows. But also, and more importantly at scale, *headroom
+against the per-writable-account compute ceiling* — a limit that applies to `MARKET` as a single key
+and does not care that your four trades were logically unrelated. Lesson five is about that ceiling,
+and it is usually the binding constraint long before thread count is.
+
+**What it costs.** The reason this is a design question and not an obvious win: a trade must now know
+*which* bucket it belongs in before the transaction is built, because the address has to be in the
+account array. Price bands move. A client that resolves the bucket, signs, and arrives after the
+price crossed a band boundary has built a transaction that declares the wrong account — and the
+program cannot reach for the right one, because it is not in the array. You have converted a
+concurrency problem into a client-side staleness problem.
+
+**The general shape.** Contention on Solana is a *data modelling* decision made at design time, not a
+runtime property you can tune later. Every account you make writable is a key that some other
+transaction may collide with, and every account you shard is a key some client now has to resolve
+correctly under time pressure. That trade — parallelism bought with client-side complexity — is the
+subject of the next lesson.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next**, the bill for all of this. Static conflict detection is only possible because a program can
+never decide at runtime to touch an account nobody declared, and that single restriction reshapes how
+data structures, iteration and even authorization get written. The next lesson prices it honestly,
+including the transaction-level limits — 1,232 bytes and a cap on how many accounts you may lock at
+all — that turn the tax into a hard ceiling.<Cite src="solana-docs-transactions" />
+
+**Then**, who does the scheduling. There is no mempool on Solana; the buffer this lesson kept
+referring to belongs to one validator, for a few hundred milliseconds at a time, and everything about
+landing a transaction follows from that.<Cite src="solana-docs-fees" />
+
+**And carry the method, not the rules.** The five-case lock table will change — it has already been
+rewritten more than once. What will not change is that on Solana the answer to "can these run
+together" is a function of two account arrays, and on Ethereum it is a function of execution. Every
+other difference in this track is downstream of that one.

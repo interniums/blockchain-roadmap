@@ -1,0 +1,330 @@
+---
+id: evm-logs-bloom-querying-for-real
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [execution-apis-filter-schema, execution-apis-log-object, ethereum-org-json-rpc, solidity-abi-events, eip-7708, eip-7773]
+stack: {}
+---
+
+The volume chart went to zero at 14:07 on a Tuesday, and stayed there.
+
+Nothing was down. The contract was processing more transactions than the week before. The indexer was
+healthy, the RPC provider was healthy, no job had failed, no alert had fired, and every query the
+pipeline ran returned `200 OK` with an empty array. It took two days to find, because the thing that
+changed was upstream of everyone looking: a routine contract upgrade had added a `uint8 feeTier`
+parameter to an event, which changed the event's canonical signature, which changed its topic0, which
+meant that every filter in every consumer was now asking for a 32-byte value that no log on the chain
+would ever again contain.
+
+Nobody had shipped a breaking change. Nobody had been told they were consuming an API. There was no
+version number to bump and no compiler anywhere in the world that could have warned them.
+
+This lesson is the two halves of that story: the query language you actually get, and the contract you
+publish whether or not you meant to.
+
+## The filter you can express
+
+The normative schema for a log filter has two mutually exclusive forms, and this is the first thing
+worth internalising because people routinely try to use both.<Cite src="execution-apis-filter-schema" />
+
+**Filter by block range:** `fromBlock` and `toBlock`, each a block number or one of the tags —
+`latest`, `safe`, `finalized`, `earliest`, `pending`.<Cite src="ethereum-org-json-rpc" /> This form
+forbids `blockHash`.
+
+**Filter by block hash:** `blockHash` alone, pinning the query to one specific block. This form
+requires `blockHash` and takes no range.
+
+Both forms then accept the same two constraints:
+
+**`address`** — null (any emitter), one address, or a list of addresses.<Cite src="execution-apis-filter-schema" />
+
+**`topics`** — null, or an array whose element *i* constrains topic *i*. Each element is itself null,
+a single 32-byte value, or an array of 32-byte values.<Cite src="execution-apis-filter-schema" />
+
+That is the whole grammar. Three levels of nesting, no operators, no comparisons.
+
+### How the topics array matches
+
+The semantics are positional, and the shape is fixed: **AND across positions, OR within a
+position.**<Cite src="ethereum-org-json-rpc" /> Writing `A` and `B` for two 32-byte values, against a
+log whose topics are `[A, B]`:
+
+<Matrix
+  corner="Filter"
+  cols={['Reads as', 'Matches a log with topics [A, B]?']}
+  rows={[
+    { label: '[]', cells: ['anything', { v: 'yes', tone: 'good' }] },
+    { label: '[A]', cells: ['topic0 = A, rest unconstrained', { v: 'yes', tone: 'good' }] },
+    { label: '[null, B]', cells: ['anything in topic0 AND topic1 = B', { v: 'yes', tone: 'good' }] },
+    { label: '[A, B]', cells: ['topic0 = A AND topic1 = B', { v: 'yes', tone: 'good' }] },
+    {
+      label: '[[A, B], [A, B]]',
+      cells: ['(A or B) in topic0 AND (A or B) in topic1', { v: 'yes', tone: 'good' }],
+    },
+    { label: '[B]', cells: ['topic0 = B', { v: 'no', tone: 'danger' }] },
+    { label: '[A, A]', cells: ['topic0 = A AND topic1 = A', { v: 'no', tone: 'danger' }] },
+  ]}
+  caption="Nesting one level deep is the only expressiveness on offer: AND across positions, OR within one, and nothing else at all."
+  alt="How a topics filter matches a log whose topics are A then B. An empty filter matches. A filter of [A] matches, constraining only topic0. [null, B] matches. [A, B] matches. [[A, B], [A, B]] matches, because each position accepts either value. [B] does not match, because topic0 is A. [A, A] does not match, because topic1 is B."
+/>
+
+A filter never constrains positions it does not mention. `[A]` is "A in position zero and anything
+after", not "exactly one topic".
+
+### What you cannot express, and what to do instead
+
+Four gaps, all of which people design around badly the first time.
+
+**No cross-position OR.** There is no way to say "topic1 is Alice *or* topic2 is Alice" in one query.
+The classic instance is "every transfer involving this address", where `from` is topic1 and `to` is
+topic2. That is two queries — `[transferSig, alice]` and `[transferSig, null, alice]` — merged
+client-side, with the merge responsible for deduplicating a self-transfer that matches both.
+
+**No comparisons.** Equality against a 32-byte value is the only predicate. Amounts, timestamps,
+tiers and ids are all unfilterable as ranges regardless of whether they are indexed.
+
+**No access to the data field.** Non-indexed parameters cannot be filtered on at any level of the
+stack — not by the bloom, not by `eth_getLogs`. If you need to filter on it, it needed to be a topic
+at emission time, and that decision is frozen into deployed bytecode.
+
+**No negation.** "Every event except this one" is a client-side operation.
+
+The general escape from all four is the same, and it is the reason the indexing industry exists: pull
+a superset with the filter the protocol gives you, and do the real query in a database you control.
+
+<Misconception
+  belief="The array-of-arrays topics syntax can express arbitrary boolean queries."
+  reality="It is one fixed shape — AND across positions, OR within a position. Anything else is several queries merged on your side."
+  why="Nested arrays look like a general expression tree, and the syntax gives no hint of where the generality stops."
+  src="ethereum-org-json-rpc"
+/>
+
+### The rest of the response is not the log
+
+A log returned over JSON-RPC carries `removed`, `logIndex`, `transactionIndex`, `transactionHash`,
+`blockHash`, `blockNumber` and `blockTimestamp` alongside `address`, `topics` and
+`data`.<Cite src="execution-apis-log-object" /> Only the last three are the record the EVM produced;
+the rest is the node telling you where it found it.
+
+Two of those fields decide whether your consumer is correct.
+
+**`blockHash` plus `logIndex` is the natural key.** Not the transaction hash — one transaction can
+emit many logs. Not `blockNumber` plus `logIndex` either, because a block number is not unique across
+a reorg and the same `(number, index)` pair can legitimately refer to two different logs on two
+different histories. `blockHash` is the field that binds a log to one specific history.
+
+**`removed` is a statement about the node's current view.** It is set when a log was in a block that
+is no longer canonical after a [reorg](/c/reorg). It is not part of the chain; it is the server's
+opinion at the moment of the response, and a different provider may not have reorged yet. Any
+consumer that writes irreversible side effects on first sight of a log has a bug that will fire on a
+reorg — the first shallow reorg your product survives will be the one where you learn whether your
+writes were idempotent.
+
+<Aside kind="warn">
+Providers impose their own limits on top of the protocol: caps on the block range per request, on the
+number of results, and on request cost. The values differ by vendor, change without notice, and are
+sometimes tighter on the free tier than the documentation implies. Treat them as configuration to
+discover and back off from, never as constants to hard-code — a range-splitting loop with retry is
+table stakes for any real log consumer.
+</Aside>
+
+## The API you shipped without noticing
+
+Now the second half, which is the expensive one.
+
+topic0 is `keccak256` of the [canonical signature](/c/abi-canonical-signature).<Cite src="solidity-abi-events" />
+Every consumer keys on it. It follows mechanically that **the signature is a published interface**,
+and that changes to it are breaking changes distributed to strangers with no announcement channel.
+
+The failure modes split cleanly, and the second is worse than the first.
+
+**Class one: the signature changes.** Adding a parameter, removing one, reordering them, widening a
+`uint128` to a `uint256`, renaming the event — each produces a completely different topic0. Every
+existing filter stops matching. Consumers see the event stop occurring. No error is raised anywhere,
+at any layer, by anyone. This is the Tuesday-afternoon story from the top of this lesson.
+
+**Class two: the indexed flags change.** Marking a parameter `indexed`, or unmarking one, does *not*
+change topic0 — `indexed` is not part of the canonical signature.<Cite src="solidity-abi-events" />
+So every existing filter keeps matching, and the value has moved between the topics and the data.
+Consumers do not stop receiving events; they start decoding them wrongly. A decoder reading topic1 as
+`from` now reads whatever else landed there, and a decoder ABI-decoding the data blob now finds a
+different tuple than it expects — sometimes throwing, sometimes silently producing a plausible wrong
+number.
+
+Class one is a loud silence you will eventually notice. Class two is corruption that flows into your
+database and looks like data.
+
+There is a third case worth knowing for the opposite reason. **Renaming a parameter** — `from` to
+`sender` — changes nothing on the wire, because parameter names are not in the canonical signature
+either.<Cite src="solidity-abi-events" /> It will still break every consumer whose code was generated
+from your ABI, at their compile step rather than at runtime. That is the one breakage in this section
+that somebody's compiler does catch.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Add or remove a parameter', tone: 'warn' },
+    { title: 'Flip an indexed flag', tone: 'danger' },
+    { title: 'Rename a parameter', tone: 'good' },
+  ]}
+  rows={[
+    {
+      label: 'Does topic0 change?',
+      cells: ['Yes — the type list is part of the signature', 'No', 'No'],
+    },
+    {
+      label: 'Do existing filters still match?',
+      cells: ['No — they ask for a value no log carries', 'Yes, every one of them', 'Yes, every one of them'],
+    },
+    {
+      label: 'What does a consumer observe?',
+      cells: ['The event stops occurring', 'The same events, decoded against the wrong layout', 'Nothing on the wire'],
+    },
+    {
+      label: 'Does anything error?',
+      cells: [
+        'No — empty arrays, 200 OK',
+        'Sometimes a throw, sometimes a plausible wrong number',
+        'Yes — their generated bindings stop compiling',
+      ],
+    },
+    {
+      label: 'How is it eventually found?',
+      cells: ['A flat line on a chart', 'Bad rows already in a database', 'At their build step'],
+    },
+  ]}
+  caption="Only one of these three raises an error anywhere, and it is the one that changes nothing on the wire."
+  alt="Three edits to a deployed event compared. Adding or removing a parameter changes topic0, so existing filters stop matching and the event appears to stop occurring, with no error raised. Flipping an indexed flag leaves topic0 unchanged, so filters keep matching but the value has moved between topics and data and decoders produce wrong output. Renaming a parameter changes nothing on the wire but breaks consumers' generated bindings at compile time, which is the only case that raises an error."
+/>
+
+<Misconception
+  belief="Adding a parameter to an event is an additive, backwards-compatible change."
+  reality="It changes the canonical signature, therefore topic0, therefore every filter that already exists. Old consumers see the event stop happening."
+  why="Adding a field is safe in almost every other API technology anyone has used — protobuf, JSON, GraphQL, REST. Those all identify a message by a name that survives the addition. Here the identifier is a hash of the whole shape."
+  src="solidity-abi-events"
+/>
+
+### Treating an event like the interface it is
+
+The rules that fall out of the above are short.
+
+**Never edit a deployed event. Add a new one.** `Settled` gains a fee tier by becoming `SettledV2`,
+emitted alongside `Settled` for a deprecation window long enough for consumers to migrate. Both
+signatures exist, both topic0 values match, and nobody's dashboard goes to zero.
+
+**Decide `indexed` before launch and never revisit it.** It is the one attribute whose change is
+invisible in topic0 and therefore invisible to consumers until their numbers are wrong.
+
+**Publish the ABI as a versioned artefact,** not as whatever Etherscan happens to have. Every consumer
+needs the per-parameter indexed flags, and those flags are not recoverable from the chain.
+
+**Write down who your consumers are.** For an event on a public chain that list includes people you
+have never met — explorers, aggregators, tax tools, competitors. You cannot notify them. The
+deprecation window is the notification.
+
+### One change coming that will arrive from outside your contract
+
+Worth flagging because it inverts the usual direction of risk.
+
+EIP-7708 proposes that every non-zero ETH transfer emit a log identical to a `LOG3`, with the emitting
+address set to the system address `0xfffffffffffffffffffffffffffffffffffffffe`, `topics[0]` set to
+`keccak256("Transfer(address,address,uint256)")` — the same constant every ERC-20 uses — `topics[1]`
+and `topics[2]` set to the from and to addresses, and the amount in the data
+field.<Cite src="eip-7708" /> It is listed as scheduled for inclusion in the Glamsterdam hardfork
+meta, which has not shipped and has no announced mainnet activation date.<Cite src="eip-7773" />
+
+Read what that does to a consumer. A pipeline that filters only on topic0 for `Transfer`, without
+constraining `address`, would begin ingesting protocol-generated ETH transfers as though they were
+token transfers — from an emitter it never registered, at a volume set by the whole chain rather than
+by one contract. Nothing in the filter would be wrong. The chain would simply have started emitting
+more of a thing the filter already asked for.
+
+If your filters pin the emitting address, you are unaffected. If they do not, this is the argument for
+pinning them.
+
+<Check type="spot-bug" concept="events-are-an-api-contract">
+A protocol ships this upgrade in a single release, described in the changelog as "add fee tier to
+settlement events; make the venue searchable":
+
+```solidity
+// before
+event Settled(bytes32 indexed id, address indexed payer, uint256 amount, string venue);
+
+// after
+event Settled(bytes32 indexed id, address indexed payer, uint256 amount, string indexed venue, uint8 feeTier);
+```
+
+Three teams consume this event: an internal dashboard, a partner's reconciliation job, and a public
+subgraph. Describe what each observes on the day of the upgrade, and rewrite the change so that none
+of them break.
+
+<Answer>
+**All three observe the same thing: `Settled` stops occurring.** The canonical signature went from
+`Settled(bytes32,address,uint256,string)` to `Settled(bytes32,address,uint256,string,uint8)`, so
+topic0 is a different 32-byte value.<Cite src="solidity-abi-events" /> Every existing filter now asks for a value no log will contain.
+The queries succeed and return empty arrays. Nothing errors, nothing alerts, and each team's first
+symptom is a flat line on a chart — which the dashboard team notices in hours, the reconciliation job
+notices at month-end, and the subgraph notices when someone files an issue.
+
+**The second change is hiding behind the first, and it is the nastier one.** `venue` became `indexed`.
+That alone would not have changed topic0, because `indexed` is not part of the canonical signature —
+so had the team shipped only that, every filter would have kept matching and every decoder would have
+started producing wrong output. `venue` would have moved out of the data blob into topic3 as a
+keccak256 hash, the data tuple would have gone from `(uint256, string)` to `(uint256)`, and decoders
+would have variously thrown, or silently misread. The teams got lucky: the parameter addition made the
+break loud.
+
+**And `venue` is now unreadable.** An indexed `string` is stored as the hash of its contents. Whatever
+displayed a venue name is now displaying a hash, permanently, for all logs emitted after the upgrade.
+
+**The rewrite.** Leave `Settled` exactly as it is and keep emitting it. Add a new event:
+
+```solidity
+event Settled(bytes32 indexed id, address indexed payer, uint256 amount, string venue);      // keep
+event SettledV2(
+    bytes32 indexed id,
+    address indexed payer,
+    string  indexed venueKey,   // searchable
+    uint256 amount,
+    string  venue,              // readable
+    uint8   feeTier
+);
+```
+
+Emit both for a stated deprecation window. `SettledV2` has three indexed parameters, which is the
+maximum for a non-anonymous event,<Cite src="solidity-abi-events" /> and it carries `venue` twice so that the searchable and readable
+properties are both available. Announce the window, then stop emitting `Settled` at the end of it.
+The cost is one extra `LOG3` per settlement during the overlap; the alternative is a silent outage in
+systems you do not control.
+
+**The process fix behind the code fix.** Two independent changes — a new parameter and a new indexed
+flag — were bundled into one release with a one-line changelog. Each is a breaking interface change
+with a different failure signature. Event schema changes belong in their own release, with their own
+migration note, reviewed by whoever owns the consumers.
+</Answer>
+</Check>
+
+## Where this pays off
+
+This lesson is the seam between the machine and everything built on top of it, and the module ends
+here because the next stop is a different track.
+
+**Indexing** on the infrastructure track picks up exactly where the four gaps above leave off. An
+indexer is a deterministic fold over a log stream into a database you can actually query — with joins,
+ranges, aggregates and the cross-position ORs `eth_getLogs` refuses. Its two hard problems are both
+visible from here: reorg handling, which is `blockHash` and `removed` taken seriously, and the natural
+key, which is why `(blockHash, logIndex)` and not `(blockNumber, logIndex)`.
+
+**Event pipelines** on the same track turn "logs are the only outbound channel" into product
+architecture: what your backend does between a log appearing and a user seeing a consequence, and what
+happens to that chain of effects when the log is un-emitted by a reorg.
+
+**Solidity events** on the contract track go the other way, into the emitting side — what the compiler
+generates for `emit`, what indexed reference types cost, and how to design an event schema that you
+will not need to break.
+
+And the reflection prompt for this module is the practical version of everything above: take an event
+from a contract you know, write down who consumes it, and work out what happens to each of them the
+day you add a parameter. There is no compiler in that story. There is only you, and a list.

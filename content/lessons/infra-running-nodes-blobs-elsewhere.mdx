@@ -1,0 +1,301 @@
+---
+id: infra-running-nodes-blobs-elsewhere
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources:
+  [
+    eip-7594,
+    eip-4844,
+    consensus-specs-fulu-das-core,
+    consensus-specs-fulu-p2p,
+    consensus-specs-fulu-validator,
+    lighthouse-blobs,
+    engine-api-osaka,
+    eth-docker-resource-usage,
+    eth-run-a-node,
+    ethereum-org-fusaka,
+    eip-7892,
+  ]
+stack: {}
+---
+
+A service you run reads blob data. It has done so for a year: it watches for the batcher transactions
+of an L2 you care about, pulls the blobs behind their versioned hashes from your own beacon node, and
+decodes them. Cheap, private, no provider in the path.
+
+After the node is upgraded it stops working. Not intermittently — every request, for every blob,
+including ones published four minutes ago. The node is synced, following head, attesting if you stake,
+and serving every other beacon API call correctly. It simply does not have the blobs.
+
+Nothing is broken. **A post-Fusaka full node stores data columns rather than whole blobs, and a
+consequence Lighthouse's documentation states outright is that such a node cannot serve blobs unless
+you run it with `--semi-supernode` or `--supernode`.**<Cite src="lighthouse-blobs" />
+
+That single sentence contains most of this lesson: which process holds blob bytes, in what form, for
+how long, and how much of them is your node's share. You know from Track 03 what a
+[blob](/c/blob) is and how [PeerDAS](/c/peerdas) samples it. This lesson is the operator's side of the
+same facts — the part that shows up on a disk, a bandwidth bill and a capacity plan.
+
+## Which of your two processes owns these bytes
+
+Start with the boundary, because the whole capacity conversation depends on getting it right.
+
+Blob data is propagated, validated and stored by the **consensus** client. It never enters
+execution-layer state. The execution client sees only the versioned hashes committed in the
+transaction, which is the entire interface the EVM has to blob data.<Cite src="eip-4844" />
+
+That is not a soft architectural claim; it is visible in the filesystem. Lighthouse stores blob data in
+a `blobs_db` that is separate from the `chain_db` and the `freezer_db`, and its published storage
+guidance quotes those two databases *excluding* the blobs database, precisely because the blob figure
+depends on settings the other two do not share.<Cite src="lighthouse-blobs" /> The practitioner
+resource tables do the same split, noting that consensus-client database size varies widely with the
+amount of blob data kept and giving a baseline for the minimal case.<Cite src="eth-docker-resource-usage" />
+
+Hold that next to what the previous lesson established. Growing execution-layer state is a monotonic,
+never-shrinking, four-category problem on one process. Blob data is a bounded rolling window on the
+*other* process, sized by a rate and a retention period. They share a machine and nothing else. **A
+disk-planning conversation about blobs and a disk-planning conversation about state growth are
+conversations about two different programs**, and the single most common planning error here is
+letting one number stand for both.
+
+<Misconception
+  belief="More blob capacity means my execution client's database grows faster."
+  reality="Blob capacity is a consensus-client resource. Raising it changes the consensus client's disk and bandwidth profile and leaves execution-layer state size alone, because blob contents never enter state."
+  why="Blob transactions are execution-layer transactions, they appear in the execution block, and they are priced in a fee market the execution client runs. Everything about them is on the execution side except the bytes."
+  src="eip-4844"
+/>
+
+### The exception, and it is worth knowing exactly
+
+The tidy claim above has one hole, and it sits precisely on the seam this module opened with.
+
+Blob-carrying transactions reach execution clients through the transaction mempool before the block
+containing them is proposed, so an execution client does hold blob bytes — transiently, in a dedicated
+pool, as mempool contents rather than as state. The Engine API turns that into a shortcut: a consensus
+client that has a beacon block but is missing its data may call `engine_getBlobsV2` or
+`engine_getBlobsV3` to fetch blobs from the execution layer's blob pool rather than waiting on
+gossip.<Cite src="engine-api-osaka" /> V2 is all-or-nothing — it must return `null` if any requested
+blob is missing — while V3 supports partial responses, returning an array of the same length with
+`null` at the positions of the missing blobs.<Cite src="engine-api-osaka" /> Both specify a one-second
+timeout, and both warn callers that execution clients may prune old blobs from their pool and will
+answer `null` when they have.<Cite src="engine-api-osaka" />
+
+So the precise statement is: **blob bytes may pass through your execution client's mempool; they never
+land in its state.** Mempool contents are transient by construction, so this changes nothing about
+long-term disk. It changes a great deal about latency, which is why the shortcut exists — and it is one
+more reason the seam between your two processes is worth having a mental model of, because a
+consensus-side data-availability problem can be caused by an execution-side pool policy.
+
+## The burden is a window, not an archive
+
+The second structural fact is retention, and it turns capacity planning into a formula rather than a
+guess.
+
+Nodes must hold sidecars for `MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS` epochs and serve them when
+capable; after that they may prune the sidecars and stop serving them.<Cite src="consensus-specs-fulu-validator" /><Cite src="consensus-specs-fulu-p2p" />
+You met that window in Track 03 as roughly eighteen days.<Cite src="eip-4844" /> Here is what it means
+for a disk: **blob storage reaches a steady state and stays there.** Data arrives at some rate, sits for
+the window, and leaves. The line on your capacity graph is flat, not sloped — which is the opposite of
+everything else on the machine.
+
+Lighthouse's documentation writes the arithmetic out, and the shape of it is the thing to keep:
+
+<Figure
+  caption="A blob capacity plan needs exactly one number that is not already written in a specification."
+  alt="The blob storage formula multiplies bytes per blob by blobs per block by blocks per epoch by epochs retained. Bytes per blob is a protocol constant, blocks per epoch is 32, epochs retained is the retention window, and blobs per block is the only term set by a blob-parameter-only fork."
+>
+  <Anatomy
+    value="bytes per blob × blobs per block × blocks per epoch × epochs retained"
+    parts={[
+      { from: 0, to: 14, label: 'constant', note: '2**17 bytes', tone: 'muted' },
+      { from: 17, to: 32, label: 'the variable one', note: 'set by a BPO fork', tone: 'warn' },
+      { from: 35, to: 51, label: 'constant', note: '32', tone: 'muted' },
+      { from: 54, to: 69, label: 'the window', note: '~18 days', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+with one blob at `2**17` bytes, 32 blocks per epoch, and the retention window in
+epochs.<Cite src="lighthouse-blobs" /><Cite src="eip-4844" /> Every term but one is a protocol constant
+you can look up and rely on.
+
+The exception is **blobs per block**, and it is deliberately not a constant any more. EIP-7892
+introduced blob-parameter-only hardforks — upgrades that change nothing but the blob parameters — so
+capacity is stepped on telemetry rather than on a release train.<Cite src="eip-7892" /> That has been
+the mechanism since Fusaka went live on 3 December 2025.<Cite src="ethereum-org-fusaka" /><Cite src="eip-7892" />
+The sources gathered for this curriculum do not agree on the target and maximum in force in August
+2026, and **no pair is stated here as current.** Read it from your client's configuration for the fork
+you are on, and treat any figure printed in any document as a snapshot with an expiry date.
+
+<Aside kind="note">
+Notice what the formula makes obvious and a single quoted number hides: because retention is fixed and
+the rate is a parameter, **a doubling of blob capacity doubles your steady-state blob storage and then
+stops.** It does not compound. If you have ever had to explain to a finance partner why one line in the
+capacity model grows forever and another does not, this is the distinction — and it is the same
+distinction as [storage versus data availability](/c/storage-is-the-expensive-one), read off a disk
+instead of a gas schedule.
+</Aside>
+
+## What your node actually holds is a fraction
+
+Now the PeerDAS half, from the operator's side rather than the protocol's.
+
+Before data availability sampling, every node downloaded every blob, so blob capacity and per-node
+bandwidth were the same number times a constant. Under PeerDAS each blob is erasure-coded into columns
+and a node custodies and samples only a subset.<Cite src="eip-7594" /> The extended matrix has
+`NUMBER_OF_COLUMNS` of 128, columns are grouped into `NUMBER_OF_CUSTODY_GROUPS` of 128, and a node's
+baseline obligation is `CUSTODY_REQUIREMENT` of 4 groups, with `SAMPLES_PER_SLOT` of 8 samples for an
+honest node.<Cite src="consensus-specs-fulu-das-core" />
+
+The operational reading of those constants is a single sentence: **the network's total blob capacity
+and your node's share of it are now separate numbers, and the second one is a policy setting rather
+than a consequence of the first.** That is what makes it possible to raise capacity through parameter
+forks without pricing home operators off the network.<Cite src="eip-7594" />
+
+<Misconception
+  belief="If the network doubles blob capacity, my node needs twice the bandwidth."
+  reality="Your node's obligation is a custody-group count, not a share of total capacity. More columns per block flow past you; the number you are required to hold and serve is set by your custody configuration."
+  why="It was literally true before Fusaka — every node downloaded every blob — so every operational guide written before December 2025 describes a proportional relationship that no longer holds."
+  src="eip-7594"
+/>
+
+### The part nobody expects: your blob burden scales with your stake
+
+Here is the fact most likely to surprise someone who has run a node for years, and it is worth reading
+twice because it inverts the usual relationship between load and cause.
+
+A node with validators attached custodies **more** than the baseline, and the amount is a function of
+the effective balance of the validators attached to it. The specification defines it directly: a node
+custodies `total_node_balance // BALANCE_PER_ADDITIONAL_CUSTODY_GROUP` custody groups per slot, with a
+floor of `VALIDATOR_CUSTODY_REQUIREMENT` of 8 groups and a ceiling of all 128, where
+`BALANCE_PER_ADDITIONAL_CUSTODY_GROUP` is 32 ETH.<Cite src="consensus-specs-fulu-validator" />
+
+Do the arithmetic and the thresholds fall out: 32 ETH of attached effective balance buys one group,
+so the 8-group floor covers everything up to 256 ETH; 2,048 ETH lands you at 64 groups, and 4,096 ETH
+at the full 128. Lighthouse's documentation states exactly those two thresholds in operator terms — at
+2,048 ETH staked the custody requirement makes the beacon node a semi-supernode, and at 4,096 ETH it
+becomes a supernode without any flag being set.<Cite src="lighthouse-blobs" />
+
+Three consequences, and none of them is obvious from the outside.
+
+**Your disk and bandwidth requirements can change without you changing anything.** The spec says a node
+should dynamically adjust its custody groups without user input following changes to the total
+effective balance of attached validators.<Cite src="consensus-specs-fulu-validator" /> Add validators to
+a beacon node and its blob obligation rises on its own.
+
+**The adjustment is deliberately asymmetric.** If the requirement increases, a node should immediately
+advertise the higher count; if it decreases, the node should *not* reduce its advertised count, should
+keep custodying and serving at the previous highest level, and should persist that across
+restarts.<Cite src="consensus-specs-fulu-validator" /> A ratchet, in other words — which is correct for
+the network and means capacity planning has to track the high-water mark rather than the current
+balance.
+
+**Your blob load is unrelated to your application's traffic.** A read-only node serving a busy product
+has the baseline obligation. A quiet node backing a large staking operation has a much larger one. If
+you have an instinct that resource usage tracks requests served, this is a place it will mislead you.
+
+## Three configurations, and what each can answer
+
+Put the pieces together as a decision, because it is one you make on the command line.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Default full node' },
+    { title: <code>--semi-supernode</code> },
+    { title: <code>--supernode</code>, tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What does it hold?',
+      cells: ['its custody subset of data columns', 'half the data columns', 'all data columns'],
+    },
+    {
+      label: 'Can it serve blobs to your application?',
+      cells: [
+        { v: <><strong>no</strong><Cite src="lighthouse-blobs" /></>, tone: 'danger' },
+        <>yes, reconstructing them first<Cite src="lighthouse-blobs" /></>,
+        <>yes, and faster, since it skips reconstruction<Cite src="lighthouse-blobs" /></>,
+      ],
+    },
+  ]}
+  caption="Whether your own node will hand you a blob is a flag you set at sync time, not a consequence of being healthy."
+  alt="A default post-Fusaka full node holds only its custody subset of data columns and cannot serve blobs; --semi-supernode holds half the columns and serves blobs by reconstructing them; --supernode holds all columns and serves them without reconstruction."
+/>
+
+Two footnotes that decide real projects. Running a supernode comes at a significant increase in storage
+and bandwidth, and combining it with disabled pruning means blob storage grows without bound — the
+documentation puts that in the range of several terabytes.<Cite src="lighthouse-blobs" /> And obtaining
+blob data from *before* your node started is a separate problem again: Lighthouse offers an experimental
+`--complete-blob-backfill` flag that works only when present during a fresh checkpoint sync as the
+database is initialised, and will not backfill on an already-running node.<Cite src="lighthouse-blobs" />
+
+So "we will just backfill later" is not a plan. Blob retention is decided at the moment a node's
+database is created, which puts it in the same family as the sync-mode decision from two lessons ago:
+chosen once, early, and before anyone tells you what the product will need.
+
+<Check type="predict" concept="blob-storage-is-separate">
+A team runs a beacon node and an execution client on one machine, with no validators attached, to feed
+an L2 analytics product that decodes blob data. They plan capacity like this:
+
+- "Blob capacity is going up, so budget for the consensus client's disk to keep growing."
+- "We do not stake, so PeerDAS is a protocol detail with no operational effect on us."
+- "If we ever need older blobs, we will fetch them from the node later."
+
+Predict what happens to this deployment over the next year, and name the one flag whose absence is the
+most urgent problem.
+
+<Answer>
+**The most urgent problem is that the product is already broken, and the reason is the flag that is not
+set.** A default post-Fusaka beacon node holds its custody subset of data columns and cannot serve
+blobs; serving them requires `--semi-supernode` or `--supernode`.<Cite src="lighthouse-blobs" /> The
+node will look healthy in every other respect, which is what makes this expensive to diagnose. This is
+the first thing to fix.
+
+**"Budget for the consensus disk to keep growing" is the wrong shape, in a direction that matters.**
+Blob retention is bounded: nodes hold sidecars for the retention window and may prune
+afterwards.<Cite src="consensus-specs-fulu-validator" /><Cite src="consensus-specs-fulu-p2p" /> Blob
+storage therefore reaches a steady state set by rate times window, and a capacity increase steps that
+plateau up once rather than bending the curve.<Cite src="lighthouse-blobs" /> The line that actually
+grows without bound is on the *other* process — execution-layer state. Budgeting a growth rate for the
+consensus client and a fixed size for the execution client is exactly backwards.
+
+**"We do not stake, so PeerDAS has no operational effect" is wrong twice.** It is the reason the node
+cannot serve blobs at all, and it is the reason the fix is expensive: a supernode holds all data
+columns, at a significant increase in storage and bandwidth.<Cite src="lighthouse-blobs" /> The one
+thing not staking does buy them is that their custody obligation stays at the baseline rather than
+rising with attached balance,<Cite src="consensus-specs-fulu-validator" /> so their supernode cost is a
+deliberate choice rather than something the protocol imposes.
+
+**"We will fetch older blobs later" fails on two independent grounds.** The window is a minimum
+serving obligation after which nodes may prune,<Cite src="consensus-specs-fulu-p2p" /> so beyond it
+nobody owes them a copy. And backfilling within the window is not something you enable on a running
+node: Lighthouse's flag applies only at fresh checkpoint sync, when the database is
+initialised.<Cite src="lighthouse-blobs" />
+
+**The corrected deployment.** Run the beacon node as a supernode from a fresh sync, sized for the
+plateau rather than a growth rate, with the execution client's state growth budgeted separately as the
+line that does grow. Decode blobs as they arrive and persist what the product needs into your own
+storage, because the chain's obligation to hand them back expires and yours to your users does not.
+Any historical range older than the window is an out-of-band data problem, not a node configuration.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now say, for any byte on a node's disk, which of the two processes owns it, whether it grows
+without bound or plateaus, and which upgrade mechanism moves it. That is the last piece of the capacity
+model this module has been assembling: execution state that only grows, block history that is now
+partly droppable, and blob data that arrives at a parameterised rate and expires on a clock.
+
+It also sharpens something you will need on the scaling track. When a rollup's cost model says data
+availability is cheap, the reason is visible from here: the resource is cheap because nobody has to
+keep it and, since PeerDAS, nobody has to hold all of it.<Cite src="eip-7594" /> Both halves of that
+sentence are operator facts before they are economic ones.
+
+One constraint is left, and it is the one that decides whether any of this works. Every number in this
+module has been a quantity of bytes. The final lesson is about a rate — specifically about how quickly
+those bytes can be found — and about why a node with plenty of free disk and an excellent throughput
+figure can still fall permanently behind head.

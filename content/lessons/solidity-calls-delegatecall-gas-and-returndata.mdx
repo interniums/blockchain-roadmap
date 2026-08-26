@@ -1,0 +1,297 @@
+---
+id: solidity-calls-delegatecall-gas-and-returndata
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    eip-150,
+    eip-211,
+    eip-2929,
+    eip-7825,
+    excessively-safe-call,
+    oz-lowlevelcall-lib,
+    solidity-docs-control-structures,
+    solidity-docs-global-vars,
+    solidity-docs-security,
+    measured-gas-constants,
+  ]
+stack: { solidity: "0.8.36" }
+---
+
+A cross-chain relayer delivers messages by calling a handler on the destination contract. It has run
+for a year at a stable cost per message. One morning, one route starts costing four times as much,
+then eight, then the relayer's transactions start failing outright.
+
+The handler on that route has not changed its logic. It has changed its `return` statement.
+
+```solidity
+fallback() external {
+    assembly { return(0, 0xffffff) }
+}
+```
+
+Sixteen megabytes of zeros. The handler does no work, consumes almost no gas of its own, and hands
+the relayer a bill for memory it will never look at. The relayer's code is a single line:
+
+```solidity
+(bool ok, ) = target.call(payload);
+```
+
+The second element of that tuple is discarded on the same line it is produced. It is still copied.
+
+## Why the copy happens at all
+
+The return-data buffer is not memory. EIP-211 gives each call frame a new internal buffer of variable
+size, cleared on every call-like opcode and filled with the complete return data of the call
+afterwards, from which the caller can copy it or parts of it into
+memory.<Cite src="eip-211" /> Reading its size is free of any copy; reading its contents is not.
+
+The EIP is explicit about what compilers should therefore do: implementors are advised to reserve a
+zero-length area for return data if the size is unknown before the call, and then use
+`RETURNDATACOPY` in conjunction with `RETURNDATASIZE` to actually retrieve
+it.<Cite src="eip-211" />
+
+Solidity follows the second half and skips the discretion in the first. `addr.call(bytes memory)`
+returns `(bool, bytes memory)`, where the `bytes memory` is a freshly allocated buffer holding the
+entire return data.<Cite src="solidity-docs-global-vars" /> There is no syntax for "give me the first
+64 bytes". The language's low-level call has one behaviour, and it is the unbounded one.
+
+The cost of that allocation is [memory expansion](/c/memory-expansion-quadratic), which grows
+quadratically in the highest word touched. The callee chooses the size. You pay the bill, in your own
+frame, after the callee has already finished and returned.
+
+## The asymmetry with the 63/64 rule
+
+The instinct at this point is that the 63/64 rule protects you, and it is worth being precise about
+what it does and does not cover, because the answer is "the other thing".
+
+EIP-150 defines all-but-one-64th of N as `N - floor(N / 64)`, and specifies that if a call asks for
+more gas than the maximum allowed amount, the machine does *not* return an out-of-gas error —
+instead, if the call asks for more than all-but-one-64th of that maximum, it is called with
+all-but-one-64th.<Cite src="eip-150" /> The Solidity docs restate the consequence: the caller always
+retains at least one sixty-fourth of the gas in a call, so even if the called contract goes out of
+gas, the caller still has gas left.<Cite src="solidity-docs-control-structures" />
+
+So a child cannot burn your budget to zero *while it is running*. What it can do is hand you an
+expensive object on the way out. The memory expansion is charged in **your** frame, from **your**
+retained gas, after the protection has already done its job. The rule bounds the callee's
+consumption; it says nothing about the callee's output.
+
+That is the whole mechanism, and it is why this griefing vector survives every defence aimed at
+runaway callees.
+
+<Figure
+  caption="The protection ends the instant the callee returns, and the bill arrives one step after that."
+  alt="A call forwards at most all but one sixty-fourth of the remaining gas, so the callee cannot exhaust the caller while running. The callee then chooses the size of its return data, and the caller pays quadratic memory expansion to copy it in its own frame, after the sixty-three sixty-fourths rule has finished applying."
+>
+  <Flow
+    nodes={[
+      { id: 'c', label: 'call', note: 'capped at 63/64', col: 0, tone: 'accent' },
+      { id: 'run', label: 'callee runs', note: 'your budget is safe', col: 1, tone: 'good' },
+      { id: 'ret', label: 'callee returns', note: 'it picks the size', col: 2, tone: 'warn' },
+      { id: 'copy', label: 'your frame copies', note: 'quadratic expansion', col: 3, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="Writing gas: g guarantees the callee receives g gas."
+  reality="A subcall is capped at all but one sixty-fourth of the gas remaining after the call's own upfront costs. Asking for more silently gives less — it is not an error — so you can neither force a callee to run out at a chosen point nor guarantee it has enough."
+  why="The braces syntax reads like an exact allocation, and in the common case where you have plenty of gas the request and the grant happen to coincide."
+  src="eip-150"
+/>
+
+## Under-funding, and the arithmetic that fixes it
+
+The mirror image of the bomb is a caller who forwards too little. It is the more dangerous of the two
+because it is silent and because it is usually the *attacker* who chooses the number.
+
+The shape: a relayer, a bridge, or a queue-processing contract calls a handler and records the
+message as delivered whether or not the handler succeeded — which is often correct behaviour, since
+one bad handler must not block the queue. An attacker submits the transaction themselves with a gas
+limit chosen so that the outer call survives and the handler runs out. The handler's effects revert;
+the outer contract marks the message processed; the message can never be retried.
+
+The defence is a floor check before the call, and the arithmetic is worth doing once by hand.
+
+**Subgoal — write down what the child actually receives.** After the call's upfront charges, if the
+caller has `N` gas remaining and requests everything, the child gets `N - floor(N / 64)`, which is
+approximately `63N/64`.<Cite src="eip-150" />
+
+**Subgoal — invert it for the quantity you care about.** To guarantee the child receives at least
+`G`, you need `63N/64 >= G`, so `N >= ceil(64G/63)`.
+
+**Subgoal — put a number on it, because the ratio is easy to underestimate.** For a handler needing
+100,000 gas, `ceil(64 x 100000 / 63) = 101,588`. The margin is a little over 1.5%, which is small
+enough that a check written as `require(gasleft() >= 100000)` looks fine and is wrong by 1,588 gas —
+enough for the handler to fail on a cold storage slot at 2,100.<Cite src="measured-gas-constants" />
+
+**Subgoal — put the check in the right place.** It must be `require(gasleft() >= 101588)` immediately
+before the call, in the same frame, and the constant must be derived from a measurement of the
+handler on the version you deployed. A check further up the function measures gas that later
+statements will spend.
+
+**Subgoal — notice which failures this does not fix.** A handler that legitimately needs more than
+the floor still fails. A handler that grows past the floor in an upgrade still fails. And the whole
+transaction is now capped at roughly 16.78 million gas, so a chain of calls that each demand a floor
+can hit a ceiling that did not exist before Fusaka.<Cite src="eip-7825" /> A gas floor buys you a
+guarantee about one call, not about a call graph.
+
+<Aside kind="note">
+Two smaller facts that ruin gas estimates and are worth knowing before they cost you an afternoon.
+First, warmth is scoped: if a scope reverts, the accessed-address and accessed-storage-key sets are
+restored to the state they were in before that scope was
+entered.<Cite src="eip-2929" /> A retried call after a reverted attempt pays cold prices again.
+Second, external function calls can fail at any time because they exceed the maximum call stack size
+of 1,024, and since the caller is in total control of the call depth, they can force
+it.<Cite src="solidity-docs-security" /> A gas floor does not defend against a depth attack.
+</Aside>
+
+## The bounded call
+
+The defence against the bomb has one shape, popularised by Nomad's `ExcessivelySafeCall` and now
+shipped in the standard library. The idea is to make the call from assembly with an output area of
+zero and then copy a bounded prefix of the return data yourself.<Cite src="excessively-safe-call" />
+
+```solidity
+assembly {
+    _success := call(_gas, _target, _value, add(_calldata, 0x20), mload(_calldata), 0, 0)
+    _toCopy := returndatasize()
+    if gt(_toCopy, _maxCopy) { _toCopy := _maxCopy }
+    mstore(_returnData, _toCopy)
+    returndatacopy(add(_returnData, 0x20), 0, _toCopy)
+}
+```
+
+The library's own comment states the purpose exactly: the main difference from a Solidity low-level
+call is that it limits the number of bytes the callee can cause to be copied into caller memory,
+which prevents malicious contracts returning ten million bytes and causing a local out-of-gas when
+copying to memory.<Cite src="excessively-safe-call" />
+
+OpenZeppelin 5.7.0 ships the same shape as a first-party `LowLevelCall` library, and the API is
+worth knowing because it names the two cases you actually
+have:<Cite src="oz-lowlevelcall-lib" />
+
+- `callNoReturn(target, value, data)` performs the call with both output arguments set to `0x00` and
+  returns only the boolean. This is the right primitive when you genuinely do not read the result —
+  a fire-and-forget notification, a value transfer, a relayer's handler invocation.
+- `callReturn64Bytes(target, data)` sets the output area to the 64 bytes of memory scratch space and
+  returns two words directly. This is the right primitive for a token `transfer` that returns a bool,
+  or any function whose entire return value fits in two words. Nothing is allocated and the bomb has
+  nowhere to land.
+- `returnDataSize()` and `returnData()` expose the buffer explicitly, so you copy on purpose rather
+  than by default.
+
+<Matrix
+  corner="How you make the call"
+  cols={['Output area given to the call', 'Allocated in your memory', 'Who decides how much is copied']}
+  rows={[
+    { label: 'callNoReturn', cells: ['zero bytes', { v: 'nothing', tone: 'good' }, 'you'] },
+    { label: 'callReturn64Bytes', cells: ['64 bytes of scratch space', { v: 'nothing', tone: 'good' }, 'you'] },
+    { label: 'returnDataSize + returnData', cells: ['zero, then a deliberate copy', 'a bytes memory you asked for', 'you'] },
+    { label: 'addr.call(data)', cells: [{ v: 'the whole buffer', tone: 'danger' }, { v: 'a bytes memory, always', tone: 'danger' }, { v: 'the callee', tone: 'danger' }] },
+  ]}
+  caption="The language's own low-level call is the only row where the size of the copy is somebody else's choice."
+  alt="Four ways to make a low-level call compared on the output area passed to the call instruction, what gets allocated in the caller's memory, and who decides how many bytes are copied. Only Solidity's built-in call lets the callee decide."
+/>
+
+The library carries a warning worth transcribing: do not assume that the results are zero if
+`success` is false, because memory can already be allocated and the function does not zero it
+out.<Cite src="oz-lowlevelcall-lib" /> A failed call leaves your two result words holding whatever
+was in scratch space. Branch on `success` first, always.
+
+<Aside kind="warn">
+This is where the previous lesson's advice and this one's collide, and the resolution is not a
+compromise — it is a decision about what your contract is for.
+
+If your contract **should fail** when the callee fails, bubble the raw revert data. You will copy
+whatever the callee produced, and the memory-expansion gas is spent, but the frame is reverting
+anyway and the caller learns the real reason.
+
+If your contract **must not fail** when the callee fails — a relayer, a batch processor, a queue —
+then you cannot afford an unbounded copy on either path. Bound it: copy a fixed prefix of the revert
+data, enough for a four-byte selector and one or two arguments, and log that. `ExcessivelySafeCall`'s
+`_maxCopy` parameter exists for exactly this and its own comments suggest 256
+bytes.<Cite src="excessively-safe-call" />
+
+The mistake is picking one rule and applying it everywhere. "Always bubble" gives an attacker a lever
+on your relayer; "never copy" makes your user-facing contracts undebuggable.
+</Aside>
+
+<Check type="predict" concept="returndata-bomb">
+A batch payout contract processes a list of recipients and must never let one bad recipient block the
+rest:
+
+```solidity
+for (uint256 i = 0; i < recipients.length; i++) {
+    (bool ok, bytes memory ret) = recipients[i].call{value: amounts[i], gas: 50_000}("");
+    if (!ok) { emit PayoutFailed(recipients[i], ret); }
+}
+```
+
+Answer three questions. First: how much gas does a recipient at index `i` actually receive? Second:
+what is the cheapest way for one recipient to make the whole batch fail? Third: what does
+`gas: 50_000` buy the contract, and what would it need instead?
+
+<Answer>
+**One: at most 50,000, and possibly much less — it is a ceiling on a ceiling.**
+
+The request is capped at all-but-one-64th of the gas remaining after the call's upfront
+charges.<Cite src="eip-150" /> Early in a large batch with plenty of gas left, 50,000 is the binding
+constraint and the recipient gets 50,000. Late in the batch, if only 40,000 remain, the recipient
+gets `40000 - floor(40000/64) = 39,375` — and the machine does not raise an error for the shortfall,
+it simply forwards less.<Cite src="eip-150" /> The same line of code funds different recipients
+differently depending on where they sit in the array.
+
+**Two: return data. It costs the attacker almost nothing.**
+
+The value transfer is capped at 50,000 gas, so the recipient cannot burn the batch down by consuming
+gas — that is what the cap and the 63/64 rule between them prevent. But `ret` is an unbounded
+`bytes memory` allocated in the *caller's* frame from the caller's remaining
+gas.<Cite src="solidity-docs-global-vars" /> A `receive` function that ends in
+`assembly { return(0, 0xffffff) }` returns sixteen megabytes; the caller pays quadratic memory
+expansion for all of it, in a frame the 63/64 rule has already finished
+protecting.<Cite src="eip-211" /> One recipient in a thousand-entry batch can exhaust the
+transaction, and every subsequent retry hits the same entry.
+
+Note the second bug hiding in the same line: `ret` is then passed into an event, so the bomb is also
+copied into log data and paid for a second time.
+
+**Three: `gas: 50_000` buys a bound on the callee's *execution* and nothing else.**
+
+It bounds the recipient's own work. It does not bound the recipient's output, does not guarantee the
+recipient receives 50,000, and — per the compiler team's own guidance — encodes an assumption about
+opcode pricing that hard forks are free to change.<Cite src="solidity-docs-control-structures" />
+
+**What the contract needs instead**, in order of importance:
+
+Use an output-bounded call. `LowLevelCall.callNoReturn(recipient, amount, "")` sets the output area
+to zero, so nothing is copied and there is nothing to bomb.<Cite src="oz-lowlevelcall-lib" /> If the
+failure reason is worth logging, copy a bounded prefix rather than the whole
+buffer.<Cite src="excessively-safe-call" />
+
+Then reconsider the loop itself. A push-payment loop over untrusted recipients is the structure that
+creates the exposure; a pull model — record a credit, let each recipient withdraw — removes every one
+of these questions at once, and the docs recommend it directly for exactly the reason this exercise
+demonstrates.<Cite src="solidity-docs-security" /> The bounded call is the fix for the code as
+written; the pull pattern is the fix for the design.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next**, the last lesson in this module: where a proxy keeps state that no borrowed code can reach,
+what a library's link-time address substitution means for the bytecode you verify, and what "this
+address is a contract" is worth as a check in 2026.
+
+**In the toolchain track**, gas measurement gets its own treatment, and the first thing it says is
+that a test harness leaves accounts and slots warm in ways mainnet does not — so every floor constant
+you derive from a default test run is optimistic. Derive it under isolation, then add margin.
+
+**And in the security track**, gas griefing joins denial-of-service and read-only reentrancy as a
+class defined by what a contract *cannot* be forced to do rather than what it can. The pattern to
+carry from here: whenever an attacker gets to choose a number that ends up in your frame's cost —
+the size of returned data, the depth of a call stack, the gas limit on a transaction — that number is
+part of your threat model whether you wrote it down or not.

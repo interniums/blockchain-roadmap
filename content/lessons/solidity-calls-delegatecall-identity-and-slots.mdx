@@ -1,0 +1,416 @@
+---
+id: solidity-calls-delegatecall-identity-and-slots
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    eip-1967,
+    eip-7201,
+    eip-7702,
+    eip-6780,
+    eip-3607,
+    eip-1014,
+    solidity-docs-contracts,
+    solidity-docs-storage-layout,
+    solidity-docs-global-vars,
+    solidity-docs-using-the-compiler,
+    solidity-changelog,
+    oz-issue-6362,
+    oz-reentrancy-guard-v570,
+    measured-gas-constants,
+  ]
+stack: { solidity: "0.8.36" }
+---
+
+Everything in this module has been one instruction seen from six angles. This lesson closes it with
+the question the instruction leaves behind: when the code executing is somebody else's, what is still
+*yours*?
+
+Three answers, and they are less alike than they look. A proxy's own state has to live where no
+borrowed code will ever reach. A library's address has to be substituted into your bytecode before it
+can be deployed at all. And a contract's ability to say "the thing calling me is a contract" has
+stopped being a question with an answer.
+
+## Part one: state that borrowed code cannot reach
+
+The problem is the one the second lesson established: a proxy and an implementation both number their
+variables from zero, and slot numbers are all that cross the boundary. The fix is not to make them
+agree. It is to put the proxy's state somewhere a sequential compiler will never assign.
+
+ERC-1967 fixes three slots, and each is a hash minus one:<Cite src="eip-1967" />
+
+```text
+implementation  0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
+                bytes32(uint256(keccak256('eip1967.proxy.implementation')) - 1)
+
+beacon          0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50
+                bytes32(uint256(keccak256('eip1967.proxy.beacon')) - 1)
+
+admin           0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103
+                bytes32(uint256(keccak256('eip1967.proxy.admin')) - 1)
+```
+
+The standard's stated purpose is worth keeping in view, because it is not primarily a safety
+mechanism: it standardises the slots so that clients like block explorers can properly extract and
+show this information to end users, and so logic contracts can optionally act on
+it.<Cite src="eip-1967" /> The collision-avoidance property was already achieved by *any*
+pseudorandom slot; what the EIP adds is that everyone chooses the same one. It also specifies the
+lookup order — the beacon slot should only be considered if the implementation slot is
+empty.<Cite src="eip-1967" />
+
+### Three ways to write it in 0.8.36, and when each is right
+
+**Assembly against a constant.** The oldest form and still the one you will read most often.
+
+```solidity
+bytes32 private constant _IMPL =
+    0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+
+function _implementation() internal view returns (address impl) {
+    assembly { impl := sload(_IMPL) }
+}
+```
+
+Correct, explicit, and completely outside the compiler's storage model — which is the point and also
+the cost. No layout artefact mentions it, no upgrade-safety tool can reason about it, and a typo in
+the constant produces a working contract that reads a slot nobody will ever write.
+
+**A typed slot accessor.** OpenZeppelin's `StorageSlot` wraps the same assembly behind
+`getAddressSlot(SLOT).value`, which restores type checking at the read and write. Structurally
+identical, materially easier to review.
+
+**A declared layout.** Solidity 0.8.29 added the ability to relocate a contract's storage to an
+arbitrary location, and a contract carries a `layout at` specifier in its header; the compiler then
+shifts every static storage variable in the whole inheritance tree
+accordingly.<Cite src="solidity-changelog" /><Cite src="solidity-docs-contracts" /><Cite src="solidity-docs-storage-layout" /> Since
+0.8.35 there is a builtin to compute the base slot: `erc7201(string memory id) returns (uint)`
+computes the base slot of a storage namespace according to the ERC-7201 formula, equivalent to
+`keccak256(keccak256(id) - 1) & ~0xff`, and it works in a compile-time
+context.<Cite src="solidity-docs-global-vars" /><Cite src="solidity-changelog" /><Cite src="eip-7201" />
+
+```solidity
+contract PoolStorage layout at erc7201("acme.pool.main") {
+    uint256 feeBps;
+    uint256 totalShares;
+    mapping(address => uint256) shares;
+}
+```
+
+That is the same collision avoidance, expressed as ordinary state variables the compiler knows about.
+Declaration order still matters, packing still matters, `storageLayout` artefacts still diff — but
+the whole block now starts somewhere sequential allocation cannot reach.
+
+The specifier's documented constraints are worth reading before you use it: it goes in the contract
+header, before or after the inheritance list, at most once; the expression must be an integer literal
+expression evaluable at compile time yielding a `uint256`, and constants initialised from such
+expressions and the `erc7201` builtin are allowed; a custom layout cannot make storage wrap around,
+and the compiler errors if the base slot would push the static variables past the end of
+storage.<Cite src="solidity-docs-contracts" /> The docs add a recommendation that is really an
+upgrade warning: avoid locations too close to the end of the address space, because leaving too
+little room complicates later upgrades.<Cite src="solidity-docs-contracts" />
+
+<Matrix
+  corner="Where the state sits"
+  cols={['Base slot', 'Can sequential allocation reach it?', 'Does the compiler track it?']}
+  rows={[
+    { label: 'Implementation variables', cells: ['0, 1, 2, and upward', { v: 'yes — this is the collision', tone: 'danger' }, 'yes'] },
+    { label: 'An ERC-1967 slot', cells: ['keccak of a string, minus one', { v: 'no', tone: 'good' }, { v: 'no, it is assembly', tone: 'warn' }] },
+    { label: 'An ERC-7201 namespace', cells: ['keccak(keccak(id) − 1) masked', { v: 'no', tone: 'good' }, { v: 'yes, through layout at', tone: 'good' }] },
+  ]}
+  caption="Two of the three schemes are out of sequential allocation's reach; only one of those two is also inside the compiler's storage model."
+  alt="Three storage schemes compared on their base slot, whether sequential slot allocation can ever reach them, and whether the compiler tracks the variables. Sequential implementation variables collide; ERC-1967 slots avoid collision but live outside the compiler's model; an ERC-7201 namespace declared with layout at achieves both."
+/>
+
+<Aside kind="note">
+Two details about the formula that look arbitrary and are not.
+
+The **minus one** appears in both ERC-1967 and ERC-7201. A slot equal to `keccak256(x)` exactly is a
+slot a compiler could plausibly produce, since mappings and dynamic arrays derive their locations by
+hashing.<Cite src="solidity-docs-storage-layout" /> Subtracting one lands on a value with no known
+preimage under those derivations — the same "make the collision uncomputable rather than merely
+unlikely" argument as [second preimages in Merkle trees](/c/merkle-second-preimage).
+
+The **`& ~0xff`** mask clears the low byte, which leaves 256 consecutive slots free above each
+namespace root.<Cite src="eip-7201" /> That is what makes a whole struct of related fields safe to
+place at the root instead of a single value. You can see the result in the standard library:
+OpenZeppelin's reentrancy guard stores its lock at
+`0x9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00`, with the derivation written out
+in a comment directly above it.<Cite src="oz-reentrancy-guard-v570" />
+</Aside>
+
+### What this still does not fix
+
+Namespaced slots remove proxy-versus-implementation collisions. They do nothing about
+implementation-versus-*next*-implementation collisions, which is the same problem one axis over —
+version two reordering what version one already wrote.
+
+The strongest available evidence is that migrating *between* layout schemes is itself the hazard.
+OpenZeppelin's tracker carries a case where a live UUPS proxy was moved from a version using
+sequential storage to one using ERC-7201 namespaces, and an initialisation flag from the old layout
+landed in the same slot as the new layout's first field, violating an encoding invariant and leaving
+the contract unable to be initialised, upgraded or administered by any on-chain
+transaction.<Cite src="oz-issue-6362" /> Two carefully engineered schemes; the transition between
+them had no owner. The proxies module works that incident through slot by slot.
+
+## Part two: a library is an address you have to fill in
+
+Solidity's `library` is the oldest delegatecall pattern in the language, and it is a good place to see
+the mechanism without a proxy's ceremony.
+
+The docs state the design directly: libraries are similar to contracts, but their purpose is that
+they are deployed only once at a specific address and their code is reused using the `DELEGATECALL`
+feature of the EVM — `CALLCODE` until Homestead — which means that if library functions are called
+their code is executed in the context of the calling contract, `this` points to the calling contract,
+and the storage of the calling contract can be accessed.<Cite src="solidity-docs-contracts" />
+
+Only some library functions work that way. An `internal` library function is compiled into the
+calling contract's own bytecode: the docs describe free functions as having their code included in
+all contracts that call them, similar to internal library
+functions.<Cite src="solidity-docs-contracts" /> No frame, no address, no cost beyond the code it
+adds. A `public` or `external` library function is a separate deployed contract reached by
+`DELEGATECALL`. Same keyword, same call syntax, two different machines — and nothing at the call site
+tells you which.
+
+### The placeholder, and what it does to your bytecode
+
+Because the compiler does not know where the library will be deployed, the compiled hex contains
+placeholders of the form `__$30bbc0abd4d6364515865950d3e0d10953$__`, and such bytecode is incomplete
+and should not be deployed.<Cite src="solidity-docs-contracts" /> The placeholder is a 34-character
+prefix of the hex encoding of the keccak256 hash of the fully qualified library name — the path of
+its source file and the library name separated by a colon, such as
+`libraries/bigint.sol:BigInt`.<Cite src="solidity-docs-contracts" /><Cite src="solidity-docs-using-the-compiler" />
+The bytecode file also carries `// <placeholder> -> <fq library name>` lines at the end so you can
+tell which placeholder is which, and `solc` can act as the linker via
+`--libraries "file.sol:Math=0x1234..."`, either on the command line or from a
+file.<Cite src="solidity-docs-using-the-compiler" />
+
+Three consequences follow that are easy to miss until they bite:
+
+**The artefact you compiled is not the artefact you deployed.** Linking rewrites bytes. Any process
+that hashes or compares deployed bytecode — source verification, a reproducible-build check, a
+bytecode diff between environments — has to account for the link map, and two deployments of the same
+source with different library addresses are genuinely different code.
+
+**A `CREATE2` address depends on the link map.** The address is derived from the deployer, the salt
+and the hash of the initcode.<Cite src="eip-1014" /> Link to a different library address and the
+initcode hash changes and so does the address. "Same source, same salt, same address everywhere" is
+false the moment a library is linked in.
+
+**Contract A and contract B can be running different library code.** They were linked separately.
+Upgrading a library means redeploying it and relinking every consumer, which is a deployment process,
+not a transaction.
+
+### Call protection, and the compiler's answer to "am I being delegatecalled?"
+
+The second lesson left a question open: Solidity gives you no keyword for detecting whether your code
+is executing in someone else's context. The compiler needed the same thing for libraries, and its
+answer is a concrete piece of machinery worth reading.
+
+If a library's code is executed using a `CALL` instead of a `DELEGATECALL` or `CALLCODE`, it reverts
+unless a `view` or `pure` function is called. The EVM does not provide a direct way for a contract to
+detect whether it was called using `CALL`, but a contract can use the `ADDRESS` opcode to find out
+where it is currently running, and the generated code compares this address to the address used at
+construction time. More specifically, the runtime code of a library always starts with a push
+instruction, which is a zero of 20 bytes at compilation time; when the deploy code runs, this
+constant is replaced in memory by the current address and the modified code is stored in the
+contract. At runtime this causes the deploy-time address to be the first constant pushed onto the
+stack, and the dispatcher compares the current address against it for any non-`view` and non-`pure`
+function.<Cite src="solidity-docs-contracts" />
+
+<Figure
+  caption="The compiler's answer to 'am I being delegatecalled' is a constant it writes into its own code at deployment time."
+  alt="A library's runtime code is compiled with a twenty-byte zero push; the deploy code replaces that constant with the library's own address before storing the code. At runtime the dispatcher compares ADDRESS against the constant: a match means the library was reached by CALL and it reverts, while a difference means it was reached by DELEGATECALL and the body runs in the caller's context."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'c', label: 'compile', note: 'the runtime code opens with a zero push', col: 0 },
+      { id: 'd', label: 'deploy', note: 'the push is patched to the real address', col: 1, tone: 'accent' },
+      { id: 'r', label: 'a call arrives', note: 'compare ADDRESS with that constant', col: 2 },
+      { id: 'same', label: 'they match', note: 'reached by CALL', col: 3, tone: 'danger' },
+      { id: 'diff', label: 'they differ', note: 'reached by DELEGATECALL', col: 3, tone: 'good' },
+      { id: 'rev', label: 'revert', note: 'unless view or pure', col: 4, tone: 'danger' },
+      { id: 'run', label: 'the body runs', note: 'in the caller storage', col: 4, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'c', to: 'd' },
+      { from: 'd', to: 'r' },
+      { from: 'r', to: 'same' },
+      { from: 'r', to: 'diff' },
+      { from: 'same', to: 'rev', tone: 'danger' },
+      { from: 'diff', to: 'run', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+And then the sentence that catches people out: this means the actual code stored on chain for a
+library is different from the code reported by the compiler as
+`deployedBytecode`.<Cite src="solidity-docs-contracts" />
+
+That is the whole primitive. Record your own address at construction; compare `ADDRESS` against it at
+runtime; they differ exactly when your code is running in someone else's account. UUPS
+implementations do the same thing by hand to refuse direct calls, and the reason is identical.
+
+### The restrictions, and the one that is not enforced
+
+Libraries cannot have state variables, cannot inherit nor be inherited, cannot receive Ether, and
+cannot be destroyed.<Cite src="solidity-docs-contracts" /> A library can only access state variables
+of the calling contract if they are explicitly supplied, because it would otherwise have no way to
+name them.<Cite src="solidity-docs-contracts" /> That last clause is the same fact as the whole of
+lesson two, stated from the library's side: without an explicit storage pointer, there are no names,
+only numbers.
+
+Two more that matter in practice. External calls to public or external library functions use a
+calling convention considered internal to Solidity and *not* the same as the regular contract ABI —
+signatures for the four-byte selector are computed following an internal naming schema, and arguments
+of types not supported in the contract ABI use an internal encoding, which is what allows library
+external functions to take recursive structs and storage
+pointers.<Cite src="solidity-docs-contracts" /> A tool that decodes library calls with a standard ABI
+decoder will get them wrong.
+
+And the enforcement gap from the fourth lesson, restated where it belongs: for library `view`
+functions `DELEGATECALL` is used, because there is no combined `DELEGATECALL` and `STATICCALL`, so
+library view functions do not have run-time checks that prevent state
+modifications.<Cite src="solidity-docs-contracts" /> Combine that with link-time address substitution
+and the shape of the risk is clear — a `view` call into a library at an address supplied at
+deployment is an unchecked `DELEGATECALL` into your own storage.
+
+<Aside kind="note">
+Transient storage inside libraries has its own rules today: because references to transient storage
+variables are not currently supported under `DELEGATECALL`, they cannot be passed into library calls,
+and access to transient storage inside a library is only possible using inline
+assembly.<Cite src="solidity-docs-contracts" /> Worth knowing before you try to put a shared guard in
+a library.
+</Aside>
+
+## Part three: what "is this a contract" means now
+
+You have already been through the general case: `msg.sender == tx.origin` still proves key control
+because EIP-3607 forbids transactions from senders with deployed code and EIP-7702 relaxed that only
+for valid delegation designators, while `code.length == 0` is unsound in both
+directions.<Cite src="eip-3607" /><Cite src="eip-7702" /> That is not this section. This section is
+the part that only appears once delegatecall is in the picture.
+
+**`address(this).code` reads the proxy, not the implementation.** Inside delegatecalled code,
+`address(this)` is the caller's account, so every language-level query about "my code" —
+`address(this).code.length`, `address(this).codehash` — describes the proxy's runtime bytecode. The
+code actually executing is the implementation's, and Solidity exposes no member for it. Reaching it
+requires `assembly { codesize() }`. Two questions that read identically in source, answered by two
+different accounts.<Cite src="solidity-docs-global-vars" />
+
+**A delegated EOA makes three different code fields relevant at once.** The account carries a 23-byte
+designator, so `EXTCODESIZE` on it returns 23; the code that runs is the designated contract's; and
+when that contract's code executes, `address(this)` is the EOA.<Cite src="eip-7702" /> A library
+routine asking "does this address have code" is now asking a question with three possible intended
+meanings and one available answer.
+
+**The "brick the library" attack is largely historical, twice over.** Since EIP-6780, `SELFDESTRUCT`
+only removes code when it is executed in the same transaction as the contract's creation; otherwise
+it moves the balance and leaves the code in place.<Cite src="eip-6780" /> And libraries specifically
+have been undestroyable at the language level since 0.4.20, when they gained a mechanism disallowing
+state-modifying functions from being called directly.<Cite src="solidity-docs-contracts" /> The 2017
+Parity multisig incident remains the canonical teaching story and is no longer the live threat it
+describes.
+
+The consequence for reviewing an upgradeable system is that "the source is verified" now covers four
+separate artefacts: the proxy's bytecode, the implementation's bytecode, the link map for any
+libraries either of them uses, and — for any EOA in the flow — a delegation designator that can be
+changed by a signature at any time. The chain commits to bytecode. Every one of those four is a place
+where the bytecode and the source you read can diverge without anybody lying.
+
+<Check type="explain" concept="proxy-storage-slots">
+You are reviewing a protocol before an upgrade. Three facts are on the table:
+
+1. The implementation uses `contract Vault layout at erc7201("acme.vault.v1")`, and the proposed v2
+   changes the namespace string to `"acme.vault.v2"` because the team added fields and wants a clean
+   slate.
+2. The implementation links a `public` library `RiskMath` at an address recorded in the deploy
+   script.
+3. A helper inside the implementation guards a privileged path with
+   `require(msg.sender.code.length == 0, "EOA only")`.
+
+For each, say what breaks, and what you would ask for instead.
+
+<Answer>
+**One: changing the namespace string abandons the existing state, silently.**
+
+The base slot is `keccak256(keccak256(id) - 1) & ~0xff`, so a different `id` is a different, unrelated
+region of storage.<Cite src="eip-7201" /><Cite src="solidity-docs-global-vars" /> The v1 data is not
+migrated and it is not deleted — it is still sitting at the v1 root, unreachable by any v2 code path.
+Every balance reads zero. Every configuration reads its type's default. Nothing reverts, because
+reading an unwritten slot is a legitimate read of zero.
+
+"A clean slate" is a coherent thing to want for a *new* deployment and never for an upgrade behind a
+live proxy. Ask for: the namespace string held constant across versions, new fields appended inside
+the existing namespace, and a `storageLayout` diff between v1 and v2 in CI as the gate. If the team
+genuinely needs a second region, it should be an *additional* namespace, not a replacement — that is
+what namespaces are for.
+
+**Two: the library address is part of the deployed bytecode, and nothing on chain proves which one.**
+
+Linking substitutes the address into the placeholder, so the implementation's deployed bytecode
+differs from the compiler's output and differs between environments with different library
+addresses.<Cite src="solidity-docs-contracts" /><Cite src="solidity-docs-using-the-compiler" /> Two
+practical consequences to raise. Verification and any reproducible-build check must pin the link map,
+or a byte-for-byte comparison against a fresh compile will fail for a legitimate reason and mask a
+failure for an illegitimate one. And if the deployment uses `CREATE2` for a deterministic address, the
+address depends on the initcode hash and therefore on the linked library address, so "same address on
+every chain" does not survive a different link map.<Cite src="eip-1014" />
+
+The one to raise loudest: a `public` library function is reached by `DELEGATECALL` into the linked
+address, and if any of them is `view`, there is no runtime check preventing state
+modification.<Cite src="solidity-docs-contracts" /> Ask what governs that address, whether it is
+immutable after deployment, and whether `RiskMath` could be `internal` instead — inlining it removes
+the address, the link step and the delegatecall together.
+
+**Three: the guard is unsound in both directions and, behind a proxy, is asking the wrong question
+anyway.**
+
+It admits a contract calling from its own constructor, whose code length is zero, and it rejects an
+ordinary user who has delegated their EOA under EIP-7702, whose code length is
+23.<Cite src="eip-7702" /> That is the general form you have already met. The delegatecall-specific
+addition is that `msg.sender` here is *whoever called the proxy*, propagated unchanged — so this
+check is examining the end user's account, not the proxy, and a reviewer skimming the implementation
+in isolation can easily read it as a check on the caller of the implementation.
+
+Ask what property the guard was protecting. If the answer is "not a contract", there is no sound
+version and the requirement has to change. If it is reentrancy, use a guard — a transient one costs
+about 284 gas of overhead against roughly 3,100 to 7,100 for a storage guard depending on whether the
+slot is cold or warm.<Cite src="measured-gas-constants" /> If it is flash-loan atomicity, no on-chain
+check has ever provided it.
+
+**The thread through all three.** Each is a place where the source and the deployed reality can
+diverge with nobody at fault: a string that names a storage region, an address baked into bytecode
+after compilation, and a check whose meaning was changed by a network upgrade. Reviewing upgradeable
+systems is mostly the discipline of listing those divergence points and asking, for each, what
+artefact would prove the two sides agree.
+</Answer>
+</Check>
+
+## What this module leaves you with
+
+The artefact worth keeping is the context table — what `CALL`, `DELEGATECALL` and `STATICCALL` do to
+`address(this)`, `msg.sender`, `msg.value`, the storage being written, and what side effects are
+permitted. The module's reflection prompt asks you to write it from memory, and that is a reasonable
+bar: it is five rows, it is the same five rows every time, and almost every question in this module
+reduces to reading one cell of it.
+
+The habits are smaller and matter more day to day. When you read a call site, ask which of the four
+call shapes it is before you ask what it does. When you read `success`, ask what it would be if the
+target held no code. When you read a low-level call's `bytes memory`, ask who chose its size. When
+you read a state-variable declaration in an implementation contract, ask what slot it lands in and
+what else has ever been written there.
+
+**Where this pays off next.** The errors and events module designs the byte strings this module taught
+you to bubble. The contract patterns module puts checks-effects-interactions and pull payments on top
+of the call semantics established here. The proxies module takes the storage discipline from this
+lesson and turns it into three named patterns with three different failure modes. And the security
+track catalogues the incidents — access control first, by value, and proxy-admin mistakes are a
+subset of access control rather than a category of their own.
+
+One last framing, because it is the sentence that keeps the whole module in place: there is no
+function call across contracts. There is a message, a frame, and a set of choices about which parts
+of your context that frame inherits. Every proxy, every library, every account delegation and every
+integration bug in this module is one of those choices, made deliberately or made by default.

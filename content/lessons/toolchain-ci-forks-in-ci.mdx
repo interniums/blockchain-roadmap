@@ -1,0 +1,334 @@
+---
+id: toolchain-ci-forks-in-ci
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [foundry-toolchain-action, foundry-ci, foundry-fork-testing, foundry-troubleshooting, github-actions-using-secrets, github-actions-security-hardening, github-actions-cache, foundry-testing-config, measured-forge-1-7-1, forge-test-reference]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+A forked test suite is the only part of a contract pipeline that costs money per run and depends on a
+machine you do not own. Both of those turn into CI problems that have nothing to do with your
+contracts: an RPC bill that scales with commit volume, and a security boundary that silently deletes
+your endpoint for exactly the contributors you most want to help.
+
+This lesson is those two problems and the one mechanism that sits between them — the cache — plus the
+reason the cache quietly stops working the moment you add a fuzz test.
+
+## What the cache actually holds
+
+Fork testing works by lazy fetch: the local EVM runs normally until it needs state it does not have,
+then issues an RPC call for that account or that slot and remembers the answer.<Cite src="foundry-fork-testing" />
+A forked suite is therefore not one request. It is hundreds or thousands of small state reads, which
+is why a broad forked suite can exhaust a free-tier budget or start collecting 429s.
+
+Foundry persists those answers on disk, and the toolchain action can persist that directory between
+CI runs. The action's `cache` input defaults to `true` and covers `~/.foundry/cache` — described as
+holding "RPC responses, Etherscan queries, and other data".<Cite src="foundry-toolchain-action" />
+
+The two remaining inputs are the ones nobody reads, and they are where the behaviour lives:<Cite src="foundry-toolchain-action" />
+
+| Input | Default |
+|---|---|
+| `cache-key` | `${{ github.job }}-${{ github.sha }}` |
+| `cache-restore-keys` | `[${{ github.job }}-]` |
+
+Look at what that pair does on a pull request. The **write** key contains the commit SHA, so it is
+unique to this run and can never be hit by a later one. The **restore** key is a bare prefix, so on a
+miss the runner falls back to the most recent cache written by a job of the same name — typically the
+previous run on this branch, or a run on the default branch.<Cite src="github-actions-cache" /> The
+exact key exists to avoid clobbering; the prefix key is the one that gives you the hit. If you
+override `cache-key` with something stable and forget `cache-restore-keys`, you get a cache that
+never updates. If you override neither, the default behaviour is already correct.
+
+<Aside kind="note">
+**The documentation disagrees with itself about where the RPC responses live, and you do not need to
+resolve it.** Foundry's current fork-testing page gives `~/.foundry/cache/rpc/<chain>/<block>/`,
+while other Foundry documentation surfaced through search gives
+`$HOME/.foundry/cache/<chain id>/<block number>` with no `rpc/` segment — this curriculum's research
+recorded both and picked neither.<Cite src="foundry-fork-testing" /> On the machine this module was
+verified against, the tree that actually appears after a mainnet fork test is
+`~/.foundry/cache/rpc/mainnet/21000000`: the `rpc/` segment is present and the chain appears by
+**name**, not by id.<Cite src="measured-forge-1-7-1" /> Treat that as one observation, not as a
+settled contract — and sidestep it entirely by caching the parent directory `~/.foundry/cache`,
+which is what the toolchain action does by default.<Cite src="foundry-toolchain-action" /> The
+question only arises if you hand-roll `actions/cache` with a narrower `path`, which is a reason not
+to.
+</Aside>
+
+### The cache is keyed on the block, so the block has to be pinned
+
+Whatever the exact path, both candidate layouts agree on the structure: the cached state is filed
+under a chain and a **block number**.<Cite src="foundry-fork-testing" /> That is the whole argument
+for pinning your fork block, restated as an economics problem rather than a determinism one.
+
+A suite that forks at `latest` asks for state at a block that changes every twelve seconds. Every run
+is a fresh directory. The cache is populated perfectly and hit never. Pinning the block — via
+`--fork-block-number`, the `fork_block_number` config key, or the block argument to
+`vm.createSelectFork` — is what makes the second run cheap.<Cite src="foundry-fork-testing" />
+
+There is a second-order benefit worth naming because teams discover it the hard way: a pinned block
+means a forked test that starts failing is telling you about *your* change, not about a governance
+vote that executed on mainnet last night.
+
+<Figure
+  caption="The block number is part of the cache path, which is what turns pinning from a determinism preference into a billing decision."
+  alt="Two fork configurations traced through the cache: a pinned block writes one directory that later runs read, while forking at latest writes a new directory every run that nothing ever reads."
+>
+  <Flow
+    lanes={['the fork', 'the cache directory', 'the next run']}
+    nodes={[
+      { id: 'pin', label: 'pinned block', note: 'the fork_block_number key', col: 0, row: 0, tone: 'good' },
+      { id: 'lat', label: 'fork at latest', note: 'a new block each run', col: 0, row: 1, tone: 'warn' },
+      { id: 'd1', label: 'one directory', note: 'filed by chain and block', col: 1, row: 0, tone: 'good' },
+      { id: 'd2', label: 'a new directory', note: 'filed by chain and block', col: 1, row: 1, tone: 'warn' },
+      { id: 'hit', label: 'hit', note: 'populated once, read after', col: 2, row: 0, tone: 'good' },
+      { id: 'miss', label: 'miss', note: 'populated perfectly, hit never', col: 2, row: 1, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'pin', to: 'd1', tone: 'good' },
+      { from: 'd1', to: 'hit', tone: 'good' },
+      { from: 'lat', to: 'd2', tone: 'warn' },
+      { from: 'd2', to: 'miss', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="warn">
+When a forked test fails in a way that makes no sense — a balance that should exist reading zero, a
+call reverting against a contract you can see on the explorer — the first move is not to debug the
+contract. It is `rm -rf ~/.foundry/cache/rpc`, because a poisoned or partially-written cache is
+indistinguishable from broken state until you delete it.<Cite src="foundry-troubleshooting" /> In CI
+the equivalent is invalidating the cache key. Caching is invisible until it is wrong, and then it is
+invisible in a way that looks exactly like a contract bug.
+</Aside>
+
+## The fuzzer that defeats the cache
+
+Here is the sentence in the toolchain action's own documentation that most teams meet only after
+their RPC bill fails to drop: **"if you are fuzzing in your fork tests, the cache strategy above will
+not work unless you set a fuzz seed."**<Cite src="foundry-toolchain-action" />
+
+The reason is mechanical, and it follows from everything above. The cache is keyed by the requests
+actually issued. Those requests are determined by which code paths executed, which is determined by
+the inputs the fuzzer drew. An unseeded fuzzer draws different inputs each run, so it calls different
+functions, touches different accounts and different storage slots, and asks the RPC for state that
+nothing put in the cache — while the state that *is* in the cache goes unread.
+
+On forge 1.7.1 there is no default seed: `[fuzz]` resolves with `runs = 256` and no `seed`
+key.<Cite src="measured-forge-1-7-1" /> Setting one is either config or a flag:<Cite src="foundry-testing-config" /><Cite src="forge-test-reference" />
+
+```toml
+[profile.ci.fuzz]
+runs = 256
+seed = "0x1"
+```
+
+```console
+$ forge test --fuzz-seed 0x1 --match-path 'test/fork/*'
+```
+
+The cost is real and should be stated plainly rather than buried: **a seeded fuzzer searches the same
+points every time.** It will find the same bugs on run one thousand that it found on run one, and it
+will never find the ones just outside that trajectory. You have traded search coverage for
+reproducibility, which is the right trade for a gating job and the wrong trade for the only fuzzing
+you do. The [budgeting lesson](/c/campaign-tiering) is about giving the unseeded search somewhere
+else to live.
+
+<Misconception
+  belief="Caching makes fork tests in CI deterministic."
+  reality="The cache is keyed by the RPC requests actually issued, and an unseeded fuzzer changes which requests those are. The cache misses, the RPC bill stays, and the results still vary run to run."
+  why="The cache is pictured as a snapshot of the chain at a block — something fixed by the test file. It is closer to a memo table over calls your test happened to make."
+  src="foundry-toolchain-action"
+/>
+
+## The boundary you cannot pin
+
+Foundry's CI page tells you to put your endpoint in repository secrets: "Set `ETH_RPC_URL` in your
+repository secrets. Use your own RPC endpoint or a provider like Alchemy or
+Infura."<Cite src="foundry-ci" /> Correct, and it works — until the first pull request from a fork.
+
+GitHub's documentation states the rule in one line: **"With the exception of `GITHUB_TOKEN`, secrets
+are not passed to the runner when a workflow is triggered from a forked
+repository."**<Cite src="github-actions-using-secrets" />
+
+This is a good boundary. Without it, anyone could open a pull request whose workflow prints your RPC
+key, or your deployer key, into a public log. But it has a consequence a contract repository feels
+sharply: the outside contributor fixing a typo in your vault gets a red pipeline, or a green one that
+skipped the tests that matter, and the failure looks like their fault. Neither outcome is what you
+want from the interaction.
+
+There are exactly three honest designs, and the wrong one is popular.
+
+**Design A — skip loudly, on the trigger.** The fork suite runs only where secrets exist, and says so
+when it does not:
+
+```yaml
+  fork-tests:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { submodules: recursive }
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with: { version: v1.7.1, cache: true }
+      - run: forge test --match-path 'test/fork/*' --fuzz-seed 0x1
+        env:
+          ETH_RPC_URL: ${{ secrets.ETH_RPC_URL }}
+```
+
+The condition is on the *event*, not on whether the secret happens to be empty, so the skip is
+predictable rather than emergent. Pair it with a required status that a maintainer re-runs after
+review, and the contributor sees a skip with a reason instead of a failure with none.
+
+**Design B — move the fork suite off pull requests entirely.** Run it on pushes to the default branch
+and on a schedule. Pull requests get the local suite; the forked suite is a merge-queue or nightly
+concern. This is the right answer when the forked suite is slow enough that nobody was reading it on
+pull requests anyway.
+
+**Design C — `pull_request_target`, and this is the popular wrong one.** That trigger runs the
+workflow *from the base repository* with full secret access, which is exactly why people reach for
+it. GitHub's hardening page is unambiguous about what it costs: "The `pull_request_target` and
+`workflow_run` workflow triggers, when used with the checkout of an untrusted pull request, expose the
+repository to security compromises," and "Workflows that use these triggers must not explicitly check
+out untrusted code, including from pull request forks."<Cite src="github-actions-security-hardening" />
+These workflows "may have repository write access and access to referenced
+secrets."<Cite src="github-actions-security-hardening" />
+
+Read that against what a Foundry job does. `forge test` compiles and executes Solidity from the
+checked-out tree. If the tree is the contributor's, you have granted arbitrary code from an untrusted
+pull request the same environment that holds your RPC key and a writable `GITHUB_TOKEN`. Every
+mitigation people layer on this — checking out only the base, gating on a label, requiring an approval
+— is an attempt to re-establish the boundary the trigger removed, and each one is a thing that can be
+got wrong once.
+
+<Compare
+  axis="Design"
+  columns={[
+    { title: 'A — skip on the trigger', note: 'gate on the event' },
+    { title: 'B — off pull requests', note: 'push and schedule' },
+    { title: 'C — pull_request_target', note: 'the popular wrong one', tone: 'danger' },
+  ]}
+  rows={[
+    { label: 'When does the fork suite run?', cells: ['Only when the branch lives in this repository', 'On pushes to the default branch and on a schedule', 'On every pull request, forks included'] },
+    { label: 'What does a fork contributor get?', cells: ['A skip with a reason attached', 'The local suite, and nothing else', 'A full green run'] },
+    { label: 'Whose code runs beside the RPC key?', cells: ['Yours', 'Yours', "The contributor's tree, compiled and executed"] },
+    { label: 'What is left to do by hand?', cells: ['A maintainer re-runs the suite from a branch after reading the diff', 'Somebody has to read a result nobody is waiting on', 'Every mitigation that re-establishes the boundary the trigger removed'] },
+  ]}
+  caption="Two of these keep the boundary GitHub drew and pay for it with a manual step; the third removes the boundary and then rebuilds it by hand."
+  alt="Three designs for fork pull requests compared — skipping the fork suite on the trigger, moving it off pull requests entirely, and pull_request_target — across when the suite runs, what a fork contributor sees, whose code runs beside the RPC key, and what is left to do by hand."
+/>
+
+<Misconception
+  belief="Use `pull_request_target` so outside contributors' fork tests get the RPC key."
+  reality="It runs with the base repository's secrets and potentially write access. Combined with checking out the pull request's code — which is exactly what makes it useful — it hands untrusted Solidity and untrusted config the credentials you were protecting."
+  why="It is presented as the trigger for 'pull requests that need secrets', and the failure is invisible: it works perfectly until someone uses it deliberately."
+  src="github-actions-security-hardening"
+/>
+
+<Check type="spot-bug" concept="fork-pr-secrets">
+A maintainer is tired of fork pull requests going red, and ships this:
+
+```yaml
+on:
+  pull_request_target:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge test -vvv
+        env:
+          ETH_RPC_URL: ${{ secrets.ETH_RPC_URL }}
+```
+
+It works. Fork pull requests now run the full forked suite and go green. Say what has been granted to
+whom, name the two lines that do it, and give a version that keeps the useful property.
+
+<Answer>
+**What has been granted.** Anyone on the internet can now run arbitrary code inside this repository's
+job with `secrets.ETH_RPC_URL` in the environment and a `GITHUB_TOKEN` issued for the base
+repository.<Cite src="github-actions-security-hardening" /> They do not need to attack the contract.
+They open a pull request that edits `foundry.toml`, `remappings.txt`, a test file, or any of the
+Solidity the runner compiles and executes, and read the secret out.
+
+**The two lines.** `on: pull_request_target` supplies the secrets that
+`on: pull_request` would have withheld.<Cite src="github-actions-using-secrets" /> The `ref:` on the
+checkout, pointing at the pull request's head SHA, supplies the untrusted code. Either alone is
+defensible; together they are the exact combination GitHub's guidance says must not be
+used.<Cite src="github-actions-security-hardening" />
+
+**Why it is hard to spot in review.** Nothing here is obscure syntax, and the diff reads as "make CI
+work for contributors". The failure mode produces no error, no warning and no red check — it produces
+a green pipeline, which is the outcome the change was made to get.
+
+**A version that keeps the useful property.** The useful property is "a contributor gets a clear
+result", not "a contributor's code touches my key". Split the suite:
+
+```yaml
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:                         # runs for everyone, no secrets needed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { submodules: recursive }
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with: { version: v1.7.1 }
+      - run: forge test --no-match-path 'test/fork/*'
+
+  fork-tests:                   # runs where secrets legitimately exist
+    if: github.event.pull_request.head.repo.full_name == github.repository
+      || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { submodules: recursive }
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with: { version: v1.7.1, cache: true }
+      - run: forge test --match-path 'test/fork/*' --fuzz-seed 0x1
+        env:
+          ETH_RPC_URL: ${{ secrets.ETH_RPC_URL }}
+```
+
+Three things to notice. Path filtering does the separation, so the split is visible in the repository
+layout rather than only in the workflow.<Cite src="forge-test-reference" /> `cache: true` and the
+pinned seed are on the fork job only, because they are the job with an RPC bill.<Cite src="foundry-toolchain-action" />
+And the fork job also runs on `push`, so the default branch stays covered and — because a
+default-branch cache is readable from other branches — that run is what warms the cache every later
+pull request restores from.<Cite src="github-actions-cache" />
+
+**What you have accepted.** An outside contributor's pull request is checked by the local suite only.
+That is a real gap, and the mitigation is procedural rather than technical: a maintainer who has read
+the diff re-runs the forked suite from a branch in the repository. The boundary stays where GitHub
+put it, and a human is the thing that crosses it.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** is about a gate that measures gas, and it inherits a constraint from this one: a
+gas number is only comparable across runs if the calls that produced it were the same calls. The
+seeded-fuzzer trade-off you just accepted for cache hits turns out to be a prerequisite for a gas diff
+that means anything.
+
+**The last lesson in this module** picks the seed argument back up from the other side and asks where
+the *unseeded* search should live, given that it cannot live on the critical path.
+
+**The transferable rule** is that caching and randomness are adversaries. Any cache keyed on
+observed behaviour — an RPC cache, a build cache keyed on inputs, a memoised test fixture — is
+defeated by a component that deliberately varies its behaviour. When a cache does not pay off, look
+for the randomness before you look at the key.

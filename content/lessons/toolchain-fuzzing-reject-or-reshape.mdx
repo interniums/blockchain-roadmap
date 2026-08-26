@@ -1,0 +1,436 @@
+---
+id: toolchain-fuzzing-reject-or-reshape
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [foundry-cheatcode-assume, foundry-testing-config, foundry-forge-testing, forge-std-repo, forge-std-stdutils-source, foundry-cheatcodes-overview, measured-fuzz-probe-1-7-1, measured-forge-1-7-1]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Two tests. Same property, same range, same 256 runs, both green.
+
+```solidity
+function testFuzz_AssumeRange(uint256 x) public pure {
+    vm.assume(x >= 1e18 && x <= 2e18);
+    console.log(x);
+}
+
+function testFuzz_BoundRange(uint256 x) public pure {
+    x = bound(x, 1e18, 2e18);
+    console.log(x);
+}
+```
+
+Run both on forge 1.7.1 with `--fuzz-seed 42` and `show_logs` on, then count what each one actually
+saw:<Cite src="measured-fuzz-probe-1-7-1" /><Cite src="measured-forge-1-7-1" />
+
+<Matrix
+  numeric
+  cols={['runs', 'distinct values tested', 'runs at exactly 1e18', 'runs at exactly 2e18']}
+  rows={[
+    { label: 'vm.assume(x >= 1e18 && x <= 2e18)', cells: ['256', { v: '7', tone: 'danger' }, '129', '122'] },
+    { label: 'bound(x, 1e18, 2e18)', cells: ['256', { v: '192', tone: 'good' }, '19', '9'] },
+  ]}
+  caption="Both lines report 256 runs; one of them spent 251 of those runs on two values."
+  alt="Measured on forge 1.7.1 with fuzz seed 42: the vm.assume version completes 256 runs over 7 distinct values, 129 of them at exactly 1e18 and 122 at exactly 2e18. The bound version completes 256 runs over 192 distinct values, 19 at 1e18 and 9 at 2e18."
+/>
+
+The `assume` version reports 256 runs and tested seven values. Two hundred and fifty-one of its 256
+runs were one of the two endpoints. It has the coverage of a two-case unit test and the output of a
+fuzz campaign, and nothing in the terminal distinguishes it from the version underneath.
+
+This lesson is about why that happens, why it is not the failure mode the folklore warns about, and
+what to write instead.
+
+<Figure
+  caption="Only one of these paths turns every draw into coverage; the other discards draws and reports the same run count either way."
+  alt="A drawn value reaches either vm.assume, which discards the run when the condition is false and lets it proceed when true, or bound, which maps the value into range so that every draw becomes one of the 256 runs."
+>
+  <Flow
+    nodes={[
+      { id: 'v', label: 'a value is drawn', col: 0 },
+      { id: 'a', label: 'vm.assume', note: 'is it in range?', col: 1, tone: 'warn' },
+      { id: 'b', label: 'bound', note: 'map it into range', col: 1, tone: 'accent' },
+      { id: 'rej', label: 'run discarded', note: 'no coverage; draw again', col: 2, tone: 'danger' },
+      { id: 'run', label: 'the run proceeds', note: 'one of the 256', col: 2 },
+    ]}
+    edges={[
+      { from: 'v', to: 'a' },
+      { from: 'v', to: 'b' },
+      { from: 'a', to: 'rej', label: 'false', tone: 'danger', dashed: true },
+      { from: 'a', to: 'run', label: 'true' },
+      { from: 'b', to: 'run', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+## `assume` filters by retrying
+
+The cheatcode's own documentation gives the mechanism in one sentence: if the boolean expression
+evaluates to false, the fuzzer will discard the current fuzz inputs and start a new fuzz
+run.<Cite src="foundry-cheatcode-assume" />
+
+Read *discard* literally. `vm.assume` does not tell the generator to produce values in a range. The
+generator has already produced a value, the run has already started, and the cheatcode throws the
+whole thing away and asks for another one. It is rejection sampling, bolted on after generation.
+
+Three consequences follow directly, and they are the entire content of the technique:
+
+- **A rejected run produces no coverage.** It executed up to the assume and then vanished. It does
+  not count toward `runs:`.
+- **The cost of a constraint is the reciprocal of its acceptance rate.** Accepting one draw in a
+  hundred means a hundred draws per useful run.
+- **The runs that survive are not a random sample of the accepted region.** They are a random sample
+  *of the generator's output*, filtered. If the generator is biased toward some values inside your
+  range — and you know from the previous lesson that it is — the filter concentrates that bias
+  instead of correcting it.
+
+That third point is the one nobody teaches, and it is what the table at the top of this lesson is
+measuring.
+
+## `bound` reshapes instead
+
+`bound(x, min, max)` comes from forge-std's `StdUtils` and does the other thing: it maps an arbitrary
+input into the range. Every generated value produces a real run. Nothing is thrown
+away.<Cite src="forge-std-repo" />
+
+It is worth reading the implementation, because two of its branches exist specifically to preserve
+properties you now know to care about:<Cite src="forge-std-stdutils-source" />
+
+```solidity
+function _bound(uint256 x, uint256 min, uint256 max) internal pure virtual returns (uint256 result) {
+    require(min <= max, "StdUtils bound(uint256,uint256,uint256): Max is less than min.");
+    // If x is between min and max, return x directly. This is to ensure that dictionary values
+    // do not get shifted if the min is nonzero.
+    if (x >= min && x <= max) return x;
+
+    uint256 size = max - min + 1;
+
+    // If the value is 0, 1, 2, 3, wrap that to min, min+1, min+2, min+3. Similarly for the
+    // _UINT256_MAX side. This helps ensure coverage of the min/max values.
+    if (x <= 3 && size > x) return min + x;
+    if (x >= _UINT256_MAX - 3 && size > _UINT256_MAX - x) return max - (_UINT256_MAX - x);
+
+    // Otherwise, wrap x into the range [min, max], i.e. the range is inclusive.
+    if (x > max) {
+        uint256 diff = x - max;
+        uint256 rem = diff % size;
+        if (rem == 0) return max;
+        result = min + rem - 1;
+    } else if (x < min) {
+        uint256 diff = min - x;
+        uint256 rem = diff % size;
+        if (rem == 0) return min;
+        result = max - rem + 1;
+    }
+}
+```
+
+**The pass-through branch** returns `x` unchanged when it is already in range, and the comment says
+why: so dictionary values do not get shifted if `min` is
+nonzero.<Cite src="forge-std-stdutils-source" /> If the fuzzer scraped a meaningful constant out of
+your bytecode and it happens to be inside your range, `bound` must not move it, or the previous
+lesson's mechanism is destroyed by the constraint.
+
+**The two small-value branches** map `0, 1, 2, 3` to `min, min+1, min+2, min+3` and the four values
+nearest `type(uint256).max` to the four nearest `max`, with the comment "this helps ensure coverage
+of the min/max values".<Cite src="forge-std-stdutils-source" /> Boundary inputs stay boundary inputs.
+That is the precise reason `bound` is not just `min + x % (max - min + 1)`: plain modulo maps
+`type(uint256).max` to an arbitrary interior value and throws away the most valuable draw the
+generator makes.
+
+**Everything else wraps modulo the size**, which is where the residual bias lives. When the domain
+does not divide evenly by the range, low values are very slightly favoured. For a small range over a
+`uint256` domain the skew is far too small to observe.
+
+<Aside kind="note">
+`bound` reverts on `min > max` with a named message rather than silently swapping the
+arguments.<Cite src="forge-std-stdutils-source" /> That is worth knowing because a `bound` whose
+bounds are themselves derived from fuzzed values is a common shape, and it will fail loudly rather
+than quietly inverting your range.
+</Aside>
+
+## The measurement, with the mechanism isolated
+
+Now put the two together with the dictionary as the third variable, because the whole story only
+makes sense in four cells. Same test, same range `[1e18, 2e18]`, forge 1.7.1, solc
+0.8.36:<Cite src="measured-fuzz-probe-1-7-1" />
+
+<Matrix
+  cols={['dictionary at defaults', 'dictionary disabled']}
+  rows={[
+    { label: 'vm.assume(x >= 1e18 && x <= 2e18)', cells: [{ v: 'PASS, 256 runs, 7 distinct values', tone: 'warn' }, { v: 'FAIL — rejected too many inputs, stopped at 217 runs', tone: 'danger' }] },
+    { label: 'bound(x, 1e18, 2e18)', cells: [{ v: 'PASS, 256 runs, 192 distinct values', tone: 'good' }, { v: 'PASS, 256 runs', tone: 'good' }] },
+  ]}
+  caption="Turning the dictionary off changes the assume version from green to a rejection failure and leaves the bound version untouched — so the green was the dictionary's doing, not the constraint's."
+  alt="A two-by-two measurement on forge 1.7.1. With the dictionary at defaults, vm.assume passes 256 runs over 7 distinct values and bound passes 256 runs over 192. With the dictionary disabled, vm.assume fails with a rejection error at 217 runs and bound still passes 256 runs."
+/>
+
+*Disabled* means `dictionary_weight = 0` with `include_storage` and `include_push_bytes` both
+false.<Cite src="foundry-testing-config" />
+
+**Subgoal 1 — explain the top-left cell.** The literals `1e18` and `2e18` appear in the test's own
+compiled code, so the dictionary proposes them constantly. They are also the only proposals with a
+high chance of surviving a filter that rejects everything outside a band covering roughly 1 in 10^59
+of the domain. The dictionary and the filter are selecting for each other, and the fixed point of
+that loop is the two endpoints.
+
+**Subgoal 2 — explain the top-right cell.** Take the dictionary away and the filter faces raw
+generated values. Almost every draw is rejected, the rejection counter runs out, and the test fails
+with a rejection error before completing 256 runs.
+
+**Subgoal 3 — name what the two cells jointly prove.** The reason the broad `assume` "worked" was
+never that the constraint was reasonable. It was that a mechanism you did not configure was feeding
+it the two values you wrote in the condition. The green result was an artefact.
+
+**Subgoal 4 — read the bottom row.** `bound` is unaffected by either change, because it does not
+filter. It converts every draw into a run, and both the dictionary values and the raw random ones
+land somewhere useful inside the range.
+
+## Rejection failure: what it looks like and how to recognise it
+
+`max_test_rejects` defaults to 65536 and is counted across the whole test, not per
+run.<Cite src="foundry-testing-config" /><Cite src="measured-forge-1-7-1" /> The documentation warns
+about both halves of the outcome: broad checks will slow down tests significantly as the fuzzer
+struggles to find valid values, and the test may fail if you hit the max number of
+rejects.<Cite src="foundry-cheatcode-assume" />
+
+On forge 1.7.1 the failure looks like this:<Cite src="measured-fuzz-probe-1-7-1" />
+
+```text
+[FAIL: `vm.assume` rejected too many inputs (65536 allowed)] testFuzz_Unsatisfiable(uint256) (runs: 0, μ: 0, ~: 0)
+```
+
+Three things to notice, in order of how quickly they will save you time.
+
+**The message names `vm.assume`.** Current Foundry is clearer here than a lot of circulating material
+implies — you are not left guessing. Older write-ups describing a cryptic failure are describing
+older output.
+
+**`runs: 0`.** No run completed. A property violation always reports the run count at which it broke
+and a counterexample; a rejection failure reports zeros and no arguments. That pair is the fastest
+visual tell in the whole test output.
+
+**The number in parentheses is your configured limit**, echoed back. Setting
+`max_test_rejects = 100` produces `(100 allowed)`.<Cite src="measured-fuzz-probe-1-7-1" /> Which
+makes lowering it a genuinely useful diagnostic: if you suspect a constraint is doing more filtering
+than you intended, drop the limit and see whether the test starts failing.
+
+<Misconception
+  belief="An assume that rejects a lot just makes the test slower."
+  reality="Past max_test_rejects — 65536 by default — the test fails outright with a rejection error. And before that point, it can pass while testing a handful of values."
+  why="Rejection is completely invisible in the passing case: the output shows the accepted runs and never mentions the discarded ones."
+  src="foundry-testing-config"
+/>
+
+<Aside kind="warn">
+The dangerous case is not the one that fails. A rejection failure is loud and gets fixed within the
+hour. The case that costs you is the top-left cell of the table above: **a broad `assume` that stays
+under the rejection cap, prints 256 runs, and tests almost nothing.** It will sit in your suite for
+years, and every coverage report will count it.
+</Aside>
+
+## The recommendation is documented, not folklore
+
+This is worth stating explicitly because the opposite pattern is everywhere in tutorials. The
+`vm.assume` reference page itself says: for range constraints, prefer `bound` or the modulo operator
+over `assume`, and that these approaches are much more
+efficient.<Cite src="foundry-cheatcode-assume" /> The same page tells you where the rejection
+threshold is configured.<Cite src="foundry-cheatcode-assume" />
+
+So material that teaches `vm.assume(x > 0 && x < 1e18)` as the standard way to constrain a fuzzed
+amount is teaching a pattern the vendor's own reference discourages, and the measurement above shows
+what it costs.
+
+<Misconception
+  belief="vm.assume is the normal way to constrain a fuzzed input to a range."
+  reality="Foundry's cheatcode reference recommends bound or modulo for ranges and reserves assume for narrow exclusions."
+  why="assume reads like a precondition, it is usually the first fuzzing cheatcode anyone meets, and it produces a green test on the first try — which is exactly why the problem goes unnoticed."
+  src="foundry-cheatcode-assume"
+/>
+
+## What `assume` is still the right tool for
+
+`assume` is not a deprecated cheatcode with a better replacement. It is the correct tool for a
+different job: **excluding a set you can count.**
+
+The canonical case is a fuzzed `address` parameter. The address space is 2^160 and there are a
+handful of addresses that make the test meaningless rather than failing:
+
+```solidity
+function testFuzz_Transfer(address to, uint256 amount) public {
+    vm.assume(to != address(0));
+    vm.assume(to != address(this));
+    vm.assume(to != address(token));
+    vm.assume(to != 0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);   // the cheatcode address
+    amount = bound(amount, 0, token.balanceOf(alice));
+    // ...
+}
+```
+
+Four excluded points out of 2^160. The rejection rate is not merely small, it is unmeasurable, and
+the test spends nothing to get the exclusion. Note that the amount in the same signature is handled
+with `bound`, not `assume` — the two cheatcodes are doing genuinely different jobs in one function,
+and that is the shape to aim for.
+
+That fourth line matters more than it looks.
+[A fuzzed address can land on the cheatcode address](/c/cheatcode-address-in-fuzzing), and a call
+into it gets cheatcode behaviour instead of contract behaviour; the resulting failure reads as a
+contract bug. Foundry's own documentation recommends assuming fuzzed addresses away from
+`0x7109709ECfa91a80626fF3989D68f67F5b1DD12D` alongside the usual exclusions of the zero address and
+the test contract.<Cite src="foundry-cheatcodes-overview" />
+
+**The rule of thumb, stated so you can apply it in review: `assume` is fine when you can count the
+excluded values.** Four addresses, yes. "Not zero", yes. "Between one and a hundred", no — that is
+`bound`. If you cannot write down the excluded set, you are filtering, not excluding.
+
+<Aside kind="note">
+There is one more legitimate use, and it is easy to miss: assuming away a *precondition your
+contract enforces anyway*, so that the test exercises the success path rather than spending runs on
+reverts. `vm.assume(alice.balance >= amount)` before a transfer is really a statement that this test
+is about successful transfers, and there is a separate test about the revert. Prefer to write it as
+`amount = bound(amount, 0, alice.balance)` when the quantity is numeric — but when the precondition
+is a genuine yes/no about state rather than a range, `assume` is the honest expression of it.
+</Aside>
+
+## Worked rewrite
+
+Take a test as it is usually first written and fix it one constraint at a time, naming what each step
+is for.
+
+```solidity
+// before
+function testFuzz_Deposit(address depositor, uint256 amount, uint16 feeBps) public {
+    vm.assume(depositor != address(0));
+    vm.assume(amount > 0 && amount <= 1_000_000e18);
+    vm.assume(feeBps <= 500);
+    vm.prank(depositor);
+    vault.deposit(amount, feeBps);
+    assertEq(vault.totalAssets(), amount - (amount * feeBps) / 10_000);
+}
+```
+
+**Subgoal 1 — separate the exclusions from the ranges.** Line one excludes a single point out of
+2^160: keep it as `assume`. Lines two and three constrain quantities to intervals: those are the ones
+paying rejection cost and, worse, the ones whose surviving values will cluster on `1_000_000e18` and
+`500` because those literals are in the test's own bytecode.
+
+**Subgoal 2 — convert every range to `bound`.** `amount = bound(amount, 1, 1_000_000e18)` and
+`feeBps = uint16(bound(feeBps, 0, 500))`. Both now produce a run for every draw, and `bound`'s
+pass-through and small-value branches keep the interesting values interesting.
+
+**Subgoal 3 — add the exclusions the address parameter actually needs.** A `depositor` that is the
+vault, the test contract, or the cheatcode address will produce failures that are not about your
+contract. Three more countable exclusions.
+
+**Subgoal 4 — check what the type already guarantees, and delete what is redundant.** `feeBps` is
+declared `uint16`, so its domain is 0 to 65,535 before you constrain anything. If the contract's real
+limit is 500, bounding is right. If the contract accepts any `uint16`, the bound is a decision to
+stop testing 99% of the legal range, and that decision belongs in the next lesson rather than being
+made by reflex here.
+
+**Subgoal 5 — read the assertion against the new domain.** With `amount` bounded to `1_000_000e18`
+the expression `amount * feeBps` cannot overflow, so this test can never reach the overflow path.
+That may be correct and deliberate. It is not something you should discover by accident.
+
+```solidity
+// after
+function testFuzz_Deposit(address depositor, uint256 amount, uint16 feeBps) public {
+    vm.assume(depositor != address(0));
+    vm.assume(depositor != address(vault));
+    vm.assume(depositor != address(this));
+    vm.assume(depositor != 0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);
+    amount = bound(amount, 1, 1_000_000e18);
+    feeBps = uint16(bound(feeBps, 0, 500));
+    vm.prank(depositor);
+    vault.deposit(amount, feeBps);
+    assertEq(vault.totalAssets(), amount - (amount * feeBps) / 10_000);
+}
+```
+
+<Check type="spot-bug" concept="bound-preferred-over-assume">
+This test is green in CI and has been for four months. The team believes it demonstrates that the
+staking contract handles every lock duration correctly.
+
+```solidity
+uint256 constant MIN_LOCK = 7 days;
+uint256 constant MAX_LOCK = 365 days;
+
+function testFuzz_RewardScalesWithLock(uint256 amount, uint256 lock) public {
+    vm.assume(amount >= 1e18 && amount <= 1000e18);
+    vm.assume(lock >= MIN_LOCK && lock <= MAX_LOCK);
+    uint256 reward = staking.previewReward(amount, lock);
+    assertGe(reward, staking.previewReward(amount, MIN_LOCK));
+}
+```
+
+Say what this test is actually verifying, and what single output you would look at to confirm your
+diagnosis without changing any code.
+
+<Answer>
+**It is verifying the property at a handful of points, most likely four: the two amount endpoints
+crossed with the two lock endpoints.**
+
+Both constraints are range constraints written as `assume`. `lock` is confined to a window of
+358 days out of a `uint256` domain — an acceptance rate around 1 in 10^69 for raw draws. Almost
+nothing survives the filter except values the dictionary proposes, and the dictionary's supply here
+is exactly the literals present in the compiled code: `1e18`, `1000e18`, `MIN_LOCK` and `MAX_LOCK`,
+which are `PUSH` constants in the test and in the staking
+contract.<Cite src="foundry-testing-config" /><Cite src="measured-fuzz-probe-1-7-1" />
+
+**The output that confirms it, with no code change.** Turn on fuzz logs — `show_logs = true` under
+`[fuzz]`, or `FOUNDRY_FUZZ_SHOW_LOGS=true` — and add nothing but the existing run's `-vv` output on a
+`console.log`. Failing that, the zero-instrumentation version: compare `μ` and `~` on the result
+line. A test genuinely sweeping 358 days of lock durations against a reward curve will show mean and
+median differing, because different durations take different branches of the fee or tier logic. On
+this test they will be identical or near-identical, which is what "every run is one of four inputs"
+looks like from the outside.<Cite src="foundry-forge-testing" />
+
+**The other half of the bug, which is worse than the sampling.** The assertion compares
+`previewReward(amount, lock)` to `previewReward(amount, MIN_LOCK)`. When `lock` is drawn as
+`MIN_LOCK` — which, given the above, is a large share of the runs — the assertion is
+`assertGe(r, r)`. It is vacuously true and always was. A test that is mostly evaluating a tautology
+will not go red no matter what you do to the reward curve.
+
+**The fix, in the order that matters.**
+
+1. `lock = bound(lock, MIN_LOCK, MAX_LOCK)` and `amount = bound(amount, 1e18, 1000e18)`. That alone
+   takes the test from four values to a real sweep, and `bound`'s pass-through branch keeps
+   `MIN_LOCK` and `MAX_LOCK` reachable rather than shifting them
+   away.<Cite src="forge-std-stdutils-source" />
+2. Restate the property so it is not satisfiable by equality alone — for example, take two fuzzed
+   durations, order them with `bound`, and assert the reward for the longer one is at least the
+   reward for the shorter. That is monotonicity, and it has no vacuous case.
+3. Then add a `table` test enumerating `MIN_LOCK`, `MIN_LOCK + 1`, `MAX_LOCK - 1` and `MAX_LOCK`
+   explicitly, so the boundaries are covered by construction instead of by whether the dictionary
+   feels like it. That is the next lesson.
+</Answer>
+</Check>
+
+## The decision, in one line each
+
+- **Range constraint** — `bound`. Always. The documentation says so and the distribution measurement
+  shows why.<Cite src="foundry-cheatcode-assume" />
+- **Countable exclusion** — `assume`. Zero address, the cheatcode address, the test contract, the
+  contracts under test, addresses you have already deployed.
+- **A genuine yes/no about state that is not a range** — `assume`, and check the rejection rate is
+  low by lowering `max_test_rejects` temporarily and seeing whether it still passes.
+- **Values you specifically want tested every time** — neither. That is a fixture, in the next
+  lesson.
+
+## Where this pays off
+
+**The next lesson** turns the question around. You have just learned to write constraints that do not
+waste runs; the next problem is that a *correct* constraint still narrows what the test can find, and
+that the narrowing is invisible in a green result. Clamping, overconstraining, and the fixture
+mechanism that puts known-nasty values back in deliberately.
+
+**In audit and review work.** The measurement at the top of this lesson is the reason a reviewer
+reads a fuzz test's constraints before its assertion. Seven distinct values out of 256 runs is not a
+hypothetical; it is what one plausible line produces, and there is no output that flags it.
+
+**When you meet invariant campaigns.** `max_assume_rejects` is the `[invariant]` analogue of the key
+you just met, and the same reasoning applies to handler functions — a handler that assumes its way
+into a narrow state does to a campaign exactly what the top-left cell of the table does to a fuzz
+test, over a much larger budget.<Cite src="foundry-testing-config" />

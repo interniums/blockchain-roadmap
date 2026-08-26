@@ -1,0 +1,248 @@
+---
+id: fundamentals-state-children-that-are-not-hashes
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [ethereum-org-mpt, execution-specs-mpt, geth-trie-proof, yellow-paper, eip-1186]
+stack: {}
+---
+
+Your trie implementation is finished. It reproduces the reference root for your test set. You point
+it at a different set of keys and the root is wrong — not corrupt, not unparseable, just different.
+Nothing in the code changed.
+
+The overwhelmingly likely cause is the rule in this lesson, and the reason it takes a whole lesson
+is that it contradicts the mental model the word "Merkle" installs.
+
+## Children are not always hashes
+
+In the worked trie from lesson 5, two nodes were written inside their parents rather than as hash
+references. That was not notational convenience. It is the rule:
+
+> A child is referenced by `keccak256(rlp(child))` when `rlp(child)` is 32 bytes or longer. When it
+> is shorter, the parent embeds the child's RLP **literally**.<Cite src="ethereum-org-mpt" />
+
+The executable specification implements exactly this, and states the reason in its own
+documentation: when the serialisation is at least 32 bytes keccak256 is applied so that parents store
+a fixed-size hash, and shorter encodings are returned unhashed and embedded directly into the parent,
+since storing a hash would only waste space.<Cite src="execution-specs-mpt" />
+
+```python
+encoded = rlp.encode(unencoded)
+if len(encoded) < 32:
+    return unencoded          # parent embeds the child verbatim
+else:
+    return keccak256(encoded) # parent stores a 32-byte reference
+```
+
+Note where the boundary sits. The specification tests `< 32` and go-ethereum's proof builder tests
+`>= 32`,<Cite src="execution-specs-mpt" /><Cite src="geth-trie-proof" /> which is the same line drawn
+from opposite sides: a node whose RLP is *exactly* 32 bytes is hashed, not inlined. Off-by-one here
+is a real failure mode, and it is the one your test set is least likely to contain by accident.
+
+<Figure
+  caption="One length test decides three separate things: what the parent holds, whether the child is stored at all, and whether it appears in a proof."
+  alt="A fork on the length of a child's RLP encoding. Under 32 bytes the child is embedded in its parent verbatim, is never written to the database, and never becomes its own proof entry. At 32 bytes or more it is hashed, costs 33 bytes in the parent, and appears as its own entry."
+>
+  <Flow
+    nodes={[
+      { id: 'rlp', label: 'rlp(child)', note: 'measure it', col: 0, tone: 'accent' },
+      { id: 'small', label: 'under 32 bytes', note: 'embedded verbatim', col: 1, row: 0 },
+      { id: 'big', label: '32 bytes or more', note: 'keccak256 of it', col: 1, row: 1 },
+      { id: 'inl', label: 'no entry of its own', note: 'and never stored', col: 2, row: 0 },
+      { id: 'hsh', label: '33 bytes in the parent', note: 'and its own proof entry', col: 2, row: 1 },
+    ]}
+    edges={[
+      { from: 'rlp', to: 'small' },
+      { from: 'rlp', to: 'big' },
+      { from: 'small', to: 'inl' },
+      { from: 'big', to: 'hsh' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="Every child reference in the trie is a 32-byte hash. That is what makes it a Merkle structure."
+  reality="Children whose RLP encoding is under 32 bytes are embedded in the parent verbatim. A branch slot may contain a nested list rather than a hash, and a verifier has to handle both."
+  why="The Merkle framing implies hash-linking everywhere. And on mainnet, small nodes are rare enough that an implementation which always hashes looks correct for a long time before it does not."
+  src="ethereum-org-mpt"
+/>
+
+## Why the rule exists
+
+Because below 32 bytes, the hash is bigger than the thing it points at.
+
+A keccak256 digest is 32 bytes, and RLP-encoding a byte string of that length adds a one-byte length
+prefix, so a hash reference costs 33 bytes on the wire.<Cite src="yellow-paper" /> A child whose
+entire RLP encoding is, say, 16 bytes would be replaced by a 33-byte pointer to itself. You would
+have doubled the size *and* added a database lookup to follow it.
+
+The rule also removes storage work. Nodes at or above the threshold have to go into the client's
+key-value store under their hash so they can be fetched later. Nodes below it do not need storing at
+all — they are already present in their parent, and the identity function is trivially
+reversible.<Cite src="ethereum-org-mpt" />
+
+<Aside kind="note">
+This is why the threshold is a comparison against 32 rather than some tuned constant. It is not a
+performance heuristic somebody benchmarked. It is the point at which indirection stops paying for
+itself, fixed by the digest size.
+</Aside>
+
+## What it means for a verifier
+
+When you walk a proof and read a child reference, you have to look at what you got.
+
+If the slot holds 32 bytes, it is a hash: the next node in your proof list should hash to it, and
+you check that. If the slot holds a list, the child is *right there* — no lookup, no hash check,
+because there is nothing to fetch and no reference to verify. Decode it and keep walking.
+
+The canonical documentation's lookup routine makes the branch explicit: it decodes the reference
+directly when it is under 32 bytes, and otherwise treats it as a database key.<Cite src="ethereum-org-mpt" />
+
+```python
+curnode = rlp.decode(node_hash if len(node_hash) < 32 else db.get(node_hash))
+```
+
+A verifier that assumes "32 bytes, always" will try to fetch a nested list as if it were a hash, and
+fail on a proof that is perfectly valid.
+
+### The consequence that surprises people: the proof array is shorter than the path
+
+This is the part that connects the rule to something you can observe, and it is the reason to learn
+it before lesson 9 rather than after.
+
+A proof is delivered as a flat array of RLP-encoded nodes.<Cite src="eip-1186" /> go-ethereum builds
+that array by walking the path, collecting every node it passes, and then writing out only some of
+them — its condition is `len(enc) >= 32 || i == 0`.<Cite src="geth-trie-proof" /> Two rules in one
+line:
+
+**An inlined node never appears as its own entry.** It is already inside the bytes of its parent, so
+emitting it separately would be duplicate data, and a verifier that expected one array entry per
+level would be looking for a node that does not exist as an entry.
+
+**The root is always emitted, even when it is short.** That is the `i == 0` clause, and it is there
+because a tiny trie's root has no parent to be embedded in — the case lesson 5's arithmetic rules out
+for account proofs and lesson 8 handles in general.
+
+So the array length is *not* the depth of the walk. A verifier written as a `for` loop over the array
+that assumes each iteration descends exactly one level is wrong on any proof containing an inlined
+node, and correct on every account proof you are likely to have tested with.
+
+<Figure
+  caption="Four nodes on the walk, three entries in the array — the last one arrives inside the third."
+  alt="A four-level walk through a storage trie: a branch, an extension and a second branch each become their own entry in the proof array, while the final five-byte leaf is embedded in the branch above it and never appears as a separate entry."
+>
+  <Flow
+    lanes={['level 1', 'level 2', 'level 3', 'level 4']}
+    nodes={[
+      { id: 'b1', label: 'branch', note: 'proof entry 1', col: 0 },
+      { id: 'e', label: 'extension', note: 'proof entry 2', col: 1 },
+      { id: 'b2', label: 'branch', note: 'proof entry 3', col: 2 },
+      { id: 'l', label: 'leaf, 5 bytes', note: 'inlined — no entry', col: 3, tone: 'accent', dashed: true },
+    ]}
+  />
+</Figure>
+
+## Where you will actually meet an inlined node
+
+It helps to know which situations put a node under the threshold, because those are the ones your
+tests need to contain.
+
+**A short remaining path with a short value.** A leaf is `[encodedPath, value]`. Work the arithmetic
+on a plausible storage leaf: three remaining nibbles hex-prefix-encode to two bytes, which RLP to
+three; a value of `1` RLP-encodes to the single byte `0x01`.<Cite src="yellow-paper" /> Payload four
+bytes, list header one byte, **five bytes total** — a sixth of the threshold. Inlining here is not an
+edge case, it is the ordinary outcome.
+
+**Storage tries holding small numbers.** Booleans, counters, small enums, addresses of zero. Combine
+any of them with a short remaining path and inlining is the normal case rather than the exception.
+
+**Transaction and receipt tries near the start of a block.** Keys there are `rlp(index)` — one or two
+bytes — so remaining paths are short by construction.<Cite src="execution-specs-mpt" />
+
+**Small tries generally**, including almost every hand-built test fixture. This is the trap: your
+test data is exactly the data that exercises the rule, and mainnet-sampled data is exactly the data
+that hides it. The two failure modes point in opposite directions depending on which you used.
+
+The account leaves of the world-state trie are the reliable counterexample. Lesson 5 counted the
+bytes: two 32-byte hashes inside the account record put the leaf over 70 bytes even for the emptiest
+account that can exist,<Cite src="execution-specs-mpt" /> so every node in an account proof is a hash
+reference. Which is precisely why testing only against account proofs proves nothing about this rule.
+
+## The root is always hashed
+
+One special case, because it is the kind of thing that produces an off-by-one root.
+
+If the entire trie is small enough that the root node's RLP is under 32 bytes, the rule above says
+it would be embedded — but there is no parent to embed it in. The specification handles this by
+hashing it anyway: if `rlp(root_node)` is under 32 bytes, the root is `keccak256(rlp(root_node))`;
+otherwise the root node has already been reduced to its hash and that is the
+root.<Cite src="execution-specs-mpt" />
+
+Either way, a state root is always 32 bytes. Header fields have fixed widths and the trie does not
+get to be an exception. go-ethereum's proof builder carries the mirror image of the same special
+case — the root is written into the proof unconditionally.<Cite src="geth-trie-proof" />
+
+<Check type="spot-bug" concept="mpt-child-reference-rule">
+An engineer implements the trie and, for simplicity, always hashes children:
+
+```python
+def child_ref(node):
+    return keccak256(rlp.encode(node))   # no length check
+```
+
+They test it against a reference implementation using 500 randomly generated accounts from mainnet
+and every root matches. They ship it. Later it breaks.
+
+Two questions. Why did the test pass? And what kind of input makes it fail?
+
+<Answer>
+**The test passed because mainnet account leaves are almost never under 32 bytes.**
+
+An account value is `rlp([nonce, balance, storageRoot, codeHash])`.<Cite src="execution-specs-mpt" />
+The storage root and the code hash are 32 bytes each, so the encoded account is comfortably over the
+threshold on its own — over 70 bytes even at its emptiest, as lesson 5 counted — and a leaf node
+wrapping it is larger still. Every node in a randomly sampled state trie is a hash reference, so the
+missing length check never fires. The test set was drawn from exactly the distribution where the bug
+is invisible.
+
+**It fails wherever a node's RLP comes out under 32 bytes**, which means short paths and small
+values. Concretely:
+
+- **Storage tries.** A slot holding a small integer is a short value, and a leaf holding a short
+  value with a short remaining path can encode to five or six bytes. Any contract with a compact,
+  sparsely-populated storage trie can trigger it.
+- **Transaction and receipt tries** early in a block, where keys are `rlp(index)` — one or two bytes
+  — and remaining paths are correspondingly tiny.<Cite src="execution-specs-mpt" />
+- **Any small test trie**, including the four-key `do`/`dog`/`doge`/`horse` example, which contains
+  two inlined nodes.<Cite src="ethereum-org-mpt" /> Ironically the toy example would have caught this
+  and the realistic sample did not.
+
+The symptom is the worst kind: a root that is wrong for some inputs and right for others, with no
+exception and no parse failure anywhere. The logical key-value set is identical; only the encoding
+of the structure differs.
+
+There is a second, quieter defect in the same function that no root comparison can catch, because it
+only shows up when this code is asked to produce a *proof*. Since it never inlines, it will also
+never learn the corresponding output rule — that an inlined child is not a separate proof
+entry.<Cite src="geth-trie-proof" /> A verifier built on the same assumption will reject honest
+storage proofs from real clients while accepting its own.
+
+The general lesson is about test-set selection. Sampling from production data tests the common case
+by construction. Rules with thresholds need inputs chosen to sit on both sides of the threshold —
+here, at minimum one node whose RLP is 31 bytes, one whose RLP is 32, and one whose RLP is 33.
+</Answer>
+</Check>
+
+## Where this pays off
+
+Two places, immediately. Lesson 8 argues that a root hash is a pure function of the key-value set —
+and this threshold is one of the choices that had to be nailed down for that to be true, since an
+implementation free to inline or not would produce two valid roots for one set of data.
+
+And lesson 9's proof verifier has to implement both halves of the branch above: skip the hash check
+when the reference is an inlined node, and do not expect that node to have its own entry in the
+array.<Cite src="geth-trie-proof" /> Every production verifier — in a light client, in a bridge
+contract reading another chain's storage — contains this check, and a verifier missing it rejects
+honest proofs it should accept.

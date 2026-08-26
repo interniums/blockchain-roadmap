@@ -1,0 +1,382 @@
+---
+id: evm-opcodes-memory-cheaper-is-not-safer
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    eip-1153,
+    eip-2200,
+    chainsecurity-tstore,
+    solidity-transient-storage-blog,
+    solidity-known-bugs,
+    measured-gas-constants,
+    eip-2929,
+  ]
+stack:
+  solc: "0.8.36"
+  forge: "1.7.1"
+---
+
+The pull request is one line per modifier and the description writes itself: *same behaviour, roughly
+eleven times less gas.*
+
+The first half of that sentence is the problem. It is not the same behaviour. Transient storage
+differs from persistent storage in two specified ways that have nothing to do with price, and both of
+them are load-bearing for security. One of them was published as a concrete attack five months before
+the fork that shipped the feature.<Cite src="chainsecurity-tstore" />
+
+This lesson is about those two differences, and then about the economics question underneath them:
+what does making a defence cheap actually buy, and what does it not?
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'SSTORE / SLOAD', note: 'persistent' },
+    { title: 'TSTORE / TLOAD', note: 'transient', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What are the stack operands?',
+      cells: ['Slot, then value', 'Slot, then value — identical'],
+    },
+    {
+      label: 'Who owns the slot under DELEGATECALL?',
+      cells: ['The calling contract', 'The calling contract'],
+    },
+    {
+      label: 'Does a revert roll the write back?',
+      cells: ['Yes, including writes made in inner calls', 'Yes, including writes made in inner calls'],
+    },
+    {
+      label: 'Will it execute with 2,300 gas left?',
+      cells: ['No — the stipend check refuses', 'Yes — there is no such check'],
+    },
+    {
+      label: 'When is the value discarded?',
+      cells: ['Never, until you pay to clear it', 'At the end of the transaction, not when the call returns'],
+    },
+  ]}
+  caption="Three of these rows match exactly, which is what makes the two that do not so easy to miss in a review."
+  alt="Persistent and transient storage compared on semantics rather than price. Both take a slot and a value, both are owned by the calling contract under DELEGATECALL, and both roll back with a reverting frame including inner-call writes. They differ in two places: SSTORE refuses to run with 2,300 gas or less remaining while TSTORE has no such check, and a persistent value is never discarded while a transient one is discarded at the end of the transaction rather than when the call returns."
+/>
+
+## Difference one: the stipend rule does not carry over
+
+`SSTORE` refuses to run when the gas remaining is at or below 2,300 — the stipend check EIP-2200
+introduced. EIP-1153 specifies that `TSTORE` carries no such requirement: its behaviour differs from
+`SSTORE` in that it does not require `gasleft` to be less than or equal to the gas
+stipend.<Cite src="eip-1153" /><Cite src="eip-2200" />
+
+That looks like a footnote. It invalidates a security assumption that a decade of Solidity and Vyper
+code was built on.
+
+The assumption is this: `address.transfer()` and Vyper's `send()` forward exactly 2,300 gas, and 2,300
+gas was, by construction, too little to change state. A recipient's fallback could log something and
+that was all. Many contracts therefore skipped a reentrancy guard around an ETH transfer, reasoning —
+correctly, at the time — that the callee could not reach back in and do anything.
+
+With transient storage, 2,300 gas is enough. `TSTORE` costs 100 and there is no minimum-gas check
+standing in front of it.<Cite src="eip-1153" /><Cite src="measured-gas-constants" /> An audit firm
+laid this out in November 2023, before Dencun activated, and its summary is worth carrying whole:
+reentrancy with 2,300 gas is now possible when transient storage is used, so Solidity's `transfer` and
+Vyper's `send` are no longer reentrancy-safe.<Cite src="chainsecurity-tstore" />
+
+### The drain, step by step
+
+The firm's realistic example is a wrapped-ETH contract offering a `temporaryApprove` — one of the use
+cases EIP-1153 itself suggested.<Cite src="eip-1153" /> The allowance lives in transient storage. The
+withdrawal function checks the allowance, sends the ETH, decrements the balance, and finally clears
+the allowance.<Cite src="chainsecurity-tstore" />
+
+**Subgoal — establish the ordering.** Note that the send happens *before* the transient allowance is
+cleared. With persistent storage this ordering was safe, because a 2,300-gas fallback could not have
+called back in and changed the allowance.
+
+**Subgoal — set up.** The attacker deposits 10 ETH from address A1, then calls
+`temporaryApprove(A2, 10 ETH)`.<Cite src="chainsecurity-tstore" />
+
+**Subgoal — trigger the send.** The attacker calls the withdrawal for `(A1, A2)`. The check passes and
+10 ETH is sent to A2.
+
+**Subgoal — reenter inside the 2,300-gas window.** In A2's fallback, A2 calls A1, and A1 calls
+`temporaryApprove(A2, 0)`. That is a `TSTORE`, and it executes, because there is no stipend check to
+stop it.<Cite src="eip-1153" />
+
+**Subgoal — collect.** Back in the withdrawal function, the allowance is now read as zero from
+transient storage. The balance decrement subtracts zero. A1 keeps its full wrapped balance and A2 has
+the ETH.<Cite src="chainsecurity-tstore" />
+
+**Subgoal — notice what the fix is not.** Adding a reentrancy guard to the withdrawal function does
+close this particular hole, and it is the right immediate fix. But the general lesson is not "add a
+guard here". It is that the *reason* the ordering was safe has been removed everywhere at once, in
+every contract that adopts transient storage, without any of those contracts changing.
+
+<Figure
+  caption="Every step here was safe under persistent storage; the only thing that changed is that a 100-gas write now fits inside the stipend."
+  alt="The drain in five steps. The attacker approves A2 for 10 ETH, held in transient storage. The withdrawal passes its check and sends 10 ETH to A2. Inside A2's 2,300-gas fallback, a TSTORE sets the allowance to zero. Control returns to the withdrawal, which reads the allowance as zero and subtracts zero from the balance. A1 keeps its full wrapped balance and A2 keeps the ETH."
+>
+  <Flow
+    dir="down"
+    lanes={['setup', 'the send', 'the fallback', 'the return', 'the result']}
+    nodes={[
+      { id: 'a', label: 'temporaryApprove(A2, 10)', note: 'allowance held transiently', col: 0 },
+      { id: 'b', label: 'withdraw(A1, A2)', note: 'check passes, 10 ETH sent', col: 1 },
+      { id: 'c', label: 'tstore(approval, 0)', note: 'fits inside 2,300 gas', col: 2, tone: 'danger' },
+      { id: 'd', label: 'balance -= allowance', note: 'allowance now reads 0', col: 3 },
+      { id: 'e', label: 'A1 keeps its balance', note: 'A2 keeps the ETH', col: 4, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+### The part that reaches contracts you do not control
+
+The firm makes a second point that is easy to skip and is arguably more important: the new reentrancy
+can affect a contract that uses transient storage even when it contains no `transfer` call itself,
+because the transfer may live in a *different* contract it interacts with — an exchange, a payout
+splitter.<Cite src="chainsecurity-tstore" />
+
+Their examples are ordinary, widely used infrastructure: a `disperseEther` function that pays multiple
+recipients using `transfer`, which at the time of writing had been called over 150,000 times, and an
+exchange's `orderBuy` that forwards ETH to a seller the same way, called over 1,300 times in the
+preceding month.<Cite src="chainsecurity-tstore" /> Callers of those functions previously did not have
+to think about reentrancy. Callers that use transient storage now do.
+
+Existing deployed contracts are not themselves affected — nothing about their bytecode changed — but
+they must be treated carefully by anything new that integrates with
+them.<Cite src="chainsecurity-tstore" />
+
+<Aside kind="stop">
+The practical instruction: if your contract uses transient storage anywhere, every integration that
+relies on a 2,300-gas ceiling to bound what a callee can do must be re-examined. That includes
+integrations you inherited, integrations inside dependencies, and the general habit of treating
+`transfer` as the safe way to send ETH — which was already obsolete for repricing reasons and is now
+obsolete for a second, independent reason.
+</Aside>
+
+## Difference two: composability stops being free
+
+The second difference is subtler, has no exploit attached, and will cost more teams more time.
+
+Composability, in the sense the Solidity team uses it, means each component behaves as an independent
+transaction that does not share state with previous components. The EVM has largely guaranteed this:
+several calls into a contract inside one complex transaction are virtually indistinguishable from the
+same calls spread over several transactions. Transient storage allows that principle to be
+violated.<Cite src="solidity-transient-storage-blog" />
+
+Their example is three lines and it is the whole hazard:
+
+```solidity
+contract MulService {
+    function setMultiplier(uint multiplier) external {
+        assembly { tstore(0, multiplier) }
+    }
+    function multiply(uint value) external view returns (uint) {
+        uint m;
+        assembly { m := tload(0) }
+        return value * m;
+    }
+}
+```
+
+Now run `setMultiplier(42)`, `multiply(1)`, `multiply(2)`.
+
+Sent as one batched transaction, the answers are 42 and 84. Sent as three separate transactions, the
+multiplier is discarded between them and the answers are 0 and 0. With memory or storage the results
+would be identical either way; grouping calls would not matter.<Cite src="solidity-transient-storage-blog" />
+
+That is a contract whose observable behaviour depends on how a caller chose to batch. Every batching
+relayer, every account-abstraction bundler, every multicall router is now a variable in your
+contract's semantics.
+
+<Aside kind="note">
+The announcement notes this is not inherent to the idea. Clearing transient storage for a contract as
+soon as no function of that contract remained on the call stack — possibly several times per
+transaction — would remove the problem. The Solidity team advocated for exactly that scoping change
+during standardisation; the concern was ultimately not adopted, so responsible use now sits with the
+contract author rather than with the EVM.<Cite src="solidity-transient-storage-blog" />
+</Aside>
+
+The operational rule that follows is narrow and mechanical: **set the value, run the protected body,
+clear the value, all within one call into your contract.** Never leave a transient value set when a
+call into your contract returns.
+
+And do not economise on the clearing write. Skipping it saves 100 gas and restricts your contract to a
+single call per transaction, which prevents its use in the composed transactions complex applications
+depend on.<Cite src="solidity-transient-storage-blog" /> A lock you did not clear is a lock against
+your own users.
+
+<Misconception
+  belief="A transient reentrancy guard is strictly better than a storage one — same semantics, less gas."
+  reality="It is cheaper and it is not semantically identical. TSTORE has no gas-stipend check, which reopens reentrancy through 2,300-gas ETH sends, and a transient value left set after a call returns changes what later calls in the same transaction observe."
+  why="'Same behaviour, less gas' is the headline every migration write-up leads with, and it is nearly true — the addressing, the revert semantics and the delegatecall ownership rules really do match. The two places they do not match are a single clause in the EIP and an absence of automatic per-call clearing, neither of which appears in a diff."
+  src="chainsecurity-tstore"
+/>
+
+## Locks stop at the contract boundary
+
+One more limit, because it is the thing people reach for next.
+
+Transient storage is private to the contract that owns it, exactly as persistent storage
+is.<Cite src="eip-1153" /> A lock set by contract A is invisible to contract B. If your protocol's
+safety depends on B honouring or forwarding A's lock state, it depends on B's cooperation rather than
+on the machine — and if B is untrusted, you have no argument at all.
+
+It is worth being precise about what EIP-1153 did and did not fix here, because the motivation is easy
+to over-read. The problem it solves is that *frames of the same contract* could previously communicate
+only through call inputs and outputs, which an untrusted intermediate frame is under no obligation to
+relay, or through costly storage.<Cite src="eip-1153" /> Transient storage gives those frames a
+private channel that routes around the intermediate frame entirely.
+
+It does nothing for coordination *between* mutually distrusting contracts. That still requires
+explicit arguments, explicit return values, and a trust argument about the party in the middle.
+
+The safe pattern is therefore the narrow one: lock, body, unlock, one contract. Anything that spans a
+trust boundary needs a safety argument that does not rest on a transient value.
+
+## What cheap defences actually change
+
+Now the economics, and this section is an argument rather than a citation, so it is worth marking as
+one. The inputs are measured; the conclusion is reasoning, and you should check the reasoning rather
+than take it.
+
+The measured inputs: a storage guard costs roughly 3,100 gas warm and somewhere up to roughly 7,100
+cold; a transient guard costs about 284, flat.<Cite src="measured-gas-constants" /><Cite src="eip-2929" />
+
+**On the defender's side**, that changes which decisions get made. At thousands of gas, "guard every
+external function" is a proposal someone will price and reject, and the rejection produces a set of
+functions judged safe by argument rather than by mechanism. At hundreds of gas, guarding everything is
+below the threshold at which anyone bothers to object. The gain is not that guarded functions became
+safer. It is that the *category* of unguarded-because-expensive functions can stop existing.
+
+**On the attacker's side**, the ledger moves too, and this half is usually omitted. The general
+principle is that lowering the price of a defence also lowers the price of *testing whether it is
+present*: probing a protocol for an unguarded path costs gas per attempt, and the same cheapening of
+inter-frame state that lets a defender guard forty functions lets an attacker construct and rehearse
+more multi-step paths for the same budget. Nothing here makes the individual probe more expensive.
+And, as the first half of this lesson established, the feature opened a reentrancy vector that did not
+previously exist — a change in attack surface, not merely in attack cost.
+
+**The honest conclusion** is therefore narrower than "cheaper defences improve security":
+
+> Transient storage changed the price of both sides of the same game. Its security value is that it
+> removes the excuse for leaving a function unguarded — not that it made reentrancy harder to attempt
+> or harder to succeed at.
+
+<Misconception
+  belief="Making a defence cheaper unambiguously improves security."
+  reality="It changes relative costs on both sides. Here the concrete gain is that guarding everything becomes affordable; the concrete loss is a new reentrancy vector through 2,300-gas sends. Both are consequences of the same feature."
+  why="Defence improvements are almost always reported without the attacker's side of the ledger, because the defender's side is the one with a number attached. A gas saving is measurable and a change in attack surface is not, so the measurable half becomes the whole story."
+  src="chainsecurity-tstore"
+/>
+
+## A migration checklist
+
+If you are converting storage guards to transient ones, these are the questions that are not in the
+diff:
+
+1. **Does anything in the contract or its dependencies rely on a 2,300-gas ceiling to bound a
+   callee?** Every `transfer`, every `send`, and every integration that inherits one. That assumption
+   is void.<Cite src="chainsecurity-tstore" />
+2. **Is every transient value cleared before every return path out of the outermost call into the
+   contract?** Including revert paths handled with `try`/`catch`, where the frame did not revert and so
+   nothing was rolled back for you.
+3. **Does the contract behave identically whether its functions are called in one transaction or
+   several?** Run the batched and unbatched sequences and compare.<Cite src="solidity-transient-storage-blog" />
+4. **Is the compiler at 0.8.34 or later?** The transient-storage clearing bug, rated high severity, was
+   introduced in 0.8.28 and fixed in 0.8.34 — and its symptom is a clearing operation silently not
+   happening, which is indistinguishable from item 2 being done wrong.<Cite src="solidity-known-bugs" />
+5. **Does every target chain implement the Dencun opcodes?** The compiler emits `TSTORE` for whatever
+   EVM version you target, not for whatever chain you deploy to.
+6. **Did you re-measure, on your own toolchain, with cold and warm cases separated?** The circulating
+   numbers for this comparison were all wrong for this configuration.<Cite src="measured-gas-constants" />
+
+<Check type="spot-bug" concept="transient-composability-hazard">
+A vault adopts transient storage in two places. Both changes were reviewed and approved.
+
+```solidity
+// (a) a reentrancy guard, cleared on the way out
+modifier nonReentrant() {
+    assembly { if tload(LOCK) { revert(0, 0) } tstore(LOCK, 1) }
+    _;
+    assembly { tstore(LOCK, 0) }
+}
+
+// (b) a cache, so repeated price lookups in one transaction hit the oracle once
+function _price() internal returns (uint256 p) {
+    assembly { p := tload(PRICE_SLOT) }
+    if (p == 0) {
+        p = oracle.latest();
+        assembly { tstore(PRICE_SLOT, p) }
+    }
+}
+
+function withdraw(uint256 amt) external nonReentrant {
+    uint256 owed = amt * _price();
+    balances[msg.sender] -= amt;
+    payable(msg.sender).transfer(owed);   // 2300-gas stipend
+}
+```
+
+Find the defects. There are three, and they are of three different kinds.
+
+<Answer>
+**Defect one — the cache is never cleared, so the contract is not composable.** `PRICE_SLOT` is
+written on the first call into the vault and survives every later call in the same transaction,
+because transient storage is discarded only at the transaction boundary and not when a call
+returns.<Cite src="eip-1153" /> A batching relayer that groups four user operations into one
+transaction gives all four the price fetched by the first. Split across four transactions, each gets
+its own price. The contract's answers now depend on how someone else batched, which is exactly the
+violation the Solidity team's announcement describes.<Cite src="solidity-transient-storage-blog" />
+Worse, the vault's exposure to a stale price is now a function of transaction composition rather than
+of anything the vault controls. The rule the announcement gives is to clear transient storage
+completely at the end of a call into the contract; the guard in (a) follows it and the cache in (b)
+does not.<Cite src="solidity-transient-storage-blog" />
+
+**Defect two — `transfer` is no longer a bound on what the recipient can do.** The 2,300-gas stipend
+stopped a callee from writing storage because `SSTORE` has a minimum-gas check. `TSTORE` does
+not.<Cite src="eip-1153" /><Cite src="eip-2200" /> A recipient's fallback can therefore write this
+vault's transient state within the stipend — and the cache slot is a `TSTORE`-writable value that
+changes what subsequent calls compute with.<Cite src="chainsecurity-tstore" /> The guard in (a) does
+block re-entry into `withdraw` itself, which limits the immediate damage, but it does not block
+re-entry into any *other* function of the vault, nor into a different contract that then calls back
+in through a path the guard does not cover.
+
+**Defect three — the ordering inside `withdraw` is stale-safe only by accident.** `owed` is computed
+before the balance decrement, and the decrement happens before the transfer, which is
+checks-effects-interactions and is correct. But `_price()` is now an *external call* to the oracle
+made inside a guarded body, and its result is cached in a slot the recipient may be able to influence
+per defect two. The safe shape is to read the price into a local, clear the transient cache before
+returning, and never let a value that survives a call boundary participate in a solvency calculation.
+
+**The three kinds, named.** The first is a composability defect — no exploit, wrong answers, discovered
+by a partner integration. The second is a security defect created by a specified semantic difference
+between two opcodes. The third is a design defect, in which a caching optimisation quietly widened the
+trust surface of a calculation. Only the second has an attacker in it, and it is the one a
+gas-focused migration review is least likely to look for.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Reentrancy and vulnerability classes** in the security track pick this up as one instance of a
+general pattern: a mitigation whose safety rested on a numeric assumption — 2,300 gas — survives right
+up until the numbers move. The same shape explains why gas-based defences age badly in general.
+
+**Checks-effects-interactions** is the control that did not depend on a gas number and therefore did
+not break. It remains the primary defence; guards are a backstop, and this lesson is a demonstration
+of why the ordering discipline is worth more than the cheap
+lock.<Cite src="chainsecurity-tstore" />
+
+**Audit scoping** in the security track inherits the third-party point directly. "Does this dependency
+use transient storage" is now a question with security consequences for *your* contract, and it is not
+visible in an interface.
+
+**Uniswap v4 hook development** is where all of this lands in production. Hooks run inside someone
+else's unlock window, with someone else's transient deltas live, and the discipline of clearing what
+you set and never depending on what you did not set is the difference between a hook that composes and
+one that does not.
+
+That closes the module. Seven regions, three orders of magnitude of price between them, and one
+consistent rule underneath: **choose the location by lifetime, and let the price follow.**

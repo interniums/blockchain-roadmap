@@ -1,0 +1,518 @@
+---
+id: security-fuzzing-making-campaigns-converge
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [measured-forge-1-7-1, tob-why-fuzzing, ackee-guided-fuzzing, crytic-medusa, crytic-echidna, tob-unleashing-medusa, medusa-fuzzing-config, echidna-default-config, bsc-echidna-corpus, bsc-echidna-optimization-mode, bsc-echidna-fuzzing-tips, echidna-parade, foundry-testing-config, forge-test-reference, foundry-issue-3001, foundry-ci, echidna-action, foundry-releases]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+A six-stage state machine. Each stage advances only from the one before it, so the bug at the end
+needs six specific calls in the right order out of six available selectors.
+
+```solidity
+contract Lock {
+    uint8 public stage;
+    bool  public broken;
+    function a() external { if (stage == 0) stage = 1; }
+    function b() external { if (stage == 1) stage = 2; }
+    function c() external { if (stage == 2) stage = 3; }
+    function d() external { if (stage == 3) stage = 4; }
+    function e() external { if (stage == 4) stage = 5; }
+    function f() external { if (stage == 5) broken = true; }
+}
+```
+
+Now sweep sequence length at a **fixed total budget of 5,000 calls**, so every configuration does
+exactly the same amount of work. Measured on forge 1.7.1, five seeds each:<Cite src="measured-forge-1-7-1" />
+
+```text
+runs=1000  depth=5     found in 0/5 seeds
+runs=500   depth=10    found in 5/5 seeds
+runs=250   depth=20    found in 5/5 seeds
+runs=100   depth=50    found in 5/5 seeds
+```
+
+Depth 5 does not find it under any seed, and never will: the bug needs six calls and each sequence is
+five long. The campaign at depth 5 was not unlucky, it was searching a space that does not contain
+the answer. This lesson is about the four knobs that decide whether the answer is in the space, and
+about the one of them that is off by default in every tool.
+
+Track 05 set the budget. This is about spending it.
+
+## Coverage guidance is the difference between hours and never
+
+The naive picture of a fuzzer is uniform sampling: generate a random sequence, run it, throw it away,
+generate another. Under that model, reaching a state that needs six coordinated steps is
+exponentially unlikely, and reaching one that needs twenty is impossible in any budget.
+
+[Coverage-guided fuzzing](/c/coverage-guided-fuzzing) replaces the throwing-away. The engine records
+which code each input or sequence reached, keeps the ones that reached something new, and
+preferentially mutates those. Medusa's own description is exactly this: coverage-increasing call
+sequences are stored in the corpus, and coverage-increasing sequences *from the corpus* are mutated to
+further guide the campaign.<Cite src="crytic-medusa" />
+
+The consequence is that the six-stage lock is not a six-in-a-row lottery. A sequence that reaches
+stage 3 is saved, and every subsequent mutation starts from a prefix that already works. The search
+becomes incremental, and incremental search over a chain of length k costs something like k tries
+rather than 6^k.
+
+Echidna has had corpus collection, mutation and coverage guidance for years — its own feature list
+names optional corpus collection, mutation and coverage guidance to find deeper
+bugs.<Cite src="crytic-echidna" /> Both engines additionally use Slither to extract useful information
+before the campaign starts, so the value dictionary is seeded with constants that appear in the
+code.<Cite src="crytic-echidna" /><Cite src="tob-unleashing-medusa" />
+
+Foundry's `[invariant]` block on 1.7.1 carries `corpus_dir`, `corpus_gzip`, `corpus_min_mutations`,
+`corpus_min_size` and `show_edge_coverage`, which is the same vocabulary
+appearing.<Cite src="measured-forge-1-7-1" /> The semantics of those keys were not established here
+and should be read from the release notes before you depend on
+them.<Cite src="foundry-releases" />
+
+## The corpus is off by default in all three
+
+This is the finding worth carrying out of the lesson, because it is a one-line change with a large
+effect that almost nobody makes.
+
+<Matrix
+  caption="Three engines, three names for the same key, and the same default in all of them."
+  alt="The corpus directory setting in Foundry 1.7.1, Echidna and Medusa: corpus_dir is unset, corpusDir is null, and corpusDirectory is an empty string, so none of the three writes or reloads a corpus by default."
+  corner="Engine"
+  cols={['Key', 'Default', 'Meaning']}
+  rows={[
+    { label: 'Foundry 1.7.1', cells: [
+      'corpus_dir',
+      <>unset<Cite src="measured-forge-1-7-1" /></>,
+      { v: 'no corpus written or reloaded', tone: 'warn' },
+    ] },
+    { label: 'Echidna', cells: [
+      'corpusDir',
+      <>null<Cite src="echidna-default-config" /></>,
+      { v: '"by default is disabled"', tone: 'warn' },
+    ] },
+    { label: 'Medusa', cells: [
+      'corpusDirectory',
+      <>""<Cite src="medusa-fuzzing-config" /></>,
+      { v: 'no corpus loaded from or stored to disk', tone: 'warn' },
+    ] },
+  ]}
+/>
+
+Read Medusa's own wording: if `corpusDirectory` is left as an empty string, which it is by default, no
+corpus will be loaded from disk and stored to disk.<Cite src="medusa-fuzzing-config" /> Coverage
+guidance still operates *within* a run — `coverageEnabled` is `true` by default — but every campaign
+starts from nothing.<Cite src="medusa-fuzzing-config" />
+
+So the default configuration of every mainstream smart-contract fuzzer discards its own progress when
+the process exits. A nightly job that has run for six months has run six months of independent
+campaigns, each of which spent its first minutes rediscovering how to make a deposit succeed.
+
+Setting the directory is the change:
+
+```toml
+# foundry.toml
+[invariant]
+corpus_dir = "cache/corpus"
+```
+
+```yaml
+# echidna config
+corpusDir: "corpus"
+```
+
+```json
+// medusa.json
+{ "fuzzing": { "corpusDirectory": "corpus" } }
+```
+
+On forge 1.7.1 the layout that appears is one directory per test contract, per invariant function,
+per worker:<Cite src="measured-forge-1-7-1" />
+
+```text
+cache/corpus/CorpusTest/invariant_alwaysTrue/worker0/corpus/85b000c2-…-1787737644.json.gz
+```
+
+Gzipped, because `corpus_gzip` defaults to `true`.<Cite src="measured-forge-1-7-1" /> Echidna's
+directory splits differently and more usefully for a human: a `coverage` subdirectory of replayable
+JSON transaction files, plus a `covered.<timestamp>.txt` copy of the source with per-line
+annotations.<Cite src="crytic-echidna" /><Cite src="bsc-echidna-corpus" />
+
+<Misconception
+  belief="Corpus persistence is an optimisation to add once the suite is mature."
+  reality="It is what makes a long campaign possible at all, and it is disabled by default in Foundry, Echidna and Medusa alike. Without it a nightly job is a nightly restart."
+  why="It looks like caching, and caching is the kind of thing you add later. It is closer to a checkpoint: the corpus is where the search's accumulated knowledge lives, and discarding it discards the search."
+  src="medusa-fuzzing-config"
+/>
+
+### The corpus is a directed artefact, and it can go stale
+
+Two hazards, both documented, both silent.
+
+**Address changes invalidate it.** Medusa warns that the order of `targetContracts` is the order of
+deployment, so reordering the array changes the target contracts' addresses — and if a
+`corpusDirectory` is configured, the corpus may no longer work and may be rendered entirely
+useless.<Cite src="medusa-fuzzing-config" /> The same reasoning applies anywhere a saved sequence
+encodes an address: a refactor that moves a deployment in `setUp` can quietly invalidate months of
+accumulated corpus without a single warning line.
+
+**It accumulates junk.** Medusa prunes the corpus on a timer, `pruneFrequency`, defaulting to every 5
+minutes and only doing anything when `coverageEnabled` is true; setting it to 0 disables
+pruning.<Cite src="medusa-fuzzing-config" /> Foundry's `corpus_min_mutations` and `corpus_min_size`
+appear to be the equivalent levers, though their behaviour was not established
+here.<Cite src="measured-forge-1-7-1" />
+
+### The corpus is also an input you can write by hand
+
+The most underrated use of a corpus directory has nothing to do with speed. It is that you can edit it.
+
+Echidna's documented walkthrough uses a function guarded by three exact-value `require`s —
+`magic_1 == 42`, `magic_2 == 129`, `magic_3 == magic_4 + 333` — that a fuzzer realistically cannot
+reach. Reading `covered.txt` shows all three lines marked `*r`: reached, and reverting. The fix in
+the tutorial is to copy one of the corpus files, edit the arguments to `magic(42,129,333,0)`, and
+re-run; the property then fails immediately, and a new `covered.txt` shows the trace continuing past
+the guards.<Cite src="bsc-echidna-corpus" />
+
+That is manual seeding, and it is the answer whenever the fuzzer is stuck behind a value it cannot
+guess: a signature, a merkle proof, a magic constant, a specific address. You are not required to make
+the search find everything. You are allowed to tell it the answer to one step and let it explore from
+there.
+
+The same instinct, generalised, is a named approach: Ackee's manually guided fuzzing constrains random
+execution to hand-written valid *flows* and then checks every invariant after each state
+transition.<Cite src="ackee-guided-fuzzing" /> Seeding a corpus entry is the one-off version; writing
+the flows is the systematic one. Both are you supplying knowledge the generator cannot derive, which
+is the same category as the property itself.
+
+## Sequence length: the depth knob
+
+Defaults, all three verified from the tools themselves:
+
+- Foundry 1.7.1, `[invariant] depth`: **500**<Cite src="measured-forge-1-7-1" />
+- Echidna, `seqLen`: **100** — "how many transactions are in a test sequence"<Cite src="echidna-default-config" />
+- Medusa, `callSequenceLength`: **100** — after that many calls the blockchain is reset for the next
+  sequence<Cite src="medusa-fuzzing-config" />
+
+The measured sweep at the top gives the shape of the trade-off, and it has three regions.
+
+**Below the bug's requirement, detection probability is exactly zero.** Not low — zero. Depth 5 found
+nothing across five seeds because it cannot. This is the only region where more compute is provably
+useless, and it is the one people respond to by adding runs.
+
+**Just above the requirement, detection is real but seed-dependent.** At depth 10 the bug was found
+under all five seeds tried, and *not* found under seed 11 at the same
+budget.<Cite src="measured-forge-1-7-1" /> One campaign is one sample. A team that ran seed 11 once
+and concluded the property holds would be wrong for a reason no output line discloses.
+
+**Well above the requirement, detection is reliable and each sequence wastes its tail.** At depth 500
+the failing sequence had six calls in it, out of five hundred
+executed.<Cite src="measured-forge-1-7-1" /> The other 494 were budget spent in state that had
+stopped changing.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Below the requirement', note: 'depth 5, a six-call bug', tone: 'danger' },
+    { title: 'Just above it', note: 'depth 10', tone: 'warn' },
+    { title: 'Well above it', note: 'depth 500' },
+  ]}
+  rows={[
+    { label: 'What is the chance of detection?', cells: [
+      'Exactly zero — not low',
+      'Real, and seed-dependent',
+      'Reliable',
+    ] },
+    { label: 'What did the sweep report at a fixed 5,000-call budget?', cells: [
+      'Found in 0 of 5 seeds',
+      'Found in 5 of 5 seeds tried, and not found under seed 11',
+      'Found, using six of the five hundred calls executed',
+    ] },
+    { label: 'What does more compute buy here?', cells: [
+      'Nothing, provably',
+      'More samples of a search that already works',
+      'Longer tails in state that has stopped changing',
+    ] },
+  ]}
+  caption="Depth is a boundary before it is a budget: below the bug's own sequence length there is nothing to find, and well above it every sequence pays for a tail it does not use."
+  alt="Three regions of the sequence-length trade-off at a fixed 5,000-call budget: depth 5 finds the six-call bug in none of five seeds, depth 10 finds it in five of five seeds tried but not under seed 11, and depth 500 finds it using six of five hundred calls."
+/>
+
+The right value is therefore a property of your target's state machine, not a default. The way to
+find it is the sweep: seed a bug at a known sequence length, hold the total call budget constant, and
+find the depth at which it becomes discoverable. That number is defensible in a way that "we used the
+default" is not.
+
+<Aside kind="note">
+Wall-clock time does not move monotonically with depth, and the measured numbers show why you should
+not use it as a proxy for anything. At seed 11 the campaign took 433.86ms at depth 5, 76.09ms at
+depth 10, 108.79ms at depth 50, 961.67ms at depth 100, 512.00ms at depth 500 and 100.09ms at depth
+1000.<Cite src="measured-forge-1-7-1" /> The pattern is not about depth at all — a run that finds the
+bug early stops early, so faster often means *found it sooner*, and sometimes means *did less work*.
+Track 05 measured the same inversion from the other direction: fixing 1,182 self-inflicted reverts
+made the campaign four times slower, because the calls started doing
+something.<Cite src="measured-forge-1-7-1" />
+</Aside>
+
+### Parallelism is a different knob and it is not free
+
+Worker counts, from the tools:
+
+- Echidna: `workers` unset by default, which means the clamp of the number of cores between 1 and
+  4.<Cite src="echidna-default-config" />
+- Medusa: `workers` defaults to **10**, with `workerResetLimit` at **50** sequences.<Cite src="medusa-fuzzing-config" />
+
+Medusa's docs are unusually direct about the trade-off attached to that second number: workers and
+reset limit together drive speed and memory, setting the reset limit higher increases memory per
+worker, setting it too high grows the in-memory chain database to a size that is slower to process,
+and setting it too low causes frequent resets that are expensive for complex deployments because the
+deployment has to be replayed on
+reconstruction.<Cite src="medusa-fuzzing-config" /> Parallelism in a stateful fuzzer is not
+embarrassingly parallel — each worker carries a chain.
+
+Trail of Bits' pitch for Medusa leads with parallel fuzzing that scales with your hardware, and its
+Go/geth foundation as the thing that makes that maintainable.<Cite src="tob-unleashing-medusa" /> The
+honest read of the same post is the benchmark it publishes: Medusa and Echidna perform *similarly* in
+coverage and corpus size.<Cite src="tob-unleashing-medusa" /> That is a vendor benchmarking its own
+two tools against each other, and its methodology is not published, so treat it as a claim by the
+authors of both. What it is not is evidence that one engine finds bugs the other cannot.
+
+<Misconception
+  belief="Medusa replaced Echidna, so an Echidna harness is legacy."
+  reality="Trail of Bits' own benchmark reports similar coverage and corpus size for the two, and the same announcement says they will continue maintaining Echidna for minor bug fixes while their primary focus shifts to Medusa. Echidna remains the reference for optimization mode and for on-chain campaigns."
+  why="A v1 launch post for a successor reads as a replacement announcement, and 'built on our experience with Echidna' sounds like a migration path."
+  src="tob-unleashing-medusa"
+/>
+
+Also worth knowing before you buy cores: **swarm testing** attacks a different axis than parallelism.
+Many short campaigns under randomised configurations, each blacklisting a random subset of functions,
+reach state distributions a single uniform campaign will not — and `echidna-parade` runs
+it.<Cite src="bsc-echidna-fuzzing-tips" /><Cite src="echidna-parade" /> If your budget is four cores,
+four *different* configurations often beat four copies of the same one.
+
+## Shrinking: the difference between a finding and a wall of text
+
+A failing sequence arrives at whatever length the generator produced. Shrinking repeatedly removes
+calls and reduces argument magnitudes while re-checking that the failure persists.
+
+All three engines default the effort to the same number: Foundry's `shrink_run_limit` is
+**5000**,<Cite src="measured-forge-1-7-1" /> Echidna's `shrinkLimit` is **5000** — "how much effort is
+spent shrinking failing sequences"<Cite src="echidna-default-config" /> — and Medusa's `shrinkLimit`
+is **5000** iterations.<Cite src="medusa-fuzzing-config" />
+
+What that budget buys, measured on the truncating-cap target from lesson two, clearing the persisted
+failure between each run:<Cite src="measured-forge-1-7-1" />
+
+```text
+shrink_run_limit=5000   65 calls -> 2 calls    476.90ms
+shrink_run_limit=100    65 calls -> 2 calls     23.29ms
+shrink_run_limit=10     65 calls -> 55 calls    10.56ms
+shrink_run_limit=0      65 calls -> 65 calls     7.18ms
+```
+
+Half a second converts a 65-call trace nobody will read into a two-call reproducer that fits in a
+pull request. At a limit of 10 the shrinker gets 65 down to 55, which is worse than useless — it
+looks like it worked.
+
+Two operational consequences.
+
+**A long counterexample is a shrinking problem before it is a triage problem.** If a finding arrives
+with dozens of calls in it, raise the limit and re-run before you start reading. Running out of
+shrink budget is silent; nothing in the output says "I gave up".
+
+**Optimization mode wants a much larger limit.** Trail of Bits' own optimization example runs with
+`--shrink-limit 50000`, ten times the default, because in that mode shrinking is minimising input
+complexity against a maximum rather than reducing a sequence against a
+predicate.<Cite src="bsc-echidna-optimization-mode" />
+
+<Aside kind="warn">
+Failures are persisted and replayed, which interacts confusingly with shrinking measurements. On
+forge 1.7.1 the invariant runner writes to `cache/invariant`
+(`failure_persist_dir`).<Cite src="measured-forge-1-7-1" /> A second run replays the saved
+counterexample, so the summary reports `original: 2` — the length of the *saved shrunken* sequence,
+not of the sequence the generator originally produced. Every shrink measurement above required
+deleting that directory first, and any comparison you make yourself will need the same. The
+persistence is a feature — Track 05 covered it under
+[failure persistence](/c/failure-persistence) — and it is also a trap for anyone benchmarking the
+shrinker.
+</Aside>
+
+## Putting a converging campaign in CI
+
+Three constraints, all verified on forge 1.7.1, and one of them is the reason most fuzzing CI is
+broken.
+
+**Machine-readable results come from `--junit`, not `--json`.** `--junit` emits JUnit XML that every
+CI system already parses.<Cite src="forge-test-reference" /> `--json` exists and the long-open report
+of non-JSON appearing on stdout is still open, so anything consuming it must tolerate
+that.<Cite src="foundry-issue-3001" /> Build the pipeline on `--junit`.
+
+**`--junit` and `--gas-report` cannot be combined** — forge rejects the pair
+outright:<Cite src="measured-forge-1-7-1" />
+
+```text
+$ forge test --junit --gas-report
+error: the argument '--junit' cannot be used with '--gas-report'
+```
+
+So one job cannot produce both structured results and a gas report. Two invocations, and the second
+re-runs the suite.
+
+**Inline per-test configuration is profile-scoped.** `/// forge-config: default.invariant.runs =
+10000` does nothing when CI runs with `FOUNDRY_PROFILE=ci`.<Cite src="foundry-testing-config" /> This
+is the easiest way to ship a campaign that silently runs at a hundredth of its intended budget.
+
+Beyond those, the shape that works is tiering, and the corpus is what makes the tiers different from
+each other rather than merely longer.
+
+**On every pull request:** a short bounded campaign with a **fixed seed** and the corpus **loaded but
+not written**. Fixed seed because a randomised search used as a required check produces red builds
+unrelated to the diff, which trains reviewers to press re-run rather than read. Read-only corpus
+because a PR branch should not be able to poison the shared corpus.
+
+**Nightly, on the default branch:** a long campaign with a random seed, corpus read and written,
+cached between runs. This is the job that actually finds things, and it is the one that benefits from
+persistence — each night starts where the last one ended rather than at zero.
+
+**On a schedule, less often:** the same target under a second engine. Echidna ships a GitHub Action
+for exactly this.<Cite src="echidna-action" /> The value is not that one engine is stronger; the
+published benchmark says they are close.<Cite src="tob-unleashing-medusa" /> The value is that two
+generators make different mistakes, and a second engine's coverage report is a second opinion about
+where your harness cannot reach.
+
+One caching caveat that applies to the whole arrangement: Foundry's toolchain action can cache
+`~/.foundry/cache`, and that cache does not help a fuzz job unless the seed is fixed — a different
+seed generates different inputs and hits none of it.<Cite src="foundry-ci" /> The *corpus* cache is
+the one that helps a random-seed campaign, and it is a different directory that you have to configure
+and cache yourself.
+
+<Matrix
+  corner="Job"
+  cols={['When it runs', 'How it is configured', 'What it is there to produce']}
+  rows={[
+    { label: 'Bounded campaign', cells: [
+      'Every pull request',
+      { v: 'Fixed seed; corpus loaded but not written', tone: 'good' },
+      'A red build that is about the diff, and a shared corpus a branch cannot poison',
+    ] },
+    { label: 'Long campaign', cells: [
+      'Nightly, on the default branch',
+      { v: 'Random seed; corpus read, written and cached between runs', tone: 'accent' },
+      'Findings — each night starts where the last one ended',
+    ] },
+    { label: 'Second engine', cells: [
+      'On a schedule, less often',
+      "The same target under another engine's generator",
+      'A second opinion about where your harness cannot reach',
+    ] },
+  ]}
+  caption="Three jobs with three different purposes, and only one of them is allowed to write the corpus."
+  alt="A tiered fuzzing CI arrangement: a bounded fixed-seed campaign on every pull request with a read-only corpus, a long random-seed nightly campaign that reads and writes the corpus, and a less frequent run of the same target under a second engine."
+/>
+
+<Check type="spot-bug" concept="corpus-reuse">
+A team's nightly invariant job has run for four months. The config:
+
+```toml
+[profile.ci.invariant]
+runs = 50000
+depth = 100
+```
+
+The CI workflow checks out the repo, installs Foundry with `cache: true`, and runs
+`FOUNDRY_PROFILE=ci forge test --match-path 'test/invariant/*' --junit`. Results are uploaded as an
+artifact. It has never failed.
+
+Name what four months of this has actually bought, and the two changes that would change the answer.
+
+<Answer>
+**It has bought one night's campaign, repeated 120 times.**
+
+`corpus_dir` is unset, which is the default on forge 1.7.1, so nothing is written to disk and nothing
+is reloaded.<Cite src="measured-forge-1-7-1" /> Each night's job starts from an empty corpus and
+rediscovers the same shallow states before it can begin exploring. The 120 nights are 120 independent
+samples of the same search, not one search 120 times as deep.
+
+The `cache: true` on the toolchain action does not help either, and the official guidance says why:
+that cache holds RPC and Etherscan responses, and it does not help a fuzz campaign unless the seed is
+fixed.<Cite src="foundry-ci" /> Here the seed is not fixed — which is correct for a nightly job — so
+the cache is doing nothing for this workload.
+
+**Change one: set `corpus_dir` and cache that directory between runs.** This is the single largest
+practical speedup available, and it converts the job from a nightly restart into a continuation. Cache
+the corpus directory as a separate CI cache keyed on something stable, not on the commit.
+
+**Change two: fix `depth = 100` or justify it.** Fifty thousand runs at depth 100 is five million
+calls spent on sequences of at most a hundred steps. If any invariant in the suite needs a longer
+coordinated sequence, no amount of nightly repetition reaches it — the depth-5 row of this lesson's
+sweep is the same situation at a smaller scale.<Cite src="measured-forge-1-7-1" /> Sweep it once
+against a seeded bug and pick a number you can defend.
+
+**Two more things worth fixing while you are in there.** The job produces no coverage artefact, so
+nobody can tell whether the five million calls reached the module that matters — and coverage, not the
+pass, is what a green campaign entitles you to talk about. And if `--gas-report` is ever added to this
+command line it will simply fail, because forge rejects it alongside
+`--junit`.<Cite src="measured-forge-1-7-1" />
+</Answer>
+</Check>
+
+<Check type="predict" concept="sequence-length">
+Your protocol has a bug that requires: deposit, wait for interest to accrue, borrow at the inflated
+rate, then liquidate yourself. Four actions, and the second is a `vm.warp`.
+
+You run at `depth = 20` with 10,000 runs and find nothing. Predict what happens at `depth = 200` with
+1,000 runs — same total budget — and name the thing that could make both fail.
+
+<Answer>
+**Prediction: depth 200 is more likely to find it, but the reason is not "four is less than twenty".**
+
+Four actions fit comfortably in a 20-call sequence, so this is not the depth-5 case where the answer
+is outside the space. The difference is *density*. The fuzzer picks uniformly among the handler's
+selectors, so with, say, eight handler actions, the chance that a given 20-call window contains the
+four required actions **in order** is small — and each run that fails to contain them is discarded
+wholesale when the sequence resets. At depth 200 each sequence gets ten times as many chances to
+stumble into the ordering, and, more importantly, coverage guidance has ten times as much room to
+extend a saved prefix that already reached step two.<Cite src="crytic-medusa" />
+
+**The thing that could make both fail: the time warp.**
+
+If the handler's `vm.warp` action clamps the jump to something small — a few blocks, a few minutes —
+then interest never accrues enough to inflate the rate, and no depth reaches the state. That is
+lesson two's tight-side clamp, and it is invisible in the metrics because those calls all succeed. The
+diagnostic is not depth; it is asking what the maximum simulated elapsed time across a whole sequence
+is, and comparing it against the accrual period the bug needs.
+
+Note that both standalone engines expose this as configuration rather than handler code: Echidna's
+`maxTimeDelay` defaults to 604,800 seconds and `maxBlockDelay` to 60,480 — one week's worth in each
+case, by their own annotation.<Cite src="echidna-default-config" /> If your Foundry handler warps by
+less than that, you are searching a strictly smaller time domain than Echidna's defaults would.
+
+**Second candidate cause, worth checking before you buy more compute:** self-liquidation may be
+blocked by a same-block or same-actor guard, in which case the four-action sequence is unreachable by
+construction and needs a second actor. Three actors is the minimum for "A's action harmed B" and it
+is also the minimum for most liquidation flows.
+
+**And the thing to do rather than guess:** seed the bug deliberately at a known sequence length, hold
+the budget constant, and sweep. The measured sweep in this lesson took four commands and produced a
+number that a default cannot give you.<Cite src="measured-forge-1-7-1" />
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The last lesson** applies all of this to a target you did not write, where the corpus matters more
+than anywhere else — because on forked state, every call is expensive.
+
+**The practice exercises** ask you to produce the sweep yourself: a time-to-detection curve against
+sequence length at a fixed budget, with a statement of which bug class each end of the curve favours.
+The measured curve in this lesson is one target; yours will have a different knee, and the knee is the
+number worth knowing.
+
+**Audit craft** inherits a better sentence for the report. "We ran the suite for eight hours" says
+nothing. "We ran at depth 500 with a persisted corpus across nine campaigns, reaching 84% line
+coverage of the vault and 31% of the liquidation module" says what was searched — and names the module
+that still needs a human.
+
+**And when the campaign genuinely converges** — coverage plateaued, corpus stable, no new findings —
+that is the signal to escalate to formal methods on the properties that matter, not to buy more
+compute. The order Trail of Bits recommends is fuzzing first — the easiest and most effective technique —
+and formal methods only when appropriate.<Cite src="tob-why-fuzzing" />

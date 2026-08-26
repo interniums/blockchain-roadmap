@@ -1,0 +1,363 @@
+---
+id: app-passkeys-two-valid-signatures
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-7951, rip-7212, nist-fips-186-5, eip-2, webauthn-sol, daimo-p256-verifier, certik-passkey-wallets, eip-4337]
+stack: { solidity: "0.8.36", foundry: "1.7.1" }
+---
+
+Take the `s` value from the `webauthn-sol` test vector you have been using since lesson three:<Cite src="webauthn-sol" />
+
+```
+s   = 22655632649588629308599201066602670461698485748654492451178007896016452673579
+    = 0x3216a237b73765d01b839e0832d73474bc7e63f4c86ef05fbbbfbeb34b35602b
+```
+
+Subtract it from the subgroup order `n` that EIP-7951 lists in its curve parameters:<Cite src="eip-7951" />
+
+```
+n   = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
+n-s = 0xcde95dc748c89a30e47c61f7cd28cb8b006896b8dea8ae2537fa0c0fb12dc526
+```
+
+Send `(r, n - s)` to the precompile at `0x100`, with the same digest and the same public key, and it
+returns thirty-two bytes ending in one. The same one it returns for `(r, s)`.
+
+No key was compromised to produce that second signature. No ceremony was performed, no device was
+touched, no biometric was collected. It is arithmetic anyone can do on a value they observed, and the
+result is a *genuine* signature by the user's key over the user's message — indistinguishable from the
+first in every way except its bytes.
+
+You know this shape. [ECDSA malleability](/c/signature-malleability) is in the core track, and so is the
+archetypal bug it enables. What is different here is that on this curve, nothing anywhere in the stack
+fixes it for you, and that is deliberate.
+
+## The design decision, stated by the specifications
+
+EIP-7951's Security Considerations section says it in two sentences:
+
+> Unlike secp256k1 ECDSA signatures, secp256r1 ECDSA signatures are not required to be non-malleable per
+> NIST FIPS 186-5 standard. Applications requiring non-malleability should implement additional checks at
+> the application layer.<Cite src="eip-7951" /><Cite src="nist-fips-186-5" />
+
+RIP-7212 made the same choice years earlier and gave the reason: the NIST FIPS 186-5 specification does
+not include a malleability check, and the RIP matched that in order to maximise compatibility with the
+large existing NIST P-256 ecosystem.<Cite src="rip-7212" />
+
+That is not an oversight to be reported. It is a compatibility requirement. The precompile exists so that
+Ethereum can verify signatures produced by hardware and software written to the NIST standard — Secure
+Enclaves, Android Keystore, HSMs, FIDO2 authenticators.<Cite src="eip-7951" /> A verifier that rejected
+half of what those devices produce would not be a verifier for those devices.
+
+<Misconception
+  belief="EIP-7951 rejects malleable signatures the way Ethereum's secp256k1 rules do — the precompile canonicalises for you."
+  reality="It imposes no low-s requirement at all. Both (r, s) and (r, n - s) return one, and the specification says applications requiring non-malleability must add the check themselves."
+  why="EIP-2 trained every Ethereum engineer to expect low-s enforcement, and the P-256 precompile looks like ecrecover's sibling. It is a NIST-conformant verifier that happens to live at an Ethereum address, and NIST conformance is exactly what makes it accept both forms."
+  src="eip-7951"
+/>
+
+### How this differs from what you already know about secp256k1
+
+You learned [low-s normalisation](/c/low-s-normalisation) with a specific structure, and the structure does
+not transfer. Lay the two curves side by side:
+
+<Compare
+  axis="Property"
+  columns={[
+    { title: 'secp256k1' },
+    { title: 'secp256r1 (P-256)', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'Protocol-level rule',
+      cells: [
+        <>EIP-2 makes a transaction invalid if <code>s</code> exceeds half the curve order<Cite src="eip-2" /></>,
+        'none — no equivalent rule exists',
+      ],
+    },
+    {
+      label: 'Where it is enforced',
+      cells: [
+        <>transaction validity, not <code>ecrecover</code><Cite src="eip-2" /></>,
+        'nowhere in the protocol',
+      ],
+    },
+    {
+      label: 'What the verifier accepts',
+      cells: [
+        <><code>ecrecover</code> accepts either <code>s</code><Cite src="eip-2" /></>,
+        <>the precompile accepts either <code>s</code><Cite src="eip-7951" /></>,
+      ],
+    },
+    {
+      label: 'Who must add the check',
+      cells: [
+        'a contract verifying signatures itself',
+        'a contract verifying signatures itself',
+      ],
+    },
+  ]}
+  caption="Three of these four rows change when the curve does; the one that does not is the only one most engineers ever had to act on."
+  alt="secp256k1 and secp256r1 compared on whether a protocol-level low-s rule exists, where it is enforced, what the verifier accepts, and who must add the check."
+/>
+
+The last row is identical, and that is the trap. The habit you built on secp256k1 was "libraries like
+OpenZeppelin's ECDSA reject high-`s`, so use a library." The habit is right. What is different is the
+*scope* of the protection: on secp256k1, a malleated signature could never become a second valid
+transaction, because EIP-2 stops it at the protocol boundary.<Cite src="eip-2" /> That boundary made
+transaction hashes stable and quietly absorbed a whole class of application bug.
+
+On P-256 there is no boundary. Every signature that reaches your account has an equally valid twin, and the
+only thing standing between that twin and a second execution is code you wrote.
+
+## What breaks
+
+The failure is never in the cryptography. It is always in something that used a signature as a *name*.
+
+**The archetype: a replay guard keyed on the signature.**
+
+```solidity
+// broken
+mapping(bytes32 => bool) public used;
+
+function execute(WebAuthnAuth calldata auth, Call calldata call) external {
+    bytes32 key = keccak256(abi.encode(auth.r, auth.s));
+    require(!used[key], "replayed");
+    used[key] = true;
+    require(_verify(auth, _digest(call)), "bad signature");
+    _execute(call);
+}
+```
+
+Submit the operation. Then compute `n - s`, submit again. The key is different, the guard passes, and the
+signature verifies — because it is a real signature over the same message. The call executes twice on one
+authorisation.
+
+**The same bug wearing other clothes.** The mapping above is easy to spot in review. These are not:
+
+- **An idempotency key in the relayer.** Your backend deduplicates incoming operations by hashing the
+  submitted payload, signature included. Two payloads, two rows, two submissions.
+- **A "signature receipt" identifier.** A support tool, an analytics pipeline, or a webhook that identifies
+  an authorisation by the hash of its signature will show two events for one user action, and no amount of
+  reading the on-chain data will explain it.
+- **A nonce-free ERC-1271 flow.** A contract signer that answers "did this account approve this message"
+  has no sequence of its own. If a consumer of that answer caches or deduplicates by signature bytes, the
+  same two-form problem appears one protocol removed from your code.
+- **A cross-chain deduplication table.** A system that tracks "we already processed this authorisation"
+  across chains by signature identity inherits the problem and spreads it.
+
+**One thing that does not change, and rules out a family of wrong fixes.** Malleating `s` does not touch the
+digest. `authenticatorData` is unchanged, `clientDataJSON` is unchanged, both SHA-256 invocations produce the
+same values, and the `h` your contract reconstructs is bit-identical.<Cite src="webauthn-sol" /> Nothing in
+the WebAuthn structures is malleable — the authenticator signed them and any edit invalidates the signature.
+So there is no defence available in the reconstruction step, and no point hashing the assertion fields to get
+a stable identifier for the *signature*: you would be hashing the message, which is what a nonce already
+does. The DER encoding is not a second degree of freedom either, because parsing DER into `(r, s)` happens
+off-chain, before the contract sees anything. Exactly two integers reach the account, and exactly one of them
+has a twin.
+
+**One place it does *not* break, which is worth knowing so you do not over-correct.** In ERC-4337, the
+operation's identity is `userOpHash`, and the hash is computed over the user operation *excluding the
+signature*, plus the EntryPoint address and the chain id.<Cite src="eip-4337" /> So the malleated form has
+the identical `userOpHash`, and any component that keys on it — the account's own nonce logic, a bundler's
+mempool, an indexer built on the EntryPoint's events — is unaffected. The malleability bites systems that
+chose a different key, and the fix for most of them is to stop choosing a different key.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'The assertion', note: 'what the device produced', tone: 'accent' },
+    { title: 'Its twin', note: '(r, n − s)', tone: 'warn' },
+  ]}
+  rows={[
+    {
+      label: 'What produced it?',
+      cells: [
+        'An authenticator, after a user gesture',
+        'One subtraction, by anyone who saw the first',
+      ],
+    },
+    {
+      label: 'What does the verifier return?',
+      cells: [
+        'Thirty-two bytes ending in one',
+        <>Thirty-two bytes ending in one<Cite src="eip-7951" /></>,
+      ],
+    },
+    {
+      label: 'Is the digest h the same?',
+      cells: [
+        <>Bit-identical — nothing the authenticator signed was touched<Cite src="webauthn-sol" /></>,
+        'Bit-identical',
+      ],
+    },
+    {
+      label: 'Is the userOpHash the same?',
+      cells: [
+        <>Identical — it is computed excluding the signature<Cite src="eip-4337" /></>,
+        'Identical',
+      ],
+    },
+    {
+      label: 'Is keccak(r ‖ s) the same?',
+      cells: [
+        'This is the only row where the two differ',
+        'A different key, so a guard built on it passes twice',
+      ],
+    },
+  ]}
+  caption="The twin is a real signature by the user's key over the user's message: nothing in the digest, the assertion or the operation hash records that it is a copy."
+  alt="An assertion and its malleated twin compared on what produced each, what the verifier returns, whether the digest and the userOpHash are the same, and whether a hash of r and s is the same."
+/>
+
+<Misconception
+  belief="Malleability is only a problem if I let the same operation run twice — my account has a nonce, so I am covered."
+  reality="A nonce covers execution. It does not cover anything else that treats the signature bytes as an identifier: relayer idempotency, receipt ids, analytics dedup, cross-chain bookkeeping, or a cache of 'already approved'."
+  why="The canonical example in every write-up is a replay guard, so the lesson gets stored as 'do not build a replay guard out of signatures' rather than as 'signature bytes are not an identity'. The second statement is the one that generalises."
+  src="certik-passkey-wallets"
+/>
+
+## The two fixes, and why you need both
+
+Both fixes are one line. They protect different things, and shipping only one leaves a real gap.
+
+### Fix one: refuse the high half
+
+Reject any `s` above `n / 2` before you verify. This is exactly what `webauthn-sol` does, at the very top of
+its `verify` function, before it looks at anything else:<Cite src="webauthn-sol" />
+
+```solidity
+/// @dev Secp256r1 curve order / 2 used as guard to prevent signature malleability issue.
+uint256 private constant _P256_N_DIV_2 = FCL_Elliptic_ZZ.n / 2;
+
+if (webAuthnAuth.s > _P256_N_DIV_2) {
+    // guard against signature malleability
+    return false;
+}
+```
+
+Daimo's verifier exposes the same decision as two entry points rather than one policy: `P256.verifySignature`
+rejects malleability, while `P256.verifySignatureAllowMalleability` ignores it, matching the behaviour
+specified by the NIST standard exactly.<Cite src="daimo-p256-verifier" /> Two functions, one library, and the
+choice is explicitly yours — which is the honest API for a property the standard declines to decide.
+
+**The cost you must plan for.** Nothing in the standard biases an authenticator toward either half of the
+curve order, so treat the `s` your users produce as a coin flip per signature. If your contract rejects high
+`s`, then roughly half of all genuine assertions will be rejected unless something in your stack normalises
+first. That normalisation is the same arithmetic you did at the top of this lesson — if `s > n / 2`, replace it
+with `n - s` — and it belongs in the client or the relayer, on the path between the authenticator's DER output
+and the contract's calldata.
+
+Get this wrong in the other direction and the symptom is memorable: the wallet works perfectly in
+development, and in production about half of transactions fail, per user, at random, with no pattern anyone
+can describe. It is the same failure distribution as the DER leading-zero-byte bug from lesson two, and it
+has the same cause — a value whose top half behaves differently from its bottom half, and a test suite that
+happened to sample the friendly half.
+
+<Aside kind="note">
+The test vector this lesson opened with is already low-`s`: `0x3216…` is well below `n / 2`. That is not a
+coincidence — it is a vector published alongside a library that rejects high `s`, so it could not have been
+otherwise.<Cite src="webauthn-sol" /> Which is a small, useful warning about fixtures generally. A vector that
+ships with an implementation has been filtered by that implementation's rules, so it cannot exercise the
+cases those rules exclude. If you want to test your high-`s` path, you have to construct the input yourself,
+and the construction is one subtraction.
+</Aside>
+
+### Fix two: never let a signature be an identity
+
+Normalisation makes the two forms into one form *at your boundary*. It does not make signature bytes into a
+safe identifier, because the next system downstream may not normalise, and because the property you actually
+want has nothing to do with the curve.
+
+The correct replay key is derived from the **message**: a nonce, or the operation's own hash. In an ERC-4337
+account that is `userOpHash` and the account's nonce, both of which the EntryPoint already
+manages.<Cite src="eip-4337" /> In an ERC-1271 flow it is whatever sequencing the consuming protocol defines.
+In your relayer it is the operation identity, not the payload bytes.
+
+State the rule in the form that survives contact with new code: **a signature answers a question, it does not
+name an event.** Any table whose primary key is a signature is a table with a hidden uniqueness assumption
+that ECDSA does not provide on either curve, and provides less on this one.
+
+### Why both
+
+Normalisation alone leaves every downstream consumer exposed and depends on a check being present at every
+entry point you will ever add. Message-derived replay keys alone leave the account accepting two byte-strings
+for the same authorisation, which is harmless in the account and confusing everywhere else — support tooling,
+receipts, dashboards, and any partner integration that reasonably assumed uniqueness.
+
+Ship the normalisation because it makes your data clean, and ship the message-derived key because it makes
+your logic correct. They are not redundant; they are two different properties that happen to be fixed by
+adjacent lines.
+
+<Check type="spot-bug" concept="eip-7951-no-low-s">
+A team ships a passkey account. Their security review flagged malleability, so they added the low-`s` check
+to the account and normalised in the SDK. Six weeks later, an internal tool reports that a small number of
+users have been credited twice for the same on-chain deposit.
+
+The account is fine — no double execution, nonces are sequential, the on-chain history shows each deposit
+exactly once. The crediting service consumes a webhook from their relayer, whose delivery payload is:
+
+```json
+{
+  "account": "0x…",
+  "signatureId": "keccak256(r ‖ s)",
+  "callData": "0x…",
+  "status": "included"
+}
+```
+
+Explain how a duplicate credit happens when the account never executed twice, and say what the team should
+change.
+
+<Answer>
+**The account is not the source, and that is why it took six weeks.** Execution happened once. The duplicate
+is in the *reporting* path, and the reporting path was built before the low-`s` policy existed.
+
+**The mechanism.** The relayer accepts operations from more than one place — the SDK, a retry path, a partner
+integration, or an older client version still in the field. Only the current SDK normalises. An operation
+submitted with high `s` is rejected on-chain by the account's own guard, the client retries with the
+normalised form, and the relayer now holds two records with two different `signatureId` values for one
+authorisation. Depending on how the relayer reports terminal states, both records can reach the webhook — the
+second one legitimately marked `included`, the first one marked `included` too if the relayer resolves status
+by looking up the *operation* rather than the exact payload it submitted. One user action, two deliveries, two
+credits.
+
+**Why the review missed it.** The review asked "can the account execute twice", which is the question the
+canonical write-up asks, and the answer was no. Nobody asked "does anything else in the system use signature
+bytes as a name", and something did.
+
+**What to change, in order:**
+
+1. **Re-key the webhook.** `signatureId` should be the operation's identity — `userOpHash` in an ERC-4337
+   system, which is computed over the operation excluding the signature and therefore identical for both
+   forms.<Cite src="eip-4337" /> This is the actual fix, and it also makes the payload correct for retries,
+   repricing, and any future signature scheme.
+2. **Make the crediting service idempotent on that key** rather than trusting delivery-once semantics. A
+   webhook consumer that credits on every delivery has a second bug, independent of this one.
+3. **Move normalisation to the relayer boundary as well as the SDK**, so it holds for every client, including
+   the ones you do not control and the versions still in the field. Client-side normalisation is a UX
+   optimisation — it avoids a wasted round trip. It is not an enforcement point.
+4. **Audit the rest of the system for the same pattern.** Grep for anything hashing or storing `r`, `s`, or a
+   serialised signature as a key. Each hit is the same bug with a different blast radius.
+
+**The generalisation worth keeping.** Fixing malleability inside the contract fixes the *contract*. The
+property "one authorisation has one identity" is a system property, and it has to hold in the boundaries
+between components, which is exactly where nobody re-runs the security review.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** moves from the signature to the credential, and to a dependency with no cryptographic
+component at all: the domain the credential is bound to. A malleated signature costs you a duplicated row.
+A lost relying-party identifier costs every user their account at once.
+
+**Your review checklist** gains one question that is faster to ask than to answer: *what does this system use
+as the identity of an authorisation?* If any answer anywhere is "the signature", you have found this bug,
+whichever curve it is on.
+
+**Your test suite** gains a case that no library ships for you, because no library's own vectors can contain
+it: take a valid assertion, replace `s` with `n - s`, and assert both that the precompile accepts it and that
+your account does not act on it twice.<Cite src="eip-7951" />

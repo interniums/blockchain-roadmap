@@ -1,0 +1,325 @@
+---
+id: toolchain-deploy-verify-deployment-is-a-program
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [foundry-deploying, forge-script-reference, foundry-project-layout, foundry-cheatcodes-overview, eip-7825, eip-170, measured-forge-1-7-1, solidity-0836-release]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+The launch is four contracts. A token, a vault, a fee router, and a small registry that has to know
+all three addresses. The vault's constructor takes the token. The router's constructor takes the
+vault. The registry gets wired afterwards by three setter calls, and then ownership of everything
+moves to a multisig.
+
+Written in JavaScript, that is a file which imports an ABI, encodes constructor arguments by hand,
+signs with a key it read from an environment variable, and awaits eight receipts in order. It has
+its own idea of what a `uint256` is. It has its own copy of the contract addresses. When it breaks
+at 2am you are debugging a JavaScript program that is failing to talk about Solidity correctly.
+
+`forge script` removes that layer. The deployment is a Solidity contract, compiled by the same
+compiler, against the same types, with the same imports as the code it deploys.
+
+<Figure
+  caption="The module runs from what a script sends to what a stranger can check: the address, and the code sitting at it."
+  alt="The deploy-and-verify module in six stages: a Solidity deployment program, the broadcast record it leaves behind, the signer and target flags, where an address comes from, the factory the address is derived against, and what verification certifies."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'prog', label: 'a Solidity program', note: 'simulate, then broadcast', col: 0, tone: 'accent' },
+      { id: 'rec', label: 'the broadcast record', note: 'state, not logs', col: 1 },
+      { id: 'sign', label: 'signer and target', note: 'two independent flags', col: 2, tone: 'warn' },
+      { id: 'addr', label: 'the address', note: 'CREATE, CREATE2, CREATE3', col: 3 },
+      { id: 'fac', label: 'the factory', note: 'the deployer input', col: 4 },
+      { id: 'ver', label: 'verification', note: 'correspondence, not safety', col: 5, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+## The shape of a script
+
+A script is a contract in `script/`, named with a `.s.sol` suffix, inheriting from `Script`, with a
+`run()` entrypoint.<Cite src="foundry-deploying" /><Cite src="foundry-project-layout" /> Foundry
+identifies file types by suffix — `.sol` is a contract, `.t.sol` a test, `.s.sol` a
+script.<Cite src="foundry-project-layout" />
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+import {Script} from "forge-std/Script.sol";
+import {Counter} from "../src/Counter.sol";
+
+contract DeployScript is Script {
+    function run() public {
+        vm.startBroadcast();
+        Counter counter = new Counter();
+        counter.setNumber(42);
+        vm.stopBroadcast();
+    }
+}
+```
+
+That is the docs' own minimal example, and every element of it is load-bearing.<Cite src="foundry-deploying" />
+
+`run()` is a default, not a law. The `--sig` option takes "the signature of the function you want to
+call in the contract, or raw calldata", and its default is `run`.<Cite src="forge-script-reference" />
+So one script file can hold `deployCore()`, `wireRegistry()` and `handOverOwnership()` as three
+separately invocable entrypoints, and you call the one you want. If a file holds several contracts,
+`--target-contract` (alias `--tc`) picks which one to run.<Cite src="forge-script-reference" />
+
+The command's own one-line description is worth reading literally: it runs "a smart contract as a
+script, building transactions that can be sent onchain".<Cite src="forge-script-reference" /> A
+script is not a transaction. It is a program whose *output* is a list of transactions.
+
+## Why sharing the language is the whole point
+
+You already know what [ABI encoding](/c/abi-encoding) costs to get wrong, and you have spent Track 04
+inside Solidity's type system. A script inherits all of it for free:
+
+- **The constructor arguments are typed.** `new Vault(token, 500)` is checked by the compiler. There
+  is no `abi.encode` call in your deployment code that could disagree with the constructor's actual
+  parameter list, because there is no separate encoding step at all.
+- **The interfaces are the real interfaces.** `registry.setVault(address(vault))` fails to compile if
+  you renamed the setter. A JavaScript deploy script finds out on chain.
+- **The cheatcodes are the same cheatcodes.** Scripts have access to the whole
+  cheatcode surface you learned for testing.<Cite src="foundry-deploying" /><Cite src="foundry-cheatcodes-overview" />
+  `vm.envString`, `vm.readFile`, `vm.parseJsonAddress` and `console.log` are the ones that earn their
+  keep here.<Cite src="foundry-deploying" />
+
+That last point is what makes the [cheatcode families](/c/cheatcode-families) you learned for tests
+pay off twice. The same `vm` object that rehearses a fork in a test reads your config file in a
+deployment.
+
+## Two worlds inside one function
+
+Here is the part that decides what a script costs and what it can safely contain.
+
+`vm.startBroadcast()` and `vm.stopBroadcast()` delimit a region. Calls made inside that region are
+collected into transactions. Everything outside it is ordinary local computation that the chain never
+sees.<Cite src="foundry-deploying" />
+
+That single fact is why a deploy script can contain arbitrary logic without paying for it. Consider
+this shape, with each block labelled by its purpose rather than its mechanism.
+
+```solidity
+function run() public {
+    // Subgoal 1 — LOAD CONFIG. Local. Reads a file off your disk; no chain involved.
+    string memory cfg = vm.readFile("deploy/config.json");
+    address treasury  = vm.parseJsonAddress(cfg, ".treasury");
+    uint256 feeBps    = vm.parseJsonUint(cfg, ".feeBps");
+
+    // Subgoal 2 — REFUSE TO PROCEED ON BAD INPUT. Local. A failed assertion here costs
+    // nothing and prevents a real transaction, which is the entire reason to check before
+    // broadcasting rather than inside a constructor.
+    require(treasury != address(0), "treasury unset");
+    require(feeBps <= 1000, "fee too high");
+
+    // Subgoal 3 — MAKE IT REAL. Everything from here to stopBroadcast becomes transactions.
+    vm.startBroadcast();
+
+    Token token = new Token("Example", "EX");        // -> a creation transaction
+    Vault vault = new Vault(address(token), feeBps); // -> a creation transaction
+    vault.setTreasury(treasury);                     // -> a call transaction
+
+    vm.stopBroadcast();
+
+    // Subgoal 4 — ASSERT ON THE RESULT. Local again. Reads state from the simulation, so a
+    // wrong wiring fails the dry run instead of being discovered on a block explorer.
+    require(vault.treasury() == treasury, "wiring failed");
+    console.log("vault", address(vault));
+}
+```
+
+Three consequences fall straight out of the boundary.
+
+**Reading is free.** Subgoal 4 calls `vault.treasury()`, a `view` function. Outside the broadcast
+region it is a local read against the simulated state, not a transaction. Assertions on the finished
+deployment cost nothing and belong in every script you write.
+
+**Only top-level calls become transactions.** `new Vault(address(token), feeBps)` produces one
+creation transaction. If that constructor internally calls the token five times, those are internal
+calls inside one transaction, not five transactions. The broadcast list records what the *script's
+sender* did, at the top level, one entry per call.
+
+**Computation is not a transaction.** Deriving a salt, hashing an initcode, sorting a list of
+recipients — all of it is local. This is what lets a deployment script be a real program instead of a
+sequence of `cast send` invocations glued together with `jq`.
+
+<Misconception
+  belief="Everything inside run() gets executed on chain, so scripts should be kept minimal."
+  reality="Only calls between vm.startBroadcast() and vm.stopBroadcast() become transactions. Config parsing, address derivation, assertions and logging run locally and never reach the chain."
+  why="The script is written in Solidity, which everywhere else in your work means on-chain code, so the instinct is that all of it costs gas."
+  src="foundry-deploying"
+/>
+
+## Who is the deployer inside a script
+
+A question that catches people once, and only once, because the symptom is an address that does not
+match a prediction.
+
+Inside the broadcast region, the transactions are attributed to the *broadcasting account*, not to
+the script contract. `new Token()` between `startBroadcast` and `stopBroadcast` produces a creation
+transaction sent by your deployer EOA. The script contract is not in the sender chain at all; it was
+never deployed anywhere real.
+
+Outside the region — or in a plain local run with no broadcasting — the script contract itself
+executes the `new`, so the deployer is the script contract's own ephemeral address. Since a
+[`CREATE` address depends on the deployer and its nonce](/c/create-address-from-nonce), the same line
+of code yields different addresses in the two cases. A prediction computed the wrong way disagrees
+with reality and the mistake surfaces as "the address changed for no reason".
+
+Which account broadcasts is controllable from inside the script as well as from the command line. The
+docs give both forms: `vm.startBroadcast(deployerAddress)` broadcasts from a specific address, and
+`vm.startBroadcast(privateKey)` — with the key typically loaded via `vm.envUint("PRIVATE_KEY")` —
+broadcasts from the account that key controls.<Cite src="foundry-deploying" /> Multiple broadcast
+regions in one `run()` are allowed, which is how a script that must act as two different roles is
+written.
+
+The starting nonce matters for the same reason, and it is configurable. By default the sender's
+starting nonce "is fetched from the RPC endpoint, or set to 1 when no endpoint is configured", and
+`--sender-nonce` pins it instead.<Cite src="foundry-deploying" /><Cite src="forge-script-reference" />
+The docs are explicit about why that flag exists: because `CREATE` addresses depend on the sender's
+nonce, pinning it "keeps simulated deployment addresses consistent with the nonce you plan to
+broadcast from".<Cite src="foundry-deploying" />
+
+That is a small flag with a large implication, and it is the first hint of the theme this module
+keeps returning to: an address is a function of inputs you can change by accident.
+
+## One flag separates a rehearsal from the real thing
+
+The same command does both. Without `--broadcast` the script simulates and sends nothing; with
+`--broadcast` it sends.<Cite src="foundry-deploying" /> There are three modes worth naming, because
+they differ in what state they run against.
+
+```bash
+# 1. Local only. No RPC. Executes against an empty in-memory chain.
+forge script script/Deploy.s.sol
+
+# 2. Simulated against the live chain. Reads real state over RPC. Sends nothing.
+forge script script/Deploy.s.sol --rpc-url $RPC_URL
+
+# 3. Real. Signs and submits.
+forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast --account deployer
+```
+
+Mode 1 catches compile errors, bad config, failed assertions. Mode 2 catches everything mode 1
+catches *plus* everything that depends on the chain you are actually targeting — a factory that is
+not deployed there, a token whose decimals differ, an owner who is not who you think. The docs
+describe it exactly: it "simulates against the live chain state and shows what would
+happen".<Cite src="foundry-deploying" />
+
+Mode 2 is the step teams skip and should not. It is the difference between "my script is correct" and
+"my script is correct against this chain, right now".
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: '1. local only', note: 'no --rpc-url', tone: 'muted' },
+    { title: '2. simulated', note: '--rpc-url', tone: 'accent' },
+    { title: '3. real', note: '--rpc-url --broadcast', tone: 'danger' },
+  ]}
+  rows={[
+    { label: 'What state does it execute against?', cells: ['an empty in-memory chain', 'the live chain, read over RPC', 'the live chain'] },
+    { label: 'Does anything leave your machine?', cells: ['No', 'Reads only', 'Yes — signed and submitted'] },
+    { label: 'What does it catch?', cells: ['compile errors, bad config, failed assertions', 'the above, plus anything that depends on the chain you are targeting', 'nothing it has not already had the chance to catch'] },
+    { label: 'Can it be undone?', cells: ['Nothing to undo', 'Nothing to undo', 'No'] },
+  ]}
+  caption="Everything mode 3 can tell you, mode 2 has already told you — except whether the transaction lands."
+  alt="The three ways to run a deploy script compared: local only with no RPC, simulated against the live chain, and a real broadcast, across the state each runs against, whether anything is sent, what each catches, and whether it can be undone."
+/>
+
+<Aside kind="warn">
+`--broadcast` is a one-word difference in a command you will run many times, and shell history recall
+makes it trivially easy to reach the version with the flag when you meant the version without. Type
+the command deliberately, or keep the two forms in separate `Makefile` targets with names that cannot
+be confused. There is no undo.
+</Aside>
+
+`--skip-simulation` exists and "skips on-chain simulation".<Cite src="forge-script-reference" /> It is
+occasionally necessary — a chain whose RPC cannot simulate your transaction correctly — and it should
+feel uncomfortable every time, because it removes exactly the check that mode 2 buys you.
+
+The gas figures the script uses are not raw estimates either: `--gas-estimate-multiplier` applies a
+"relative percentage to multiply gas estimates by", defaulting to 130.<Cite src="forge-script-reference" />
+Your transactions carry a limit 30% above the estimate by default. That is a deliberate margin
+against state drift between simulation and inclusion, and it is a number you can tighten or widen.
+
+<Misconception
+  belief="Running forge script deploys the contract."
+  reality="Without --broadcast it only simulates. With --broadcast the transactions are signed and sent, and cannot be recalled."
+  why="The same command does both, and only one flag distinguishes them."
+  src="foundry-deploying"
+/>
+
+## The ceiling a large deployment runs into
+
+One protocol-level constraint shapes how big a single step can be. EIP-7825 caps any single
+transaction at 16,777,216 gas — 2 to the power of 24.<Cite src="eip-7825" /> A system deployed by a
+script is naturally spread across transactions, because each top-level call is its own transaction,
+so the cap rarely bites on the deployment as a whole. It bites on *one* of them: a constructor that
+seeds a large table, a migration function that writes thousands of slots, a factory call that deploys
+six contracts in one frame.
+
+The mitigation is the same shape as the [contract size limit](/c/code-deposit-and-size-limits) you
+already work around — split the work and make the split explicit. Foundry's own `--non-interactive`
+flag exists to disable "interactive prompts that might appear when deploying big contracts", pointing
+at EIP-170 for context, which tells you how routinely people run into the size ceiling
+too.<Cite src="forge-script-reference" /><Cite src="eip-170" />
+
+<Aside kind="note">
+Versions in this module are the ones on the machine these lessons were checked against: forge and
+cast **1.7.1** (commit `4072e487`, built 2026-05-08) and solc **0.8.36**.<Cite src="measured-forge-1-7-1" /><Cite src="solidity-0836-release" />
+Flag surfaces move; when a command in these lessons disagrees with your machine, `forge script --help`
+is the authority, not this page.
+</Aside>
+
+<Check type="predict" concept="broadcast-cheatcode">
+A colleague's script deploys a vault and then, still inside the broadcast region, runs a loop that
+calls `vault.previewDeposit(i)` — a `view` function — one thousand times to build a table it logs at
+the end. They are worried about the gas bill.
+
+Predict what actually happens when this runs with `--broadcast`, and say what would change if
+`previewDeposit` were not `view`.
+
+<Answer>
+**Nothing expensive happens, but for a reason worth being precise about.**
+
+A `view` call from the script does not produce a transaction to send. Foundry has to execute it to
+get the return value, but a call that changes no state has nothing to broadcast; it is resolved in
+simulation. The broadcast list gets one creation transaction for the vault and nothing else. No gas
+bill, no thousand entries.
+
+The position of the loop relative to `vm.stopBroadcast()` is therefore irrelevant *for this
+function*. That is the trap: the code looks dangerous and is not, which teaches the wrong lesson to
+whoever reads it next. Move it outside the broadcast region anyway, so the file says what it means.
+
+**If `previewDeposit` were state-changing, the answer inverts completely.** One thousand top-level
+state-changing calls from the broadcasting sender is one thousand transactions — a thousand nonces, a
+thousand base fees, a thousand chances for one to fail and strand the rest. At that point the correct
+design is not "a faster script" but "a batching contract": deploy something with a function that does
+the loop internally, and broadcast one call to it. The whole loop then lives inside a single
+transaction — where the 16,777,216-gas cap becomes your real
+constraint.<Cite src="eip-7825" />
+
+**The general rule this illustrates.** Ask of every line inside the broadcast region: is this a
+top-level state-changing call by the sender? If yes, it is a transaction and you are paying for it
+and it can fail independently. If no, it does not belong inside the region.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Immediately next:** a broadcast run leaves a durable record on disk, and that record is not a log
+file. It is the input to `--resume`, the source of the addresses your follow-up scripts read, and the
+only local evidence of what you actually sent. The next lesson treats it as state.
+
+**In the signing lesson:** the script now decides *what* to send. It still has to be told *who signs*
+and *which network receives it*, and those are two independent flags that are easy to get wrong in
+opposite directions.
+
+**In your own repository:** the strongest argument for scripts-as-contracts is that your deployment
+becomes testable. A script is a contract, so a test can call `run()` against a fork and assert on the
+result. Deployment logic stops being the one part of the system nobody exercises before it matters.

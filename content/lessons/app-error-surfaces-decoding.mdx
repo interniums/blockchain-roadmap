@@ -1,0 +1,368 @@
+---
+id: app-error-surfaces-decoding
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [measured-revert-surfaces-1-7-1, viem-src-decode-error-result, viem-src-contract-errors, viem-src-base-error, viem-src-panic-reasons, viem-decode-error-result-doc, viem-errors-glossary, viem-discussion-1789, foundry-cast-reference, sourcify-4byte]
+stack: { viem: "2.x", foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+The same failing token call, reached three ways, produces three different selectors.
+
+A `Router` with two entry points. Both take a target and calldata and make the same low-level call.
+`swap` checks the boolean and reverts with its own `SwapFailed()`. `swapBubbling` copies the return
+data into a raw `revert`. Measured through the prober on anvil
+1.7.1:<Cite src="measured-revert-surfaces-1-7-1" />
+
+```text
+call the token directly        0xcf479181 0000…0005 0000…0064
+call it through swapBubbling   0xcf479181 0000…0005 0000…0064
+call it through swap           0x81ceff30
+```
+
+<Figure
+  caption="The selector you receive is chosen by the last frame that handled the failure, not by the frame that produced it."
+  alt="Three entry points into the same failing token call: a direct call and a call through swapBubbling both arrive as 0xcf479181 with the two argument words intact, while a call through swap arrives as 0x81ceff30, SwapFailed, with no arguments."
+>
+  <Flow
+    lanes={['how you reached the token', 'what reaches your client']}
+    nodes={[
+      { id: 'direct', label: 'call the token', note: 'no router in the path', col: 0, row: 0 },
+      { id: 'bub', label: 'Router.swapBubbling', note: 'copies return data into revert', col: 0, row: 1 },
+      { id: 'swap', label: 'Router.swap', note: 'checks ok, reverts with its own', col: 0, row: 2, tone: 'warn' },
+      { id: 'keep', label: '0xcf479181', note: 'InsufficientBalance(5, 100)', col: 1, row: 0, tone: 'good' },
+      { id: 'lost', label: '0x81ceff30', note: 'SwapFailed(), no arguments', col: 1, row: 1, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'direct', to: 'keep' },
+      { from: 'bub', to: 'keep' },
+      { from: 'swap', to: 'lost' },
+    ]}
+  />
+</Figure>
+
+`0x81ceff30` is `SwapFailed()`.<Cite src="measured-revert-surfaces-1-7-1" /> The token's
+`InsufficientBalance(5, 100)` — its name, both its numbers — is gone, destroyed inside a contract
+that made a defensible choice about its own error surface. Nothing recovers it. The client's ABI
+coverage is irrelevant; the bytes never left the router.
+
+That is the shape of this lesson. Decoding is two separate problems, and the industry conflates
+them. One is *do I hold the definition for these four bytes* — solvable, and mostly a build
+problem. The other is *were the original bytes even forwarded to me* — not solvable from the client
+at all. Knowing which one you are in decides whether you fix your bundler or file an issue against
+somebody's router.
+
+## The call graph is the ABI requirement
+
+You know [how a revert bubbles](/c/revert-bubbling): a high-level Solidity call that fails
+propagates the callee's return data upward unchanged, so a failure four frames down usually arrives
+intact. What the bubbling hides is *whose* failure it is. The selector belongs to the contract that
+executed the `REVERT`, and its definition lives in that contract's source, which is not in the ABI
+of the contract you called.
+
+Four common shapes of this, all of which appear in a single ordinary transaction:
+
+**A library.** `SafeERC20`, `Address`, `Math` — each declares its own errors, and an
+`internal`-linked library's revert appears to come from your contract while its error definition
+lives in the library's ABI, not yours.
+
+**A token.** Your router calls `transferFrom`; the token reverts with `ERC20InsufficientAllowance`
+or its own bespoke error. That error is defined in the token, a contract you did not write, deploy,
+or generate types for.
+
+**An implementation behind a proxy.** You hold the proxy's ABI because that is the address you
+call. The proxy has almost no errors of its own. Everything that can fail is defined in the
+implementation, at a different address, and after an upgrade it is defined in a *different*
+implementation than the one you generated from.
+
+**A callback into you.** A flash loan, an NFT receive hook, a smart account calling your paymaster. Execution re-enters code you own from a frame you do not control, and the revert
+that comes back may be yours, theirs, or the framework's.
+
+<Misconception
+  belief="Passing the contract's ABI to the client is enough to decode its failures."
+  reality="The ABI you pass is the ABI of the address you called. Errors raised by a library, a token, or an implementation behind a proxy are defined elsewhere and will not be in it — and the client reports that as an undecodable selector, not as a missing-ABI problem."
+  why="One call feels like one contract, and typed clients reinforce the feeling by binding an ABI to an address."
+  src="viem-errors-glossary"
+/>
+
+The consequence is not that decoding is hopeless. It is that the unit of ABI assembly is the **call
+graph**, not the contract. That set is finite, it is known at build time, and every artifact in it
+is a file you can already produce.
+
+## What viem actually does, at source level
+
+viem separates the two jobs cleanly, and reading its implementation is faster than reading its
+docs.
+
+**Job one: the pure decode.** `decodeErrorResult({ abi, data })` takes revert bytes and error
+definitions and returns `{ abiItem, errorName, args }`.<Cite src="viem-decode-error-result-doc" />
+Three details in the implementation change how you use
+it:<Cite src="viem-src-decode-error-result" />
+
+```ts
+const signature = slice(data, 0, 4)
+if (signature === '0x') throw new AbiDecodingZeroDataError({ cause })
+
+const abi_ = [...(abi || []), solidityError, solidityPanic]
+const abiItem = abi_.find(
+  (x) => x.type === 'error' && signature === toFunctionSelector(formatAbiItem(x)),
+)
+if (!abiItem) throw new AbiErrorSignatureNotFoundError(signature, { … })
+```
+
+First, empty data throws a *distinct* error class rather than returning a null result — the
+zero-bytes case from the previous lesson is separated for you at the lowest level. Second,
+`Error(string)` and `Panic(uint256)` are appended to whatever you pass, so those two shapes decode
+against an empty ABI array and you never need to special-case them. Third, an unknown selector
+throws `AbiErrorSignatureNotFoundError`, which is a *decode failure*, not a decode result — so
+`decodeErrorResult` inside a `try` with a swallowed `catch` is how applications end up rendering
+raw hex without ever noticing the ABI gap.
+
+**Job two: getting to the bytes.** An action does not throw the revert; it throws a wrapper. viem's
+`BaseError` carries a `cause` chain and a `walk` that recurses down
+it:<Cite src="viem-src-base-error" />
+
+```ts
+function walk(err, fn) {
+  if (fn?.(err)) return err
+  if (err && typeof err === 'object' && 'cause' in err && err.cause !== undefined)
+    return walk(err.cause, fn)
+  return fn ? null : err
+}
+```
+
+The link you are looking for is `ContractFunctionRevertedError`, which holds `data` — the decoded
+`{ errorName, args }` — plus `raw` for the original bytes, `reason` and
+`signature`.<Cite src="viem-src-contract-errors" /> It builds those fields in its constructor by
+calling `decodeErrorResult` with the ABI the action was given, which is why the ABI you pass to
+`simulateContract` determines what you can read out of the error later. This walk is the canonical
+answer in viem's own discussion thread on the topic, and it is the piece most tutorials
+omit.<Cite src="viem-discussion-1789" />
+
+Its constructor also encodes the shape branch you built by hand in lesson
+one:<Cite src="viem-src-contract-errors" />
+
+- `errorName === 'Error'` → `reason` is the string argument.
+- `errorName === 'Panic'` → `reason` is looked up in `panicReasons`, which has nine entries and no
+  key for `0`.<Cite src="viem-src-panic-reasons" />
+- anything else → `reason` stays undefined and the formatted error and arguments go into
+  `metaMessages` for display.
+- selector not found → `signature` is set and the meta-messages tell you to look it up at
+  `4byte.sourcify.dev`.<Cite src="viem-src-contract-errors" /><Cite src="sourcify-4byte" />
+
+<Aside kind="note">
+That last branch is the tell you should learn to recognise in a log. If a viem error mentions
+"Unable to decode signature" and points at a lookup URL, the chain did its job, the node did its
+job, the transport did its job, and the ABI you shipped is incomplete. It is a build-configuration
+bug wearing the costume of a chain error, and it is fixed in your bundler, not in your error
+handler.
+</Aside>
+
+<Figure
+  caption="Only the last step depends on anything you shipped, which is why the two jobs fail for different reasons."
+  alt="A downward sequence: a thrown action error, walking the cause chain, reaching ContractFunctionRevertedError which holds the raw bytes, then decodeErrorResult against the union ABI, which either yields a shape or throws AbiErrorSignatureNotFoundError."
+>
+  <Flow
+    dir="down"
+    lanes={['thrown', 'job two', 'the bytes', 'job one', 'outcome']}
+    nodes={[
+      { id: 'thrown', label: 'action error', note: 'simulateContract threw', col: 0 },
+      { id: 'walk', label: 'err.walk(…)', note: 'recurse down cause', col: 1, tone: 'accent' },
+      { id: 'rev', label: 'ContractFunctionRevertedError', note: 'holds raw, reason, signature', col: 2 },
+      { id: 'dec', label: 'decodeErrorResult', note: 'against the union ABI', col: 3, tone: 'accent' },
+      { id: 'ok', label: 'a shape', note: 'errorName and args', col: 4, tone: 'good' },
+      { id: 'no', label: 'AbiErrorSignatureNotFoundError', note: 'your build, not the chain', col: 4, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'thrown', to: 'walk' },
+      { from: 'walk', to: 'rev' },
+      { from: 'rev', to: 'dec' },
+      { from: 'dec', to: 'ok' },
+      { from: 'dec', to: 'no' },
+    ]}
+  />
+</Figure>
+
+## Worked example: one decoder, assembled once
+
+The goal is a single function used at every call site, whose ABI coverage is a build artifact
+rather than a per-call argument.
+
+**Subgoal 1 — enumerate the call graph, not the contracts you own.** Write down every address a
+user action can reach. For a swap: your router, the two tokens, the pool, the implementation behind
+each proxied address, and any library whose errors are declared separately. Do this from a trace of
+a *successful* transaction rather than from memory — a trace lists every frame, which is exactly
+the set you need, and it will contain contracts you had forgotten.
+
+**Subgoal 2 — extract error definitions from each artifact.** For contracts you compile, Foundry
+prints them with their selectors:
+
+```text
+$ forge inspect Errors abi
+| error    | InsufficientBalance(uint256,uint256) | 0xcf479181 |
+| error    | Unauthorized(address)                | 0x8e4a23d6 |
+```
+
+`forge inspect <Contract> abi --json` emits the machine-readable form.<Cite src="foundry-cast-reference" /><Cite src="measured-revert-surfaces-1-7-1" />
+For third-party contracts, pull the verified ABI from the explorer at build time and commit it. For
+an implementation behind a proxy, take the *implementation's* ABI, and make the build fail if the
+on-chain implementation address no longer matches the artifact you generated from.
+
+**Subgoal 3 — build the union, and make collisions loud.** Concatenate every error definition into
+one array. Before shipping it, group by selector and assert that each selector maps to exactly one
+signature. Two definitions with the same four bytes and different argument types is the silent
+mis-decode from the previous lesson, and it is trivially detectable at build time and undetectable
+at runtime.
+
+```ts
+// build step, not runtime
+const errorAbi = [...routerAbi, ...erc20Abi, ...poolImplAbi, ...ozErrorsAbi]
+  .filter((x) => x.type === 'error')
+
+const bySelector = new Map<string, string>()
+for (const item of errorAbi) {
+  const sel = toFunctionSelector(formatAbiItem(item))
+  const sig = formatAbiItem(item)
+  const prev = bySelector.get(sel)
+  if (prev && prev !== sig) throw new Error(`selector ${sel}: ${prev} vs ${sig}`)
+  bySelector.set(sel, sig)
+}
+```
+
+**Subgoal 4 — write the walk once, and return a shape rather than a string.** The decoder's job
+ends at classification. Turning a classification into copy is a separate concern with different
+reviewers, and mixing them is why error handling gets rewritten every quarter.
+
+```ts
+import { BaseError, ContractFunctionRevertedError, decodeErrorResult } from 'viem'
+
+export function decodeRevert(err: unknown, abi = errorAbi) {
+  const revert =
+    err instanceof BaseError
+      ? err.walk((e) => e instanceof ContractFunctionRevertedError)
+      : null
+  if (!(revert instanceof ContractFunctionRevertedError)) return { kind: 'not-a-revert' } as const
+
+  const raw = revert.raw
+  if (!raw || raw === '0x') return { kind: 'empty' } as const
+
+  try {
+    const { errorName, args } = decodeErrorResult({ abi, data: raw })
+    if (errorName === 'Error') return { kind: 'error-string', reason: args?.[0] } as const
+    if (errorName === 'Panic') return { kind: 'panic', code: args?.[0] } as const
+    return { kind: 'custom', name: errorName, args } as const
+  } catch {
+    return { kind: 'unknown-selector', selector: slice(raw, 0, 4), raw } as const
+  }
+}
+```
+
+**Subgoal 5 — instrument the branch you hope never fires.** `unknown-selector` is the one outcome
+that means *your* build is wrong rather than the user's request. Send it to your alerting system
+with the selector, the target address and the chain id attached. A selector that appears in
+production and not in your union tells you precisely which ABI you forgot, and it is the only
+signal that will.
+
+**Subgoal 6 — accept the case you cannot fix.** If an intermediate contract replaced the failure
+with its own, as `swap` did above, the union is complete and correct and the answer is still
+`SwapFailed()`. Decoding cannot recover what was never forwarded. What you can do is notice: a
+contract in your call graph that produces exactly one no-argument error for every downstream
+failure is a known limitation of that integration, worth writing down next to it, and worth raising
+with whoever maintains it.
+
+<Aside kind="warn">
+`cast decode-error` will happily name a custom error you have no ABI for — measured, it turns
+`0xcf479181 …` into `InsufficientBalance(uint256,uint256)` with arguments 5 and
+100.<Cite src="measured-revert-surfaces-1-7-1" /> It does that by querying openchain.xyz over the
+network.<Cite src="foundry-cast-reference" /> That is the right trade for a human at a terminal and
+the wrong one inside an application: it adds a network dependency to your failure path, and it
+returns candidates rather than an identification. Use it while debugging; do not port it into your
+client.
+</Aside>
+
+## Where the two problems diverge in practice
+
+The distinction matters because the fixes live in different places and on different timescales.
+
+**Missing definition.** Symptom: `AbiErrorSignatureNotFoundError`, or a `signature` field set on the
+viem error. Cause: your bundle. Fix: add the ABI, ship. Detection: automatic, if you instrumented
+the branch above. This is the majority of undecodable production errors and it is entirely within
+your control.
+
+**Bytes never forwarded.** Symptom: a decode that *succeeds* and names an error from an intermediate
+contract, usually with no arguments and a name like `CallFailed` or `SwapFailed`. Cause: somebody
+else's `try`/`catch`. Fix: none on the client. Detection: only by reading the intermediate
+contract's source or a trace. This is a minority of cases and it is the one that wastes the most
+time, because the decode worked and the answer is still uninformative.
+
+The diagnostic that separates them in thirty seconds is a trace of the failing call. A trace shows
+every frame and the data each one returned, so you can see the original error at depth four and the
+substituted one at depth two. If you can fork the chain at the failing block, you have the trace;
+that is what [fork testing](/c/fork-testing-purpose) was for.
+
+<Check type="explain" concept="decode-needs-the-right-abi">
+A team ships a swap interface. In staging, against contracts they deploy themselves from the same
+repo, every failure renders a precise message. In production, against the real deployments, roughly
+a third of failures render as raw hex, and a different third render as "Swap failed" with no
+detail. The remaining third render correctly.
+
+Their client passes `routerAbi` to `simulateContract` and calls `decodeErrorResult` with the same
+ABI, wrapped in a `try`/`catch` that falls back to printing `error.message`.
+
+Account for all three thirds. Say which are fixable by them, what the fix is in each case, and what
+instrumentation would have shown them the split before users did.
+
+<Answer>
+**Why staging looked perfect.** In staging they deploy every contract from one repo, so one Foundry
+build produced every artifact and the router's ABI happened to be compiled alongside the tokens and
+pools they also deployed. The environment silently supplied ABI coverage that production does not —
+and worse, staging's contracts are the *only* ones whose errors they ever tested against.
+
+**The third that renders correctly.** Failures raised by the router itself. Its errors are in
+`routerAbi`, `decodeErrorResult` finds them, and everything works exactly as designed. This third is
+also why nobody escalated sooner: the error path demonstrably worked, so the other two thirds looked
+like chain weirdness rather than a build gap.
+
+**The third that renders as raw hex — missing definitions, fixable.** These are errors raised by the
+real tokens and the real pool implementations, whose definitions are not in `routerAbi`. viem
+raises `AbiErrorSignatureNotFoundError`; their `catch` swallows it and prints `error.message`, which
+for a custom error contains no
+text.<Cite src="viem-src-decode-error-result" /><Cite src="viem-src-contract-errors" /> The fix is
+a union ABI assembled from the whole call graph — the router, both tokens, the pool implementation
+behind its proxy, and the shared library errors — built at build time with a
+selector-collision assertion. Note the proxy trap specifically: the ABI they need is the
+implementation's, not the proxy's, and it changes when the implementation is upgraded.
+
+**The third that renders as "Swap failed" — not fixable by them.** The router catches a downstream
+failure and reverts with its own no-argument error. The decode is *correct*; the information was
+destroyed on chain, before any of their code ran, and no ABI recovers
+it.<Cite src="measured-revert-surfaces-1-7-1" /> Their options are to read a trace when
+investigating, to special-case that error into a message that at least says which integration
+failed, and to raise it with the router's maintainers. What they must not do is keep hunting for a
+missing ABI, which is where teams typically spend a week.
+
+**The instrumentation that would have shown this.** A counter on each outcome of the decoder —
+`custom`, `error-string`, `panic`, `empty`, `unknown-selector`, `not-a-revert` — tagged with the
+target address and chain id. The hex third would have appeared immediately as `unknown-selector`
+with a selector they could have looked up in one command, and the "Swap failed" third would have
+appeared as a `custom` decode of a single recurring no-argument error, which is a recognisable
+signature of downstream information loss. The `try`/`catch` that swallows the decode failure is
+what deleted both signals: it converted a precise, actionable exception into a string.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You now have the whole revert path: four shapes, the bytes, the walk down the cause chain, and a
+union ABI that makes the decode deterministic. That covers every failure where revert data reached
+you.
+
+**The next two lessons are about the failures where it did not.** Gas estimation is a separate RPC
+surface with its own semantics, its own failure modes, and — critically — no obligation to hand you
+revert data at all. It is the machinery that decides whether a transaction is even offered to the
+user, it fails for at least four unrelated reasons that arrive looking identical, and it is where
+most applications get "this transaction will fail" from without knowing which of the four they are
+looking at.
+
+It starts with the fact that `eth_estimateGas` is not a measurement.

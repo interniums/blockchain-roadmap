@@ -1,0 +1,392 @@
+---
+id: solidity-contract-patterns-deploying-the-same-logic-often
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-1167, eip-211, oz-docs-proxy-api, oz-changelog, solidity-docs-contracts, measured-gas-constants, eip-2929, eip-170, eip-3860, eip-150, eip-1153]
+stack: { solidity: "0.8.36" }
+---
+
+You are building a protocol where every user gets their own vault contract. The vault's runtime
+bytecode is 3,800 bytes. You expect a few thousand of them.
+
+Deploying the full contract each time stores those 3,800 bytes in the state, once per user, and pays
+for every byte at deployment — [code deposit is charged per byte](/c/code-deposit-and-size-limits).
+Three thousand identical copies of the same logic is a state-growth problem you are creating on
+purpose, and you are paying for the privilege.
+
+There are two independent decisions hiding in that sentence, and conflating them is the most common
+error in this area. **Where the contract lands** is one question. **What is in it** is a different
+one. This lesson takes them in that order.
+
+## Where it lands: two derivations, two different promises
+
+You already know both address derivations. What matters here is what each one promises a *factory*.
+
+**`CREATE` derives the address from the deployer and its nonce.** A factory's nonce increments with
+every contract it deploys, so the address of Alice's vault depends on how many vaults were deployed
+before it. You cannot tell Alice her address before Bob's deployment lands, and if a transaction
+reorders, the addresses reorder with it.
+[Address-from-nonce](/c/create-address-from-nonce) is a fine default when nobody needs to know the
+address in advance — which is most of the time, because the factory can just emit it in an event.
+
+**`CREATE2` derives the address from `0xff`, the deployer, a salt, and the keccak256 of the
+initcode.** Now the address is computable before deployment, which unlocks the things people
+actually want: telling a user their vault address before it exists so they can fund it, and
+deploying to the same address on several chains. [The derivation](/c/create2-address) is not new to
+you. Its consequences for a factory are.
+
+### The initcode hash is a commitment, and that cuts both ways
+
+Because `keccak256(initcode)` is inside the derivation, the predicted address changes if *anything*
+in the initcode changes. Two of those are surprising in practice:
+
+**Constructor arguments are part of the initcode.** They are appended to the creation code, so a
+factory that passes per-user arguments produces a different address per argument set. Usually
+that is what you want. It also means the address commits to the arguments — a genuinely useful
+property, and one people accidentally rely on without noticing.
+
+**A compiler bump changes it.** Solidity appends a metadata hash to the bytecode by default, so
+recompiling with a different compiler version, different optimizer settings, or even a changed
+source path can change the initcode and therefore every address you have already
+promised.<Cite src="solidity-docs-contracts" /> If your deployment scripts hard-code predicted
+addresses, pin the compiler and the settings, and check the
+[initcode-hash fragility](/c/initcode-hash-fragility) concept before you build anything on top.
+
+The corollary is the one worth carrying into cross-chain work: "CREATE2 gives you the same address
+everywhere" is true only when the deployer address, the salt, and the initcode are identical on
+every chain — including the deployer *existing* at that address, which is its own problem. See
+[the deterministic deployer proxy](/c/deterministic-deployer-proxy) and
+[ERC-7955](/c/erc-7955-factory) for why that assumption fails on specific chains in a specific,
+teachable way.
+
+### CREATE3, and what it trades away
+
+`CREATE3` is the community pattern that removes the initcode from the derivation. The mechanism is a
+composition of the two opcodes you know: `CREATE2`-deploy a tiny intermediate deployer at an address
+derived from `(deployer, salt)` only, then have *that* contract `CREATE` your real contract at its
+own nonce 1. The final address therefore depends on the deployer and the salt, and not at all on the
+bytecode being deployed.
+
+OpenZeppelin shipped a first-party `Create3` library in Contracts 5.7.0, released 29 July 2026,
+described as allowing the deployment address to depend only on the salt and the deployer,
+independently of the deployed bytecode.<Cite src="oz-changelog" /> Before that it was Solady,
+Solmate and hand-rolled variants only.
+
+Two things to hold about it. It is **not an EIP** — implementations differ between libraries, so
+"the CREATE3 address" is meaningful only relative to a specific deployer contract. And the property
+it gives you is the exact property `CREATE2` was giving you for free and you may have been relying
+on: with `CREATE3` the address **no longer commits to the code at it**. Same address, different
+bytecode, is now a legal state. Whether that is a feature or a hole depends entirely on whether
+anyone downstream was treating the address as a proof of what runs there.
+
+<Aside kind="note">
+Note the ordering: `CREATE3` costs two deployments and one extra frame to buy address stability
+across code changes. If your reason for wanting deterministic addresses is "so users can pre-fund,"
+`CREATE2` is enough. If it is "so this contract is at 0xABC on eleven chains and stays there through
+a redeploy," that is what `CREATE3` is for.
+</Aside>
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'CREATE', note: 'the default' },
+    { title: 'CREATE2', note: 'address from a salt', tone: 'accent' },
+    { title: 'CREATE3', note: 'a composition of the two', tone: 'warn' },
+  ]}
+  rows={[
+    {
+      label: 'What is the address derived from?',
+      cells: [
+        'The deployer and its nonce',
+        '0xff, the deployer, a salt, and keccak of the initcode',
+        'The deployer and a salt, and nothing else',
+      ],
+    },
+    {
+      label: 'Can you give a user the address in advance?',
+      cells: ['No — it depends on how many deployments came first', 'Yes', 'Yes'],
+    },
+    {
+      label: 'Does the address commit to the code at it?',
+      cells: ['No', 'Yes — change one byte of initcode and the address moves', 'No — same address, different bytecode is a legal state'],
+    },
+    {
+      label: 'What quietly breaks a predicted address?',
+      cells: [
+        'A reordered transaction',
+        'A compiler bump, changed optimizer settings, even a changed source path',
+        'Nothing about the code — but the deployer contract must exist at the same address',
+      ],
+    },
+    {
+      label: 'Is it standardised?',
+      cells: ['An opcode', 'An opcode', 'No EIP; implementations differ between libraries'],
+    },
+  ]}
+  caption="Only one of these three lets an address be a promise about the code sitting at it, and it is the one people give up first."
+  alt="CREATE, CREATE2 and CREATE3 compared across what the address is derived from, whether it can be predicted, whether it commits to the deployed code, what breaks a predicted address, and whether the mechanism is standardised."
+/>
+
+## What is in it: the 45 bytes of EIP-1167
+
+Now the second decision. Rather than deploying 3,800 bytes per user, deploy a forwarder that
+delegates to one shared copy.
+
+ERC-1167 specifies the exact bytecode, and it is short enough to print:<Cite src="eip-1167" />
+
+<Figure
+  caption="Twenty of the forty-five bytes are an address; the other twenty-five are identical in every clone ever deployed."
+  alt="The forty-five byte ERC-1167 runtime: a ten-byte prologue that copies calldata into memory, a twenty-byte implementation address sitting at indices ten to twenty-nine, and a fifteen-byte epilogue that delegatecalls and relays the result."
+>
+  <Anatomy
+    cols={90}
+    value="363d3d373d3d3d363d73bebebebebebebebebebebebebebebebebebebebe5af43d82803e903d91602b57fd5bf3"
+    parts={[
+      { from: 0, to: 20, label: 'prologue', note: '10 bytes' },
+      { from: 20, to: 60, label: 'implementation address', note: '20 bytes, the only ones that vary', tone: 'accent' },
+      { from: 60, to: 90, label: 'epilogue', note: '15 bytes' },
+    ]}
+  />
+</Figure>
+
+Forty-five bytes total. The specification's wording is that the bytes at indices 10 through 29
+inclusive are replaced with the 20-byte address of the master functionality
+contract.<Cite src="eip-1167" /> Everything else is fixed for every clone ever deployed, which is the
+point: the abstract says the standardisation lets users and tools simply discover that a contract
+will always redirect in a known manner, and then depend on representations about the destination
+code — verified source, third-party audits — as representations about the
+clone.<Cite src="eip-1167" />
+
+### Reading the runtime, one purpose at a time
+
+The EIP publishes the disassembly.<Cite src="eip-1167" /> Here it is grouped by what each group is
+*for* rather than by opcode.
+
+**Subgoal 1 — get the caller's calldata into memory, because `DELEGATECALL` reads its arguments from
+memory, not from calldata.**
+
+```text
+36  CALLDATASIZE          cds
+3d  RETURNDATASIZE        0 cds
+3d  RETURNDATASIZE        0 0 cds
+37  CALLDATACOPY          (copies cds bytes from calldata 0 to memory 0)
+```
+
+**Subgoal 2 — build the six `DELEGATECALL` arguments on the stack, in reverse order.**
+
+```text
+3d  RETURNDATASIZE        0                 <- retSize
+3d  RETURNDATASIZE        0 0               <- retOffset
+3d  RETURNDATASIZE        0 0 0
+36  CALLDATASIZE          cds 0 0 0         <- argSize
+3d  RETURNDATASIZE        0 cds 0 0 0       <- argOffset
+73  PUSH20 <impl>         impl 0 cds 0 0 0  <- the only variable bytes in the whole contract
+5a  GAS                   gas ...           <- forward everything available
+f4  DELEGATECALL          suc 0
+```
+
+Return size and offset are zero because the clone does not know how much will come back; it collects
+the returndata afterwards instead.
+
+**Subgoal 3 — copy whatever came back into memory.**
+
+```text
+3d  RETURNDATASIZE        rds suc 0
+82  DUP3                  0 rds suc 0
+80  DUP1                  0 0 rds suc 0
+3e  RETURNDATACOPY        suc 0
+```
+
+**Subgoal 4 — return it on success, bubble it as revert data on failure.**
+
+```text
+90 3d 91                  (stack shuffle: suc 0 rds)
+602b  PUSH1 0x2b          0x2b suc 0 rds     <- offset of the JUMPDEST at byte 43
+57    JUMPI               0 rds
+fd    REVERT                                 <- taken when suc == 0
+5b    JUMPDEST            0 rds
+f3    RETURN
+```
+
+The abstract states both halves of that last behaviour: the implementation forwards all calls and
+100% of the gas, relays the return value back to the caller, and in the case where the
+implementation reverts, the revert is passed back along with the payload
+data.<Cite src="eip-1167" /> Your custom errors survive the hop.
+
+<Aside kind="note">
+Two details a byte-level reader will notice. `RETURNDATASIZE` is used everywhere a zero is needed,
+which works because EIP-211 guarantees it returns zero before any call in the frame — and it uses one
+less gas than a `DUP`.<Cite src="eip-1167" /><Cite src="eip-211" /> And the standard documents a
+vanity-address optimisation: if the implementation is deployed at an address with Z leading zero
+bytes, the `PUSH20` becomes a `PUSH(20-Z)` and the jump destination decrements by Z, shortening the
+clone.<Cite src="eip-1167" />
+</Aside>
+
+### The 55-byte figure is not in the standard
+
+You will see "45 bytes of runtime, 55 bytes of creation code" quoted as if both halves were
+standardised. Only the first is. The EIP says, in as many words, that deployment bytecode is **not**
+included in this specification, and points at a reference implementation as one
+approach.<Cite src="eip-1167" /> The common 10-byte creation prefix is a convention that libraries
+converged on, not a normative requirement, and a factory is free to use another. Worth knowing before
+you write a tool that identifies clones by their creation code rather than their runtime.
+
+## What the clone is like to use
+
+Three consequences of "every call is a `DELEGATECALL` to a fixed address."
+
+**Storage lives in the clone.** The implementation's code executes in the clone's context, so
+`sload`/`sstore` hit the clone's slots, and `msg.sender` and `msg.value` are the original caller's
+— the [delegatecall context rules](/c/sol-delegatecall-context) you already know, with the clone as
+the storage owner. The same is true of transient storage: EIP-1153 specifies that under
+`DELEGATECALL` the owner of the transient storage is the caller, so a reentrancy guard inside the
+implementation locks the clone's slot, per clone.<Cite src="eip-1153" />
+
+**Everything is forwarded, including plain value transfers.** A transfer with empty calldata is
+still a call; the clone copies zero bytes and delegatecalls with empty calldata, which lands on the
+implementation's `receive` or `fallback`. If the implementation has neither, ETH sent to a clone
+reverts — the clone's own bytecode contains no `receive`, because it contains nothing but the
+forwarder.
+
+**A clone pointing at an address with no code is a live footgun.** `DELEGATECALL` to an account with
+no code succeeds and returns success — [the empty-code case](/c/delegatecall-no-code-succeeds) —
+so OpenZeppelin's `Clones` library warns on every one of its functions that it does not check whether
+the implementation has code, that such a clone cannot be initialized, and that initialization calls
+may appear to succeed while having no effect, leaving the clone open for a third party to initialize
+later.<Cite src="oz-docs-proxy-api" /> Check the implementation once, in the factory's constructor.
+
+## The tradeoff, as an equation rather than a slogan
+
+The EIP's rationale states the cost side in five words: the design has small operational overhead,
+and **adds a single call cost to each call**.<Cite src="eip-1167" /> That is the honest summary. Here
+is what it decomposes into.
+
+**One-time saving, per instance.** Deploying 45 bytes instead of the implementation's full runtime.
+The saving scales with the implementation's size because code deposit is charged per byte, and
+[EIP-170's 24,576-byte cap](/c/code-deposit-and-size-limits) bounds how large that difference can
+be.<Cite src="eip-170" /><Cite src="eip-3860" /> A 400-byte contract barely benefits; a 20,000-byte
+one benefits enormously.
+
+**Permanent cost, per call.** Every call to a clone pays, before any of your logic runs:
+
+- the forwarder's own dispatch — roughly two dozen opcodes, calldata copy, returndata copy, plus the
+  memory expansion for both;
+- an account access for the `DELEGATECALL` target, which under EIP-2929 is 2,600 gas cold and 100
+  warm as measured — so the first call of a transaction pays the cold
+  rate;<Cite src="eip-2929" /><Cite src="measured-gas-constants" />
+- the [63/64 rule](/c/63-64-rule) applied one frame deeper than it would otherwise
+  be.<Cite src="eip-150" />
+
+**Break-even.** Put those together and the decision is arithmetic, not doctrine:
+
+```text
+instances × (deploy_full − deploy_clone)   vs   total_calls × per_call_overhead
+```
+
+Clones win when the left side is bigger: many instances of a large contract, each called a moderate
+number of times. Clones lose for a singleton, and they lose for a contract that is small to deploy and
+called constantly.
+
+<Aside kind="warn">
+**There is no canonical number for the deployment saving, and you should distrust any source that
+gives you one.** Published figures differ widely and they are all correct for their own
+implementation, because the saving is a function of that implementation's bytecode size. Measure it:
+deploy your contract once directly and once as a clone, record both, then measure an identical
+function call through each path. The result is a break-even instance count for *your* contract, which
+is the only form of this answer that is worth anything.
+</Aside>
+
+<Misconception
+  belief="Clones are strictly cheaper than full deployments."
+  reality="Cheaper to deploy and permanently more expensive to call. Every call pays the forwarder's dispatch plus a DELEGATECALL account access before reaching any logic — the standard's own rationale says it adds a single call cost to each call."
+  why="Published benchmarks quote deployment gas only, because that is the number that looks impressive and the per-call delta is small enough to disappear in a summary."
+  src="eip-1167"
+/>
+
+<Check type="predict" concept="clone-tradeoff">
+You measured your own vault contract on your own machine and got:
+
+```text
+full deployment            1,240,000 gas
+clone via Clones.clone        68,000 gas
+deposit() on a full vault     52,000 gas
+deposit() on a clone          54,900 gas   (warm implementation account)
+```
+
+Your product expects roughly 40 deposits per vault over its lifetime. Compute the break-even, decide,
+and then say what would change your answer.
+
+<Answer>
+**Per instance, the deployment saving is 1,240,000 − 68,000 = 1,172,000 gas.**
+
+**Per call, the clone overhead is 54,900 − 52,000 = 2,900 gas.** Note the measurement says "warm" —
+the first call to a given clone in a transaction pays the cold account access instead, 2,600 rather
+than 100, so the real per-call figure varies by about 2,500 depending on
+warmth.<Cite src="eip-2929" /><Cite src="measured-gas-constants" /> Use the warm number for a
+steady-state estimate and know the first call costs more.
+
+**Break-even in calls per instance:** 1,172,000 ÷ 2,900 ≈ **404 calls**.
+
+**Decision: clone, comfortably.** At 40 deposits per vault you are using about 10% of the budget the
+deployment saving bought you. Net saving per vault is roughly 1,172,000 − (40 × 2,900) ≈ 1,056,000
+gas, and it scales linearly with the number of vaults.
+
+**What would change the answer.**
+
+*A much smaller implementation.* Shrink the vault to 600 bytes and the deployment saving collapses
+toward the clone's own cost, while the per-call overhead does not move at all. The break-even count
+falls, possibly below your expected call volume.
+
+*A much higher call count.* A vault that is called in every block — a keeper-driven strategy, an
+AMM position — crosses 404 calls quickly, and then the clone is costing you money forever in exchange
+for a one-time discount.
+
+*Who pays.* This is the part the arithmetic hides. The deployment saving is usually paid by *you* or
+by the user creating the vault; the per-call overhead is paid by *every user, every time*. Two
+different budgets. A protocol whose users are gas-sensitive may rationally choose the more expensive
+deployment to make the common path cheaper, and that is a product decision, not a gas one.
+
+*Whether you will ever need to change the logic.* Not in this equation at all, and it is the largest
+consideration of the three. The next lesson is about it.
+</Answer>
+</Check>
+
+## Building the factory
+
+Two shapes, both from `Clones`.<Cite src="oz-docs-proxy-api" />
+
+`Clones.clone(implementation)` uses `CREATE`, and the docs note that this never
+reverts.<Cite src="oz-docs-proxy-api" /> Use it when nobody needs the address in advance.
+
+`Clones.cloneDeterministic(implementation, salt)` uses `CREATE2`, paired with
+`predictDeterministicAddress(implementation, salt, deployer)`. Deploying the same implementation and
+salt twice reverts, because two contracts cannot occupy one address — which is a useful uniqueness
+constraint if your salt is derived from something meaningful, like the user's
+address.<Cite src="oz-docs-proxy-api" />
+
+Since Contracts 5.2.0 there is a third: `cloneWithImmutableArgs(implementation, args)` and its
+deterministic variant append per-instance immutable arguments to the clone, retrievable inside the
+implementation via `fetchCloneArgs(address instance)`, with a `CloneArgumentsTooLong`
+error if they do not fit.<Cite src="oz-changelog" /><Cite src="oz-docs-proxy-api" /> That is the
+answer to "I want each clone to have a different token address without paying an `SSTORE` for it" —
+the value lives in the clone's code rather than its storage.
+
+## Where this pays off
+
+**The next lesson** is the other half of this one. A clone runs no constructor, which changes how
+every instance gets its initial state — and gets that state wrong in a way that has repeatedly cost
+real money.
+
+**Proxies and upgrades**, later in this track, shares the `DELEGATECALL` mechanism and almost nothing
+else. A clone's implementation address is bytecode; a proxy's is storage. That single difference is
+the whole distinction, and the next lesson makes it precisely.
+
+**Deployment and verification** in Track 05 is where deterministic addresses become an operational
+concern: the same address on eleven chains, verified on each, with a script that fails loudly when
+the initcode hash moves.
+
+**Reading a contract you did not deploy.** Forty-five bytes with `363d3d37` at the front is a clone,
+and its behaviour is entirely the implementation's. That is a two-second identification that tells
+you where to actually go looking.

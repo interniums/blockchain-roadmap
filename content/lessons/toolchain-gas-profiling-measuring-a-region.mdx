@@ -1,0 +1,375 @@
+---
+id: toolchain-gas-profiling-measuring-a-region
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [foundry-gas-tracking, foundry-cheatcodes-overview, forge-test-reference, measured-gas-profiling-1-7-1, measured-forge-1-7-1, eip-2929]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Write the probe everyone writes. Read the counter, do the thing, read the counter again:
+
+```solidity
+function readDiscarded() external view returns (uint256 used) {
+    uint256 a = gasleft();
+    assembly { pop(sload(0)) }
+    uint256 b = gasleft();
+    used = a - b;
+}
+```
+
+Slot 0 holds a non-zero value. It has not been touched in this transaction, so under [EIP-2929's
+cold and warm pricing](/c/cold-vs-warm-access) the read should cost 2,100. The optimizer is off —
+forge 1.7.1's default.<Cite src="measured-forge-1-7-1" /> Run it:
+
+```
+empty baseline    9
+read, discarded   9
+read, sunk (cold) 2116
+```
+
+**Nine gas.** And the empty control — two `gasleft()` calls with nothing between them — also reads
+nine.<Cite src="measured-gas-profiling-1-7-1" /> The probe did not measure a cheap `SLOAD`. It measured no `SLOAD` at all.
+
+## The compiler removed it, with the optimizer off
+
+`pop(sload(0))` loads a word and discards it. It writes no storage, emits no log, returns nothing,
+and cannot revert. Its result is observable by nothing. So it is dead, and dead code is removed
+before it can execute — including when you have explicitly turned the optimizer off.
+
+That last clause is the part that fails people. "Optimizer off" is heard as "the compiler emits what
+I wrote". It does not mean that. It means the *optimizer passes* are off. Eliminating an expression
+with no observable effect is not an optimizer pass; it falls out of how the code is generated in the
+first place, and there is no setting that restores it.
+
+Measured across all three pipelines on forge 1.7.1 with solc 0.8.36:<Cite src="measured-gas-profiling-1-7-1" />
+
+<Matrix
+  numeric
+  corner="Pipeline"
+  cols={['Empty control', 'Discarded read', 'Sunk read']}
+  rows={[
+    { label: 'legacy, optimizer off (default)', cells: ['9', { v: '9', tone: 'danger' }, { v: '2,116', tone: 'good' }] },
+    { label: 'legacy, optimizer on', cells: ['9', { v: '9', tone: 'danger' }, { v: '2,116', tone: 'good' }] },
+    { label: 'via-IR, optimizer on', cells: ['2', { v: '2', tone: 'danger' }, { v: '2,107', tone: 'good' }] },
+  ]}
+  caption="Turning the optimizer off does not restore the read: an expression nobody observes is gone before the optimizer is consulted."
+  alt="Measured gas across three compiler pipelines. Legacy with the optimizer off and legacy with it on both report 9 gas for an empty control and 9 for a discarded read, against 2,116 for a read sunk into storage. Via-IR with the optimizer on reports 2, 2 and 2,107."
+/>
+
+All six figures from the same probe contract, one flag changed at a time.<Cite src="measured-gas-profiling-1-7-1" />
+
+The discarded read is indistinguishable from doing nothing under every setting. And note the third
+column: subtract the control and both pipelines land within seven gas of 2,100, the cold `SLOAD`
+constant.<Cite src="measured-forge-1-7-1" />
+
+<Misconception
+  belief="With the optimizer turned off, the compiler emits exactly the instructions I wrote, so a gasleft() probe measures the operation."
+  reality="Code whose result is never observed is eliminated regardless of the optimizer setting. Measured on forge 1.7.1 with solc 0.8.36, a discarded SLOAD costs the same as an empty region — nine gas — with the optimizer off, on, and under via-IR."
+  why="'Optimizer off' is read as 'no transformations at all', when it means 'the optimizer passes are off'."
+  src="measured-gas-profiling-1-7-1" />
+
+## The fix: sink the result
+
+Give the value somewhere to go that the compiler cannot prove is unnecessary.
+
+```solidity
+uint256 public sink;
+
+function readSunk() external returns (uint256 used) {
+    uint256 v;
+    uint256 a = gasleft();
+    assembly { v := sload(0) }
+    uint256 b = gasleft();
+    sink = v;                 // observable: a storage write outside the measured window
+    used = a - b;
+}
+```
+
+2,116.<Cite src="measured-gas-profiling-1-7-1" /> The read now happens, because its value ends up in storage and storage survives the
+call.
+
+Three properties make that sink work, and all three matter:
+
+- **The consumer is a storage write.** Assigning to a local, or to a `memory` variable that nothing
+  else reads, is not enough — a local that is never observed is itself dead. A storage write, a
+  returned value, an emitted event, or a revert-condition are the observable sinks.
+- **The sink is outside the measured window.** `sink = v` sits *after* the second `gasleft()`, so
+  its own 20,000-or-2,900 gas is not in the number. Putting it inside would swamp the 2,100 you are
+  trying to see.
+- **The function is no longer `view`.** It cannot be — it writes. If your probe compiled as `view`
+  before and does not now, that is the sink doing its job.
+
+<Aside kind="stop">
+The diagnostic to memorise: **if several different operations all measure the same small number,
+they were all eliminated.** The Chainpath measurement pass hit this before anyone noticed — every
+read in the first probe run came back as nine gas, which looked like a plausible constant instead of
+the absence of a measurement.<Cite src="measured-forge-1-7-1" /> Always include an empty control region in the probe. When the
+control and the operation agree, you have measured nothing, and you know it in one line instead of
+after publishing a table.
+</Aside>
+
+## Calibrate the harness before you trust the number
+
+The empty control is not only a smoke test. It is the constant you subtract.
+
+Two `GAS` opcodes plus the surrounding stack work cost **9** gas in the probe above and **2** under
+via-IR.<Cite src="measured-gas-profiling-1-7-1" /> A different harness shape — the one used for the repository's constant table, which
+wraps operations in inline assembly and assigns into a struct — measured roughly sixteen to
+seventeen.<Cite src="measured-forge-1-7-1" /> There is no universal overhead constant, because the overhead is whatever your
+specific probe's surrounding code compiles to.
+
+So the procedure is: write the control into the same contract, under the same settings, and subtract
+it. A number reported without its control is a number nobody can reproduce.
+
+## The instrument you should reach for first
+
+Foundry ships a purpose-built version of this, and it does not need a sink at all, because it does
+not depend on the compiler emitting anything.
+
+```solidity
+function test_snapshotRegion() public {
+    expensiveSetup();
+    vm.startSnapshotGas("credit_after_setup");
+    l.credit(alice, 1);
+    uint256 used = vm.stopSnapshotGas();
+}
+```
+
+`vm.startSnapshotGas(name)` opens a named region; `vm.stopSnapshotGas()` closes it and returns the
+gas used.<Cite src="foundry-gas-tracking" /> Like every member of the [cheatcode families](/c/cheatcode-families), it is
+intercepted by Foundry's EVM rather than compiled into your bytecode, so the measurement is of the
+frames that actually executed.<Cite src="foundry-cheatcodes-overview" />
+
+Here is what that buys, on one test where the operation under measurement is preceded by twenty
+credits of fixture work:<Cite src="measured-gas-profiling-1-7-1" />
+
+<Matrix
+  numeric
+  corner="Instrument"
+  cols={['Reported']}
+  rows={[
+    { label: 'whole test, no controls', cells: [{ v: '577,880', tone: 'warn' }] },
+    { label: 'vm.pauseGasMetering() around the fixture', cells: ['31,242'] },
+    { label: 'vm.resetGasMetering() after the fixture', cells: ['28,158'] },
+    { label: 'vm.startSnapshotGas / vm.stopSnapshotGas region', cells: [{ v: '28,053', tone: 'accent' }] },
+  ]}
+  caption="The tightest instrument is the one that brackets a region you named, rather than a test boundary the framework chose for you."
+  alt="One operation measured four ways: the whole test reports 577,880 gas, pauseGasMetering around the fixture reports 31,242, resetGasMetering after the fixture reports 28,158, and a named startSnapshotGas region reports 28,053."
+/>
+
+One operation, four instruments, measured in one run of one suite.<Cite src="measured-gas-profiling-1-7-1" />
+
+One operation, four instruments, four numbers spanning a factor of twenty. The whole-test figure is
+95% fixture. The named region is the tightest and the only one that is *about* the operation.
+
+### Where the region output lands
+
+The Chainpath research pass could not confirm where the snapshot cheatcodes write their results.
+Measured on forge 1.7.1: a file per test contract at `snapshots/<ContractName>.json`, a flat JSON
+object mapping each region name to a decimal string.<Cite src="measured-gas-profiling-1-7-1" />
+
+```json
+{
+  "credit_after_setup": "28053"
+}
+```
+
+Two flags control it, both documented in `forge test --help` on this version: `--gas-snapshot-emit`
+enables or disables recording, and `--gas-snapshot-check` compares against the previous
+run.<Cite src="measured-gas-profiling-1-7-1" /><Cite src="forge-test-reference" /> A deliberately corrupted value produces:
+
+```
+[LedgerTest] Failed to match snapshots:
+- [credit_existing] 40000 → 20251
+
+Error: Snapshots differ from previous run
+```
+
+That is the cheatcode-side equivalent of `forge snapshot --check`, keyed on region names you chose
+rather than on test names that churn — which makes it the better gate of the two, for exactly the
+reason the previous lesson gave.
+
+<Aside kind="warn">
+Since Foundry 1.0 there are **two** gas-snapshot mechanisms and they do not talk to each other: the
+whole-test `forge snapshot` writing `.gas-snapshot`, and these named regions writing
+`snapshots/*.json`. A repository normally uses one. Say which one you are reading before comparing a
+number with anybody, because both are called "the gas snapshot".
+</Aside>
+
+### Naming regions so the diff stays readable
+
+Because the JSON is keyed on the name you pass, the name is the thing a reviewer reads six months
+from now. Two habits pay for themselves:
+
+**Name the scenario, not the function.** `credit_existing_holder` and `credit_new_holder` are two
+regions with a 2× cost difference between them and a reason for it. A single region called `credit`
+collapses that into one number that moves when the fixture changes.
+
+**Keep the names stable across refactors.** A renamed region reads as one deletion and one addition
+in the diff, with no delta — the same false positive that whole-test snapshots suffer, arriving
+through a different door. The advantage of these names over test names is only that *you* control
+when they change, so exercise that control.
+
+In CI, `--gas-snapshot-emit false` runs the suite without overwriting the recorded values, which is
+what you want on a job whose purpose is to compare rather than to record.<Cite src="forge-test-reference" /><Cite src="measured-gas-profiling-1-7-1" /> Pair it with
+`--gas-snapshot-check true` and the job becomes: run, compare, fail on mismatch, change nothing on
+disk.
+
+## The cheatcode number is flag-dependent too
+
+One measurement to keep you honest. The same `vm.startSnapshotGas` region around the same call,
+recorded twice:<Cite src="measured-gas-profiling-1-7-1" />
+
+- `forge test` — **20,251**
+- `forge test --gas-report` — **41,619**
+
+The difference is 21,368, and it is not noise:<Cite src="measured-gas-profiling-1-7-1" /> it is the intrinsic charge plus the calldata
+bytes of that call, which appear because `--gas-report` switches on isolation. The next lesson does
+that arithmetic digit by digit.
+
+The point for now is that a named region is not immune to the harness. It excludes the *fixture*,
+which is what it promises. It does not excuse you from recording the flags.
+
+## What a region still includes
+
+A bracket around `l.credit(alice, 1)` does not measure `credit`. It measures *your test contract
+calling* `credit` — laying the arguments out in memory, executing the `CALL`, and copying any return
+data back. All of that is inside the window and none of it is in the callee.
+
+The size of that wrapper is measurable. On a no-argument call, the gas the test contract burned
+around the call came to **526** more than the gas-report row attributed to the callee: 26,908
+measured from outside against 26,382 attributed to the function.<Cite src="measured-gas-profiling-1-7-1" /> Five hundred gas is nothing
+next to a storage write and everything next to a claim that reordering two opcodes saved forty.
+
+Two consequences worth holding on to. **Comparing two implementations is fine** — the wrapper is the
+same on both sides and cancels out. **Quoting an absolute figure as "what this function costs" is
+not**, because you have included the caller and excluded the transaction. When you need the second
+kind of number, the next lesson names the tool for it.
+
+## Measuring something you cannot call
+
+Regions and `gasleft()` deltas both need an external call boundary to be interesting, which leaves
+`internal` and `private` functions awkward. There is no cheatcode that reaches inside a frame.
+
+The workable pattern is a **harness contract**: a subclass of the contract under test, in `test/`,
+that exposes the internal function through a thin external wrapper.
+
+```solidity
+contract LedgerHarness is Ledger {
+    function exposed_settle(uint256 x) external { _settle(x); }
+}
+```
+
+Now the region brackets `harness.exposed_settle(x)`, and the wrapper's own overhead is the same
+500-ish gas discussed above — constant across whatever variants you are comparing. What you must not
+do is add the wrapper to `src/`: a function that exists only to be measured is a function an
+attacker can call, and the internal one was internal for a reason.
+
+## Pause, resume, reset — and when to use each
+
+Three metering cheatcodes, all documented with worked examples:<Cite src="foundry-gas-tracking" />
+
+- `vm.pauseGasMetering()` / `vm.resumeGasMetering()` bracket work you want excluded. Use when the
+  expensive preparation sits in the middle of the test and you want everything else still counted.
+- `vm.resetGasMetering()` zeroes the counter at a point. Use when everything before the marker is
+  setup and everything after is the subject.
+
+Measured, pause/resume reported 31,242 against reset's 28,158 for the same operation.<Cite src="measured-gas-profiling-1-7-1" /> They are
+close but not equal, and the pair is not interchangeable with the single call. If you switch
+instruments mid-project, expect the number to move and do not attribute the movement to the
+contract.
+
+<Aside kind="note">
+`vm.pauseGasMetering()` has a documented cost of its own in a different sense: with metering paused,
+operations that would run out of gas do not, so a test can pass through a path that would revert on
+chain. Use it to *measure*, not to make an expensive test fit under a limit.
+</Aside>
+
+## A probe you can trust, assembled
+
+**Subgoal — establish the baseline, so the harness's own cost is a known quantity.** Add an
+`empty()` function that takes two `gasleft()` readings with nothing between them, under the exact
+compiler settings you will use for the real measurement.
+
+**Subgoal — make the operation observable, so the compiler cannot delete it.** Assign the result
+into a storage `sink`, placed after the closing `gasleft()` so its cost is outside the window.
+
+**Subgoal — control the state the operation runs against, because cold and warm are different
+prices.** Decide whether you are measuring a first touch or a repeat touch, then arrange it
+deliberately: call the function once to warm everything and measure the second call, or measure the
+first and say so. There is no cheatcode to force a slot cold again, so warming is the direction you
+can control.
+
+**Subgoal — record the environment, so the number is reproducible.** Forge version, solc version,
+optimizer on or off, `optimizer_runs`, via-IR or legacy, and whether `--isolate` or `--gas-report`
+was set. A gas figure without those six facts is not a measurement, it is an anecdote.
+
+**Subgoal — repeat the measurement, because a single reading cannot distinguish a constant from a
+coincidence.** Run the probe twice in the same test and confirm the second reading matches the first
+once warmth is accounted for. Two identical readings are evidence; one reading is a number.
+
+**Subgoal — cross-check with a second instrument.** Put a `vm.startSnapshotGas` region around the
+same call. If the hand-rolled delta and the named region disagree by more than the harness baseline,
+one of them is measuring something you did not intend.
+
+<Check type="spot-bug" concept="gas-probe-dead-code-elimination">
+A colleague is comparing two hash implementations and reports that both cost the same, so the choice
+does not matter. Their probe:
+
+```solidity
+function measureKeccak(bytes memory data) external view returns (uint256) {
+    uint256 a = gasleft();
+    keccak256(data);
+    uint256 b = gasleft();
+    return a - b;
+}
+
+function measureSha(bytes memory data) external view returns (uint256) {
+    uint256 a = gasleft();
+    sha256(data);
+    uint256 b = gasleft();
+    return a - b;
+}
+```
+
+They ran it with `optimizer = false` in `foundry.toml` and both functions returned single-digit
+numbers. What is wrong, what would you expect after fixing it, and is there a second problem?
+
+<Answer>
+**The first bug is the one this lesson is about.** Neither hash result is assigned to anything. Both
+expressions are dead, both are eliminated, and both probes return the harness baseline — which is
+why the two numbers agree. The tell is that they agree *and* that they are single-digit; a hash of
+any real payload cannot cost nine gas. Fix: `sink = uint256(keccak256(data));` after the second
+`gasleft()`, and drop `view`.
+
+**Second problem, and it is a different one.** `sha256` is a precompile, reached by a `STATICCALL`
+to a fixed address. That call has an account-access cost that is cold on the first touch in a
+transaction and warm afterwards.<Cite src="eip-2929" /> So even with the sink added, whichever hash is measured
+*first* in a given transaction pays a cold surcharge the other does not, and the comparison is
+decided by statement order rather than by the algorithms. `keccak256` has no such asymmetry — it is
+an opcode, not a call.
+
+**Third, more subtle.** Both take `bytes memory`, so each call copies the payload into memory and
+the memory-expansion cost is inside the measured window for the first one and already paid for the
+second. Hoist the allocation before the first `gasleft()`, or measure each in its own call.
+
+**What to expect after fixing.** Two numbers that scale with the input length at different rates,
+and a difference that is real. What you must not do is publish either absolute figure without the
+empty control subtracted and the compiler settings recorded — the same discipline that would have
+caught the original bug in one line.
+
+</Answer>
+</Check>
+
+## Where this goes
+
+**Next**, the flag-dependence that has now appeared three times gets its explanation: isolation, the
+intrinsic charge, and the exact arithmetic that turns 20,339 into 41,707.<Cite src="measured-gas-profiling-1-7-1" /> That lesson also
+explains why every number in this module is *below* what a user pays, and why the bias only runs one
+way.
+
+**After that**, the measurement discipline gets pointed at the things that actually cost money —
+storage slots, refunds and calldata — and then at the folklore, where a working probe is the only
+thing standing between you and a review checklist that costs more than it saves.

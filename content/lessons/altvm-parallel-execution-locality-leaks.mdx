@@ -1,0 +1,257 @@
+---
+id: altvm-parallel-execution-locality-leaks
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [helius-local-fee-markets, anza-central-scheduler, agave-greedy-scheduler, solana-docs-fee-structure, agave-thread-aware-account-locks, agave-block-cost-limits, solana-swqos-guide, solana-cookbook-retry, lightspeed-local-fee-markets]
+stack: {}
+---
+
+Your product writes exactly one shared account, and it is not a popular one. Nobody else on Solana
+touches it. By the previous lesson's mechanism you are insulated: contention is bounded per writable
+account, so a bidding war somewhere else is somebody else's problem.
+
+Then a launch happens on an unrelated program, and your landing rate drops by half for twenty minutes
+while your users pay the same fees they always paid, on the same account they always used.
+
+Nothing is broken. Locality on Solana is real and it is partial, and the gap between those two words is
+where a lot of production incidents live. This lesson locates the leaks precisely — each one in a
+specific mechanism you have already met — so that you can predict which parts of the slogan hold.
+
+## The claim, stated fairly first
+
+The strong version of the claim is not silly. It follows from real mechanism.
+
+Ethereum prices block space with one number that everyone pays; congestion anywhere raises the price
+everywhere. Solana has no such number, contention is bounded per writable account, and the priority
+fee is a per-transaction bid. So the *ceiling* on how much any one account can consume is genuinely
+local, and the resulting fee floors on different accounts genuinely differ — the median-versus-average
+spread from the previous lesson is direct evidence of that.<Cite src="helius-local-fee-markets" />
+
+Hold onto that, because the rest of this lesson is qualification and it would be easy to overcorrect
+into "local fee markets are fake". They are not fake. They are leaky, in five identifiable places.
+
+## Leak one: there is only one queue
+
+The central scheduler exists precisely to give one thread a global view of all buffered traffic — that
+was the stated fix for the previous design, where independent worker threads pulled from a common
+queue with no knowledge of each other.<Cite src="anza-central-scheduler" />
+
+The global view is what makes ordering deterministic and fee-responsive. It is also what makes
+locality leak, and you cannot have one without the other.
+
+Read the scheduling loop again. It pops from a single container, one transaction at a time, in
+priority order, and priority is `reward × 1,000,000 / (cost + 1)` computed over the whole
+buffer.<Cite src="agave-greedy-scheduler" /><Cite src="solana-docs-fee-structure" /> There is no
+per-account queue. There is no round-robin across accounts. Your transaction on a quiet account is
+ranked in the same list as every transaction on the hot one, by the same formula, and if ten thousand
+of them outbid you then ten thousand of them are examined first.
+
+**The ceiling is per-account. The queue is not.** That asymmetry is the root of everything below.
+
+## Leak two: the scan is bounded
+
+A scheduling pass does not walk the whole buffer. It stops when the block budget is spent, when every
+worker is saturated, when the container empties — or when it has scanned
+`max_scanned_transactions_per_scheduling_pass`, whose default is **100,000**.<Cite src="agave-greedy-scheduler" />
+
+And unschedulable transactions are not consumed by the scan for free: they are popped, examined,
+counted against the scan limit, appended to an `unschedulables` list, and pushed back into the queue
+when the pass ends.<Cite src="agave-greedy-scheduler" /> A deep queue of mutually conflicting
+high-fee transactions on one account therefore *burns scan budget* while producing very little
+scheduled work.
+
+So a hot account can degrade you twice: by outranking you, and by consuming the scheduler's attention
+before it reaches you.
+
+## Leak three: workers are shared, and they saturate on compute
+
+The scheduler tracks compute units in flight per worker thread and removes a thread from the
+schedulable set once its in-flight CU reaches a per-thread target — derived from
+`target_scheduled_cus`, whose default is the block unit constant divided by four and then split across
+workers.<Cite src="agave-greedy-scheduler" /> When no schedulable threads remain, the pass ends for
+everyone.<Cite src="agave-greedy-scheduler" />
+
+Notice the unit. A worker is not taken out of circulation by having "too many transactions" — it is
+taken out by having too much *compute* in flight. Which means expensive transactions on a hot account
+remove capacity that your cheap transaction on a cold account needed, without ever touching your
+account.
+
+There is a second-order version of this that is easy to miss. Because a transaction conflicting on one
+account is pinned to the thread already holding that lock, a hot account **concentrates** work onto
+one worker rather than spreading it.<Cite src="agave-thread-aware-account-locks" /> That worker
+saturates first. The remaining workers are still available — but the scheduler's four-way capacity has
+effectively become three-way for the duration, and your transaction is competing for a smaller pool
+than the architecture diagram suggests.
+
+## Leak four: block space is shared
+
+The per-account cap and the block cap are separate limits, and only one of them is
+per-account.<Cite src="agave-block-cost-limits" /> A hot account operating at its ceiling is consuming
+a large fraction of the block's total compute, and every unit it takes is a unit unavailable to
+everyone else regardless of which accounts they touch.
+
+This is not a bug in the design; it is arithmetic. Bounding one account's share below 100% guarantees
+that *some* capacity remains for others. It does not guarantee that capacity is plentiful, and it
+certainly does not make the remainder free.
+
+## Leak five: ingress is shared, and rationed by stake
+
+Everything above happens after your transaction reaches the leader. The last leak happens before.
+
+Leader connection capacity is allocated by stake, not by account: a peer with 1% of stake may transmit
+up to 1% of packets, and stake-weighted quality of service covers 80% of a leader's TPU
+capacity.<Cite src="solana-swqos-guide" /> Nothing in that allocation knows or cares which accounts
+your transaction touches. A flood of traffic aimed at one popular account consumes ingress capacity
+that is shared with everyone submitting through the same peers.
+
+And the same is true one hop earlier: an RPC node drops newly submitted transactions once its
+outstanding rebroadcast queue exceeds 10,000, and that queue is not partitioned by
+account.<Cite src="solana-cookbook-retry" /> Your transaction can lose to congestion it has no
+economic relationship with, inside infrastructure you do not operate.
+
+<Misconception
+  belief="Local fee markets mean congestion on one application never affects anyone else."
+  reality="Only the per-account compute ceiling is local. The priority queue, the scan budget, the worker pool, the block's total compute and the leader's ingress capacity are all shared, so heavy high-fee traffic on one account measurably delays unrelated low-fee traffic."
+  why="The marketing shorthand describes the one mechanism that is genuinely per-account and omits the five that are not. It is repeated without the scheduler detail that qualifies it."
+  src="helius-local-fee-markets"
+/>
+
+## What practitioners actually measured
+
+Two sources are worth reading with their limitations attached, because this is a claim where the
+evidence is empirical and the loudest voices are interested parties.
+
+**The practitioner argument.** Eugene Chen of Ellipsis Labs made the case, on a podcast in January
+2024, that Solana's local fee markets are not real in the sense that matters — that fees do not buy
+guaranteed prioritisation. Three reasons are given: continuous block building makes inclusion
+probabilistic, because a high-fee transaction arriving late in a block's construction may miss it
+regardless of what it paid; multi-threaded execution produces ordering driven by account locks rather
+than by fees; and the priority fee system gives users no signal about what to
+pay.<Cite src="lightspeed-local-fee-markets" />
+
+*Read that source with two caveats.* It predates the central scheduler entirely, so the second point
+describes a design that has since been replaced — the whole purpose of the redesign was to give one
+thread a global fee-ordered view.<Cite src="anza-central-scheduler" /> And the page carrying these
+notes states on its face that they are AI-generated summaries of a video and may not be fully
+accurate.<Cite src="lightspeed-local-fee-markets" /> Treat it as a well-sourced statement of the
+*shape* of the criticism, not as a quotable technical reference.
+
+The first and third points, though, survive the redesign untouched. Continuous block building is
+still how leaders work, and a first-price bid with no published clearing price is still what you set.
+
+**The vendor analysis.** Helius's write-up reaches a more measured conclusion: local fee markets are
+functional, with significant room for improvement. Its specific criticisms are worth carrying: analysis
+of banking-stage thread workloads by Anza engineers indicated a scheduler bug preventing the client
+from using its full capacity; there is no formal specification for how transactions should be ordered;
+and every major RPC provider ships its own priority fee API, which the write-up flags as a soft form
+of vendor lock-in and a source of inaccurate estimates.<Cite src="helius-local-fee-markets" /> Helius
+sells RPC infrastructure, which is worth knowing when reading a document that concludes fee estimation
+is hard.
+
+<Aside kind="note">
+Both sources are dated — January 2024 and January 2025 — and both carry constants that are now stale,
+including block and per-account limits that have since changed twice.<Cite src="lightspeed-local-fee-markets" /><Cite src="helius-local-fee-markets" />
+Use them for the *arguments*, which are structural and still apply, and take every number in them from
+somewhere current. That is a general rule for this topic: the mechanism criticism ages well and the
+constants age badly.
+</Aside>
+
+## The position to hold
+
+**Fee markets on Solana are more local than Ethereum's, and less local than "congestion on one
+application never affects anyone else."**
+
+<Matrix
+  corner="Resource"
+  cols={['Local to an account?', 'Why']}
+  rows={[
+    { label: 'Compute ceiling', cells: [{ v: 'Yes', tone: 'good' }, <>the cost tracker accumulates against each writable key on its own<Cite src="agave-block-cost-limits" /></>] },
+    { label: 'Priority queue', cells: [{ v: 'No', tone: 'warn' }, <>one container, one ordering, computed over the whole buffer<Cite src="anza-central-scheduler" /></>] },
+    { label: 'Scan budget', cells: [{ v: 'No', tone: 'warn' }, <>100,000 transactions per pass, spent on unschedulables too<Cite src="agave-greedy-scheduler" /></>] },
+    { label: 'Worker threads', cells: [{ v: 'No', tone: 'warn' }, <>a thread leaves the schedulable set on in-flight compute<Cite src="agave-greedy-scheduler" /></>] },
+    { label: 'Block compute', cells: [{ v: 'No', tone: 'warn' }, <>one block limit; the account ceiling bounds only a share of it<Cite src="agave-block-cost-limits" /></>] },
+    { label: 'Leader ingress', cells: [{ v: 'No', tone: 'warn' }, <>stake-weighted over 80% of TPU capacity, and blind to accounts<Cite src="solana-swqos-guide" /></>] },
+  ]}
+  caption="The ceiling is the only thing the account model bounds. Everything downstream of it is a shared resource."
+  alt="Six resources a Solana transaction competes for, and whether each is local to an account. The compute ceiling is local, because the cost tracker accumulates against each writable key on its own. The priority queue is not, being one container with one ordering over the whole buffer. The scan budget is not, being 100,000 transactions per pass and spent on unschedulable transactions too. Worker threads are not, because a thread leaves the schedulable set on in-flight compute. Block compute is not, because there is one block limit and the account ceiling bounds only a share of it. Leader ingress is not, being stake-weighted over 80% of TPU capacity and blind to which accounts a transaction touches."
+/>
+
+That sentence is longer than the slogan and it is the one that predicts your incidents. Concretely,
+what you should expect:
+
+- **A fee war on one account raises your latency, not your price.** You are not forced to pay more —
+  nothing on Solana raises a base fee under you. You are outranked, and your transaction waits.
+- **Waiting has a deadline.** The blockhash lifetime is the clock, and being outranked long enough is
+  indistinguishable from failing. This is why locality leakage shows up in your metrics as a *landing
+  rate* problem rather than a cost problem.
+- **The cheapest defence is being small.** Since priority divides reward by cost, a tuned transaction
+  survives a congestion event better than an untuned one at the same fee — which makes lesson four's
+  advice a reliability measure and not only a cost measure.<Cite src="solana-docs-fee-structure" />
+- **The second cheapest defence is not sharing an account.** Every writable key you remove from the
+  shared path removes one ceiling and one thread-pinning effect.
+
+<Check type="explain" concept="local-fee-markets-are-leaky">
+During a large NFT mint, your payments product — which writes only its own accounts, none of them
+shared with the mint — sees confirmation latency triple and about a fifth of transactions expire
+without landing. Your fees are unchanged and your users' accounts were never contended.
+
+Name the mechanisms that could produce this, and say how you would distinguish between them with data
+you can actually collect.
+
+<Answer>
+**Four candidate mechanisms, and they are distinguishable.**
+
+**1 — you were outranked in the global queue.** The mint's transactions carry high priority fees, the
+scheduler pops one priority-ordered container, and yours sit lower in it.<Cite src="agave-greedy-scheduler" /><Cite src="solana-docs-fee-structure" />
+*Evidence:* compute your own priority value — `reward × 1,000,000 / (cost + 1)` — and compare it
+against the priority values of transactions that did land in the same slots, reconstructed from their
+fee and cost metadata. If landed transactions cluster above you, this is it. *Fix:* raise the
+numerator or, better, cut the denominator.
+
+**2 — worker capacity was consumed.** Mint transactions conflicting on one account concentrate onto a
+single worker, and workers are removed from the schedulable set on in-flight
+compute.<Cite src="agave-thread-aware-account-locks" /><Cite src="agave-greedy-scheduler" />
+*Evidence:* this predicts that *low-cost* transactions of yours suffered less than high-cost ones,
+because the scheduler could still fit small work into the remaining budget. Bucket your landing rate
+by `costUnits` and look for a gradient. A pure ranking problem produces a gradient too, but a
+capacity problem also shows up as blocks that are not full by compute yet still excluded you.
+
+**3 — block space ran out.** The block limit is global; the mint's account ceiling bounds its share
+but not the remainder.<Cite src="agave-block-cost-limits" />
+*Evidence:* read total block compute for the affected slots. If blocks were at or near the block
+limit, capacity was genuinely exhausted; if they were well under, the problem was ordering or
+ingress, not space.
+
+**4 — you never reached the leader.** Ingress is rationed by stake and covers a large share of the
+leader's capacity, and your RPC drops new submissions once its rebroadcast queue exceeds
+10,000.<Cite src="solana-swqos-guide" /><Cite src="solana-cookbook-retry" />
+*Evidence:* this is the one that leaves no on-chain trace at all, which is how you identify it — by
+elimination and by instrumentation on your own side. Submit an identical control transaction through
+a second, independently-peered provider during the event and compare landing rates. A large
+divergence between providers points here; near-identical results point at the first three.
+
+**The diagnostic order.** Check block fullness first — it is one RPC call and it eliminates or
+confirms mechanism three outright. Then the provider A/B, because it separates "did not reach the
+leader" from "reached the leader and lost". Only then bother with priority reconstruction, which is
+the most work.
+
+**Why the answer matters.** Each mechanism has a different fix and three of the four are not "pay
+more". Ordering problems are fixed by shrinking cost; capacity problems by retry strategy and timing;
+ingress problems by infrastructure and peering — which is the subject of the next lesson. Reflexively
+raising the CU price is the response that costs money in every case and helps in one.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next**, the outcome all of this produces. Being outranked, unreached, or scanned past does not
+generate an error — it generates silence, and then an expired blockhash. The final lesson of this
+module is about the failure mode with no receipt, and about the one lever that is neither fee nor code:
+which path your transaction takes to the leader.<Cite src="solana-swqos-guide" />
+
+**And carry the qualified sentence, not the slogan.** When someone tells you Solana's fee markets are
+local, the useful reply is a question: *which of the ceiling, the queue, the workers, the block and
+the ingress is local?* Exactly one of them is. That is a genuine architectural advantage over a single
+global base fee, and it is not isolation.

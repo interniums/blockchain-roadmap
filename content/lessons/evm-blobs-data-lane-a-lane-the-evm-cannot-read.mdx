@@ -1,0 +1,338 @@
+---
+id: evm-blobs-data-lane-a-lane-the-evm-cannot-read
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    eip-4844,
+    eip-4844-site,
+    eip-7594,
+    eip-2718,
+    consensus-specs-fulu-preset,
+    ethereum-org-peerdas,
+  ]
+stack: {}
+---
+
+A design review, forty minutes in. The proposal is a document-notarisation product: users upload a
+PDF, the platform publishes it on Ethereum, and anyone can later verify that the exact bytes existed
+at that block. The author has done the arithmetic and it is genuinely impressive — publishing a
+120 KB document as blob data costs a fraction of what the same bytes cost as calldata.
+
+Someone asks which opcode the verifier contract uses to read the document back.
+
+There is a long pause, because the answer is that there is no such opcode, there has never been one,
+and adding one is not on any roadmap. The proposal is not slightly wrong about a cost. It is built on
+a resource whose defining property is that the thing you are trying to do with it is the one thing it
+does not do.
+
+This lesson is about that property, which is not an implementation gap. It is the design.
+
+<Figure
+  caption="The blob forks away from the transaction before the block is built, and only the 32-byte branch ever reaches a contract."
+  alt="A blob splits into two paths: one through a KZG commitment to a 32-byte versioned hash that BLOBHASH and the point-evaluation precompile can reach, and one through consensus-layer sidecars that are served for a window and sampled rather than stored."
+>
+  <Flow
+    nodes={[
+      { id: 'blob', label: 'blob', note: '128 KiB, fixed', col: 0, tone: 'accent' },
+      { id: 'kzg', label: 'KZG commitment', note: '48 bytes \u00b7 lesson 2', col: 1 },
+      { id: 'side', label: 'sidecars', note: 'consensus layer', col: 1, tone: 'warn' },
+      { id: 'vh', label: 'versioned hash', note: '32 bytes, in the block', col: 2, tone: 'accent' },
+      { id: 'ret', label: 'served, then dropped', note: 'a window \u00b7 lesson 3', col: 2, tone: 'warn' },
+      { id: 'evm', label: 'BLOBHASH \u00b7 0x0A', note: 'all the EVM touches', col: 3, tone: 'accent' },
+      { id: 'das', label: 'sampled, not stored', note: 'PeerDAS \u00b7 lesson 4', col: 3, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'blob', to: 'kzg', tone: 'accent' },
+      { from: 'kzg', to: 'vh', tone: 'accent' },
+      { from: 'vh', to: 'evm', tone: 'accent' },
+      { from: 'blob', to: 'side', tone: 'warn' },
+      { from: 'side', to: 'ret', tone: 'warn' },
+      { from: 'ret', to: 'das', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+## What a blob is, precisely
+
+You already know the envelope from [type `0x03`](/c/tx-type-3-blob): a 1559 field set plus
+`max_fee_per_blob_gas` and a non-empty `blob_versioned_hashes`. This is the thing on the other end of
+those hashes.
+
+A blob's type alias in the specification is
+`ByteVector[BYTES_PER_FIELD_ELEMENT * FIELD_ELEMENTS_PER_BLOB]`, with `BYTES_PER_FIELD_ELEMENT` of
+**32** and `FIELD_ELEMENTS_PER_BLOB` of **4,096**.<Cite src="eip-4844" /> Multiply them out:
+131,072 bytes, or 128 KiB, exactly, every time.
+
+Three consequences follow from "exactly", and each of them catches somebody.
+
+**There is no such thing as a partial blob.** The type is a fixed-length vector, not a variable-length
+list.<Cite src="eip-4844" /> A 4 KB payload occupies a whole blob and is charged for a whole blob.
+A 200 KB payload needs two. Blob capacity is quantised in a way that calldata is not, and any cost
+model that multiplies bytes by a per-byte price is wrong at the first decimal.
+
+**The 32-byte units are not free-form bytes.** Each one is interpreted as an element of a finite
+field whose modulus, `BLS_MODULUS`, the specification writes out in full — a 255-bit prime.<Cite
+src="eip-4844" /> A 32-byte word is 256 bits, so not every 32-byte string you might want to write is
+a valid field element, and the specification is explicit that non-canonical field elements must be
+rejected where they are checked.<Cite src="eip-4844" /> The prime sits above 2<sup>254</sup>, so
+254 bits per element is always safe and 256 is not. Encoders therefore reserve headroom in every
+element, and the payload a blob can actually carry is a little under 128 KiB. If you are sizing a
+batch, size it against your encoder's usable figure rather than against 131,072.
+
+**The blob is not in the block.** This is the structural fact the rest of the module rests on. Blobs
+are referenced but not encoded in the beacon block body; they propagate separately as *sidecars*, and
+the specification says the division of labour in one sentence: the consensus layer is tasked with
+persisting the blobs, and the execution layer is not.<Cite src="eip-4844" /> Nothing in the execution
+payload, the state trie or the receipts contains a byte of blob data. The historical block is
+complete and valid without it.
+
+That is also why blobs can be dropped later without rewriting history, which is the subject of the
+third lesson in this module.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'The blob', note: 'consensus layer', tone: 'warn' },
+    { title: 'The versioned hash', note: 'execution layer', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'How large is it?',
+      cells: [
+        '131,072 bytes \u2014 4,096 field elements of 32 bytes, every time',
+        '32 bytes: the version byte 0x01, then sha256 of the commitment minus its first byte',
+      ],
+    },
+    {
+      label: 'What carries it?',
+      cells: [
+        'Sidecars propagated beside the beacon block, never the execution payload',
+        'The signed transaction itself, in blob_versioned_hashes',
+      ],
+    },
+    {
+      label: 'Which layer is obliged to keep it?',
+      cells: [
+        'The consensus layer, and only for a retention window',
+        'None in particular \u2014 it is in a historical block, which is complete without the blob',
+      ],
+    },
+    {
+      label: 'What can a contract do with it?',
+      cells: [
+        'Nothing. No instruction returns a byte of blob data',
+        'BLOBHASH, opcode 0x49, three gas, one hash per attached blob',
+      ],
+    },
+    {
+      label: 'How does anyone establish its contents?',
+      cells: [
+        'Fetch the bytes off-chain while they are still served and recompute the commitment',
+        'Pass a position, a claimed value, the 48-byte commitment and a proof to the precompile at 0x0A',
+      ],
+    },
+  ]}
+  caption="The two columns never meet inside the EVM: the contract holds the reference and some party outside the chain holds the bytes."
+  alt="Blob data and its versioned hash compared on size, what carries them, which layer must keep them, what a contract can do with each, and how contents are established."
+/>
+
+<Aside kind="note">
+The wire formats are the previous module's material and are not repeated here: a blob transaction has
+a plain [EIP-2718](/c/eip-2718-envelope) payload in block bodies and a *wrapped* form during
+transaction gossip that carries the blobs, the commitments and — since PeerDAS — a cell proof per
+cell rather than one proof per blob.<Cite src="eip-2718" /><Cite src="eip-7594" /> What matters here
+is the asymmetry that shape encodes: the blobs exist on the network and in the consensus layer, and
+the execution layer only ever sees 32-byte references to them.
+</Aside>
+
+### Follow one blob through the system
+
+The asymmetry is easier to hold if you trace where the bytes are at each step rather than reading the
+field definitions. Take a batcher publishing 128 KiB.
+
+**Subgoal — commit before sending.** The sender encodes its payload into 4,096 field elements,
+computes the KZG commitment over them, and derives the versioned hash by hashing that
+commitment.<Cite src="eip-4844" /> Since PeerDAS it also computes a cell proof for every cell of the
+extended blob, because the specification moved that work onto the sender: computing cell proofs is
+expensive and verifying them is cheap, so it is done once by the party sending rather than repeatedly
+by every block producer.<Cite src="eip-7594" />
+
+**Subgoal — put the reference, not the payload, in the transaction.** The signed transaction carries
+`blob_versioned_hashes`. The blob does not appear in it. That is what makes the transaction small
+enough to be an ordinary object in the execution layer.<Cite src="eip-4844" />
+
+**Subgoal — hand the payload to the consensus layer.** The blobs travel as sidecars alongside the
+beacon block rather than inside it, and persistence is the consensus layer's job.<Cite src="eip-4844" />
+After PeerDAS the sidecar is not even a whole blob any more — it is a column of the extended data
+matrix, and the network's 128 columns are spread across nodes rather than replicated to all of
+them.<Cite src="consensus-specs-fulu-preset" /><Cite src="ethereum-org-peerdas" />
+
+**Subgoal — execute against the reference.** When the transaction runs, the EVM has the versioned
+hashes and nothing else. It can read them, store them, compare them, and pass one to a precompile.
+There is no step at which blob bytes become available to it.
+
+**Subgoal — notice what the block committed to.** The historical block contains the transaction,
+which contains the hashes. It never contained the blob, which is why every later question about
+whether the blob still exists is a question about *node retention policy* rather than about chain
+history.
+
+## The 32 bytes that do cross over
+
+So what does the EVM get? Exactly one value per attached blob, and one instruction that returns it.
+
+A **versioned hash** is `VERSIONED_HASH_VERSION_KZG || sha256(commitment)[1:]` — the version byte
+`0x01`, followed by all but the first byte of the SHA-256 hash of the blob's KZG
+commitment.<Cite src="eip-4844" /> The commitment itself is a `Bytes48` value that lives on the
+consensus side and never enters the EVM.<Cite src="eip-4844" />
+
+The instruction is **`BLOBHASH`**, opcode byte `0x49`, costing **3 gas**. It reads an index from the
+top of the stack as a big-endian `uint256` and replaces it with `tx.blob_versioned_hashes[index]` if
+that index is in range, and **with a zeroed `bytes32` otherwise**.<Cite src="eip-4844" />
+
+Read that last clause again, because it is the shape of a real bug. An out-of-range index does not
+revert and does not signal. It returns thirty-two zero bytes, which is a perfectly well-formed
+`bytes32` that will flow through your comparison, your storage write and your event unnoticed.
+
+There is a second surface, and it is the one that makes hash-only access useful rather than merely
+tolerable. A precompile at address `0x0A`, costing **50,000 gas**, takes exactly 192 bytes laid out
+as `versioned_hash | z | y | commitment | proof`, checks that the supplied commitment hashes to the
+supplied versioned hash, and then verifies a KZG proof that the polynomial behind that commitment
+evaluates to `y` at `z`.<Cite src="eip-4844" /> On success it returns `FIELD_ELEMENTS_PER_BLOB` and
+`BLS_MODULUS` as two padded 32-byte words.<Cite src="eip-4844" />
+
+<Figure
+  caption="The precompile's whole job is in the first field: bind the caller's 48-byte commitment back to the 32 bytes the chain already had."
+  alt="The 192-byte input to the point-evaluation precompile, in order: a 32-byte versioned hash, a 32-byte position z, a 32-byte claimed value y, a 48-byte KZG commitment and a 48-byte proof."
+>
+  <ByteLayout
+    caption="192 bytes at address 0x0A"
+    fields={[
+      { label: 'versioned_hash', size: 32, tone: 'accent', note: 'what the EVM already held' },
+      { label: 'z', size: 32, note: 'the position' },
+      { label: 'y', size: 32, note: 'the claimed value' },
+      { label: 'commitment', size: 48, tone: 'warn', note: 'supplied by the caller' },
+      { label: 'proof', size: 48, tone: 'warn', note: 'supplied by the caller' },
+    ]}
+  />
+</Figure>
+
+That return value looks like a curiosity and is in fact the most forward-looking line in the EIP. The
+rationale explains it: a contract doing point evaluation needs to know the field modulus, and a
+contract that hard-codes today's modulus cannot survive a future commitment scheme. Returning the
+modulus from the precompile lets a contract be written once and keep working across a version
+change, without an upgrade.<Cite src="eip-4844" />
+
+The versioned hash exists for the same reason. The rationale states it directly: references are
+versioned rather than raw commitments so that if the scheme has to be replaced — the example given is
+Merkle trees plus STARKs for quantum-safety — a new version can be added, the precompile can be
+taught the new format, and rollups need make no EVM-level changes at all.<Cite src="eip-4844" /> The
+32-byte width is not incidental either. One word fits on the stack, into a storage slot and into a
+mapping key, which is what makes a blob reference usable by ordinary Solidity in the first place.
+
+<Misconception
+  belief="Blobs are cheap contract storage."
+  reality="No instruction reads blob data. A contract can obtain a 32-byte versioned hash and verify a claimed evaluation against it, and that is the entire surface. Blobs buy public availability of some bytes, not the ability to read those bytes on-chain."
+  why="'Cheap data on Ethereum' compresses to 'cheap storage' in one step, and the transaction visibly carries the data across the network. It carries it past the EVM rather than into it."
+  src="eip-4844-site"
+/>
+
+<Misconception
+  belief="The contract sees the blob's KZG commitment."
+  reality="It sees a 32-byte versioned hash of that commitment. The commitment is 48 bytes and lives on the consensus side; the only way it enters execution is as an argument you pass to the point-evaluation precompile, which checks it against the hash."
+  why="Casual descriptions use 'commitment' and 'versioned hash' interchangeably, and the two really are references to the same blob — but only one of them fits in a word, and only one of them is what the transaction carries."
+  src="eip-4844"
+/>
+
+## What you can build with a hash and a precompile
+
+If it stopped at "you get a hash", blobs would be a curiosity. The reason a whole scaling strategy is
+built on top of them is that a hash plus a point-evaluation check turns out to be enough for both
+families of rollup, and EIP-4844's own rationale spells out how.
+
+**An optimistic rollup does not need the blob during normal operation at all.** It needs it only when
+a fraud proof is being run, and the fraud proof does not load the blob — it verifies the transition in
+small steps, pulling at most a few values of the blob at a time through calldata. For each value the
+challenger supplies a KZG proof, the contract runs the point-evaluation precompile against the
+versioned hash that was submitted earlier, and the dispute proceeds on data the contract has now
+verified without ever having read the blob.<Cite src="eip-4844" />
+
+**A ZK rollup carries two commitments to the same bytes** — the blob commitment, which the protocol
+guarantees points at available data, and the rollup's own commitment in whatever proof system it uses
+internally. It then runs a *proof of equivalence*, using the same precompile, to show the two
+commitments refer to the same data.<Cite src="eip-4844" />
+
+Both patterns have the same shape, and it is worth naming because it generalises well beyond blobs:
+the chain is being used as a **notary over data it does not hold**. The expensive, scarce resource —
+execution — is spent only on the tiny fraction of the data that a dispute actually touches. The bulk
+of the bytes are the network's problem, not the EVM's.
+
+Which brings the opening scene back. The notarisation product was not wrong about the price. It was
+wrong about the party doing the reading. Blobs make it cheap for *anyone off-chain* to obtain the
+document and check it against a commitment the chain vouches for. They do nothing whatsoever to make
+the document readable *by a contract*, and a design whose verifier is a contract has picked the one
+consumer that is excluded by construction.
+
+<Check type="spot-bug" concept="blob-not-in-evm">
+A contract exposes this function, intended to record the blob attached to the calling transaction and
+reject any transaction that did not attach one.
+
+```solidity
+function record(uint256 index) external {
+    bytes32 h = blobhash(index);
+    require(h != bytes32(0) || index == 0, "no blob at index");
+    recorded[msg.sender] = h;
+    emit Recorded(msg.sender, h, index);
+}
+```
+
+Find the defect, say what an attacker gets from it, and state the fix. Then say what `recorded[user]`
+proves about the blob's contents once the function is correct.
+
+<Answer>
+**The `|| index == 0` clause turns the check off for the case it most needs to cover.** `BLOBHASH`
+returns a zeroed `bytes32` for any out-of-range index rather than reverting,<Cite src="eip-4844" />
+so at index 0 with no blobs attached the value is zero — and the disjunction accepts it. The guard
+fires only for indices the caller can avoid using.
+
+**What the attacker gets.** They send an ordinary type `0x02` transaction with no blobs, call
+`record(0)`, and land a stored entry of `bytes32(0)` plus a `Recorded` event. Every downstream
+consumer that treats "there is an entry" as "a blob was published" is now wrong, and cheaply so — the
+attacker paid no blob fee, because they attached no blob. If a second user is ever also recorded at
+zero, the two entries collide, since zero is a value and not an absence.
+
+**The fix is `require(h != bytes32(0), "no blob at index")`,** with no exemption. The specification
+gives no other failure signal, so a non-zero return is the whole of the availability check the EVM
+can perform.
+
+**And what the corrected entry proves is narrower than it looks.** It proves that a blob with that
+versioned hash was attached to the transaction that called this function, and therefore that its
+data was published to the network and available for the retention window. It does not prove anything
+about the *contents*. The contract cannot read them, and nothing here has read them.
+
+To make a claim about contents you need the second surface: someone supplies a position `z`, a
+claimed value `y`, the 48-byte commitment and a proof, and the contract calls the point-evaluation
+precompile at `0x0A`, which checks the commitment against the stored versioned hash before verifying
+the opening.<Cite src="eip-4844" /> Even then, what you have learned is one evaluation of one
+polynomial — a claim about a point, supplied by the caller, not a decoding of the blob.
+</Answer>
+</Check>
+
+## Where this pays off
+
+The next lesson opens up the word this one leaned on without defining: what a **KZG commitment**
+actually compresses, why 4,096 field elements are treated as a polynomial at all, and what the
+constant-size opening in the precompile is doing. The `sha256` in the versioned hash is the boring
+half of that pair; the interesting half is underneath it.
+
+After that, the retention window explains why the specification bothered to keep blob data out of the
+execution layer in the first place: because data the execution layer never held is data the protocol
+is free to stop serving.<Cite src="eip-4844" /> And PeerDAS, in the final lesson, explains why the
+number of blobs per block became something that can grow at all.<Cite src="eip-7594" /><Cite src="ethereum-org-peerdas" />
+
+On the scaling track, the two rollup patterns above stop being rationale text and become the actual
+architecture you are reasoning about: which component posts the blob, which contract holds the
+versioned hash, and what happens to a dispute whose data nobody kept. The one-line version to carry
+forward is that a rollup's safety rests on data the chain vouches for and never possessed.

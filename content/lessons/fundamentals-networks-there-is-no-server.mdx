@@ -1,0 +1,310 @@
+---
+id: fundamentals-networks-there-is-no-server
+authorship: authored
+verifiedAt: "2026-08-25"
+volatility: evolving
+sources:
+  [
+    devp2p-repo,
+    devp2p-rlpx,
+    devp2p-eth-wire,
+    discv5-spec,
+    discv5-theory,
+    discv5-rationale,
+    eip-778,
+    eip-8070,
+    consensus-specs-p2p,
+    geth-cli-options,
+    ethereum-org-networking-layer,
+    eth2-p2p-measurement,
+  ]
+stack: {}
+---
+
+Your backend calls `eth_getBlockByNumber` and gets a block back. Something answered. What was it?
+
+The reflex answer is "Ethereum". That answer is the reason blockchain systems surprise product
+engineers later, so it is worth dismantling now. Nothing named Ethereum received your request.
+A process on some machine received it, consulted a database it built itself, and replied. That
+process learned everything it knows from a few dozen other processes it found by asking around.
+Those processes did the same.
+
+The question this lesson answers is therefore not "what is a peer-to-peer network" — you can guess
+that. It is: **if there is no authority, how does a brand-new process find anyone at all, and what
+exactly does it end up trusting?**
+
+<Figure
+  caption="Everything the rest of this module goes wrong about goes wrong in one place: the peer set a node assembled for itself at startup."
+  alt="A node starts from a hard-coded bootnode list, runs a discv5 lookup, and ends up with a few dozen peers that constitute its entire view of the network. Two consequences follow: propagation delay, covered in the second and third lessons, and a view an adversary can shape, covered in the fourth."
+>
+  <Flow
+    lanes={['where you start', 'how you look', 'what you end up with', 'what follows']}
+    nodes={[
+      { id: 'boot', label: 'bootnodes', note: 'shipped in the client', col: 0, tone: 'muted' },
+      { id: 'disc', label: 'discv5 lookup', note: 'XOR distance, not geography', col: 1 },
+      { id: 'peers', label: 'a few dozen peers', note: 'your entire view', col: 2, tone: 'accent' },
+      { id: 'lat', label: 'propagation delay', note: 'lessons 2 and 3', col: 3, tone: 'warn' },
+      { id: 'ecl', label: 'a view others shape', note: 'lesson 4', col: 3, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+## The overlay is the network
+
+Every node holds open connections to a small set of peers. It sends what it learns to those peers
+and learns what it knows from them. The "network" is nothing more than the union of all those links
+— an *overlay* riding on ordinary TCP and UDP, with no membership list, no registry, and no node
+that can enumerate the rest.<Cite src="ethereum-org-networking-layer" />
+
+Three consequences follow immediately, and they run through the rest of this track.
+
+**No node has a global view.** A node knows what its peers told it. If they did not tell it
+something, it does not know that thing, and it has no way to notice the absence.
+
+**No node is authoritative.** There is no tie-breaker to appeal to. Agreement is produced by every
+node independently applying the same rules to the data it happens to hold — which is why the rules
+have to be deterministic to the byte, and why so much of this curriculum is about encoding.
+
+**Every property you want must survive a hostile peer set.** A node's beliefs are a function of its
+peers. Anything an adversary can do to shape which peers a node has is leverage over what that node
+believes. Lesson 4 of this module is that idea taken to its conclusion.
+
+<Misconception
+  belief="An RPC provider is a window onto 'the network'."
+  reality="It is a window onto that provider's nodes and their peer sets. Two providers can disagree about what is pending, and — briefly — about what the head block is."
+  why="The RPC interface is shaped exactly like a database query against a single system: one endpoint, one request, one authoritative-looking answer. Nothing in the response tells you it is one participant's opinion."
+/>
+
+## There are two networks, not one
+
+Here is the first structural fact that catches people out. A full Ethereum node is two programs, and
+they participate in **two separate peer-to-peer networks with different transports, different
+encodings, and different peer sets**.<Cite src="ethereum-org-networking-layer" />
+
+- The **execution client** speaks devp2p over TCP to other execution clients. This is where
+  transactions circulate.
+- The **consensus client** speaks libp2p to other consensus clients. This is where beacon blocks and
+  attestations circulate.
+
+The two halves on your machine talk to each other over a local RPC connection — the Engine API — not
+over the public network.<Cite src="ethereum-org-networking-layer" /> Your node's execution client has
+no peers in common with your node's consensus client, and neither of them can see what the other's
+peers are doing.
+
+<Compare
+  caption="A full node is not one participant in one network — it is two, sharing nothing but a machine."
+  alt="The execution client and the consensus client compared by what carries their messages, what travels on each, which encoding they use, and who their peers are."
+  axis="Question"
+  columns={[
+    { title: 'Execution client', note: 'devp2p' },
+    { title: 'Consensus client', note: 'libp2p' },
+  ]}
+  rows={[
+    { label: 'What carries the messages?', cells: ['RLPx over TCP', 'libp2p'] },
+    { label: 'What travels on it?', cells: ['Transactions, headers, bodies, receipts', 'Beacon blocks and attestations'] },
+    { label: 'What encoding?', cells: ['RLP', 'SSZ'] },
+    { label: 'Who are its peers?', cells: ['Other execution clients', 'Other consensus clients, none in common'] },
+  ]}
+/>
+
+<Aside kind="note">
+This split is why "how many peers does my node have" is an ambiguous question, and why a node can be
+perfectly healthy on one side and starved on the other. When you debug a node later, ask the two
+halves separately.
+</Aside>
+
+There is exactly one piece of networking the two layers share, and it is the piece that runs before
+any connection exists: discovery.
+
+## Discovery: how a process with no peers finds peers
+
+A node starting from nothing has one hard-coded resource — a short list of **bootnodes**, whose
+addresses ship inside the client. Bootnodes exist only to make introductions. They do not sync the
+chain and they are not peers in the ordinary sense.<Cite src="ethereum-org-networking-layer" />
+
+From that seed, the node runs **Node Discovery v5** — discv5, currently protocol version
+v5.1.<Cite src="discv5-spec" /> It runs on UDP on its own port and does one job: maintain a database
+of live nodes and let anyone look up records in it.<Cite src="discv5-spec" />
+
+### What is being stored
+
+Not blocks, and not state. Discovery stores **node records** — one signed document per node,
+describing how to reach it and what it can do. The format is specified by EIP-778: an RLP list of
+`[signature, seq, k, v, ...]`, capped at 300 bytes, signed by the node it describes, with a sequence
+number so a newer copy beats an older one.<Cite src="eip-778" />
+
+Because the record is self-signed, no intermediary can tamper with it in transit. A record is either
+available in exactly the form its owner published, or not at all.<Cite src="discv5-rationale" />
+The keys are a small open dictionary: an IP address, a TCP port, a UDP port, a public key, plus
+whatever a network wants to add.<Cite src="eip-778" />
+
+That extensibility is doing real work. Consensus clients require an `eth2` entry carrying the node's
+fork digest, so a node can filter out peers on a different fork before dialling them, and an
+`attnets` bitfield advertising which attestation subnets the node subscribes to.<Cite src="consensus-specs-p2p" />
+Discovery therefore answers not only "who is out there" but "who is out there that is useful to me".
+
+<Misconception
+  belief="The consensus layer uses SSZ for everything."
+  reality="Discovery is shared with the execution layer and stayed on RLP. Node records are RLP-encoded even for consensus clients, whose every other wire message is SSZ."
+  why="The RLP-versus-SSZ split is usually taught as 'execution versus consensus', which is a clean story with an exception in it. The encoding boundary and the layer boundary are not the same line."
+  src="eip-778"
+/>
+
+### How lookup works
+
+discv5's design is "loosely inspired by the Kademlia DHT", with one crucial difference: it stores no
+arbitrary keys and values, only node records.<Cite src="discv5-spec" />
+
+Each node has a 32-byte ID derived from its record. The distance between two IDs is their bitwise
+XOR read as a big-endian number, and in practice the *logarithmic* distance — the length of the
+differing suffix in bits — is what gets used.<Cite src="discv5-theory" /> This is not geography.
+Two nodes on the same rack can be maximally distant; two nodes on opposite continents can be
+neighbours.
+
+Each node keeps a routing table of **k-buckets**: one bucket for every logarithmic distance from 0
+to 255, each holding up to `k = 16` entries, sorted by time last seen.<Cite src="discv5-theory" />
+When a bucket is full and a new node turns up, the least-recently-seen occupant is pinged; it is
+only evicted if it fails to answer.<Cite src="discv5-theory" /> Incumbency is an advantage by
+design — a long-lived responsive node is hard to displace.
+
+A lookup for a target ID works outward-in: pick the closest nodes you know, ask them for nodes closer
+to the target, repeat with what comes back, stop when the closest set stops improving. The number of
+requests in flight is an implementation choice, `α`, typically 3.<Cite src="discv5-theory" />
+
+<Aside kind="note">
+The spec also suggests running a lookup along **multiple disjoint paths**, where results found on one
+path are deliberately not reused on another. The stated reason is resilience against adversarial
+nodes: one poisoned branch cannot contaminate the others.<Cite src="discv5-theory" /> File that away
+— it is the first defensive design decision you have seen in this module, and it will not be the
+last.
+</Aside>
+
+### One protocol, two layers, and a wrinkle
+
+Both layers use discv5. The consensus layer wraps it in an adaptor so its results — ENRs converted
+to multiaddrs — feed the libp2p stack that handles everything after discovery.<Cite src="consensus-specs-p2p" />
+
+On the execution side the picture is less tidy, and the sources describe it differently. go-ethereum
+documents **both** `--discovery.v4` and `--discovery.v5` as defaulting to
+true.<Cite src="geth-cli-options" /> The ethereum.org networking page, meanwhile, still describes
+execution clients as using discv4 with "an active effort to migrate" to
+discv5.<Cite src="ethereum-org-networking-layer" /> Do not read either as "discv4 is gone". The
+accurate statement is that an execution client today runs the older and newer discovery protocols
+side by side, and the retirement of discv4 has not happened.
+
+## devp2p: the execution layer's transport
+
+Once discovery has produced a candidate, the execution client dials it over TCP and runs **RLPx**,
+currently version 5.<Cite src="devp2p-rlpx" /> RLPx is the encrypted, authenticated transport;
+the handshake uses ECIES over secp256k1 to establish session keys, after which the two sides
+exchange `hello` messages and negotiate which **capabilities** they both
+speak.<Cite src="devp2p-rlpx" /><Cite src="ethereum-org-networking-layer" />
+
+Capabilities are the extensibility point. RLPx carries messages belonging to one or more of
+them,<Cite src="devp2p-rlpx" /> and the devp2p repository specifies several: `eth` (the wire protocol
+for chain data and transactions), `snap` (snapshot sync), and a handful of
+others.<Cite src="devp2p-repo" /> The one you will care about is `eth`.
+
+<Figure
+  caption="Three protocols and two sockets stand between a fresh process and its first transaction; only the last of them carries anything about the chain."
+  alt="The execution layer's stack drawn top to bottom: discv5 or discv4 over UDP finds candidate node records, RLPx over TCP encrypts and authenticates the link and negotiates capabilities, and the eth capability then carries Status messages, transactions, headers, bodies and receipts."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'disc', label: 'discv5 / discv4', note: 'UDP — find node records', col: 0 },
+      { id: 'rlpx', label: 'RLPx', note: 'TCP — encrypt, authenticate, negotiate', col: 1 },
+      { id: 'eth', label: 'eth capability', note: 'Status, transactions, headers, bodies, receipts', col: 2, tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+`eth` is where transactions get announced and blocks get requested. Its current version is
+**eth/72**, introduced by EIP-8070 in July 2026.<Cite src="devp2p-eth-wire" /><Cite src="eip-8070" />
+
+## The part that is policy, not protocol
+
+Now the observation this lesson exists to deliver.
+
+You are coming from a world where consensus rules are specified to the byte — and they are. It is
+tempting to assume the networking layer is specified the same way. **It is not.** The transport is
+specified. The message formats are specified. Almost everything a client *decides* is not.
+
+Consider the choices a client makes every second that no specification makes for it:
+
+- **How many peers to keep.** go-ethereum's `--maxpeers` defaults to 50.<Cite src="geth-cli-options" />
+  That is a flag with a default, not a protocol rule.
+- **Which transactions to forward, and to whom.** The `eth` spec says a client "should" propagate new
+  transactions, sending complete objects to "a small, random fraction" of peers and hash
+  announcements to the rest.<Cite src="devp2p-eth-wire" /> The size of that fraction is the client's
+  call.
+- **What to keep in the transaction pool.** The spec says only that the pool "is subject to
+  client-specific limits".<Cite src="devp2p-eth-wire" /> Lesson 3 is about what that sentence costs
+  you.
+- **How to score and drop misbehaving peers.** On the consensus side the spec is explicit that the
+  gossipsub v1.1 peer-scoring parameters are not fixed by the specification.<Cite src="consensus-specs-p2p" />
+
+<Misconception
+  belief="Everything a node does on the network is specified somewhere normative."
+  reality="Transport and message formats are specified. Peering, forwarding and pool admission are per-client policy that changes between releases."
+  why="Consensus rules genuinely are rigorously specified — a client that gets them wrong forks off the chain. Networking policy has no such forcing function, so it varies, and it varies silently."
+  src="devp2p-eth-wire"
+/>
+
+There is a small, telling piece of evidence for this sitting in the specification repository itself.
+The devp2p README advertises the Ethereum Wire Protocol as `eth/70`.<Cite src="devp2p-repo" /> The
+`eth` specification document in the same repository, on the same branch, says the current version is
+`eth/72`.<Cite src="devp2p-eth-wire" /> The spec document is the one with the change log, so it is
+the one to believe — but the discrepancy is the honest texture of this layer. When something on the
+network surprises you, the answer is more often in a client's source or release notes than in a
+specification.
+
+<Check type="explain" concept="p2p-overlay">
+Your service queries two independent RPC providers for the latest block. Provider A returns block
+`N`; provider B returns block `N-1`. Nobody is lying and no consensus rule has been broken.
+
+Give the mechanical explanation, then say what your service should do about it — and what it must
+not do.
+
+<Answer>
+**Mechanically:** each provider answered from one of its own nodes, and those nodes have different
+peer sets. Block `N` reached A's node through some chain of hops and has not yet reached B's, or
+reached B's node microseconds after it answered. Neither node can see the other's peers, and neither
+has any way to know it is behind — the absence of a message is indistinguishable from the message
+not existing yet.
+
+**What to do:** treat block height as a per-source observation with a timestamp, not a global fact.
+If your logic compares data from two sources, pin both reads to the same block number rather than to
+"latest", so you are comparing the same state rather than two different instants.
+
+**What not to do:** retry against the "lagging" provider until it agrees, and treat the eventual
+agreement as confirmation. That loop converges whether the network is healthy or not — an eclipsed
+node will also eventually tell you something consistent. You have measured patience, not truth.
+</Answer>
+</Check>
+
+## The shape of what you are joining
+
+One more piece of texture, because "peer-to-peer network" is an abstraction until it has a geography.
+The earliest full measurement study of the consensus-layer network, crawling it shortly after the
+Beacon Chain launched, found nodes spread across 97 countries and a client population dominated by a
+single implementation — a distribution the authors described as a long way from
+ideal.<Cite src="eth2-p2p-measurement" /> Those specific 2020 figures are stale and should not be
+quoted as current. What is not stale is the shape of the finding: this network is geographically
+lumpy and hosted disproportionately in a few places, which means propagation times are uneven and
+correlated failure is a live concern rather than a theoretical one.
+
+## Where this pays off
+
+You now have the substrate everything else in this track sits on.
+
+The **two-network split** is the reason a node is a two-process system with an Engine API between
+them, and the reason blob data, sync and mempool behaviour each live on one side rather than "on
+Ethereum".
+
+The **peer set as the unit of trust** is the assumption you will attack in lesson 4 and carry into
+threat modelling: the question is never "is this node honest" but "who is this node listening to".
+
+And the **policy-not-protocol** point is the one that will save you time repeatedly. When two nodes
+behave differently and both are correct, the difference is almost always a client policy knob, and
+the fastest path to an answer is the client's flag list rather than a specification.

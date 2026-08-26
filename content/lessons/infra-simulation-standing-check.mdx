@@ -1,0 +1,369 @@
+---
+id: infra-simulation-standing-check
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [measured-simulation-2026-08-26, foundry-fork-testing, tenderly-vnet-github-action, tenderly-ci-foundry, tenderly-virtual-environments, cast-run-reference, eth-simulatev1-spec, execution-apis-execute-schemas, oz-pausable, alchemy-compute-units, geth-ns-eth]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+The upgrade rehearsal was written in March. It forks at a pinned block, impersonates the admin,
+executes the real calldata, and asserts that every live holder's balance survives. It has been green
+on every commit for five months. It is green right now.
+
+In June, a dependency the vault integrates with went through its own governance process and revoked a
+role. In July, the multisig that holds the admin key rotated its signers. In August, the oracle
+adapter was replaced with one that reverts on stale rounds instead of returning the last value.
+
+None of that broke the test, because the test forks at a block in March. It is a perfectly
+reproducible assertion about a world that no longer exists.
+
+That is the last problem in this module, and it is a scheduling problem rather than a technical one.
+**A pinned rehearsal answers "does our code still work". Nothing you have built so far answers "does
+our deployment path still work against the chain as it is now."** Those are different questions and
+they need two different jobs.
+
+## Two jobs, and the mistake of trying to build one
+
+The instinct is to have one fork job, pinned to something recent-ish, refreshed when someone
+remembers. That job is bad at both of its purposes: too slow and flaky to gate merges, too stale to
+report on the world.
+
+Split it.
+
+**Job one: the pinned rehearsal. Gates the merge.** Fixed block, committed in the repository, cached.
+Its failures always mean "this change broke something", because nothing else about it can move. It is
+the job whose red build blocks a pull request, and it is fast because the RPC cache at
+`~/.foundry/cache/rpc/<chain>/<block>/` is warm from the last run.<Cite src="foundry-fork-testing" />
+
+**Job two: the drift check. Runs on a schedule and does not gate anything.** Pinned to a block
+resolved at job start — recent head, minus enough confirmations to be stable — so that every run
+tests against a different, current world. Its failures do not mean somebody's commit was wrong. They
+mean **the chain moved under you**, and the right response is to read it, not to revert anything.
+
+<Compare
+  columns={[
+    { title: 'Job one — the pinned rehearsal', note: 'gates the merge', tone: 'good' },
+    { title: 'Job two — the drift check', note: 'runs on a schedule', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'Which block does it fork at?',
+      cells: ['fixed, committed in the repository', 'resolved at job start — recent head, minus enough confirmations to be stable'],
+    },
+    {
+      label: 'What does a red build mean?',
+      cells: ['this change broke something', { v: 'the chain moved under you', tone: 'warn' }],
+    },
+    { label: 'Does it gate merges?', cells: ['yes', 'no'] },
+    {
+      label: 'Does the RPC cache help?',
+      cells: ['yes — warm from the last run', 'no, and that is correct'],
+    },
+    {
+      label: 'What is the right response to red?',
+      cells: ['fix the commit', 'read it; revert nothing'],
+    },
+  ]}
+  caption="One job can be trusted because nothing except the commit can move it; the other is worth having because everything else can."
+  alt="Two jobs contrasted. The pinned rehearsal forks at a block committed in the repository, gates merges, benefits from a warm RPC cache, and a red build means the change under test broke something, so the response is to fix the commit. The drift check resolves a recent block at job start, gates nothing, always misses the cache by design, and a red build means the chain moved, so the response is to read it rather than revert anything."
+/>
+
+Be pedantic about the distinction, because it decides how people react to a red build. A job that can
+go red for reasons unrelated to the change under test will be ignored within two weeks if it gates
+merges. Wired into a scheduled run with an owner, the same job is the only thing in your pipeline
+that would have caught the revoked role in June.
+
+### What drift actually looks like
+
+Five classes, roughly in order of how often they bite:
+
+**A role or permission moved.** Someone else's governance revoked, granted or rotated something your
+deployment path depends on. Your rehearsal is the only place this shows up before the day you need
+it.
+
+**A dependency was upgraded.** A protocol you integrate with is itself upgradeable. Their new
+implementation is behind the same address — and reading it is a single `eth_getStorageAt` on the
+proxy's implementation slot, which makes this the cheapest drift check you can
+write.<Cite src="geth-ns-eth" /> Your integration test at head executes their new code; your pinned
+test never will.
+
+**A parameter changed.** A cap, a fee, a liquidation threshold — set by a vote you did not follow, in
+a forum you do not read.
+
+**The economics moved.** Liquidity that made a rehearsed migration cheap has left the pool. Nothing
+is broken; the plan is now expensive enough to be a different plan.
+
+**Your own admin assumptions expired.** The signer set changed, the timelock was replaced, or a
+one-shot initializer got consumed. Read the admin from the chain in the rehearsal, as lesson five
+insisted, and this job will notice.
+
+<Misconception
+  belief="We rehearsed the upgrade before we shipped, so we know the deployment path works."
+  reality="A rehearsal pinned to a block is evidence about that block. Roles, parameters, implementations behind proxies and the electorate are all controlled by other people and move without telling you, and a pinned test can never notice — by construction, since the block it forks at is fixed."
+  why="A green test carries an implicit 'as of now', and nothing in the output states which 'now' it means. The pinning that makes the test trustworthy is the same property that makes it stale."
+  src="foundry-fork-testing"
+/>
+
+## Operational reality of a fork job
+
+Four things reliably go wrong, and all four are cheaper to design for than to debug.
+
+**The provider is a hard build dependency, cache or no cache.** Anvil's own offline mode is explicit
+about this: `--fork-chain-id` skips fetching the chain id, but you still must pass both `--fork-url`
+and `--fork-block-number` and already have the required state cached — and anything missing locally
+is still fetched from the remote.<Cite src="measured-simulation-2026-08-26" /> Plan for provider
+outages as a build failure mode with its own runbook entry, not as a mystery.
+
+**Rate limits arrive at the worst time.** A rehearsal at head touches storage nothing has cached.
+`--fork-retry-backoff <ms>` sets the initial retry delay when the provider throttles
+you,<Cite src="foundry-fork-testing" /> and it is worth setting before you need it. Note also that
+the compute-unit price of the underlying methods is not uniform: on one provider's published price
+list `eth_call` is 26 units and `eth_simulateV1` is 40, while the decoded simulation products are
+2,500 and 4,500.<Cite src="alchemy-compute-units" /> A drift job that runs hourly is a metering
+decision as much as a scheduling one.
+
+**Cache keys and the pinned block are the same fact.** [The block number is the cache key](/c/fork-cache-keying),
+so [a CI cache restore](/c/ci-cache-restore) is only useful for job one. Job two, pinning to a fresh
+block every run, will always miss — which is correct and should be budgeted for rather than
+optimised away.
+
+**Fork pull requests cannot see your secrets.** [This is a deliberate platform behaviour](/c/fork-pr-secrets),
+not a misconfiguration, and it means an outside contributor's pull request cannot run the fork job.
+Decide explicitly whether that is a blocked merge or a job that skips with a visible notice; the
+failure mode to avoid is a silent skip that everyone reads as a pass.
+
+If you are on the hosted rung, the same shape exists as a packaged action: the Tenderly action is
+published as *Tenderly Virtual TestNet Setup*, currently v1.0.17, and its stated job is to set up an
+environment and expose the RPC link as an environment
+variable.<Cite src="tenderly-vnet-github-action" /><Cite src="measured-simulation-2026-08-26" /> The
+documented pattern is a fresh environment provisioned per pull request, contracts deployed, tests
+run, environment torn down,<Cite src="tenderly-virtual-environments" /> with framework-specific
+guides for wiring it up.<Cite src="tenderly-ci-foundry" /> Same two jobs, same distinction between
+gating and reporting; what you buy is the endpoint that other systems can reach and the artifacts
+somebody can open afterwards.
+
+## What the standing check should assert
+
+Keep it to the claims whose falsity would change what you do.
+
+**The upgrade path still executes.** The admin read from the chain can still perform the upgrade, and
+the post-upgrade integration assertions still hold.
+
+**The governance path still executes.** The timelock still holds the roles the payload needs, and the
+proposal still reaches quorum with the current electorate — which is a live fact, not a constant.
+
+**The emergency path still executes.** This one is skipped almost universally and is the one you will
+regret. Can the pause actually be called, by the address you believe holds that power, right now?
+`Pausable` is a [module whose whole purpose is a switch you flip once, in anger](/c/pause-design-patterns);<Cite src="oz-pausable" />
+a switch nobody has flipped in eighteen months is a switch of unknown state.
+
+**Nothing in the dependency set changed shape.** A cheap version: assert that the implementation
+addresses behind the proxies you depend on are the ones you recorded. When that assertion fails, a
+dependency upgraded, and you find out in a scheduled job rather than in an incident.
+
+### Make the drift job report a diff, not a colour
+
+A scheduled job that says "red" tells you something moved. A scheduled job that says *what* moved
+tells you whether to care, and it is barely more work.
+
+Have the rehearsal write a small file rather than only asserting: the block it ran at, the
+implementation address behind each proxy it depends on, the roles it checked and who holds them, the
+gas the execute step consumed, and the handful of parameters it reads. Commit the file. Now the job's
+output is a diff against the committed copy, and its failure message is
+`treasury role holder changed: 0x… → 0x…` instead of `assertion failed`.
+
+Two benefits compound quickly. Bumping the pinned block becomes a commit whose diff shows which live
+facts changed since the last bump — the drift report you wanted, produced for free. And the file's
+history records what the world looked like on any previous day, which is otherwise hard to
+reconstruct mid-incident. The hosted rung makes the same move: its documented CI pattern collects
+structured deployment logs as artifacts.<Cite src="tenderly-virtual-environments" /> Artifacts
+survive; terminal output does not.
+
+<Figure
+  caption="A check that keeps coming back is not a check that keeps failing — the loop is the mechanism working."
+  alt="A scheduled loop. The schedule fires, a recent block is resolved, the rehearsals run against it, the live facts are written to a file, and that file is diffed against the committed copy so the failure message names what moved. The loop then returns to the schedule and runs again tomorrow."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'sched', label: 'the schedule fires', col: 0, tone: 'accent' },
+      { id: 'blk', label: 'resolve a block', note: 'recent head, minus confirmations', col: 1 },
+      { id: 'run', label: 'run the rehearsals', note: 'upgrade, governance, the pause', col: 2 },
+      { id: 'file', label: 'write the facts down', note: 'block, implementations, roles, gas, parameters', col: 3 },
+      { id: 'diff', label: 'diff the committed copy', note: 'the failure names what moved', col: 4, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'sched', to: 'blk' },
+      { from: 'blk', to: 'run' },
+      { from: 'run', to: 'file' },
+      { from: 'file', to: 'diff' },
+      { from: 'diff', to: 'sched', label: 'again tomorrow', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+## The same machinery at three in the morning
+
+Everything above has a second use, and it is the one that justifies building it before you need it.
+
+During an incident, simulation has two jobs and they run in parallel.
+
+### Understand the mechanism
+
+The fastest route from "funds are leaving" to "here is how" is replaying the attacker's transaction
+with a decoded trace. `cast run` executes a transaction locally and shows the
+trace;<Cite src="cast-run-reference" /> measured on a real mainnet transaction, it produced the full
+decoded call tree — including a proxy's delegatecall into its implementation, with the event and its
+decoded arguments — in **1.3 seconds** from a laptop against a public
+endpoint.<Cite src="measured-simulation-2026-08-26" />
+
+```console
+[40652] USDC::transfer(0x051d…8d88, 44604460)
+  ├─ [33363] 0x43506849…02dd::transfer(0x051d…8d88, 44604460) [delegatecall]
+  │   ├─ emit Transfer(from: 0x58F2…0214, to: 0x051d…8d88, amount: 44604460)
+  │   └─ ← [Return] true
+  └─ ← [Return] true
+```
+
+That is the input every containment decision needs, and it is available before the first person has
+finished joining the call. Two habits make it available *reliably*: have the RPC endpoint and the
+command in the runbook rather than in someone's shell history, and have the ABIs where the tracer can
+find them, because an undecoded trace is a wall of hex at exactly the moment nobody can read one.
+
+### Rehearse the response before you send it
+
+This is the part that gets skipped under pressure, and it is the reason for a well-documented
+pattern: **the remediation causes the second incident.** The pause that also stops liquidations while
+the market is falling. The parameter change that makes every position instantly liquidatable. The
+revocation that removes the very role the recovery transaction needs.
+
+You already have three ways to check, in ascending order of time cost:
+
+**One request against head.** `eth_simulateV1` with the response calldata, executed as the address
+that will send it, against `latest`<Cite src="eth-simulatev1-spec" /> — this is the fastest possible answer to "does this call even
+succeed right now, from this sender". Add the reads that matter as subsequent calls in the same
+block, so you see the world your action creates rather than just its return
+value.<Cite src="eth-simulatev1-spec" />
+
+**A bundle that includes what happens next.** Pause, then attempt the withdrawal a user would attempt;
+pause, then attempt the liquidation a keeper would attempt. Each is one more entry in the `calls`
+array, and together they answer "what does this break" rather than "does this work".
+
+**A fork at head, for anything that needs to be poked at.** When the answer depends on a sequence you
+cannot fully anticipate, this is where you get to try things and undo them.
+
+Set the threshold before the night in question — "nothing touching money or permissions goes out
+unsimulated" — so the decision is already made when nobody is thinking clearly.
+
+<Aside kind="warn">
+Two things about incident simulation that are easy to get wrong under pressure. **Simulating against
+`latest` is simulating against a block that may be reorged out**, and during an active exploit the
+state is moving fast — re-run the check immediately before sending, not once at the start.
+And **do not reach for state overrides**<Cite src="execution-apis-execute-schemas" />: an override is
+a fiction, and the whole point of the incident check is to find out what is true. If a response needs an override to succeed in
+simulation, that is the finding.
+</Aside>
+
+The endpoint, the ABIs, the fork command, the response scripts, the runbook line: an hour on a quiet
+Tuesday, and unobtainable at 03:00. Same argument as
+[a rehearsed detect-to-respond pipeline](/c/detect-to-respond-pipeline) and
+[named war-room roles](/c/war-room-roles), applied to the one tool that answers questions rather than
+raising them.
+
+<Check type="explain" concept="simulation-in-ci">
+Your team has one CI job called `fork-tests`. It forks at whatever block is current when the job
+starts, runs the upgrade rehearsal and the governance rehearsal, and blocks merges when red. It goes
+red roughly twice a week for reasons nobody can reproduce, and the team has developed a habit of
+re-running it until it passes.
+
+Diagnose the situation and describe what you would build instead.
+
+<Answer>
+**The job is doing two incompatible things at once, and the re-run habit has already destroyed its
+value as a gate.**
+
+**Diagnosis.** An unpinned fork tests against a different world on every run. So a red build carries
+no information about the change under test: it might be a broken commit, or it might be a pool that
+rebalanced, a parameter someone else voted on, or a transient RPC error. Because the team cannot tell
+those apart, the only rational response *is* to re-run — and once "re-run until green" is the norm,
+a genuine regression will also be re-run until green. The gate is now worse than no gate, because it
+carries the authority of a check while providing none.
+
+Two secondary effects worth naming. Every run misses the cache, since
+[the block number is the cache key](/c/fork-cache-keying), so the job is slow as well as flaky. And
+an outside contributor's pull request cannot run it at all, because
+[fork pull requests do not receive secrets](/c/fork-pr-secrets).
+
+**What I would build: two jobs with different contracts.**
+
+*`rehearsal-pinned` — gates the merge.* Block number committed in the repository. Cache restored by
+that key. Every failure means a commit broke something, because nothing else can move. Fast, because
+the cache is warm. This is the job people are allowed to trust.
+
+*`rehearsal-at-head` — scheduled, reports, does not gate.* Runs nightly, resolves a recent stable
+block at start, runs the same rehearsals against it. It has a named owner and its output goes to a
+channel people read. Its failures are **news about the chain**: a role was revoked, a dependency
+upgraded, quorum is no longer reachable with the current electorate, a parameter moved. It is
+expected to miss the cache, and `--fork-retry-backoff` is set because it will meet rate
+limits.<Cite src="foundry-fork-testing" />
+
+**Three operational rules that come with the split.**
+
+*Bump the pinned block deliberately, as a reviewed commit.* Refreshing it is a decision with a diff,
+not a background process. When the bump makes `rehearsal-pinned` go red, that is drift the scheduled
+job should already have told you about.
+
+*Make provider unavailability a distinguishable failure.* A cached fork still needs a live
+endpoint,<Cite src="measured-simulation-2026-08-26" /> so give that failure its own message and its
+own runbook line rather than letting it look like a broken assertion.
+
+*Never let the fork job skip silently on fork pull requests.* Either mark the merge blocked pending a
+maintainer run, or post a visible notice. A skipped check that renders as a pass is how the whole
+mechanism gets quietly bypassed.
+
+**And one assertion I would add to the scheduled job specifically:** that the emergency pause can
+still be called by the address we believe holds that power. It is the path we rehearse least and rely
+on most.
+</Answer>
+</Check>
+
+<Misconception
+  belief="During an incident there is no time to simulate; you send the fix."
+  reality="The check that matters costs one request against head and answers 'does this call succeed from this sender right now, and what does it break'. The alternative is the well-known pattern where the remediation causes a second, sometimes larger, incident — a pause that also stops liquidations, a revocation that removes the role the recovery needs."
+  why="Urgency reads as a reason to skip verification, and the cost of the check feels like time while the cost of the mistake is still hypothetical."
+  src="eth-simulatev1-spec"
+/>
+
+## Where this leaves the module
+
+Seven lessons, one claim: **a simulation is a conditional, and its value is exactly the honesty of the
+conditions.**
+
+The measurements made the point more compactly than the argument does. A burner address chosen for
+being empty already held WETH.<Cite src="measured-simulation-2026-08-26" /> The same transfer
+succeeded identically under `state` and `stateDiff`, and only an unrelated read revealed that one of
+them had zeroed a token's entire storage.<Cite src="measured-simulation-2026-08-26" /> An upgrade
+returned `status 1` and sent every balance in a live token to zero, with the wrong number turning out
+to be an address from the neighbouring slot.<Cite src="measured-simulation-2026-08-26" /> In none of
+those cases did anything report an error.
+
+So the order of operations, when you are about to send something you cannot take back:
+
+**Say what you are claiming, and against which block.** A result without a block number is not
+reproducible by anyone, including you.
+
+**Execute the real calldata as the real authority.** Not a reconstruction, not a fixture, not a
+convenient address.
+
+**Assert on values, not on the absence of a revert.** The dangerous failures succeed.
+
+**Write down every lie you told the EVM.** Overrides, impersonations, thresholds set to one, time
+you moved. A green result with the fiction stripped off is indistinguishable from a true one.
+
+**Run it again tomorrow, automatically.** The chain does not hold still for your rehearsal.
+
+**Then decide.** Simulation reduces uncertainty; it never removes it. The residual risk is yours to
+accept explicitly or design away — and the reflection at the end of this module asks you to name
+exactly which one you chose, for a transaction you would genuinely be nervous to send.

@@ -1,0 +1,445 @@
+---
+id: defi-oracles-push-feeds
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [chainlink-data-feeds-docs, chainlink-data-feeds-api-reference, chainlink-selecting-data-feeds, chainlink-l2-sequencer-feeds, chainlink-developer-responsibilities, chainlink-historical-data, pyth-pull-updates-docs, measured-gas-constants, arxiv-manipulation-cost-2026]
+stack: {}
+---
+
+A support ticket, roughly once a quarter, at every protocol that consumes a professional feed. A user
+writes in: *your app says my collateral is worth $2,940 but the exchange says $2,760, and it has been
+wrong for forty minutes.* Somebody checks the aggregator, finds the last round was written 41 minutes
+ago at $2,940, and escalates it as an oracle outage.
+
+It is not an outage. It is the feed doing exactly what its configuration says it will do, and the
+forty minutes are a published number that somebody on the integrating team was supposed to read
+before shipping. This lesson is about that number: where it comes from, how to compute how wrong you
+have agreed to be, and the one check that separates a correct consumer from the most common
+integration bug in DeFi.
+
+## The push model, stated precisely
+
+In a push design an off-chain network of node operators collects prices from data providers, reaches
+consensus on a single value, and submits it on chain — on its own schedule, paying its own
+gas.<Cite src="pyth-pull-updates-docs" /> The contract stores the current price. A permissioned set of
+operators is authorised to update it.<Cite src="pyth-pull-updates-docs" /> Consumers do not
+participate: they call a `view` function and read what is there.
+
+Three consequences follow immediately, and they are the whole trade.
+
+**Reads are cheap and synchronous.** No coordination, no keeper, no extra transaction. A consumer
+contract does a `STATICCALL` into a proxy and gets a tuple back. In gas terms that is a cold account
+access — 2,600 on this machine's configuration — plus the aggregator's own cold storage reads at
+2,100 each.<Cite src="measured-gas-constants" /> Cheap enough that a lending market can price every
+asset in a position on every interaction without thinking about it.
+
+**Reads are available to everyone, including people you have never heard of.** The feed is a public
+good with no allowlist. This is a feature, and it is also why "who consumes this feed" is not a
+question the feed operator can answer.
+
+**The value's age is entirely outside your control.** Between updates the contract holds a number
+that is, by design, no longer the market price. Not stale in the sense of broken — stale in the sense
+of *finished being current*, on a schedule that was published in advance and that your contract has
+no ability to influence.
+
+<Aside kind="note">
+Chainlink's Data Feeds are the canonical push implementation and the one this lesson works
+against, because the mechanics are documented in enough detail to be taught precisely. The proxy
+pattern matters for a practical reason: you point your contract at a proxy, the proxy points at an
+aggregator, and the aggregator can be upgraded underneath you without your address
+changing.<Cite src="chainlink-data-feeds-docs" /> Reading the aggregator directly works and is
+explicitly not the recommended integration.<Cite src="chainlink-data-feeds-docs" />
+</Aside>
+
+## What the interface actually returns
+
+`latestRoundData()` returns five values, and the number of integration bugs caused by ignoring four of
+them is difficult to overstate.<Cite src="chainlink-data-feeds-api-reference" />
+
+```solidity
+function latestRoundData() external view
+    returns (
+        uint80 roundId,
+        int256 answer,
+        uint256 startedAt,
+        uint256 updatedAt,
+        uint80 answeredInRound
+    );
+```
+
+- **`roundId`** — the round identifier. Rounds are sequential; a specific historical round can be
+  fetched with `getRoundData(roundId)`.<Cite src="chainlink-data-feeds-api-reference" />
+- **`answer`** — the data the feed provides. Depending on the feed this is an asset price, a reserve
+  value, or another data type entirely.<Cite src="chainlink-data-feeds-api-reference" /> It is
+  `int256`, signed, which is a hint that non-positive values are representable and therefore must be
+  handled.
+- **`startedAt`** — when the round started.<Cite src="chainlink-data-feeds-api-reference" />
+- **`updatedAt`** — when the round was updated. **This is the field the whole lesson turns
+  on.**<Cite src="chainlink-data-feeds-api-reference" />
+- **`answeredInRound`** — deprecated. It was used when answers could take multiple rounds to
+  compute.<Cite src="chainlink-data-feeds-api-reference" /> Integration guides written before the
+  deprecation compare it against `roundId`; that comparison is now
+  vestigial.<Cite src="chainlink-data-feeds-api-reference" />
+
+Notice what is *not* returned: any statement about whether the answer is fresh enough for you. The
+struct hands you a timestamp precisely because the decision is yours. Returning a value is not an
+assertion of currency.
+
+<Misconception
+  belief="If the oracle returns a value, the value is usable."
+  reality="The tuple includes a timestamp because the caller is expected to decide whether the age is acceptable for its own risk tolerance. A feed that answers is not a feed that is current."
+  why="Almost every quick-start snippet destructures the tuple down to `answer` and discards the rest, so the discarded fields read as ceremony."
+  src="chainlink-data-feeds-api-reference"
+/>
+
+## Two triggers, and only two
+
+A push feed does not stream. It writes a new round when one of exactly two conditions fires, and it
+is worth being precise about both because most incident post-mortems in this area are really
+post-mortems about a misread parameter.<Cite src="chainlink-data-feeds-docs" />
+
+**Deviation threshold.** Node operators monitor the real-world value off chain. When it deviates from
+the last on-chain answer by more than a configured interval, all the nodes update.<Cite src="chainlink-data-feeds-docs" />
+
+**Heartbeat.** If the value stays inside the deviation band, an update fires anyway once the
+configured idle interval has elapsed.<Cite src="chainlink-data-feeds-docs" />
+
+Whichever comes first. The two values are per-feed and per-chain, and they are published — on the
+feed's own address listing and on the data explorer.<Cite src="chainlink-data-feeds-docs" /> They are
+not folklore; they are a configuration you are expected to look up before choosing the feed.
+
+<Figure
+  caption="Nothing streams: the slot changes only when one of two triggers fires, and then only once the round it initiated has landed."
+  alt="Either a deviation crossing or an elapsed heartbeat causes a node to initiate a round; the round lands on chain after a further delay that depends on congestion; only then does a consumer's read return the new value."
+>
+  <Flow
+    lanes={['what fires', 'the operators', 'on chain', 'your contract']}
+    nodes={[
+      { id: 'dev', label: 'deviation crossed', note: 'value left the configured band', col: 0, tone: 'accent' },
+      { id: 'hb', label: 'heartbeat elapsed', note: 'idle for the configured interval', col: 0, tone: 'accent' },
+      { id: 'init', label: 'a node initiates', note: 'all nodes update', col: 1 },
+      { id: 'land', label: 'the round lands', note: 'a further delay under congestion', col: 2, tone: 'warn' },
+      { id: 'read', label: 'latestRoundData', note: 'whatever landed last', col: 3 },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="A feed with a one-hour heartbeat updates hourly."
+  reality="The heartbeat is a maximum idle interval, not a cadence. A volatile pair may update many times a minute on deviation and never reach its heartbeat at all; a quiet pair may reach it every time."
+  why="'Heartbeat' names a periodic tick in every other system a working engineer has met."
+  src="chainlink-data-feeds-docs"
+/>
+
+Two documented details that catch teams out. First, when a node detects the heartbeat has been
+reached it *initiates* the round; depending on congestion and network conditions there can be a
+further delay before that round lands on chain.<Cite src="chainlink-data-feeds-docs" /> The heartbeat
+is therefore a lower bound on how current the answer is guaranteed to be, not an exact one. Second,
+feeds for wrapped or liquid-staking assets can carry different heartbeat and deviation thresholds
+than the underlying asset, and the same asset can be configured differently on different
+chains.<Cite src="chainlink-data-feeds-docs" /> Combining several feeds — even ones sharing a
+denominator — compounds their margins of error, and the documentation says so
+directly.<Cite src="chainlink-data-feeds-docs" />
+
+## Worked example: how wrong have you agreed to be?
+
+The question a designer must answer is not "is this feed good" but "what is the largest error this
+feed can present to my contract without anything malfunctioning". That has a derivation. Work it in
+the order that produces a bound.
+
+**Subgoal 1 — establish the error the deviation threshold permits at any instant.** Call the
+threshold `d`. Between updates the on-chain answer may differ from the off-chain aggregate by up to
+`d` without triggering anything. So at an arbitrary moment, with no market stress and nothing wrong,
+your contract's price can be off by `d` relative to what the operators themselves observe. For a feed
+configured at 0.5%, a $3,000 asset can legitimately be reported anywhere in a $15 band. That is the
+*floor* of your error, present always.
+
+**Subgoal 2 — establish the error the heartbeat permits.** Now suppose the market moves. The moment
+the aggregate crosses `d`, an update is triggered — so under normal operation the deviation trigger
+bounds the error and the heartbeat never fires. The heartbeat only becomes your binding constraint
+when the deviation trigger *cannot* fire: when nodes are unable to transmit, when the chain is
+congested, when the feed is degraded. In that case your error grows with the market's actual move
+until the heartbeat forces a write, and that can be several hours on feeds configured for consumers
+who do not need freshness.<Cite src="chainlink-data-feeds-docs" />
+
+**Subgoal 3 — convert both into your own units.** Neither number means anything until it is expressed
+as protocol damage. Take the gap between your
+[loan-to-value cap and your liquidation threshold](/c/lend-ltv-vs-liquidation-threshold) — the
+buffer you deliberately built. Ask what fraction of it a `d`-sized error consumes. If your buffer is
+5 percentage points and your feed's deviation threshold is 2%, you have already spent 40% of the
+buffer on the oracle before the market has done anything.
+
+**Subgoal 4 — check the tail, not the mean.** The relevant scenario is not a typical hour. It is the
+hour in which the asset gaps 30% and the chain is congested and gas is high — the same hour in which
+your liquidators are also struggling. Those correlate, and the correlation is the point: your feed is
+most likely to be at its maximum permitted error exactly when your protocol is least able to absorb
+it.
+
+**Subgoal 5 — state the decision as an inequality, and accept it explicitly.** Your protocol's
+tolerance for being wrong must be at least as wide as the window the feed publishes. If it is not,
+the answer is not "add monitoring" — the answer is that this feed is the wrong feed for this
+position, and something with a tighter configuration, a different delivery model, or a smaller
+exposure cap is required.
+
+The output of this exercise is a written sentence: *this market can be wrong by up to X% for up to Y
+minutes without anything being broken, and we have sized the buffer accordingly.* If a team cannot
+produce that sentence, they have not chosen a feed; they have adopted one.
+
+### The shape this produces
+
+It helps to hold the picture. Draw the off-chain aggregate as a smooth line. Draw the on-chain answer
+as a step function that only changes when a trigger fires. During a quiet stretch the step sits flat
+while the smooth line wanders inside the deviation band; the gap between them is small and
+oscillating, and the heartbeat eventually forces a step that barely moves anything. During a genuine
+move the smooth line runs away and the steps chase it, each one triggered by the deviation crossing,
+each landing a block or two after the crossing that caused it.
+
+The area between the two lines is the region in which your protocol is wrong. It is smallest exactly
+when it does not matter, and largest exactly when it does — during fast moves, and during whatever
+conditions delay transmission. That asymmetry is not a defect of the design. It is the design: a push
+feed spends gas in proportion to how much the price has moved, which is the only way a public good
+priced in blockspace can work at all.
+
+<Misconception
+  belief="Push feeds update every block."
+  reality="They update when a trigger fires. A read between triggers returns a value that is old by design, and that is documented behaviour rather than a malfunction."
+  why="Every dashboard shows a live-looking price, but the dashboard is reading the off-chain aggregate, not the on-chain answer your contract sees."
+  src="chainlink-data-feeds-docs"
+/>
+
+### Two details about rounds worth knowing before you build on them
+
+Historical data is available: `getRoundData(roundId)` returns a past round, which is how a protocol
+reconstructs what it believed at some earlier moment.<Cite src="chainlink-historical-data" /> Two
+properties make naive use of it wrong.
+
+First, `roundId` means different things at the proxy and at the aggregator, because the proxy
+abstracts an aggregator that can be replaced — which also means historical data can be spread across
+different aggregators.<Cite src="chainlink-historical-data" /> Code that walks round identifiers
+backwards across an aggregator upgrade is not reading the history it thinks it is.
+
+Second, the identifier increases with each new round, but **the increase may not be
+monotonic**.<Cite src="chainlink-historical-data" /> Any loop that assumes `roundId - 1` exists, or
+that decrements until it finds a round old enough, is built on an assumption the documentation
+declines to make.
+
+## The staleness check
+
+Everything above collapses into a handful of lines that a correct consumer executes on every read.
+Chainlink's own guidance is unambiguous: track `updatedAt`, decide whether it is recent enough, and if
+it is not, **pause operation or switch to an alternate mode** while you identify the
+cause.<Cite src="chainlink-data-feeds-docs" />
+
+```solidity
+function _price(AggregatorV3Interface feed, uint256 maxAge)
+    internal view returns (uint256)
+{
+    (, int256 answer, , uint256 updatedAt, ) = feed.latestRoundData();
+    if (answer <= 0) revert BadAnswer();
+    if (updatedAt == 0) revert NoRound();
+    if (block.timestamp - updatedAt > maxAge) revert StalePrice();
+    return uint256(answer);
+}
+```
+
+Four things are happening, and each corresponds to documented behaviour rather than to defensive
+paranoia:
+
+**Non-positive answers.** The return type is signed. A zero or negative answer must not flow into a
+division or a collateral valuation.
+
+**A round that does not exist.** An `updatedAt` of zero means there is no round to read.
+
+**Age against a maximum you chose.** Not a maximum the feed chose — it does not have one for you. The
+value should align with the feed's documented heartbeat interval, usually the heartbeat plus a small
+buffer, and explicitly not an arbitrary constant.<Cite src="chainlink-data-feeds-docs" />
+
+**Reverting rather than continuing.** A revert is a decision. Its consequence is a liveness
+dependency: when the feed is stale, your protocol stops. That is a real cost — borrowers cannot
+repay, liquidators cannot liquidate — and it must be chosen deliberately rather than inherited from a
+snippet. The alternative Chainlink names is switching to an alternate operation
+mode.<Cite src="chainlink-data-feeds-docs" />
+
+### Three more failure modes the check does not cover
+
+**The feed can be deprecated.** Routine maintenance on feeds, including decommissioning, happens on
+an ad-hoc basis, and users may have to take action to maintain continuity — with notifications going
+only to operators who registered contact details.<Cite src="chainlink-data-feeds-docs" /> A protocol
+whose oracle address is immutable and whose team has not registered is one decommissioning away from
+a permanent outage.
+
+**Bounds are your job now.** Aggregators carry `minAnswer` and `maxAnswer` values, and the current
+documentation states plainly that on most data feeds **these are no longer used and do not stop your
+application from reading the most recent answer** — you must decide what limits are acceptable and
+implement your own circuit breaker.<Cite src="chainlink-data-feeds-api-reference" /><Cite src="chainlink-data-feeds-docs" />
+Guidance that tells you to compare the answer against the aggregator's own floor and ceiling is
+describing a mechanism that is no longer there. The next lessons build the replacement.
+
+**On an L2, "the price is stale" and "the chain is broken" are different problems.** If a rollup's
+sequencer is unavailable, users lose the standard read/write path while the L1 contracts remain
+reachable by anyone technical enough — which is exactly the asymmetry that distorts liquidations. The
+documented pattern is a separate uptime feed whose `answer` is 0 for up and 1 for down, plus a grace
+period measured from `startedAt` after it comes back, before you resume trusting the price
+feed.<Cite src="chainlink-l2-sequencer-feeds" /> Note also that these feeds are no longer being
+expanded to additional networks, so their availability is a per-chain question rather than a
+given.<Cite src="chainlink-l2-sequencer-feeds" />
+
+<Aside kind="warn">
+Feeds for assets with real-world market hours do not have heartbeats while their market is closed:
+the contract stays callable and returns the last value published before the close, with a timestamp
+that may predate the close by minutes or hours.<Cite src="chainlink-selecting-data-feeds" /> A
+staleness check tuned to a crypto feed's heartbeat will either reject every weekend or accept
+arbitrarily old closes, depending on which way it was written. Neither is what anyone intended.
+</Aside>
+
+<Check type="spot-bug" concept="orac-staleness-check">
+A team ships this, having read that the feed's heartbeat is 3,600 seconds. The market is a lending
+market on a major L2, collateral is a liquid-staking token, and `MAX_AGE` is a constant.
+
+```solidity
+uint256 constant MAX_AGE = 3600;
+
+function collateralUsd(uint256 amount) public view returns (uint256) {
+    (uint80 roundId, int256 answer, , uint256 updatedAt, uint80 answeredInRound)
+        = lstUsdFeed.latestRoundData();
+    require(answeredInRound >= roundId, "stale round");
+    require(block.timestamp - updatedAt <= MAX_AGE, "stale price");
+    return amount * uint256(answer) / 1e8;
+}
+```
+
+Name every defect, and rank them by what each one costs.
+
+<Answer>
+**Defect one, and the expensive one: `answer` is not checked for sign, and the cast hides it.**
+`uint256(answer)` on a negative `int256` produces an enormous positive number. Collateral is then
+valued at roughly 10^77 dollars, every borrow is permitted, and the protocol is drained in one
+transaction. The `require` above it does not help. This is the single highest-severity line in the
+snippet.
+
+**Defect two: the heartbeat belongs to the wrong feed.** `MAX_AGE` was taken from a general figure,
+but this is an LST feed, and feeds for wrapped or liquid-staking assets can carry different heartbeat
+and deviation thresholds than the underlying — and can differ again by
+chain.<Cite src="chainlink-data-feeds-docs" /> The value must be read from *this* feed's listing on
+*this* network, and set to the heartbeat plus a small buffer rather than the heartbeat
+exactly.<Cite src="chainlink-data-feeds-docs" /> Exactly equal will reject legitimate rounds that were
+initiated on time and landed a few seconds late under congestion.<Cite src="chainlink-data-feeds-docs" />
+
+**Defect three: `answeredInRound >= roundId` is vestigial.** The field is deprecated; it existed for
+a mechanism where answers could span rounds.<Cite src="chainlink-data-feeds-api-reference" /> The
+check is not harmful, but it is doing no work, and its presence makes a reviewer believe staleness
+has been handled more thoroughly than it has.
+
+**Defect four: no sequencer-uptime condition, on an L2.** After a sequencer outage the feed's
+`updatedAt` can be fresh while users have been unable to transact, and the correct behaviour is to
+refuse to price until a grace period measured from the uptime feed's `startedAt` has
+elapsed.<Cite src="chainlink-l2-sequencer-feeds" /> Without it, the first block after recovery
+liquidates everyone who could not reach the chain.
+
+**Defect five: `1e8` is hard-coded.** The scale is a property of the feed, exposed through
+`decimals()`, not a constant of nature.<Cite src="chainlink-data-feeds-api-reference" /> If this
+address is ever repointed at a feed with a different scale, or the code is copied to a chain where it
+differs, every valuation is wrong by orders of magnitude and nothing reverts.
+
+**Defect six, structural rather than local: there is no bound on `answer`.** The aggregator's own
+`minAnswer`/`maxAnswer` are no longer used on most feeds and will not stop a wild
+value.<Cite src="chainlink-data-feeds-api-reference" /> A protocol that wants a circuit breaker has to
+implement it.<Cite src="chainlink-data-feeds-docs" />
+
+**Ranking.** One is a total loss in a single transaction. Four is a mass-liquidation event with real
+user harm. Five is a total loss but only on a migration. Two and six are the difference between
+losing a bounded amount and an unbounded amount during a genuine dislocation. Three costs nothing but
+misleads the next reviewer.
+</Answer>
+</Check>
+
+## Where the division of labour actually sits
+
+It is tempting to read all of the above as a list of chores the feed operator has offloaded. The
+operator's own documentation is more precise than that, and the distinction it draws is worth
+adopting as a review framework.
+
+It splits the risk in two.<Cite src="chainlink-developer-responsibilities" /> **Market integrity
+risks** are external market conditions affecting price behaviour and data quality in unanticipated
+ways — spoofing, ramping, wash trading, cross-market manipulation, and the general vulnerability of
+thinly traded assets. The operator states that developers are solely responsible for monitoring and
+mitigating these.<Cite src="chainlink-developer-responsibilities" /> **Application code risks** are
+the quality, reliability and dependencies of the consuming code, and developers are named as solely
+responsible for instituting the risk-mitigation processes — data quality checks, circuit breakers and
+contingency logic for their use case.<Cite src="chainlink-developer-responsibilities" />
+
+<Compare
+  axis="Who owns it?"
+  columns={[
+    { title: 'The feed operator', note: 'Chainlink Data Feeds' },
+    { title: 'You, the consuming protocol', tone: 'warn' },
+  ]}
+  rows={[
+    {
+      label: 'Who agrees on the number?',
+      cells: [
+        'An off-chain node network reaches consensus; one transmitter lands the result',
+        'Nothing — a consumer reads a slot and does not participate',
+      ],
+    },
+    {
+      label: 'Who judges whether the market it watched was real?',
+      cells: [
+        <>Market integrity risks — spoofing, ramping, wash trading, thinly traded assets — are named as external conditions<Cite src="chainlink-developer-responsibilities" /></>,
+        <>Developers are named as solely responsible for monitoring and mitigating them<Cite src="chainlink-developer-responsibilities" /></>,
+      ],
+    },
+    {
+      label: 'Who decides the answer is fresh enough to act on?',
+      cells: [
+        <>Publishes the deviation threshold and heartbeat for this feed on this chain<Cite src="chainlink-data-feeds-docs" /></>,
+        <>Tracks <code>updatedAt</code>, picks a maximum age, and pauses or switches to an alternate mode<Cite src="chainlink-data-feeds-docs" /></>,
+      ],
+    },
+    {
+      label: 'Who bounds a wild value?',
+      cells: [
+        <><code>minAnswer</code>/<code>maxAnswer</code> are no longer used on most feeds<Cite src="chainlink-data-feeds-api-reference" /></>,
+        <>Decides what limits are acceptable and implements the circuit breaker<Cite src="chainlink-data-feeds-docs" /></>,
+      ],
+    },
+    {
+      label: 'Who notices the feed was decommissioned?',
+      cells: [
+        <>Notifies operators who registered contact details<Cite src="chainlink-data-feeds-docs" /></>,
+        'Owns the consequence of an immutable oracle address',
+      ],
+    },
+  ]}
+  caption="On Chainlink's own account of the split, everything except producing the number stays on the consumer's side."
+  alt="A five-row comparison of what the feed operator owns against what the consuming protocol owns: agreeing the number, judging market integrity, deciding freshness, bounding wild values, and noticing decommissioning."
+/>
+
+Read that as an architecture statement rather than as a disclaimer. A feed operator can tell you what
+its nodes observed and how they agreed; it cannot tell you whether the market they observed was real,
+and it cannot know what your protocol does with the answer. Those are the two halves that stay with
+you, and every control in the rest of this module lands in one of them.
+
+The practical shape of that division for a lending market: the feed is responsible for *reporting the
+market*, you are responsible for *deciding whether the market is worth believing* and for *bounding
+what happens if it is not*. A team that outsources the first and assumes it has outsourced the other
+two has an oracle strategy consisting entirely of a contract address.
+
+## What this unlocks
+
+**The next lesson** takes the other delivery model, where the freshness problem is solved by moving
+the update into your own transaction — and where the liability moves with it.
+
+**The manipulation-cost lessons** will let you price the residual risk this lesson leaves open. A
+deviation threshold bounds how wrong the feed is relative to the market; it says nothing about what
+it costs to move the market the feed is watching.<Cite src="arxiv-manipulation-cost-2026" />
+
+**The hardening lesson** builds the circuit breaker that `minAnswer`/`maxAnswer` no longer
+provide,<Cite src="chainlink-data-feeds-api-reference" /> and settles the question of what to do when
+your primary and secondary sources disagree.
+
+**Reviewing an integration tomorrow.** Find every `latestRoundData` call in the codebase and check
+four things: sign, age against a per-feed constant, scale read rather than assumed, and — on an L2 —
+sequencer uptime. That grep, run honestly, finds real findings in most codebases that have one.

@@ -1,0 +1,277 @@
+---
+id: infra-event-pipelines-rebackfill
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [ponder-indexing-overview, ponder-config-reference, ponder-self-hosting, ponder-cli, sentio-obib, bilinear-indexing-events, alchemy-eth-getlogs, execution-apis-block-tags, postgres-insert, envio-indexing-and-reorgs]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The request was one sentence in a planning doc: "show the USD value of each transfer at the time it
+happened." The estimate was two days. It shipped eleven days later, and nine of those days were a
+progress bar.
+
+The two-day estimate was not careless. Adding a column, backfilling it with a default, and updating a
+serializer genuinely is two days in every other system this engineer had ever worked in. The
+assumption underneath it — that a schema change touches the schema — is the one that does not survive
+contact with an indexer.
+
+You already know that an indexer is
+[a deterministic fold over an ordered event stream](/c/indexer-is-a-deterministic-fold). This lesson
+is the operational consequence of that sentence, which is larger than it looks: **the fold is not
+incremental over changes to its own logic**, so changing what you derive means deriving it all again.
+
+## Why the ordinary migration does not apply
+
+An application migration is incremental because the table is the source of truth. `ALTER TABLE ... ADD
+COLUMN status text DEFAULT 'active'` is complete the moment it returns, because there is no other
+authority that could disagree with the default.
+
+An indexer's derived tables are not the source of truth. They are the output of a function applied to
+the entire event history. Change the function and every row it ever produced is the output of the old
+function. There is no default that is correct for historical rows, because the correct value is a
+computation over inputs that are not in the table you are altering.
+
+Three cases, and the difference between them is the whole planning discussion:
+
+**1. A field you already have, presented differently.** Renaming, reformatting, splitting an address
+into two columns. Incremental. This is an ordinary migration and it really is two days.
+
+**2. A field derived from data you already stored.** The USD value example, if you kept the raw
+`amount` and a price series locally. **You must re-run the fold, but you never touch the chain.** This
+is fast — it is a query over your own database — and the fact that it is fast is not luck. It is the
+payoff of an architectural decision described below.
+
+**3. A field derived from data you never fetched.** A gas cost per event, an internal-call trace, the
+result of an `eth_call` against state at that block. **You must re-fetch from the chain, then re-run
+the fold.** This is the nine-day case, and it is the one people estimate as if it were case 1.
+
+<Compare
+  columns={[
+    { title: 'Case 1', note: 'presented differently' },
+    { title: 'Case 2', note: 'derived from data you kept' },
+    { title: 'Case 3', note: 'derived from data you never fetched' },
+  ]}
+  rows={[
+    { label: 'Does the fold have to run again?', cells: ['No', 'Yes', 'Yes'] },
+    { label: 'Does it touch the chain?', cells: ['No', { v: 'No', tone: 'good' }, { v: 'Yes — the whole range again', tone: 'danger' }] },
+    { label: 'What bounds the duration?', cells: ['The migration itself', { v: 'Local disk', tone: 'good' }, { v: 'Provider quota and rate limits', tone: 'danger' }] },
+    { label: "The lesson's example", cells: ['Splitting an address into two columns', 'USD value, with the price series held locally', 'Gas paid per event'] },
+  ]}
+  caption="One question separates a two-day change from a nine-day one: does stage 1 already hold the inputs?"
+  alt="The three kinds of indexer schema change compared on whether the fold must run again, whether it touches the chain, what bounds its duration, and the lesson's example of each."
+/>
+
+<Misconception
+  belief="Adding one field to my indexer's schema is a small change."
+  reality="If the field is derived, the derivation must run over the entire history, because the fold is not incremental over changes to its own logic. If the inputs were never stored, the history must be fetched again first."
+  why="Every other database migration in a product engineer's experience is incremental, and the indexer presents the same interface — a schema file and a table — as the systems where that intuition is correct."
+  src="ponder-indexing-overview"
+/>
+
+## The architecture that turns case 3 into case 2
+
+Split the pipeline into two stages that are deployed and versioned separately.
+
+**Stage 1 — raw ingestion.** Immutable rows, keyed on the natural key, that record what the chain
+said. No interpretation. Envio's framing is the useful one here: create-only data is *independent* —
+it does not require previous state to process current state — which makes it parallelisable and makes
+its correction a delete-and-re-ingest rather than a rollback.<Cite src="envio-indexing-and-reorgs" />
+
+**Stage 2 — derivation.** Every product-facing table is a function of stage 1. Balances, positions,
+aggregates, denormalised feeds.
+
+With that split, a change to any derived field is case 2: re-run stage 2 over local rows. Postgres
+reads at disk speed; `eth_getLogs` reads at network speed, provider-quota speed and rate-limit speed.
+The difference is typically two orders of magnitude, and it is the difference between a deploy and a
+week.
+
+### The decision that determines which case you are in
+
+Case 3 exists when stage 1 does not contain the inputs. So stage 1's scope is the highest-leverage
+decision in the pipeline, and it is made long before anyone asks for the field.
+
+Ponder makes the trade visible as configuration. `includeTransactionReceipts` defaults to `false` and,
+when true, includes the `transactionReceipt` on each event; `includeCallTraces` defaults to `false`
+and, when true, makes each function in the ABI available as an indexing function event
+name.<Cite src="ponder-config-reference" /> Both of those flags are exactly the "do I store the inputs
+for a field nobody has asked for yet" question, defaulted to no.
+
+The honest framing is that both answers cost something:
+
+- **Store more:** larger tables, slower backfill, higher provider cost, and receipts/traces are among
+  the more expensive things to fetch.
+- **Store less:** any future field that needs them is a full historical re-fetch.
+
+The resolution most teams land on is to store raw logs generously (they are cheap and you already paid
+to fetch the range), and receipts or traces selectively, for the contracts where value moves. What is
+not defensible is making the choice by accident, which is what a default does.
+
+<Aside kind="note">
+Some fields cannot be recovered from any node you can afford. Historical state — the answer to
+`eth_call` at block *N* — needs an archive node, and the pipeline that discarded it is not one query
+away from having it. When someone asks for "the pool price at the time of each swap", establish
+whether the number is derivable from the logs you kept before agreeing to anything.
+</Aside>
+
+## Backfill duration is a product constraint
+
+Here is the reframing worth taking away from this lesson.
+
+Backfill speed is usually discussed as a benchmark result, and the benchmarks deserve the scepticism
+you already have: rankings invert across workloads, and Sentio's open benchmark publishes several
+workloads with different platforms winning different ones, some unable to run certain workloads at
+all.<Cite src="sentio-obib" /> That makes "which indexer is fastest" unanswerable in the abstract, and
+it is the wrong question anyway.
+
+The right question is: **how long does it take to change what your product knows?** Backfill duration
+is the answer, and stated that way it stops being an infrastructure metric and becomes a product
+constraint, in the same category as build time or migration time.
+
+A nine-day backfill means:
+
+- Nine days between "we should show this" and showing it.
+- Nine days of exposure if a derivation bug is found, because the fix is another nine days.
+- A strong incentive to guess right the first time, which produces over-broad schemas that make the
+  backfill slower, which makes the next change slower.
+
+That feedback loop is the real cost, and it is why the two-stage split earns its keep. It is also a
+much better argument for caring about indexer performance than any published multiplier, because it is
+denominated in something the business already understands.
+
+## Doing it without downtime
+
+The mechanics are a blue/green deploy, and the frameworks provide the primitives.
+
+<Figure
+  caption="A re-backfill is a backward edge into stage 1, and it is cheap for exactly as long as stage 1 holds the inputs."
+  alt="Raw event rows in stage 1 feed the live derivation, which feeds the static views consumers read. A second derivation, deployed into its own schema, re-runs the fold over all of stage 1 and takes over the views only once a diff comes back empty."
+>
+  <Flow
+    lanes={['stage 1', 'stage 2', 'serving']}
+    nodes={[
+      { id: 'raw', label: 'raw event rows', note: 'immutable, keyed on position', col: 0, tone: 'accent' },
+      { id: 'v1', label: 'derivation v1', note: 'the live deployment', col: 1 },
+      { id: 'v2', label: 'derivation v2', note: 'its own schema', col: 1, dashed: true },
+      { id: 'views', label: 'static views', note: 'consumers never move', col: 2 },
+    ]}
+    edges={[
+      { from: 'raw', to: 'v1' },
+      { from: 'v1', to: 'views' },
+      { from: 'v2', to: 'raw', label: 're-runs the fold' },
+      { from: 'v2', to: 'views', label: 'cutover on a zero diff', tone: 'good', dashed: true },
+    ]}
+  />
+</Figure>
+
+**Subgoal: give the new version its own tables, so the old one keeps serving.** Ponder uses database
+schemas to isolate deployments, and each deployment must use a different schema, selected with the
+`DATABASE_SCHEMA` environment variable or the `--schema` CLI argument (maximum 45
+characters).<Cite src="ponder-self-hosting" /><Cite src="ponder-cli" /> The documentation's own
+suggestion is to automate it from the Kubernetes pod name, git branch or commit hash, or deployment
+ID.<Cite src="ponder-self-hosting" />
+
+**Subgoal: keep consumers pointed at a stable name, so cutover is not a config change everywhere.**
+That is the views pattern: it makes the latest deployment's data available in a static database schema
+using database views, so direct SQL queries always target the latest deployment's tables without a
+configuration change after each deploy. Ponder supports it via
+`ponder db create-views --schema=deployment-123 --views-schema=project-name`, or automatically through
+the `--views-schema` flag on `ponder start`.<Cite src="ponder-self-hosting" /><Cite src="ponder-cli" />
+
+**Subgoal: gate the cutover on a readiness signal, not on a wall clock.** Ponder's `/ready` endpoint
+returns 200 once indexing progress has reached realtime across all chains and 503 during the
+backfill.<Cite src="ponder-self-hosting" /> "Caught up" is therefore a value you can poll rather than a
+judgement someone makes at 2am.
+
+**Subgoal: diff before you switch, on a range that cannot move.** Compare old and new over a window
+safely below `finalized` — a block that cannot be re-orged outside of manual intervention driven by
+community coordination<Cite src="execution-apis-block-tags" /> — so any disagreement is a real
+difference in your derivation rather than a difference in what the two instances have seen. Cut over
+on zero row-level diffs sustained for a stated period, not on the backfill reporting done.
+
+**Subgoal: clean up, so the cost of the next re-backfill is not disk.** `ponder db list` shows every
+instance that has ever run in the connected database with its active flag and last-active time, and
+`ponder db prune` drops the tables, functions and schemas of deployments that are not currently
+active.<Cite src="ponder-cli" /> A team that re-backfills monthly and never prunes discovers this the
+expensive way.
+
+<Check type="explain" concept="schema-change-means-rebackfill">
+Your pipeline stores raw `Transfer` logs and derives a `holder_balance` table. Two requests arrive in
+the same sprint.
+
+**A.** Show, next to each holder, the block number of their first ever transfer.
+**B.** Show, next to each transfer, the gas the transaction paid.
+
+The engineer estimates both at one day, since both are "add a column and populate it". Say which
+estimate is wrong, why, and what the two requests reveal about the pipeline's design.
+
+<Answer>
+**Request A is close to a one-day change. Request B is a full historical re-fetch.**
+
+**A — derivable from stage 1, so it never touches the chain.** First-transfer block is a `min` over
+rows you already hold:
+
+```sql
+SELECT to_addr AS address, min(block_number) AS first_block
+FROM transfer_event GROUP BY 1;
+```
+
+The fold does have to run again over the whole history, because the answer for a holder depends on
+every one of their rows — you cannot default it and you cannot compute it incrementally from the
+current balance. But "run again over the whole history" here means one query over a local table, which
+is minutes. **This is case 2**, and it is fast because someone earlier decided to keep raw event rows
+instead of only maintaining balances.
+
+**B — gas paid is not in a log.** A log carries address, topics, data and its positional
+fields<Cite src="ponder-indexing-overview" />; the gas a transaction paid lives on the transaction
+receipt. If the pipeline did not store receipts, that data was never fetched, and the only way to get
+it for historical rows is to go back to the chain for every transaction in the entire indexed range.
+That is chunked, quota-limited, provider-capped
+work<Cite src="alchemy-eth-getlogs" /><Cite src="bilinear-indexing-events" /> against a range that
+took days to walk the first time. **This is case 3**, and the estimate is off by an order of
+magnitude.
+
+**What to say in the planning meeting.** Not "B is hard" — that invites negotiation about effort. Say:
+*B requires re-reading the whole history from the chain because we never stored receipts; A does not
+touch the chain at all. B's duration is our backfill duration, which is N days, and it will be N days
+again if we get the derivation wrong.* That converts an engineering objection into a schedule fact.
+
+**What the pair reveals about the design.** Two things, and both are decisions rather than
+discoveries.
+
+*The stage-1 scope was set implicitly.* Somebody accepted the default. Ponder's
+`includeTransactionReceipts` defaults to `false`<Cite src="ponder-config-reference" />, and defaults
+are how case-3 requests get created months before anyone asks for them. The question worth asking now
+is not "should we fetch receipts for B" but "what else are we one request away from not having".
+
+*The re-backfill deployment path should exist before you need it.* If A and B both ship by mutating
+the live tables in place, the product is inconsistent during the change and there is no way back. The
+schema-per-deployment plus views pattern makes both changes a parallel build and an atomic
+switch<Cite src="ponder-self-hosting" /><Cite src="ponder-cli" />, and it costs nothing to adopt on a
+day when you are not under pressure.
+
+**One honest caveat on A.** Re-running a derivation over local rows is only safe if the derived write
+is idempotent — recomputing into the same table with `ON CONFLICT ... DO UPDATE` rather than
+incrementing<Cite src="postgres-insert" /> — which is the distinction from the natural-key lesson.
+A derivation built as a stream of increments cannot be re-run at all; it can only be rebuilt from
+empty.
+</Answer>
+</Check>
+
+## What this unlocks
+
+The takeaway is a design rule and a planning habit.
+
+**The rule: keep an immutable raw stage.** It converts most future schema changes from network-bound
+to disk-bound, it makes derivations re-runnable, and it is the same rows the reorg reconciliation and
+the finality promotion already read. One table, several jobs.
+
+**The habit: quote schema changes in backfill days.** When someone asks for a derived field, the first
+question is which of the three cases it is, and the second is whether stage 1 has the inputs. Both are
+answerable in five minutes and both are more useful than a story-point estimate.
+
+One thing remains, and it is the failure that outlasts every other lesson in this module. A pipeline
+that has stopped receiving data looks exactly like a pipeline that is healthy: the process is up, the
+cursor exists, no errors are logged, and the tables are full of yesterday's correct data. The last
+lesson is the two invariants that make that state detectable.

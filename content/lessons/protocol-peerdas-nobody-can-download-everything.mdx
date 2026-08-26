@@ -1,0 +1,357 @@
+---
+id: protocol-peerdas-nobody-can-download-everything
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-4844, eip-7594, eip-7892, consensus-specs-v161-mainnet-config, consensus-specs-fulu-preset, consensus-specs-fulu-das-core, consensus-specs-fulu-p2p, ethereum-org-peerdas]
+stack: {}
+---
+
+Sit with a stopwatch next to a home node and count what arrives.
+
+A beacon block turns up. It is small — a few hundred kilobytes at most, and most of that is
+attestations. Then the data that the block merely *commits* to starts arriving, and that is the part
+with the interesting number attached. The mainnet blob schedule in `configs/mainnet.yaml` sets
+`MAX_BLOBS_PER_BLOCK` to 21 from epoch 419072.<Cite src="consensus-specs-v161-mainnet-config" /> A
+blob is 128 KiB.<Cite src="eip-4844" /> Twenty-one of them is 2.625 MiB, and `SLOT_DURATION_MS` is
+12,000, so a full block's worth of blob data arrives every twelve
+seconds.<Cite src="consensus-specs-v161-mainnet-config" />
+
+That is 18.5 GiB a day if every block were full, which no day is. It is also, and this is the part
+that ends the conversation, the number *before* the protocol adds the redundancy that makes sampling
+work at all. Under the pre-Fusaka rule — every node downloads every blob — raising the blob count is
+raising that figure linearly, for every node on the network, permanently.
+
+You met the consequence of that from the outside in Scaling: blob capacity is the binding constraint
+on rollup cost, and it moves on a schedule of its own. This module is the inside. It is about the
+mechanism that decoupled "how much data a block carries" from "how much data a node must fetch" —
+and about the exact, smaller-than-advertised size of that decoupling.
+
+<Figure
+  caption="The whole module is this pipeline: double the data, slice it into 128 fixed columns, and hand every node a fraction."
+  alt="A vertical pipeline. A blob of 4,096 field elements, 128 KiB, is erasure-extended to 8,192 field elements. The extended blobs are arranged as a matrix with one row per blob and 128 columns. Each column is gossiped as a data column sidecar on its own subnet. An ordinary node fetches one eighth of the data, and that fraction is what its availability verdict rests on."
+>
+  <Flow
+    dir="down"
+    lanes={['the unit', 'the redundancy', 'the shape', 'the wire', 'your node', 'the verdict']}
+    nodes={[
+      { id: 'blob', label: 'a blob', note: '4,096 field elements · 128 KiB', col: 0 },
+      { id: 'ext', label: 'extended blob', note: '8,192 field elements', col: 1, tone: 'accent' },
+      { id: 'mx', label: 'the matrix', note: 'one row per blob · 128 columns', col: 2, tone: 'accent' },
+      { id: 'sc', label: '128 column sidecars', note: 'one per subnet, gossiped', col: 3 },
+      { id: 'node', label: 'your node', note: 'fetches 1/8 of the data', col: 4 },
+      { id: 'v', label: 'availability verdict', note: 'inferred, not observed', col: 5, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+## The unit everything is denominated in
+
+Before any of the machinery, pin the primitive down precisely, because every constant later in the
+module is a multiple or a divisor of it.
+
+A blob is `FIELD_ELEMENTS_PER_BLOB` = 4,096 field elements of 32 bytes each: 131,072 bytes, 128
+KiB.<Cite src="eip-4844" /> It is not a byte array that happens to be that long. Each 32-byte word is
+a canonical element of the BLS12-381 scalar field, which is why not every 32-byte string is a legal
+blob and why encoding data into blobs costs you a few bits per word.
+
+Three properties of that object matter for everything downstream.
+
+**It travels beside the transaction, not inside it.** The transaction carries
+[versioned hashes](/c/versioned-hash) — `0x01` followed by the last 31 bytes of the SHA-256 of the
+blob's KZG commitment.<Cite src="eip-4844" /> The blob itself rides in a separate network wrapper.
+The block body references commitments; it does not contain blob bytes.
+
+**The EVM cannot read a byte of it.** `BLOBHASH` returns a versioned hash. The point-evaluation
+precompile at `0x0A` takes a 192-byte input and confirms that a claimed evaluation of the committed
+polynomial is correct.<Cite src="eip-4844" /> Neither of those is a read. A contract can verify a
+claim *about* blob contents that somebody else supplies; it cannot obtain the contents. That
+restriction is not an oversight, it is the entire reason blob data can be priced in a separate market
+from calldata — see [the lane the EVM cannot read](/c/blob-not-in-evm).
+
+**It is discarded on a timer.** Nodes must serve data for
+`MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS` = 4096 epochs, roughly 18 days, and may prune
+afterwards.<Cite src="consensus-specs-fulu-p2p" /> Availability is a window, not an archive.
+
+<Misconception
+  belief="Blobs are cheap because they are temporary — the protocol charges less for data it throws away."
+  reality="Pruning is a consequence, not the cause. Blobs are cheap because the execution layer never has to load, hash into state, or re-execute against them, so their cost to a node is bandwidth and disk rather than state growth. The retention window is what makes the bandwidth-and-disk cost bounded."
+  why="The two facts arrive together in most explanations — 'blobs are cheap and get deleted' — which invites reading the second as the reason for the first."
+  src="eip-4844"
+/>
+
+## The brute-force guarantee, and what it actually costs
+
+The property a rollup needs from Ethereum is narrow and easy to state: *the batch was published*.
+Not stored forever, not readable on-chain, not even read by anyone in particular — published, in the
+sense that anyone who wanted it during the window could have got it. Everything a
+[rollup](/c/rollup) promises rests on that. Without the batch, nobody reconstructs state, nobody
+challenges a wrong claim, and nobody exits without the operator's cooperation.
+
+The brute-force way to guarantee publication is to make every node download everything and refuse to
+build on a block whose data did not arrive. It is a genuinely excellent guarantee. It is also
+self-limiting in a way worth stating as arithmetic rather than as a principle.
+
+**Subgoal 1 — express the cost as a per-node rate, because that is the quantity that gates
+participation.** At `MAX_BLOBS_PER_BLOCK` = 21 and a 12,000 ms
+slot,<Cite src="consensus-specs-v161-mainnet-config" /> full blocks mean 2.625 MiB per slot, which is
+about 1.8 Mbit/s of sustained inbound just for blob payload, before protocol overhead, before
+duplicate deliveries from a gossip mesh, and before everything else a node does.
+
+**Subgoal 2 — add the redundancy, because the sampling design needs it and it is not free.** PeerDAS
+extends each blob with a one-dimensional erasure code, doubling it:
+`FIELD_ELEMENTS_PER_EXT_BLOB` = 8,192 against `FIELD_ELEMENTS_PER_BLOB` =
+4,096.<Cite src="consensus-specs-fulu-preset" /><Cite src="eip-4844" /> The network now carries 5.25
+MiB per full slot, not 2.625.
+
+**Subgoal 3 — multiply out the storage obligation, because that is what a node operator actually
+budgets.** 4,096 epochs is 131,072 slots. A node that held the entire extended matrix for the full
+retention window would be storing about 672 GiB, assuming every block full at 21
+blobs.<Cite src="consensus-specs-fulu-p2p" /><Cite src="consensus-specs-v161-mainnet-config" /> Real
+blocks are not all full, so treat that as the ceiling the design has to survive rather than a
+prediction.
+
+**Subgoal 4 — read off why the number cannot simply be paid.** Every one of those figures scales with
+`MAX_BLOBS_PER_BLOCK`, and that constant is now raised by
+[blob-parameter-only forks](/c/bpo-fork) — a lightweight fork class defined by EIP-7892 for exactly
+this purpose, changing target, max and the base-fee update fraction and nothing
+else.<Cite src="eip-7892" /> A mechanism designed to raise capacity quickly, sitting on top of a
+distribution rule where capacity multiplies straight into every node's bandwidth bill, is a
+mechanism that runs out of room fast.
+
+<Aside kind="note">
+The blob schedule in the config read on 26 August 2026 has two entries: `MAX_BLOBS_PER_BLOCK` 15 from
+epoch 412672 and 21 from epoch 419072.<Cite src="consensus-specs-v161-mainnet-config" /> Whether a
+further BPO has been agreed and not yet merged, or shipped since, is not something the file can tell
+you, and this project's own research register flags the current mainnet target/max as unverified.
+Treat 21 as "what the checked-in config said on that date", never as "the current maximum".
+</Aside>
+
+## What sampling substitutes, stated without the sales pitch
+
+Data availability sampling replaces "I downloaded it" with "I checked a small random part of it, and
+so did thousands of others". EIP-7594's motivation puts it plainly: DAS scales data availability
+beyond EIP-4844 by not requiring all nodes to download all data while still ensuring all of the data
+has been made available.<Cite src="eip-7594" />
+
+The honest version of the trade has two halves and both of them need saying.
+
+**Individual nodes know strictly less than before.** A node that finishes its checks has not seen the
+data. It has seen a fraction of it and inferred the rest. That inference is probabilistic, and no
+amount of good engineering makes it not probabilistic. There is a real, computable chance that a
+given node concludes "available" about data that is not recoverable.
+
+**The network as a whole knows enough.** The security claim was never about one node. EIP-7594's
+security analysis bounds the probability of convincing a *fraction* of nodes, and it is candid about
+where that bound is worthless: for mainnet parameters at 10,000 nodes, the upper bound on attack
+success at ε = 0.01 — a hundred nodes — is 1, and it only collapses from ε = 0.02
+onward.<Cite src="eip-7594" /> Fooling a hundred nodes is not ruled out. Fooling five per cent of
+them is bounded at 10⁻³⁰⁶·³⁴.<Cite src="eip-7594" />
+
+You worked the arithmetic behind that in
+[checking without downloading](/c/erasure-coding-for-da). What this module adds is everything between
+the arithmetic and a node that actually does it: which columns a node holds and why those ones, how
+it finds peers who hold the rest, what happens when half the data never shows up, and what "the
+samples passed" is permitted to mean to fork choice.
+
+### Three things "published" can mean, and only one of them is on offer
+
+Say what your service needs before you decide whether the guarantee covers it. The word does at least
+three jobs and they have different price tags.
+
+**Reconstructable by somebody, during the slot.** Enough of the extended data reached enough honest
+nodes that the block could be rebuilt from what the network holds. This is what data availability
+sampling establishes, and it is the guarantee PeerDAS is engineered to deliver.
+
+**Retrievable by you, now.** You can obtain the bytes on demand. PeerDAS does *not* promise this to
+an arbitrary party: a node holds its own columns and serves requests for those, so getting a whole
+blob means asking enough distinct peers to cover the columns you lack, within the window during
+which they are still required to answer.<Cite src="consensus-specs-fulu-p2p" />
+
+**Retrievable by you in eighteen months.** Not on offer at all. The serving obligation ends after
+4,096 epochs and nodes may prune.<Cite src="consensus-specs-fulu-p2p" /> Anything longer is somebody
+running an archive — the rollup itself, a third party, or you.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Reconstructable', note: 'by somebody, during the slot', tone: 'good' },
+    { title: 'Retrievable now', note: 'by you, on demand' },
+    { title: 'Retrievable later', note: 'by you, in eighteen months', tone: 'danger' },
+  ]}
+  rows={[
+    {
+      label: 'What has to be true?',
+      cells: [
+        'Enough of the extended data reached enough honest nodes that the block could be rebuilt from what the network holds',
+        'Enough distinct peers still hold, and still owe you, the columns you lack',
+        'Somebody kept the bytes after the serving obligation lapsed',
+      ],
+    },
+    {
+      label: 'Does the protocol deliver it?',
+      cells: [
+        { v: 'Yes — this is what data availability sampling establishes', tone: 'good' },
+        { v: <>Conditionally — a node serves only its own columns, so a whole blob is a gather across peers<Cite src="consensus-specs-fulu-p2p" /></>, tone: 'warn' },
+        { v: <>No — the serving obligation ends after 4,096 epochs and nodes may prune<Cite src="consensus-specs-fulu-p2p" /></>, tone: 'danger' },
+      ],
+    },
+    {
+      label: 'Who has to be there?',
+      cells: [
+        'The honest network, once, inside the slot',
+        'Peers you can reach, inside the retention window',
+        'An archive — the rollup itself, a third party, or you',
+      ],
+    },
+  ]}
+  caption="One word, three guarantees with different price tags — and the protocol supplies only the first outright."
+  alt="Three readings of published compared: reconstructable by somebody during the slot, retrievable by you now, and retrievable by you in eighteen months. Only the first is delivered by data availability sampling; the second is conditional on peers inside the retention window; the third is not offered at all."
+/>
+
+The failure mode this distinction prevents is common and expensive: a team hears "Ethereum guarantees
+availability", designs a dispute or exit path that reads historical batch data from L1 months later,
+and discovers the guarantee expired eighteen days after the fact.
+
+<Misconception
+  belief="Between them, all the sampling nodes have downloaded the whole block, so the data is collectively held."
+  reality="Sampling establishes that the data could be reconstructed. Whether anyone actually assembles it is a separate mechanism with its own threshold, its own delay policy and its own obligation to republish — three lessons of this module exist because it is separate."
+  why="'Everyone takes a piece' sounds like a distributed download. It is a statistical test in which most of the pieces are checked and then may be thrown away."
+  src="eip-7594"
+/>
+
+## What changed on the wire, and when
+
+This is not a proposal. `FULU_FORK_EPOCH` is 411392 — 3 December 2025, 21:49:11
+UTC.<Cite src="consensus-specs-v161-mainnet-config" /> Since that epoch the object a mainnet node
+receives is not a blob.
+
+The Fulu networking spec deprecates the `blob_sidecar_{subnet_id}` gossip topic outright and replaces
+it with `data_column_sidecar_{subnet_id}`.<Cite src="consensus-specs-fulu-p2p" /> The container that
+travels on it looks like this:
+
+```python
+class DataColumnSidecar(Container):
+    index: ColumnIndex
+    column: List[Cell, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    kzg_commitments: List[KZGCommitment, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    kzg_proofs: List[KZGProof, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    signed_block_header: SignedBeaconBlockHeader
+    kzg_commitments_inclusion_proof: Vector[Bytes32, KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH]
+```
+
+Three details in that declaration are worth reading now and will be unpacked later.
+
+**`column` is a list whose length is the block's blob count, not a fixed-size vector.** One cell per
+blob.<Cite src="consensus-specs-fulu-das-core" /> That is the type-level statement of the coupling
+this lesson refuses to let go of: more blobs, longer list, more bytes on the same subnet.
+
+**Every sidecar carries the block's full commitment list plus a Merkle proof that the list is in the
+block body.** `KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH` is 4 on
+mainnet.<Cite src="consensus-specs-fulu-preset" /> A node receiving one column can bind it to a
+signed block header without having the block body — which is what makes a column independently
+useful.
+
+**The proofs are per cell, not per blob.** EIP-7594 moved proof computation to the transaction
+sender: the blob-transaction network wrapper now carries `cell_proofs`, `CELLS_PER_EXT_BLOB` of them
+per blob, plus a one-byte `wrapper_version` set to 1.<Cite src="eip-7594" /> Every rollup batcher and
+every blob-submitting library had to change for that, and material predating it shows a tidy
+one-to-one-to-one triple of blobs, commitments and proofs that no longer exists.
+
+<Misconception
+  belief="A node still receives whole blobs; PeerDAS just adds sampling on top for light clients."
+  reality="On mainnet since Fulu the gossiped unit is the data column sidecar across 128 subnets, and the blob sidecar topic is deprecated. An ordinary full node never assembles a whole blob unless it chooses to reconstruct one."
+  why="It was accurate from EIP-4844 until Fulu, and most explanatory writing about blobs dates from that window."
+  src="consensus-specs-fulu-p2p"
+/>
+
+## The thing this module will keep insisting on
+
+Here is the claim you will hear about PeerDAS, in roughly these words: *because nodes hold columns
+rather than blobs, per-node bandwidth no longer depends on how many blobs a block carries.*
+
+It is not true, and the shape of the untruth is the most useful thing in the module.
+
+`NUMBER_OF_COLUMNS` is a **preset** constant, fixed at 128 — defined as
+`uint64(CELLS_PER_EXT_BLOB)`, itself `FIELD_ELEMENTS_PER_EXT_BLOB // FIELD_ELEMENTS_PER_CELL` =
+8192 / 64.<Cite src="consensus-specs-fulu-preset" /><Cite src="consensus-specs-fulu-das-core" /> It
+does not move when the blob count moves. A column is one cell index taken across *every blob in the
+block*, so adding blobs makes each column taller. More blobs means bigger columns, and a node holding
+a fixed number of columns downloads more bytes.
+
+What PeerDAS buys is a **constant divisor**. EIP-7594 names it: with current parameters a node
+downloads 1/8 of the total data, and this can in future be decreased to 1/16 or even 1/32 by reducing
+the sample size — which means *increasing the number of columns*.<Cite src="eip-7594" /> Read that
+sentence twice. The stated next lever for scaling is raising the column count, and it is on the table
+precisely because the current count is fixed and the coupling it leaves behind is real.
+
+So the accurate sentence is: **PeerDAS divides each node's share of the data by a constant; it does
+not sever the link between block capacity and node bandwidth.** Multiply blob capacity by eight and
+an ordinary node's blob traffic goes up by eight, just from a base one-eighth as large. That is an
+enormous win. It is not independence, and a design conversation that assumes independence will
+mis-plan the next capacity increase.
+
+<Check type="explain" concept="data-availability-problem">
+A colleague proposes what sounds like a cheaper version of the same idea for an appchain: "Skip the
+erasure coding and skip the columns. Just have every node download a random 1/16 of the blobs in each
+block, whole. Same bandwidth as PeerDAS, way less machinery, and between 10,000 nodes every blob gets
+fetched hundreds of times over, so nothing can go missing."
+
+Say what this scheme does and does not guarantee, and identify the assumption doing the illegitimate
+work.
+
+<Answer>
+**It guarantees redundant retrieval of whatever was served. It guarantees nothing about withholding,
+which is the only attack the mechanism exists to stop.**
+
+**The illegitimate assumption is that a missing piece is a random event.** The scheme's "hundreds of
+times over" is an availability-of-*honest*-data argument: if all the blobs are being served, random
+sampling will indeed fetch each one many times. Withholding is not a random event. It is a choice
+made by the party that has the data, who can answer every request except the ones for blob 7 and be
+caught by exactly the nodes assigned blob 7 — a computable minority — while every other node reports
+a clean fetch.
+
+**Whole-blob sampling makes the withheld quantity as small as the attacker likes.** With no
+extension, one unserved blob out of 21 is one permanently missing batch. There is no threshold below
+which withholding is harmless, so the detector has to catch a 1-in-21 event, and the nodes that do
+catch it are outvoted by the ones that did not.
+
+**What the extension changes is not detection sensitivity but the attacker's minimum move.** Once
+each blob is extended so that any half of it reconstructs the whole, hiding anything at all requires
+suppressing more than half the extended data — a target so large that a handful of random probes
+finds it. The redundancy is not there to survive packet loss. It is there to make "hide a little" and
+"hide a lot" the same act.<Cite src="eip-7594" />
+
+**Two further things the proposal silently drops.**
+
+*Verifiability of a fragment.* A node that receives one piece must be able to check it against the
+block's commitment on its own. Whole-blob delivery gets this free from the versioned
+hash;<Cite src="eip-4844" /> any scheme that hands out sub-blob pieces has to say what binds a piece
+to the commitment, and PeerDAS's answer — a KZG proof per cell — is what the next lesson is about.
+
+*Who reassembles.* Sampling proves reconstructability. If the appchain has no rule saying which nodes
+rebuild the missing parts, when, and whether they must republish what they rebuilt, then a partial
+withholding is never repaired and the block simply stays half-available. PeerDAS spends an entire
+spec section on that.<Cite src="consensus-specs-fulu-das-core" />
+
+**The one thing the colleague has right:** bandwidth-wise, 1/16 is 1/16. The costs are comparable.
+That is what makes the comparison worth making — the machinery is not buying a smaller download, it
+is buying a guarantee the cheap version does not have at any download size.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You now have the two fixed points the rest of the module hangs from: a blob is 128 KiB of field
+elements the EVM cannot read,<Cite src="eip-4844" /> and the network's aggregate assurance is
+deliberately bought by making each node's individual knowledge weaker.
+
+**Next comes the step that makes sampling mean anything.** The extension to 8,192 field
+elements<Cite src="consensus-specs-fulu-preset" /> and the per-cell KZG proof are what turn "I asked
+for a random piece and got one" from theatre into evidence. That lesson also settles a question this
+one dodged: what, exactly, the 4,096 numbers in a blob *are* — and it will show you two current
+descriptions that disagree, one of them on ethereum.org.<Cite src="ethereum-org-peerdas" />
+
+**And keep the divisor claim in hand.** Every time a later lesson says a node holds "its share", ask
+what the share is a share *of*, and whether that thing grew.

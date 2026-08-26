@@ -1,0 +1,355 @@
+---
+id: evm-opcodes-memory-six-places-a-byte-can-live
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    yellow-paper,
+    execution-specs,
+    eip-211,
+    eip-2929,
+    eip-1153,
+    eip-3529,
+    eip-5656,
+    solidity-layout-storage,
+    solidity-layout-memory,
+    solidity-docs-types,
+    measured-gas-constants,
+  ]
+stack:
+  solc: "0.8.36"
+  forge: "1.7.1"
+---
+
+Take one 32-byte value — a token amount, say — and follow it through a single transaction.
+
+It arrives in the transaction's `data` field, where it was paid for by the byte at the door. It is
+read onto the stack, where it costs three gas to duplicate. It is written into memory as part of an
+encoded struct, where it costs three gas per word plus a term that grows with the square of the
+buffer. It is hashed. It is written to storage, where it costs twenty thousand gas and stays there
+forever. An event carries a copy of it out to indexers. A sub-call returns it, and it lands in a
+buffer that the next sub-call will erase.
+
+Same bytes, six locations, prices spanning nearly four orders of magnitude, and lifetimes ranging
+from one instruction to permanent.
+
+Almost every gas surprise in a Solidity codebase is a value sitting in the wrong one of these. This
+lesson lays all six out on the same axes, then goes deep on the one that costs real money and on the
+optimisation that only works there.
+
+## The six regions on four axes
+
+<Matrix
+  corner="Region"
+  cols={['Lifetime', 'Writable?', 'Addressed by', 'Rough price']}
+  rows={[
+    {
+      label: 'stack',
+      cells: ['the frame', 'push/pop only', 'top 16 via DUP/SWAP', { v: '~3 gas per operation', tone: 'good' }],
+    },
+    {
+      label: 'memory',
+      cells: ['the frame', 'yes', 'byte offsets, 32-byte moves', '3/word + quadratic term'],
+    },
+    {
+      label: 'calldata',
+      cells: ['the frame', 'no', 'byte offsets', 'paid once at the transaction boundary'],
+    },
+    {
+      label: 'return data',
+      cells: ['until the next sub-call', 'no', 'byte offsets', 'copy cost only'],
+    },
+    {
+      label: 'code',
+      cells: ['permanent', 'no (after deployment)', 'byte offsets', 'account access, 2,600 cold / 100 warm'],
+    },
+    {
+      label: 'storage',
+      cells: ['permanent', 'yes', '32-byte slots', { v: '20,000 / 2,900 / 100 + 2,100 cold', tone: 'warn' }],
+    },
+  ]}
+  caption="Price tracks lifetime, not convenience: the only region that outlives the transaction is the only one priced in tens of thousands."
+  alt="The EVM's six data regions on four axes. Stack, memory and calldata live for the call frame; return data lives until the next sub-call; code and storage are permanent. Memory and storage are writable, calldata, return data and code are not, and the stack only through push and pop. Storage is addressed in 32-byte slots and everything else in byte offsets or, for the stack, the top sixteen items. Stack operations cost about 3 gas, memory 3 gas per word plus a quadratic term, calldata is paid once at the transaction boundary, code costs an account access of 2,600 cold or 100 warm, and storage costs 20,000, 2,900 or 100 plus a 2,100 cold surcharge."
+/>
+
+Transient storage, which EIP-1153 added in Dencun, is a seventh region with a lifetime none of the
+others has — the transaction — and it gets the next three lessons to itself.<Cite src="eip-1153" />
+
+The prices in that table are measured on this machine rather than recalled: cold account access 2,600
+and warm 100, cold storage read 2,100 and warm 100, storage write 20,000 for a fresh slot and 2,900
+for an update, each plus the 2,100 cold surcharge when the slot has not yet been touched in the
+transaction.<Cite src="measured-gas-constants" /><Cite src="eip-2929" />
+
+Four of these you can write to: stack, memory, storage, and — only at the boundary, by constructing
+the call — calldata. Two are read-only from inside the frame: return data and code.
+
+<Misconception
+  belief="Data locations are a Solidity concept — annotations that tell the compiler how to treat a variable."
+  reality="They are separate machines in the EVM with separate instructions. MLOAD, CALLDATALOAD, SLOAD, TLOAD, CODECOPY and RETURNDATACOPY are six different opcodes reading six different things. The keywords name hardware."
+  why="They appear in the type position in a declaration, where every other language puts a type. Nothing in the syntax suggests that changing one changes which opcode family the function is compiled into."
+  src="solidity-docs-types"
+/>
+
+### The two read-only regions, briefly
+
+**Return data** is a buffer, not an array you own. EIP-211 specifies that it is created empty for each
+new call frame, cleared on executing any call-like opcode, and refilled afterwards with the complete
+return data — or the failure data — of that call.<Cite src="eip-211" /> Three consequences: a failed
+call's revert payload lands there too, which is how revert reasons are read at all; the buffer holds
+the *last* call's output regardless of outcome; and `CREATE` and `CREATE2` leave it empty on success
+and fill it only on failure.<Cite src="eip-211" /> If you need the data past your next sub-call, copy
+it out.
+
+**Code** is readable through `CODECOPY` for your own and `EXTCODECOPY` for someone else's. Reading
+another account's code is an account access, so it carries the cold/warm split — measured at 2,600
+and 100 for `EXTCODESIZE`, which shares the access component.<Cite src="measured-gas-constants" /><Cite src="eip-2929" />
+This region is the basis of the "SSTORE2" family of tricks, where data is written once as contract
+code because deploying bytes and reading them back can beat storage for large, immutable blobs. That
+is a real technique with real caveats, and it belongs to the patterns module rather than here.
+
+## Storage is the expensive one, and not for the reason people say
+
+The gap between storage and everything else is the largest price difference in the machine. A fresh
+storage slot costs 20,000 gas; a word of memory costs three.<Cite src="measured-gas-constants" />
+That is a factor of roughly 6,700 — two to three orders of magnitude depending on which pair you
+compare — and it is the single fact that most gas-optimisation advice is a restatement of.
+
+The usual explanation is that writing to disk is slow. That explanation is wrong in a way that
+matters, because it predicts the wrong things.
+
+The real reason is [structural](/c/per-account-storage-trie). A storage write changes the contract's
+storage trie. That changes the account's `storageRoot`. That changes the state root in the block
+header. Every validating node on the network must perform that same work, arrive at the same root,
+and then *keep* the result — forever, because there is no expiry.<Cite src="yellow-paper" /> You are
+not buying a disk write. You are buying a permanent, globally replicated commitment.
+
+Two predictions follow from the structural explanation that the disk explanation does not make.
+
+**Setting a slot from zero costs far more than changing one.** Writing a non-zero value into a slot
+that was zero *creates* a trie entry, because [a zero slot is not stored at all](/c/zero-slot-is-absent) —
+it is absent. Changing an existing entry rewrites a node that already exists. Measured: 20,000 against
+2,900.<Cite src="measured-gas-constants" /> A disk-speed model would predict the same cost for both.
+
+**Clearing a slot earns something back, but far less than it used to.** Deleting the entry shrinks the
+trie, so EIP-3529 credits a refund — 4,800 per clear, with total refunds capped at a fifth of the gas
+the transaction used.<Cite src="eip-3529" /> Against 20,000 to set the slot, cleanup is not close to
+free.
+
+<Misconception
+  belief="Storage is expensive because writing to disk is slow."
+  reality="It is expensive because the write is permanent and global: every node must apply it, agree on the resulting state root, and retain the result indefinitely. The price is a statement about replication and retention, not about hardware latency."
+  why="Disk cost is the familiar analogy and it gets the direction right, so it never gets questioned. It also happens to explain the cold/warm split reasonably well — cold access really does involve a lookup the client has not done yet — which makes the wrong model look confirmed."
+  src="eip-2929"
+/>
+
+The design rule this produces is blunt and it survives every repricing: **touch storage less.** Not
+"pack it tighter", not "use a smaller type" — touch it less. Read once into a local rather than
+reading the same state variable four times in a function. Accumulate in memory and write once rather
+than writing in a loop. Emit an event instead of storing a value that only off-chain consumers need.
+Every optimisation guide worth reading reduces to that sentence.
+
+## Packing: the one place narrow types pay
+
+Now the optimisation that only works in this location.
+
+Solidity assigns state variables to slots in declaration order, and packs contiguous items that need
+fewer than 32 bytes into a single slot. The rules are stated
+precisely:<Cite src="solidity-layout-storage" />
+
+- The first item in a slot is stored lower-order aligned.
+- A value type uses only as many bytes as it needs.
+- If a value type does not fit in the remaining part of a slot, it starts the next slot.
+- Structs and array data always start a new slot, and items following them start a new slot.
+- With inheritance, ordering follows the C3-linearised order starting from the most base-ward
+  contract, and variables from different contracts can share a slot.
+
+That last point is the one that surprises people during upgrades: your slot layout is a property of
+the whole inheritance chain, not of the file you are reading.
+
+### Pricing the win
+
+**Subgoal — set up the comparison.** Four `uint64` counters. Packed, they occupy one slot. Declared as
+four `uint256`, they occupy four.
+
+**Subgoal — price initialisation.** Writing all four for the first time, packed, is one
+zero-to-non-zero write on a cold slot: 20,000 + 2,100 = **22,100 gas**. Unpacked, it is four of them:
+**88,400 gas**.<Cite src="measured-gas-constants" /> The packed version saves roughly 66,000 gas, and
+this is not a micro-optimisation — it is most of the cost of the function.
+
+**Subgoal — price a batch update.** Updating all four at once, packed, reads the slot and writes it
+back: one cold read at 2,100 and one non-zero-to-non-zero write at 2,900, so about **5,000 gas** plus
+the shift-and-mask instructions. Unpacked, four cold updates at 2,900 + 2,100 each: **20,000
+gas**.<Cite src="measured-gas-constants" /> Packing wins again, by about four times.
+
+**Subgoal — price a single-field update.** This is where it inverts. Updating one packed field
+requires reading the slot, masking out the old field, ORing in the new value, and writing the slot
+back — a read-modify-write. Updating one unpacked `uint256` field is a write with no read at all,
+because the whole slot is being replaced. Packed: roughly 2,100 + 2,900 plus masking. Unpacked:
+roughly 2,900 + 2,100. The two land in the same neighbourhood, and the packed version carries extra
+instructions on top.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Four uint64, packed', note: 'one slot', tone: 'accent' },
+    { title: 'Four uint256', note: 'four slots' },
+  ]}
+  rows={[
+    {
+      label: 'What does creating all four cost?',
+      cells: ['22,100 gas — one cold zero-to-non-zero write', '88,400 gas — four of them'],
+    },
+    {
+      label: 'What does updating all four cost?',
+      cells: ['About 5,000 gas — one cold read, one write', '20,000 gas — four reads and four writes'],
+    },
+    {
+      label: 'What has to happen to write one field?',
+      cells: ['Read the slot, mask out the old value, OR in the new, write it back', 'Write the slot'],
+    },
+    {
+      label: 'What does that one-field update cost?',
+      cells: ['About 5,000 gas, plus the shift-and-mask instructions', 'About 5,000 gas'],
+    },
+  ]}
+  caption="Packing is a four-fold win when the group is written together and a wash when it is not — the same layout, priced by access pattern rather than by type."
+  alt="Four uint64 counters packed into one storage slot compared with four uint256 counters in four slots. Creating all four costs 22,100 gas packed against 88,400 unpacked. Updating all four costs about 5,000 gas packed against 20,000 unpacked. Writing a single field requires a read-modify-write when packed and a plain write when not, and both land near 5,000 gas, with the packed version carrying extra masking instructions."
+/>
+
+The documentation's own warning says the same thing without the arithmetic: reduced-size types can be
+beneficial for storage values because the compiler packs them and combines multiple reads or writes
+into one operation, but if you are *not* reading or writing all the values in a slot at the same
+time, this can have the opposite effect, since writing one value to a multi-value slot means reading
+the slot first.<Cite src="solidity-layout-storage" />
+
+<Misconception
+  belief="Packing struct fields always saves gas."
+  reality="It saves substantially when the whole group is written together — one 20,000-gas slot creation instead of four — and it can cost more when fields are updated individually, because each update becomes a read-modify-write."
+  why="Packing is presented as an optimisation with no counterpart, and the case that gets benchmarked is initialisation, where the saving is enormous. The single-field-update case is the one that runs a million times afterwards, and it is rarely the one in the blog post."
+  src="solidity-layout-storage"
+/>
+
+<Aside kind="warn">
+Every number in this section moves with cold and warm state, so all of them are ranges rather than
+constants. The 2,100 surcharge applies once per slot per transaction, so the second function in a
+batch that touches the same slot sees a different bill than the first. Any packing decision benchmarked
+in a fresh test — where everything is cold — over-states both the win and the loss. Measure with
+isolation on, and measure at both temperatures.<Cite src="eip-2929" />
+</Aside>
+
+### Why it does not work anywhere else
+
+Packing is a storage phenomenon because storage is the only location addressed in *slots*. Everywhere
+else, one value is one word:
+
+- On the stack, every item is 32 bytes regardless of the declared type.<Cite src="yellow-paper" />
+- In memory, array elements always occupy multiples of 32 bytes — even for
+  `bytes1[]`.<Cite src="solidity-layout-memory" /> Only `bytes` and `string` are packed.
+- In calldata, the ABI pads every argument to a multiple of 32 bytes.
+
+And narrow types on the stack and in memory are actively *worse*, because they carry the masking
+instructions a full word does not need. So the complete rule is:
+
+> Narrow types pay in storage, when the values are written together. They cost everywhere else.
+
+This is the collision of the first and sixth lessons in this module, and it is why "use `uint8` to
+save gas" is simultaneously excellent advice and terrible advice depending on a word the advice never
+mentions.
+
+## Choosing a location
+
+The decision is made at declaration time and it is the highest-leverage gas choice in a contract.
+Here is the procedure, in the order the questions actually resolve:
+
+**Does anything need to read this after the transaction ends?** If yes, it is storage, and the only
+remaining question is how to touch it less. If no, storage is the wrong answer regardless of how
+convenient it is.
+
+**Does it need to be visible across call frames within the transaction?** Memory cannot do this;
+memory dies with the frame. Historically this forced values into storage that had no business being
+there, which is exactly the gap transient storage was created to fill.<Cite src="eip-1153" />
+
+**Is it read-only and arriving from outside?** Then leave it in calldata. Do not copy it.
+
+**Is it small, short-lived and local?** The stack, which means an ordinary local variable, until you
+run out of reach.
+
+**Is it a buffer?** Memory, allocated once and reused, with the peak size kept in the linear region of
+the [expansion curve](/c/memory-expansion-quadratic).
+
+Notice that price is not the first question in that list. Lifetime is. Price follows from lifetime,
+because what you are paying for is how long and how widely the network has to carry the value — and
+that framing predicts the price of a location you have never seen before, which memorising a table
+does not.
+
+<Check type="explain" concept="four-data-locations">
+A contract batches withdrawals. For each of *n* users it computes an amount, records it, and at the
+end emits a summary and pays everyone out. A reviewer sees this and asks why `pending` is a storage
+mapping when nothing outside the transaction ever reads it.
+
+For each of the following, say which location it belongs in and why the alternatives are wrong:
+
+1. The per-user amount, computed and used within one function.
+2. The running total, needed by a helper function called in the same frame.
+3. The array of user addresses, arriving as an external call parameter and never modified.
+4. A flag that an inner callback must see, set before the callback and cleared after.
+5. The final per-user credited amount, which a front end reads a day later.
+
+<Answer>
+**1 — the stack.** An ordinary local variable. It is small, it has a lifetime of a few statements, and
+nothing else needs it. Memory would work and would cost an allocation you never reclaim; storage
+would cost 20,000 gas for a value discarded eleven instructions later.<Cite src="measured-gas-constants" />
+The only reason to move it is running out of the sixteen-slot reach, which is a compile-time
+constraint rather than a design one.
+
+**2 — the stack, still.** A helper called in the same frame is not a new frame in the EVM sense unless
+it is an *external* call; an internal function call is a jump, sharing the caller's stack and memory.
+The reviewer's instinct that "another function needs it" implies memory is the common mistake here —
+the boundary that matters is the call frame, not the function.
+
+**3 — calldata.** Read-only and arriving from outside is exactly the case calldata exists for.
+Declaring it `memory` copies the whole array in and pays copy and expansion gas proportional to *n*,
+with the expansion term bending upward as *n* grows.<Cite src="eip-5656" /> Nothing is gained, because
+the function never mutates it.
+
+**4 — transient storage, and this is the interesting one.** Memory cannot do it: the callback runs in
+its own frame with its own fresh, zeroed memory, and cannot see the caller's.<Cite src="execution-specs" />
+Before EIP-1153 the only region visible across frames was storage, so this flag was written and
+cleared at storage prices for a value whose lifetime is one transaction.<Cite src="eip-1153" /> It is
+the canonical case for the seventh region, and the next lesson is about it.
+
+**5 — storage, and the reviewer is wrong about this one.** "A front end reads it a day later" means it
+must survive the transaction, and only storage does. Note what the reviewer got right, though: if
+nothing on-chain ever *computes* with the value, an event is often the better answer, because logs are
+far cheaper than storage and are still Merkle-committed through the receipts root. The test is whether
+a contract needs to read it back, not whether a human does.
+
+**The reviewer's underlying question is the right one.** `pending` being a storage mapping is a
+defect precisely if nothing after the transaction reads it — in which case every entry is paying
+20,000 gas to create a trie node and then a clearing write to remove it, against a 4,800 refund capped
+at a fifth of gas used.<Cite src="eip-3529" /><Cite src="measured-gas-constants" /> That is the exact
+pattern transient storage replaced, and the exact pattern flash accounting is built on.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The tier in between**, next lesson, adds the seventh region and explains why its arrival was a
+change in the *shape* of the machine rather than a discount: it is the first location with a
+transaction lifetime, and cross-frame visibility with automatic cleanup is a combination nothing else
+offered.<Cite src="eip-1153" />
+
+**Storage layout** in the Solidity track takes packing further: mappings, dynamic arrays, the slot
+derivation formulas, and namespaced layouts for upgradeable contracts. Everything there rests on
+"storage is addressed in slots", which is the fact this lesson establishes.
+
+**Gas profiling** in the toolchain track is where [storage dominates](/c/storage-dominates) becomes a
+measurement rather than a slogan, and where the cold/warm bias in local benchmarks gets its full
+treatment.
+
+**Upgradeable proxies** inherit the packing rules as a hazard: slot assignment depends on the whole
+inheritance chain, so reordering or inserting a state variable silently relocates everything after
+it.<Cite src="solidity-layout-storage" /> That is a storage-layout bug that no compiler warning
+catches across two separately compiled versions.

@@ -1,0 +1,506 @@
+---
+id: zk-commitments-kzg-data-as-a-curve
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    eip-4844,
+    eip-7594,
+    eip-2537,
+    consensus-specs-deneb-polynomial-commitments,
+    consensus-specs-fulu-polynomial-commitments-sampling,
+    consensus-specs-trusted-setup-4096,
+    c-kzg-4844,
+    kate-zaverucha-goldberg,
+    kzg-ceremony-faq,
+  ]
+stack: {}
+---
+
+Here is the whole of `blob_to_kzg_commitment`, from the consensus specification at tag
+**v1.6.1**:<Cite src="consensus-specs-deneb-polynomial-commitments" />
+
+```python
+def blob_to_kzg_commitment(blob: Blob) -> KZGCommitment:
+    assert len(blob) == BYTES_PER_BLOB
+    return g1_lincomb(bit_reversal_permutation(KZG_SETUP_G1_LAGRANGE), blob_to_polynomial(blob))
+```
+
+One line of substance. 131,072 bytes in; 48 bytes out. No hashing, no tree, no
+recursion — a single **linear combination of fixed curve points**, weighted by the blob's own
+numbers.
+
+Everything worth understanding about KZG is in that sentence, and this lesson unpacks it in four
+moves: how bytes become numbers, why those numbers are read as *values* rather than coefficients,
+why the resulting commitment is one curve point of fixed size, and how an opening proof turns a claim
+about a polynomial into a division that either works or does not.
+
+<Figure
+  caption="Every step up to the sum is interpretation. Only the last one touches the curve, and only the last one loses size."
+  alt="The commitment path: 131,072 bytes are read as 4,096 field elements, treated as evaluations at the roots of unity in bit-reversed order, then combined linearly with the trusted setup's Lagrange-basis G1 points to give one 48-byte curve point."
+>
+  <Flow
+    dir="down"
+    lanes={['bytes', 'numbers', 'a polynomial', 'the curve']}
+    nodes={[
+      { id: 'b', label: '131,072 bytes', note: 'BYTES_PER_BLOB', col: 0, tone: 'muted' },
+      { id: 'f', label: '4,096 field elements', note: 'each asserted below BLS_MODULUS', col: 1 },
+      { id: 'p', label: 'evaluations, not coefficients', note: 'roots of unity, bit-reversed order', col: 2, tone: 'accent' },
+      { id: 'c', label: '48 bytes', note: 'one G1 point: the sum of 4,096 Lagrange points', col: 3, tone: 'accent' },
+    ]}
+    edges={[
+      { from: 'b', to: 'f', label: 'bytes_to_bls_field' },
+      { from: 'f', to: 'p', label: 'read as values' },
+      { from: 'p', to: 'c', label: 'g1_lincomb' },
+    ]}
+  />
+</Figure>
+
+## Bytes are not field elements
+
+Start with the conversion, because it is the first place a naive encoder breaks.
+
+The container is exact: `BYTES_PER_FIELD_ELEMENT` is 32, `FIELD_ELEMENTS_PER_BLOB` is 4,096, so
+`BYTES_PER_BLOB` is 131,072 — 128 KiB.<Cite src="eip-4844" /> But a blob is not 131,072 arbitrary
+bytes. It is 4,096 **scalar field elements**, and the specification's conversion says so
+explicitly:<Cite src="consensus-specs-deneb-polynomial-commitments" />
+
+```python
+def bytes_to_bls_field(b: Bytes32) -> BLSFieldElement:
+    field_element = int.from_bytes(b, KZG_ENDIANNESS)
+    assert field_element < BLS_MODULUS
+    return BLSFieldElement(field_element)
+```
+
+`KZG_ENDIANNESS` is `'big'`, and the assertion is the load-bearing
+line.<Cite src="consensus-specs-deneb-polynomial-commitments" /> The modulus is:<Cite src="eip-4844" />
+
+```text
+BLS_MODULUS = 52435875175126190479447740508185965837690552500527637822603658699938581184513
+```
+
+That value sits just below `2^255`. So a 32-byte chunk whose most significant bit is set is very
+likely **not a valid field element**, and an encoder that takes your file and chops it into 32-byte
+pieces will produce invalid blobs the first time a piece happens to be large — which, for compressed
+or encrypted data, is roughly half of all pieces.
+
+The practical consequence: the mapping from *your* bytes into a blob's field elements is an encoding
+scheme you own. The blob format gives you 4,096 slots each holding a number below the modulus, and
+how you pack application bytes into those slots — and unpack them again — is application code that
+has to round-trip and has to be tested against adversarial input.
+
+<Aside kind="warn">
+**This is the first place blobs stop resembling cheap calldata.** Calldata is bytes. A blob is a
+vector of field elements that happens to be serialised as bytes, and the difference shows up as an
+assertion failure rather than as a truncation. The EVM-facing precompile carries the same
+requirement from the other direction: it must reject non-canonical field elements, meaning the
+supplied values must be strictly less than `BLS_MODULUS`.<Cite src="eip-4844" />
+</Aside>
+
+## The 4,096 numbers are values, not coefficients
+
+There are two ways to read 4,096 numbers as a polynomial of degree 4,095: as its **coefficients**, or
+as its **values** at 4,096 fixed points. They give different polynomials, and popular explanations of
+blobs use both readings.
+
+The specification settles which one the commitment path uses, and it settles it in the function you
+already read. `blob_to_kzg_commitment` combines the blob's field elements with
+`KZG_SETUP_G1_LAGRANGE` — the **Lagrange basis** points of the trusted
+setup.<Cite src="consensus-specs-deneb-polynomial-commitments" /> A Lagrange-basis setup is precisely
+what lets you compute a commitment directly from *evaluations*, with no interpolation step in
+between. The shipped mainnet setup file carries both bases side by side for this reason: 4,096 G1
+points in the Lagrange basis, 4,096 in the monomial basis, and 65 G2
+points.<Cite src="consensus-specs-trusted-setup-4096" />
+
+**Which fixed points?** The roots of unity of order 4,096 in the scalar field, generated from
+`PRIMITIVE_ROOT_OF_UNITY = 7`, and taken in **bit-reversal permutation**
+order.<Cite src="consensus-specs-deneb-polynomial-commitments" />
+
+Two design decisions hide in that sentence, and both pay off later.
+
+**Subgoal — why roots of unity.** Evaluating a polynomial at an arbitrary set of 4,096 points costs
+quadratic work. Evaluating at the roots of unity is a fast Fourier transform: `n log n`. Every
+conversion this system performs — coefficients to values, values to coefficients, and the extension
+from 4,096 points to 8,192 — is an FFT, and that is only true because the domain is a multiplicative
+subgroup.
+
+**Subgoal — why the bit-reversal permutation.** Under bit reversal, a *contiguous* run of 64
+evaluations is a coset of the order-64 subgroup. That is exactly how PeerDAS defines a cell: the
+coset for cell `i` is the slice of the permuted roots of unity from `64 * i` to `64 * (i + 1)`, and a
+`Cell` holds `FIELD_ELEMENTS_PER_CELL = 64` field
+elements.<Cite src="consensus-specs-fulu-polynomial-commitments-sampling" /> A reordering chosen years
+earlier is what makes "the next 2 KiB of the file" and "an algebraically coherent evaluation domain"
+the same range of indices. Hold that; the last lesson in this module spends it.
+
+## The commitment is a sum of curve points
+
+Now read the linear combination for what it is.
+
+Let `d_0 … d_4095` be the blob's field elements and `L_0 … L_4095` the Lagrange-basis setup points.
+Then:
+
+```text
+C = d_0 * L_0  +  d_1 * L_1  +  ...  +  d_4095 * L_4095
+```
+
+Each `L_i` is the i-th Lagrange basis polynomial evaluated at the setup's secret scalar and carried
+in the exponent — which means the sum is the *whole polynomial* evaluated at that secret scalar, in
+the exponent. Writing `[x]_1` for "the G1 point representing `x`", the commitment is:
+
+```text
+C = [ p(tau) ]_1
+```
+
+That is the entire idea of KZG, and everything else is bookkeeping. **A commitment is the polynomial
+evaluated at a point nobody knows.**
+
+Three consequences follow immediately.
+
+**It is one point, so it is one fixed size.** `BYTES_PER_COMMITMENT` is 48 — a compressed G1 point on
+BLS12-381 — and it is 48 whether the polynomial has degree 3 or degree
+4,095.<Cite src="consensus-specs-deneb-polynomial-commitments" /> The sum of 4,096 curve points is a
+curve point. This is what Kate, Zaverucha and Goldberg's paper claims and what distinguishes the
+scheme from the homomorphic commitments that preceded it, whose sizes were *linear* in the
+degree.<Cite src="kate-zaverucha-goldberg" />
+
+**It is additively homomorphic.** Because commitment is a linear map, `commit(p) + commit(q)` is
+`commit(p + q)`, and scaling works the same way. This is not a curiosity — it is the mechanism
+behind every batched verification in the system. The batch cell-proof check builds its verification
+equation out of a random linear combination of commitments and proofs with weights `r^k`, precisely
+because commitments add.<Cite src="consensus-specs-fulu-polynomial-commitments-sampling" />
+
+**It reveals nothing you could not compute from the data.** The commitment is a deterministic
+function of the blob with no blinding factor. Anyone with the blob can recompute it and check. That
+is the intended property here — binding — and it is why the previous lesson insisted the hiding
+question is beside the point for blobs.<Cite src="eip-4844" />
+
+### 48 bytes, and the other encoding of the same point
+
+The 48 is worth one paragraph of its own, because it is where a real bug class lives.
+
+A G1 point on BLS12-381 has two coordinates in a 381-bit field. Storing both would take 96 bytes;
+**compressed** form stores the x-coordinate plus a sign bit and recovers y from the curve equation,
+which is how 48 bytes is
+enough.<Cite src="consensus-specs-deneb-polynomial-commitments" /><Cite src="eip-4844" />
+
+<Figure
+  caption="Compressed form carries one coordinate and reconstructs the other, so a whole curve point fits in 48 bytes."
+  alt="The compressed BLS12-381 G1 encoding used by KZG commitments and consensus: 48 bytes holding the x-coordinate and a sign bit, drawn against a 128-byte scale."
+>
+  <ByteLayout
+    proportional
+    total={128}
+    caption="compressed G1 — consensus, blob commitments, BYTES_PER_COMMITMENT"
+    fields={[
+      { label: 'x-coordinate + sign bit', size: 48, tone: 'accent', note: 'y recovered from the curve equation' },
+    ]}
+  />
+</Figure>
+
+Now the trap. The EVM's BLS12-381 precompiles — introduced by EIP-2537, and the route by which
+Solidity touches this curve at all — do **not** use that encoding. They take **padded uncompressed**
+values: a field element occupies 64 bytes, a G1 point 128 bytes, a G2 point 256
+bytes.<Cite src="eip-2537" /> Same curve, same points, two serialisations, and a 48-byte commitment
+handed to a precompile expecting 128 bytes fails in a way that looks like a cryptographic error and
+is actually a formatting one. Whenever you see a length mismatch around BLS12-381, check which
+encoding each side speaks before you check anything else.
+
+<Figure
+  caption="The same point, addressed by the EVM, is drawn to the same scale as the figure above — and it is not the same length."
+  alt="The EIP-2537 precompile encoding of a BLS12-381 G1 point: two padded field elements of 64 bytes each, 128 bytes in total, drawn against the same 128-byte scale as the 48-byte compressed form."
+>
+  <ByteLayout
+    proportional
+    total={128}
+    caption="padded uncompressed G1 — what the EIP-2537 precompiles take"
+    fields={[
+      { label: 'x', size: 64, tone: 'warn', note: 'one Fp element, padded' },
+      { label: 'y', size: 64, tone: 'warn', note: 'one Fp element, padded' },
+    ]}
+  />
+</Figure>
+
+## An opening is a division that either works or does not
+
+Here is the part worth slowing down for, because it is the cleanest soundness argument in this whole
+track.
+
+You want to prove `p(z) = y`. Consider the polynomial `p(X) - y`. If the claim is true, then `z` is a
+root of it, and a polynomial with a root at `z` is divisible by `(X - z)` **exactly**. So define:
+
+```text
+q(X) = ( p(X) - y ) / ( X - z )
+```
+
+**`q` is a polynomial if and only if the claim is true.** If `p(z)` is not `y`, the division leaves a
+non-zero remainder, and the object you are holding is a rational function, not a polynomial. There is
+nothing to commit to — the setup can only commit to polynomials up to its degree bound.
+
+The proof is `commit(q)`, another single G1 point: `BYTES_PER_PROOF` is also
+48.<Cite src="consensus-specs-deneb-polynomial-commitments" />
+
+Notice the shape of the argument. The prover is not prevented from lying by a check that catches
+them. They are prevented by there being **no object to produce**. That is a much stronger position
+than "the verifier will notice", and it is the flavour of argument you will meet repeatedly once you
+reach proof systems.
+
+### Do it once with numbers you can hold
+
+The argument is easier to trust after you have watched the division succeed and then fail. Take a
+degree-2 polynomial and forget the curve entirely:
+
+```text
+p(X) = X^2 + 3X + 2
+z    = 2
+```
+
+**Subgoal — the honest opening.** The true value is `p(2) = 4 + 6 + 2 = 12`, so `y = 12`. Form the
+numerator and divide:
+
+```text
+p(X) - 12  =  X^2 + 3X - 10  =  (X + 5)(X - 2)
+q(X)       =  (X^2 + 3X - 10) / (X - 2)  =  X + 5
+```
+
+The factor `(X - 2)` was there to be cancelled, because `2` really was a root of `p(X) - 12`. The
+quotient is an honest polynomial and the prover commits to it.
+
+**Subgoal — the dishonest one.** Now claim `y' = 13`:
+
+```text
+p(X) - 13  =  X^2 + 3X - 11
+at X = 2:     4 + 6 - 11  =  -1        (not zero, so (X - 2) is not a factor)
+divide:       X^2 + 3X - 11 = (X - 2)(X + 5) - 1
+q'(X)      =  X + 5  +  (-1) / (X - 2)
+```
+
+The remainder is exactly the size of the lie: `y - y'`. And the object the prover is left holding is
+`X + 5` plus a term with `X` in a denominator, which is not a polynomial and therefore not something
+the setup can commit to.
+
+Scale that up from degree 2 to degree 4,095 and nothing about the reasoning changes. The remainder is
+still the lie, and the lie is still what makes the quotient unrepresentable.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Claim y = 12', note: 'the true value', tone: 'good' },
+    { title: "Claim y' = 13", note: 'off by one', tone: 'danger' },
+  ]}
+  rows={[
+    {
+      label: 'What is the numerator?',
+      cells: ['p(X) − 12 = X² + 3X − 10', "p(X) − 13 = X² + 3X − 11"],
+    },
+    {
+      label: 'What does it come to at X = 2?',
+      cells: ['0 — so 2 is a root', '−1 — so 2 is not a root'],
+    },
+    {
+      label: 'Does (X − 2) divide it?',
+      cells: ['Yes: (X + 5)(X − 2)', 'No: (X − 2)(X + 5) − 1'],
+    },
+    {
+      label: 'What is the prover left holding?',
+      cells: [
+        { v: 'q(X) = X + 5, a polynomial', tone: 'good' },
+        { v: "q'(X) = X + 5 + (−1)/(X − 2), a rational function", tone: 'danger' },
+      ],
+    },
+    {
+      label: 'Can the setup commit to it?',
+      cells: [
+        'Yes — this is the 48-byte proof.',
+        'No. There is no object of the required kind to send.',
+      ],
+    },
+  ]}
+  caption="One digit apart, and only one of the two divisions leaves behind something that exists."
+  alt="An honest opening at y equals 12 divides exactly and yields the polynomial X plus 5; a dishonest claim of 13 leaves a remainder of minus one, so the quotient is a rational function and cannot be committed to."
+/>
+
+The specification computes the quotient directly in evaluation form, which is worth reading because
+it exposes an implementation trap:<Cite src="consensus-specs-deneb-polynomial-commitments" />
+
+```python
+# For all x_i, compute p(x_i) - p(z), and (x_i - z)
+# Then: q(x_i) = (p(x_i) - p(z)) / (x_i - z)
+#
+# ...unless (x_i - z) is zero, i.e. z is itself one of the domain points,
+# in which case that entry needs a separate formula.
+```
+
+If `z` happens to be one of the 4,096 roots of unity, one denominator is zero and the naive division
+fails. The spec handles it with a dedicated helper. Any implementation that forgets this works
+perfectly on random challenge points and breaks exactly when someone asks about a position that
+actually holds data — which is to say, in production, on the query people most want to make.
+
+## One equation, and why it needs a pairing
+
+The verifier holds `C`, `z`, `y` and the proof, and must check `p(X) - y = q(X)(X - z)` without
+knowing `p`, `q`, or the setup secret. Evaluate that identity at the secret scalar:
+
+```text
+p(tau) - y  =  q(tau) * (tau - z)
+```
+
+Every quantity here is hidden in an exponent. Group arithmetic lets you *add* hidden scalars — that
+is what point addition is — but this identity is a **product of two hidden quantities**, and ordinary
+elliptic-curve arithmetic gives you no way to multiply them. A [pairing](/c/pairing-buys-one-multiplication)
+is exactly the tool that buys one such multiplication, and the whole verification is arranged so that
+one is enough.
+
+The specification's check reads:<Cite src="consensus-specs-deneb-polynomial-commitments" />
+
+```python
+# Verify: P - y = Q * (X - z)
+X_minus_z = bls.add(bls.bytes96_to_G2(KZG_SETUP_G2_MONOMIAL[1]), bls.multiply(bls.G2(), -z))
+P_minus_y = bls.add(bls.bytes48_to_G1(commitment), bls.multiply(bls.G1(), -y))
+return bls.pairing_check([[P_minus_y, bls.neg(bls.G2())], [bls.bytes48_to_G1(proof), X_minus_z]])
+```
+
+Read the two constructions. `P_minus_y` is the commitment shifted by `y` — the left-hand side of the
+identity, in G1. `X_minus_z` is the setup's `[tau]_2` shifted by `z` — the factor `(tau - z)`, in G2.
+The pairing check then asserts that pairing the proof with `(tau - z)` equals pairing
+`(p(tau) - y)` with the generator.
+
+Three things to take from that block.
+
+**The verifier needs `[tau]_2`.** It comes from `KZG_SETUP_G2_MONOMIAL[1]` — the setup's second G2
+point.<Cite src="consensus-specs-deneb-polynomial-commitments" /> This is why the shipped setup file
+carries G2 points at all, and why 65 of them is enough while G1 needs
+4,096.<Cite src="consensus-specs-trusted-setup-4096" />
+
+**The work does not depend on the degree.** Two pairings and a handful of group operations, whether
+the committed polynomial had 4 coefficients or 4,096. That constant is what the EVM prices as a fixed
+50,000 gas for the point-evaluation precompile — a number you will meet properly in two
+lessons.<Cite src="eip-4844" />
+
+**Nothing in the equation mentions the data.** The verifier never touches the 128 KiB. It has a
+commitment, a point, a value and a proof, and that is all it will ever have.
+
+### Many openings for the price of one
+
+Two pairings is cheap for one opening and expensive for a thousand, and a node validating a block
+full of blob cells is doing thousands. The homomorphism is what rescues this.
+
+Because commitments add, a verifier can fold `k` separate claims into one by taking a **random linear
+combination**: multiply the `k`-th commitment and the `k`-th proof by `r^k` for a challenge `r`, sum
+them, and perform a single pairing check on the totals. If every individual claim holds, the combined
+one holds. If any single claim is false, the combination is false except for the negligibly rare `r`
+that happens to cancel the error. The batch cell-proof verification in the specification is built
+exactly this way, with the verification equation written out in terms of weights `r^k` over
+commitments, proofs and interpolation
+polynomials.<Cite src="consensus-specs-fulu-polynomial-commitments-sampling" />
+
+One detail in that construction is worth flagging now because it is a recurring source of real
+soundness bugs. The challenge `r` must not be chosen by the prover, and in a non-interactive setting
+there is no verifier to choose it either — so it is derived by hashing the transcript. The
+specification does this with an explicit **domain-separation tag**: cell-batch challenges are hashed
+under `RANDOM_CHALLENGE_KZG_CELL_BATCH_DOMAIN`, the byte string
+`b'RCKZGCBATCH__V1_'`.<Cite src="consensus-specs-fulu-polynomial-commitments-sampling" />
+
+That tag exists so a challenge derived for one purpose can never be replayed as a challenge for
+another. Getting the hashed transcript wrong — omitting a field, or reusing a domain — is the
+[Fiat–Shamir](/c/non-interactivity-fiat-shamir) failure mode, and it has produced live soundness bugs
+in shipped systems. When you read a batching scheme, the first question is always: what exactly went
+into the challenge, and could the prover have chosen any of it after seeing the challenge?
+
+<Misconception
+  belief="A 48-byte commitment plus a 48-byte proof establishes the contents of the blob."
+  reality="It establishes exactly one evaluation: the committed polynomial takes value y at point z. Saying anything about all 4,096 values requires many openings, a random-point argument, or a proof system built on top of the commitment."
+  why="Both objects are described as being about 'the blob', and the constant size makes it feel as though the whole thing has been compressed into 96 bytes rather than one fact about it."
+  src="kate-zaverucha-goldberg"
+/>
+
+That misconception is worth defusing carefully, because the repair is the interesting part. If one
+opening only proves one value, how does anyone ever establish something about the whole blob?
+
+Three answers, and you will meet all three:
+
+1. **Open at a random point chosen after the commitment is fixed.** Two different polynomials agree
+   at at most 4,095 points out of a field of size roughly `10^76`, so one random opening is
+   overwhelming evidence that two committed objects are the same polynomial. This is the trick behind
+   proof of equivalence, two lessons from here.
+2. **Open at many points at once, cheaply.** The original paper's claim includes exactly this: even
+   opening at multiple evaluation points costs only a constant amount of
+   communication.<Cite src="kate-zaverucha-goldberg" /> PeerDAS uses the multi-point form — a cell
+   proof opens 64 evaluations over a coset with a single 48-byte
+   proof.<Cite src="consensus-specs-fulu-polynomial-commitments-sampling" />
+3. **Build a proof system on top.** Which is the rest of this track.
+
+<Aside kind="note">
+**Repeated openings do leak the polynomial, and that is fine here.** Each opening publishes one
+evaluation. Collect 4,096 independent evaluations and you have determined `p` completely. For blobs
+this is irrelevant — the data is broadcast anyway — but it is worth knowing before you reach for KZG
+in a design where the committed data is supposed to stay secret. Hiding, if you need it, is
+something you add; it is not something you get.<Cite src="eip-4844" />
+</Aside>
+
+<Check type="explain" concept="kzg-opening-proof">
+A prover has published a commitment `C` to a blob. The true value at point `z` is `y`. They now want
+to convince a verifier that `p(z) = y'` for some `y'` that is not `y`.
+
+Work through exactly what stops them. Then answer the harder version: what changes if they know the
+setup secret `tau`?
+
+<Answer>
+**Part one: what they would have to produce.**
+
+To pass the check, they need a G1 point `pi` satisfying the pairing equation with `y'` substituted
+for `y` — which is to say, a commitment to
+
+```text
+q'(X) = ( p(X) - y' ) / ( X - z )
+```
+
+Since `p(z) = y` and `y' != y`, the numerator does **not** vanish at `z`. It evaluates to `y - y'`,
+which is non-zero. So `(X - z)` does not divide it, the division leaves a constant remainder, and
+`q'` is a rational function rather than a polynomial.<Cite src="consensus-specs-deneb-polynomial-commitments" />
+
+The setup gives them the ability to commit to polynomials — a linear combination of 4,096 fixed
+points, and nothing else.<Cite src="consensus-specs-trusted-setup-4096" /> `q'` is not in that space.
+They are not caught lying; there is simply no object of the required kind for them to send. The
+prover's constraint is one of **existence**, not of detection.
+
+**Part two: what `tau` changes.**
+
+Everything, and this is the reason the next lesson exists.
+
+The verification equation is `e(pi, [tau - z]_2) = e(C - [y']_1, [1]_2)`. A prover who knows the
+scalar `tau` can *solve* it. They compute the required exponent directly — the offending remainder
+divided by `(tau - z)`, which is now an ordinary field division they can perform because `tau` is a
+number they hold — and multiply the generator by it to produce a point that satisfies the equation.
+
+The result is a perfectly valid opening for a value the polynomial does not take. It passes every
+check, on-chain and off, because the mathematics is satisfied. There is no signature to forge and no
+hash to break; the scheme's guarantee simply evaporates.
+
+**Note precisely which property died.** Not hiding — nothing was hidden, and the blob is public
+anyway. **Binding**. The ceremony's own FAQ puts the operational consequence bluntly: an attacker
+holding the secret could make arbitrary claims about the data.<Cite src="kzg-ceremony-faq" />
+
+**And note what the prover would *not* need.** They would not need to touch the network, corrupt a
+node, or influence what data got published. They would only need a number. That is why the entire
+design of the ceremony is about making sure that number never exists anywhere — the subject of the
+next lesson.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now read the whole commitment path end to end: bytes checked into field elements, 4,096
+values over the roots of unity in bit-reversed order, one linear combination against Lagrange-basis
+setup points giving `[p(tau)]_1` in 48 bytes, an opening that is a commitment to a quotient which
+exists only when the claim is true, and a single pairing equation that checks it in constant time.
+The reference implementation's API is the same story in function names, if you want the operational
+view.<Cite src="c-kzg-4844" />
+
+Every one of those steps used the setup's points, and one quantity has been doing silent work
+throughout: `tau`, the scalar that nobody is allowed to know. You have just seen precisely what a
+prover could do with it. The next lesson is about how thousands of people cooperated to produce a
+number that provably exists in the mathematics and provably exists in no one's memory — and about
+what that ceremony actually assumes, which is narrower and stranger than "trust the Ethereum
+Foundation".

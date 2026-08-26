@@ -1,0 +1,265 @@
+---
+id: evm-state-tries-hashed-keys-and-absent-zero
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [execution-specs, ethereum-org-mpt, solidity-layout-storage, eip-3529, eip-161, eip-1186, geth-ns-debug, measured-gas-constants]
+stack: {}
+---
+
+Two requests land in the same sprint.
+
+"Show me every wallet holding our token, straight from the chain — I don't want to depend on the
+indexer." And: "For the migration, I need to know which users explicitly set their allocation to zero
+versus which ones never touched the setting at all."
+
+Both are refused by the state structure itself. Not by a missing RPC method, not by a provider's
+rate limit — by two design decisions taken years apart that between them define what a trie can and
+cannot be asked. This lesson is those two decisions, and the engineering they force on you.
+
+## The path is a hash, and that is a defence
+
+The path used to walk the state trie is `keccak256(address)`. The path used inside a storage trie is
+`keccak256(slot)`.<Cite src="ethereum-org-mpt" /> Never the raw value.
+
+You have already seen the depth argument in Track 01: hashing spreads keys uniformly, so the expected
+depth of the trie is a property of how many entries it holds rather than of what they are called. What
+Ethereum's use of it adds is the adversary the uniformity is defending against, and the adversary is
+specific enough to be worth naming.
+
+**Storage slot numbers are attacker-chosen.** Not in some abstract sense — directly, by ordinary
+contract use. A mapping's slot for key `k` is `keccak256(abi.encode(k, declarationSlot))`, and the
+caller supplies `k`.<Cite src="solidity-layout-storage" /> An attacker who wants a particular slot
+number grinds `k` until they get one. Addresses are the same story: you mine a vanity address by
+trying keys until the result matches a pattern.
+
+Now suppose the trie path were the raw slot number. An attacker grinds a family of slot numbers
+sharing a long common prefix, writes to all of them, and builds a deep, narrow subtree. Every node on
+the network stores it, and every traversal that passes through it pays for the depth. The cost of
+creating the damage is the attacker's; the cost of carrying it is everyone's, forever.
+
+Hashing removes the choice. The attacker can choose the key; they cannot choose the keccak of the key
+without inverting keccak. Path shape stops being an input the adversary controls.
+
+<Misconception
+  belief="Trie keys are hashed for privacy — so that addresses and slot numbers are not exposed."
+  reality="It bounds trie depth against an adversary who grinds keys. Addresses are public, slot derivations are public and documented, and every proof reveals the value anyway."
+  why="Hashing is introduced to most engineers as a privacy or integrity tool, so a hash in a lookup path reads as obfuscation. Here it is being used for its uniformity, not its one-wayness — the property being spent is that the output is unchooseable, not that it is secret."
+  src="execution-specs"
+/>
+
+### What the defence costs you
+
+Uniformity destroys order. Adjacent leaves in the state trie are unrelated accounts; adjacent leaves
+in a storage trie are unrelated slots. So:
+
+**No range queries.** "All addresses between X and Y" has no efficient answer, because the structure
+has no notion of address order at all.
+
+**No enumeration.** There is no standard JSON-RPC method that lists an account's non-zero slots.
+`eth_getStorageAt` requires a slot number you already computed. Geth exposes `debug_storageRangeAt`,
+and the shape of that method is itself the lesson: it pages by `keyStart`, documented as the *hash* of
+the storage key.<Cite src="geth-ns-debug" /> Even the debug path iterates in hash order, not slot
+order, and it sits in the `debug` namespace — not enabled by default on public endpoints, not part of
+the standard API, and not something to build a product on.
+
+**No reverse lookup.** Given a trie path you cannot recover the slot number, so a client walking
+storage can only report preimages it happens to have kept. This is the same wall a
+[secured trie](/c/mpt-secure-trie) puts up everywhere.
+
+The first request in the opening therefore has one honest answer: **you build the index off-chain, from
+events, and you accept that it is only as faithful as the events.** That is not a failure of tooling.
+It is the structure telling you which questions it was built to answer cheaply.
+
+### Three keccaks that are not the same keccak
+
+Almost everyone conflates these at least once. Keeping them separate is most of the debugging value in
+this module.
+
+| Hash | Input | Produces | Whose rule |
+|---|---|---|---|
+| Mapping slot derivation | `abi.encode(key, declarationSlot)` | a 32-byte **slot number** | Solidity's layout convention |
+| Storage trie path | the 32-byte slot number | the **path** into that account's storage trie | the protocol |
+| State trie path | the 20-byte address | the **path** into the state trie | the protocol |
+
+The first row is a language decision documented in Solidity's storage layout rules and could have been
+otherwise; a contract written in raw assembly can lay its storage out however it
+likes.<Cite src="solidity-layout-storage" /> The second and third are consensus rules, fixed by the
+trie definition.<Cite src="ethereum-org-mpt" /> Getting a storage proof wrong almost always means
+applying the wrong one of the three, or applying two where one was needed.
+
+<Figure
+  caption="The slot number and the trie path are two hashes of two different inputs, applied in this order."
+  alt="A mapping key becomes a slot number under Solidity's keccak of the encoded key and declaration slot; that slot number becomes a storage trie path under the protocol's keccak; the path then locates the leaf holding the value."
+>
+  <Flow
+    nodes={[
+      { id: 'k', label: 'balances[alice]', note: 'the key you chose', col: 0 },
+      { id: 's', label: 'slot number', note: 'keccak(abi.encode(key, 0))', col: 1, tone: 'accent' },
+      { id: 'p', label: 'trie path', note: 'keccak(slot number)', col: 2, tone: 'accent' },
+      { id: 'l', label: 'storage leaf', note: 'the value, or nothing', col: 3 },
+    ]}
+    edges={[
+      { from: 'k', to: 's', label: 'language rule' },
+      { from: 's', to: 'p', label: 'consensus rule' },
+      { from: 'p', to: 'l', label: 'walk' },
+    ]}
+  />
+</Figure>
+
+## Writing zero is a deletion
+
+Now the second decision.
+
+A storage slot holding zero has no entry in the storage trie. Writing zero to a non-zero slot removes
+the key; reading a slot with no entry yields zero.<Cite src="execution-specs" /> There is no stored
+zero anywhere.
+
+The gas schedule is built around this and is the clearest evidence for it. On this project's
+toolchain, an SSTORE that takes a slot from zero to non-zero costs 20,000, one that moves it between
+two non-zero values costs 2,900, and a warm write of the same value costs 100.<Cite src="measured-gas-constants" />
+Clearing is the transition that goes the other way, and it is refunded, because it shrinks a structure
+every node has to keep. EIP-3529 sets that refund to `SSTORE_RESET_GAS + ACCESS_LIST_STORAGE_KEY_COST`
+— 4,800 gas — and caps the total refunded after a transaction at `gas_used // 5`, having previously
+been half.<Cite src="eip-3529" /> The same EIP removed the SELFDESTRUCT refund
+entirely.<Cite src="eip-3529" />
+
+Read the cap as a design statement rather than a number to memorise. Refunds are a subsidy for
+shrinking state; capping them at a fifth of gas used limits how much of a block can be manufactured out
+of that subsidy.<Cite src="eip-3529" />
+
+<Misconception
+  belief="Setting a slot to zero writes a zero into the trie, the way an UPDATE writes 0 into a column."
+  reality="It removes the key. That is precisely why clearing storage is refundable and why a zero read costs nothing to store."
+  why="Every ordinary database keeps the row. Here the trie is a commitment to a set of key-value pairs, and a pair whose value is the type's default is simply not a member — so 'store zero' has no representation to store."
+  src="execution-specs"
+/>
+
+### The consequence you will actually hit
+
+Because there is no stored zero, **"never written" and "explicitly written to zero" are the same
+state.** No contract can tell them apart. Solidity's `delete x` and `x = 0` compile to the same
+operation, because at the machine level they *are* the same operation.
+
+That is the second request in the opening, and it is unanswerable as posed. It is also a bug pattern
+rather than a curiosity, because zero is the default of every value type. A `uint8` enum whose first
+member is `Unset` and a `mapping(address => uint256)` whose valid values include 0 are the same trap:
+the sentinel for "absent" collides with a legitimate value.
+
+<Matrix
+  corner="Slot"
+  cols={['Entry in the trie', 'What SLOAD returns', 'What a proof establishes']}
+  rows={[
+    {
+      label: 'Never written',
+      cells: [{ v: 'none', tone: 'muted' }, '0', 'exclusion — no such key'],
+    },
+    {
+      label: 'Written, then cleared to zero',
+      cells: [{ v: 'none', tone: 'muted' }, '0', 'exclusion — no such key'],
+    },
+  ]}
+  caption="Two histories, one state: the rows are identical because the trie has no representation for a stored zero."
+  alt="A never-written slot and a slot cleared to zero compared on their trie entry, the value SLOAD returns, and what a proof establishes — identical in all three columns."
+/>
+
+The fixes are all forms of not putting meaning on zero:
+
+- **Offset the domain.** Store `tier + 1`, so 0 means absent and 1 means tier zero. Cheapest; costs
+  nothing at runtime.
+- **Carry a flag.** A separate `bool isSet`. Honest, and pays a second slot unless it packs.
+- **Choose a sentinel that cannot occur.** Works when the domain genuinely excludes a value; fails
+  quietly the day the domain widens.
+
+A team that picks one of these deliberately writes a comment about it. A team that has not met this
+lesson picks the first one that compiles and finds out during a migration.
+
+### Absence has a proof, though
+
+The consolation is real. Because position in a trie is determined by the key, absence is *provable*:
+you supply the nodes along the path and show the walk cannot continue.<Cite src="eip-1186" /> A slot
+that has never been written and a slot cleared to zero both yield an
+[exclusion proof](/c/exclusion-proof) — the same proof, because the same state.
+
+So the structure will not tell you *which* of the two happened, but it will let a phone verify, against
+nothing but a block header, that the slot is empty. Lesson 5 is about what that is worth.
+
+### The same rule, one level up
+
+You met this shape in lesson 1 without the name. EIP-161 defines an account as empty when it has no
+code, zero nonce and zero balance, and deletes any empty account touched during a
+transaction.<Cite src="eip-161" /> Accounts and slots follow one rule: **the default value is not
+stored, and storing the default is deletion.**
+
+That consistency is worth carrying, because it predicts behaviour you have not seen yet. Anywhere the
+protocol commits to a map, expect the absent entry and the default-valued entry to be the same thing.
+
+<Check type="spot-bug" concept="zero-slot-is-absent">
+A protocol tracks per-user withdrawal limits. Governance can set any limit, including zero, to freeze
+an account. Users with no limit configured fall back to a global default.
+
+```solidity
+mapping(address => uint256) private limitOf;
+
+function setLimit(address user, uint256 newLimit) external onlyGov {
+    limitOf[user] = newLimit;
+}
+
+function effectiveLimit(address user) public view returns (uint256) {
+    uint256 configured = limitOf[user];
+    if (configured == 0) return globalDefault;
+    return configured;
+}
+```
+
+Name the bug, describe the exact sequence that exploits it, and say what the storage trie is doing
+during that sequence.
+
+<Answer>
+**Setting a user's limit to zero does not freeze them — it restores the global default.**
+
+The sequence: governance observes suspicious activity on Alice's account and calls
+`setLimit(alice, 0)`, intending a freeze. `effectiveLimit(alice)` now reads 0, takes the `configured
+== 0` branch, and returns `globalDefault`. Alice withdraws up to the default limit. If the default is
+generous — which is the usual reason to have one — the "freeze" has widened her access rather than
+removing it, and it may have widened it from a previously configured *low* limit.
+
+In the trie: `limitOf[alice]` previously had an entry at path `keccak256(keccak256(abi.encode(alice,
+slot)))`.<Cite src="solidity-layout-storage" /><Cite src="ethereum-org-mpt" /> Writing zero deleted
+that entry.<Cite src="execution-specs" /> The transaction earned a refund for the
+clearing, subject to EIP-3529's cap.<Cite src="eip-3529" /> Afterwards the slot is indistinguishable
+from one governance never touched — because it *is* one, as far as the state is concerned.
+
+The tell in the source is that `0` carries two meanings: "no value configured" and "the limit is
+zero". Nothing at the machine level distinguishes them, so the ambiguity has to be removed above.
+
+Two fixes, with different trade-offs:
+
+*Offset the stored value.* Store `newLimit + 1`, treat a stored 0 as unset, and subtract one on read.
+One slot, no extra gas, and the freeze case stores 1 rather than deleting — which incidentally means
+freezing no longer earns a refund, and no longer looks like an untouched account to anyone reading
+storage proofs.
+
+*Carry an explicit flag.* `mapping(address => bool) limitIsSet`, packed alongside the limit if the
+layout allows. More readable, and the right choice when the value's full range is genuinely needed.
+
+The general rule this instance belongs to: **never let the default value of the type be a meaningful
+state.** In a language with option types the compiler would have caught it. Here the type system
+cannot help, because the storage layer has no representation for absence to expose.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Lesson 5** relies on the exclusion proof above: the ability to prove that something is *not* in the
+state is what lets a verifier answer a membership question without downloading the set.
+
+**Lesson 6** picks up the cost side of hashed keys. Uniform paths mean state access is a random seek
+into a large on-disk structure, and that single fact explains the pricing of
+[cold versus warm access](/c/cold-vs-warm-access) better than any gas table.
+
+And when you reach storage layout in the Solidity track, the three-keccak table above is the thing to
+have memorised. [Mapping slot derivation](/c/mapping-slot-derivation) is a language convention; the
+trie path is not; and every hand-written proof verifier that fails does so by confusing one for the
+other.

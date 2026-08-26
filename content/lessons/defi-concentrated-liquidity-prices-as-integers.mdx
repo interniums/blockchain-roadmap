@@ -1,0 +1,417 @@
+---
+id: defi-concentrated-liquidity-prices-as-integers
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [uniswap-v3-whitepaper, uniswap-v3-core-tickmath, uniswap-v3-core-pool, uniswap-v3-core-factory, uniswap-v3-core-tickbitmap, uniswap-v3-core-sqrtpricemath, uniswap-v3-periphery-liquidityamounts, elsts-v3-liquidity-math, uniswap-v3-math-primer-2, mixbytes-v3-ticks, measured-gas-constants]
+stack: {}
+---
+
+You call `slot0()` on a live ETH/USDC pool and the first return value is
+`1760625833650318613189865563022222`. Thirty-four digits. The pool is trading at about two thousand
+dollars an ETH, and there is no arrangement of a decimal point that turns one of those numbers into
+the other.
+
+By the end of this lesson you will be able to derive that integer by hand, and — more usefully — say
+why every one of its design choices was forced. The square root is not an optimisation. The 96 is not
+arbitrary. The 1.0001 is not a round number someone liked. Each falls out of a constraint you already
+know from the EVM track, and the constraint is always the same one: **there is no floating point, and
+there never will be.**
+
+## The constraint, restated precisely
+
+The EVM has 256-bit integer arithmetic and nothing else. There is no float type, no exponent field,
+no hardware square root. Anything with a fractional part has to be a fixed-point integer — a plain
+integer carrying an implied scaling factor that lives in your head and in the variable's name.
+
+For a price, that is immediately awkward. Prices are multiplicative. Two per cent up then two per
+cent down is not where you started, and a price of `0.000001` and a price of `1000000` want wildly
+different absolute precision. A single fixed-point scale that gives you enough resolution at the
+bottom overflows at the top.
+
+v3 solves this with two representations that coexist, and the split confuses people because it looks
+redundant:
+
+- **A tick index** — a small signed integer, used wherever a price needs to be a *label*: position
+  bounds, the tick bitmap, oracle accumulators.
+- **A square-root price in Q64.96** — a large unsigned integer, used wherever a price needs to
+  participate in *arithmetic*: swap steps, amount computations.
+
+They are the same quantity in two encodings, and the two encodings exist because indexing and
+computing want opposite things.
+
+## The tick: making multiplication into addition
+
+The definition is one line. Conceptually there is a tick at every price that is an integer power of
+1.0001, and identifying ticks by an integer index `i`, the price at that tick is
+`p(i) = 1.0001^i`.<Cite src="uniswap-v3-whitepaper" />
+
+**Subgoal 1 — check what one tick is worth.** `1.0001^1 = 1.0001`, so consecutive ticks differ by
+one hundredth of a percent. The whitepaper states the design property directly: each tick is a
+0.01 per cent — one basis point — price movement away from each of its
+neighbours.<Cite src="uniswap-v3-whitepaper" /> A basis point is the natural quantum for a market
+price, which is why the base is 1.0001 and not 2 or 1.01.
+
+**Subgoal 2 — notice what the index actually is.** Take logs of the definition:
+`i = log(P) / log(1.0001)`. **The tick index is the logarithm of price.** That single fact is what
+makes the whole scheme work, because logarithms convert multiplication into addition. A price that
+doubles adds a fixed number of ticks *wherever it started*:
+`log(2)/log(1.0001) = 6931.8`, so a doubling is about 6,932 ticks from 20 dollars and about 6,932
+ticks from 20,000 dollars.
+
+That is the property an integer index has to have. Absolute price gaps between adjacent ticks are
+useless as labels because they vary by twelve orders of magnitude across the supported range.
+Relative gaps are constant, and a log index is exactly the encoding under which relative becomes
+absolute.
+
+<Misconception
+  belief="Ticks are evenly spaced in price, the way an order book's ticks are."
+  reality="They are evenly spaced in log price. The absolute price gap between adjacent ticks grows in proportion to the price — a tick near 1 USDC is worth 0.0001 USDC, and a tick near 100,000 USDC is worth 10 USDC."
+  why="The word 'tick' imports an order-book intuition where a tick is a fixed price increment set by the exchange. Here it is a fixed *ratio*, and the two only agree over a narrow band."
+  src="mixbytes-v3-ticks"
+/>
+
+### Where the range limits come from
+
+`TickMath` declares `MIN_TICK = -887272` and `MAX_TICK = -MIN_TICK`, and its comment says where the
+number came from: computed from log base 1.0001 of `2**-128`.<Cite src="uniswap-v3-core-tickmath" />
+That is a derivation you can run.
+
+**Subgoal 1 — decide the price range to support.** The library's own header states the target: it
+supports prices between `2**-128` and `2**128`.<Cite src="uniswap-v3-core-tickmath" /> That is a
+symmetric range in log space, which it has to be, since swapping which token you call token0 inverts
+the price.
+
+**Subgoal 2 — convert the bound into a tick index.**
+
+```text
+log_1.0001(2^-128) = -128 * ln(2) / ln(1.0001)
+                   = -128 * 0.6931472 / 0.000099995
+                   = -887272.75...
+```
+
+**Subgoal 3 — take the integer part, and notice which way.** Truncating toward zero gives
+`-887272`, not `-887273`. Rounding the other way would put the minimum tick's price *below* `2**-128`
+and outside the range the fixed-point encoding can hold. The direction of that single rounding is a
+safety property, not a style choice.
+
+**Subgoal 4 — check the type.** A tick fits in `int24`, and the pool's `Slot0` struct stores it as
+one.<Cite src="uniswap-v3-core-pool" /> `int24` spans roughly plus or minus 8.39 million, so
+887,272 leaves plenty of headroom while packing into `slot0` alongside the price and the oracle
+counters. The whitepaper makes the same point about the oracle accumulator: storing the tick index
+rather than the price lets it detect price movements of one tick while staying
+small.<Cite src="uniswap-v3-whitepaper" />
+
+## Why the square root, and not the price
+
+Now the choice that looks like premature optimisation and is not.
+
+Recall from the previous lesson that a position's token amounts are:<Cite src="elsts-v3-liquidity-math" />
+
+```text
+x = L * ( 1/sqrt(P) - 1/sqrt(Pb) )
+y = L * ( sqrt(P)   - sqrt(Pa)   )
+```
+
+and that the virtual reserves are `x = L / sqrt(P)` and `y = L *
+sqrt(P)`.<Cite src="uniswap-v3-whitepaper" /> Look at what appears in those expressions. Not `P`.
+Only `sqrt(P)` and `1/sqrt(P)`, each to the first power.
+
+The whitepaper's swap-step formulas are the same shape. The change in token1 for a step is
+`Δy = Δsqrt(P) * L`, and the change in token0 is `Δx = Δ(1/sqrt(P)) * L`; the procedure is to compute
+the new square-root price first and then the amount from
+it.<Cite src="uniswap-v3-whitepaper" /><Cite src="uniswap-v3-math-primer-2" />
+
+**Every relationship the contract needs is linear in `sqrt(P)`.** So:
+
+- **If you stored `P`**, every swap step would need a square root to get `sqrt(P)`, and an integer
+  square root over 256-bit values is an iterative routine — expensive, and a source of rounding error
+  at every step.
+- **If you store `sqrt(P)`**, the same steps are multiplications, divisions and subtractions on
+  integers. No roots at runtime. Recovering `P` is a squaring, which is cheap, and is needed far less
+  often than people assume — mostly at the display layer.
+
+The whitepaper says as much when it explains why the pool tracks `L` and the square-root price
+instead of reserves: using them is convenient because only one of them changes at a time — the price
+changes when swapping within a tick, and liquidity changes when crossing a tick or minting and
+burning.<Cite src="uniswap-v3-whitepaper" />
+
+There is a second consequence, and it is why ticks are also defined in root space. The whitepaper
+notes that for technical reasons pools actually track ticks at every square root price that is an
+integer power of the square root of 1.0001, giving `sqrt(p(i)) = 1.0001^(i/2)`.<Cite src="uniswap-v3-whitepaper" />
+The tick ladder is uniform in log space either way — halving every exponent is still a uniform
+ladder — so nothing about the one-basis-point property is lost.
+
+<Misconception
+  belief="slot0 holds the price, so I can compare it against a human-readable price directly."
+  reality="It holds the square root of the price, scaled by 2^96. Any comparison against a human price has to square it and unscale it — and then correct for the two tokens' decimals."
+  why="Nearly every explainer calls slot0 'the current price', and the field is named sqrtPriceX96 in a way that is easy to skim past. The mistake is silent: your comparison still type-checks and still returns a boolean."
+  src="elsts-v3-liquidity-math"
+/>
+
+## Q64.96, and why 96
+
+`sqrtPriceX96` is `sqrt(P)` multiplied by `2^96` and truncated to an integer, held in a `uint160`.
+`TickMath.getSqrtRatioAtTick` is documented as calculating `sqrt(1.0001^tick) * 2^96` and returning a
+Q64.96 fixed-point number.<Cite src="uniswap-v3-core-tickmath" />
+
+The name says the layout: 64 bits of integer part, 96 bits of fraction, 160 bits total. Here is why
+each half is that size.
+
+<Figure
+  caption="Neither half was chosen for tidiness. The integer part is sized by the top of the supported price range and the fraction by the bottom of it, and 64 plus 96 landing on uint160 is the consequence."
+  alt="The 160 bits of sqrtPriceX96 split into a 64-bit integer part, which spans square-root prices up to 2 to the 64, and a 96-bit fractional part, which reaches square-root prices down to 2 to the minus 64 with 32 bits of headroom left over."
+>
+  <ByteLayout
+    proportional
+    unit="bits"
+    offsets
+    caption="sqrtPriceX96 — Q64.96 in a uint160"
+    fields={[
+      { label: 'integer part', size: 64, note: 'sqrt(P) up to 2^64' },
+      { label: 'fraction', size: 96, tone: 'accent', note: 'down to 2^-64, and 32 bits below that' },
+    ]}
+  />
+</Figure>
+
+**Subgoal 1 — size the integer part from the price range.** Prices run to `2^128`, so square-root
+prices run to `2^64`. Sixty-four bits of integer part is therefore exactly enough, and one fewer
+would not be.
+
+**Subgoal 2 — size the fraction from the smallest price.** Prices go down to `2^-128`, so
+square-root prices go down to `2^-64`. To represent `2^-64` as a non-zero integer you need at least
+64 fractional bits. Ninety-six gives 32 bits of headroom below the smallest supported price, which is
+what stops the *relative* precision from collapsing at the bottom of the range.
+
+**Subgoal 3 — check the total.** 64 plus 96 is 160, which is `uint160` — the same width as an
+address, and a type the EVM already handles naturally.
+
+**Subgoal 4 — verify against the two constants the library publishes.** This is the satisfying part,
+because the prediction is exact. `MIN_SQRT_RATIO` is documented as
+`getSqrtRatioAtTick(MIN_TICK)` and equals `4295128739`; `MAX_SQRT_RATIO` equals
+`1461446703485210103287273052203988822378723970342`.<Cite src="uniswap-v3-core-tickmath" />
+
+```text
+predicted min = sqrt(2^-128) * 2^96 = 2^-64 * 2^96 = 2^32 = 4294967296
+actual    min =                                            4295128739
+ratio                                                    = 1.0000376
+
+predicted max = sqrt(2^128)  * 2^96 = 2^64  * 2^96 = 2^160
+              = 1461501637330902918203684832716283019655932542976
+actual    max = 1461446703485210103287273052203988822378723970342
+ratio                                                    = 0.9999624
+```
+
+Both land within four parts in a hundred thousand of the top and bottom of a `uint160`, and the gap
+is not noise — **it is the tick truncation from earlier, propagated**. The true bound was tick
+-887272.75; the library uses -887272, which is 0.75 of a tick *inside* the range. In root space that
+is `1.0001^(0.7518/2) = 1.0000376`. The min ratio is high by that factor and the max ratio is low by
+its reciprocal, exactly as observed.
+
+If you want one sentence for why the encoding is trustworthy: the maximum square-root price the
+protocol admits is, by construction, one truncated tick below the largest value a `uint160` can hold.
+
+<Aside kind="note">
+Notice the discipline this shows. Two constants that most codebases would carry as magic hex are
+each derivable from one stated design range, and the small deviation between prediction and constant
+is itself explained by a rounding decision made three definitions earlier. When you are auditing
+fixed-point code, this is the property to look for: **can the constants be re-derived, and does the
+error term have a name?**
+</Aside>
+
+## Converting a real price, decimals and all
+
+Time to produce the thirty-four-digit number from the opening.
+
+**Subgoal 1 — get the raw price, which is not the human price.** The pool knows nothing about
+decimals. Its price is `amount1 / amount0` in *raw integer units*. Take a pool where token0 is USDC
+with 6 decimals and token1 is WETH with 18 decimals, trading at 2,025 USDC per ETH:
+
+```text
+one ETH   = 1e18            raw token1
+2025 USDC = 2025 * 1e6      raw token0
+
+P_raw = 1e18 / (2025 * 1e6) = 1e12 / 2025 = 493827160.4938...
+```
+
+The raw price is 493 million, for a pool a human would describe as trading at two thousand. That
+factor of `10^(decimals1 - decimals0)` is the single most common source of "my tick is wrong by about
+276,324" — which is, not coincidentally, `log_1.0001(10^12)`.
+
+**Subgoal 2 — take the square root.** `sqrt(1e12/2025) = 1e6/45 = 22222.2222...`, exact to as many
+places as you like, because 2025 is 45 squared.
+
+**Subgoal 3 — scale by `2^96`.**
+
+```text
+2^96 = 79228162514264337593543950336
+
+sqrtPriceX96 = 22222.2222... * 79228162514264337593543950336
+             = 1760625833650318613189865563022222.22...
+             -> 1760625833650318613189865563022222   (truncated)
+```
+
+There is the opening number, and it occupies 111 bits — comfortably inside the 160 available.
+
+**Subgoal 4 — get the tick, and see it disagree.**
+
+```text
+tick = ln(493827160.4938) / ln(1.0001) = 200186.97
+     -> 200186   (truncated toward negative infinity)
+```
+
+Feed 200186 back through `1.0001^i` and you get 493,779,261 rather than 493,827,160 — low by
+0.97 basis points. **The tick is a coarser representation than the square-root price, by design**,
+which is exactly why the pool stores both. The tick tells you which segment you are in; the
+square-root price tells you where in it.
+
+**Subgoal 5 — snap to the tick spacing.** If this is the 0.05 per cent pool, tick spacing is 10 and
+the nearest initialisable tick at or below is 200180. A position's bounds must be multiples of the
+spacing; the *current price* is not so constrained and sits wherever the last swap left it.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Tick index', note: 'the label' },
+    { title: 'sqrtPriceX96', note: 'the operand', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'What is it?', cells: [<>The logarithm of price, base 1.0001<Cite src="uniswap-v3-whitepaper" /></>, <>sqrt(P) multiplied by 2^96 and truncated<Cite src="uniswap-v3-core-tickmath" /></>] },
+    { label: 'What type holds it?', cells: [<><code>int24</code>, packed into <code>Slot0</code><Cite src="uniswap-v3-core-pool" /></>, <><code>uint160</code>, as Q64.96<Cite src="uniswap-v3-core-tickmath" /></>] },
+    { label: 'What are its limits?', cells: [<>MIN_TICK −887272 to MAX_TICK 887272<Cite src="uniswap-v3-core-tickmath" /></>, 'MIN_SQRT_RATIO 4295128739, up to one truncated tick below the top of a uint160'] },
+    { label: 'What is it used for?', cells: ['Anywhere price is a label: position bounds, the tick bitmap, the oracle accumulator', 'Anywhere price is an operand: swap steps and amount computations'] },
+    { label: 'How exact is it?', cells: ['Coarser on purpose — tick 200186 re-expands to 493,779,261 against a true 493,827,160', 'Low by at most one unit in the last place of a 96-bit fraction'] },
+    { label: 'What does it tell you?', cells: ['Which segment the price is in', 'Where in that segment it sits'] },
+  ]}
+  caption="These are two encodings of one quantity and they are not interchangeable: one is built to be indexed, the other to be multiplied."
+  alt="The tick index and sqrtPriceX96 compared on what each is, its Solidity type, its limits, what it is used for, how exact it is, and what it tells the reader."
+/>
+
+<Check type="explain" concept="sqrt-price-x96">
+An integration you inherited compares pool prices to an off-chain oracle. It reads `sqrtPriceX96`,
+computes `price = (sqrtPriceX96 / 2**96) ** 2` in Python, and compares to the oracle's USD price for
+token1. For most pools the numbers agree to a few basis points. For one pool the code reports the
+price is out by a factor of about a trillion, and for another it reports a discrepancy of about
+0.5 basis points that never goes away.
+
+Diagnose both, and say which one is a bug.
+
+<Answer>
+**The factor of a trillion is the decimals bug.** `(sqrtPriceX96 / 2**96)**2` recovers `P_raw`,
+the ratio of raw integer amounts, not the human price. To get a human price you must multiply by
+`10 ** (decimals0 - decimals1)`. For a 6-decimal token paired with an 18-decimal token that is
+`10^-12` or `10^12` depending on the sort order — a factor of a trillion, which is what the code
+reported. The pool that "worked" almost certainly pairs two 18-decimal tokens, where the correction
+is `10^0` and the omission is invisible. **This is a real bug**, and one that hides in exactly the
+pools most people test against first.
+
+**The persistent 0.5 basis points is not a bug.** Three separate truncations are at work and all of
+them are deliberate:
+
+1. `sqrtPriceX96` is the *truncated* integer part of `sqrt(P) * 2^96`, so recovering `P` from it is
+   low by up to one unit in the last place.
+2. The pool's price only moves to values reachable by its own swap arithmetic, which computes each
+   step with a chosen rounding direction rather than to nearest — `getAmount0Delta` and
+   `getAmount1Delta` both take an explicit `roundUp` argument, and the call site picks
+   it.<Cite src="uniswap-v3-core-sqrtpricemath" />
+3. Your Python is doing binary floating point, which rounds to nearest — a *different* policy from
+   the contract's, so the two disagree in a consistent direction rather than randomly.
+
+The tell is the phrase "never goes away". A rounding disagreement is stable and one-directional; a
+real pricing bug moves with the market. If you need exactness, do the comparison in integers against
+the same libraries the contract uses<Cite src="uniswap-v3-periphery-liquidityamounts" /> rather than
+recomputing in floating point and setting a tolerance.
+
+**The general rule:** when your number differs from the chain's, first ask whether the difference has
+the shape of a scale error (orders of magnitude, constant) or a rounding error (last few digits,
+one-directional). The two have completely different fixes and the second is usually not a fix at all.
+</Answer>
+</Check>
+
+## Tick spacing: why you cannot use every tick
+
+Not every tick can be initialised. The pool carries a `tickSpacing` parameter, and only ticks whose
+index is divisible by it may be used as position bounds. Small spacings allow tighter ranges but make
+swaps more gas-intensive, because each initialised tick a swap crosses imposes a cost on the
+swapper.<Cite src="uniswap-v3-whitepaper" />
+
+Spacing is bound to the fee tier at the factory. The deployed `UniswapV3Factory` constructor enables
+exactly three in its `feeAmountTickSpacing` map: fee 500 with spacing 10, fee 3000 with spacing 60,
+and fee 10000 with spacing 200.<Cite src="uniswap-v3-core-factory" /> The whitepaper describes those
+as approximately 0.10 per cent, 0.60 per cent and 2.02 per cent between initialisable
+ticks<Cite src="uniswap-v3-whitepaper" />, and you can confirm each from the tick definition alone:
+
+<Matrix
+  numeric
+  corner="fee"
+  cols={['tick spacing', '1.0001^spacing − 1', 'gap between initialisable ticks']}
+  rows={[
+    { label: '500', cells: [{ v: '10', tone: 'accent' }, '0.0010005', '0.10 %'] },
+    { label: '3000', cells: [{ v: '60', tone: 'accent' }, '0.0060177', '0.60 %'] },
+    { label: '10000', cells: [{ v: '200', tone: 'accent' }, '0.0202003', '2.02 %'] },
+  ]}
+  caption="A spacing is a fixed ratio, so the gap it leaves between initialisable ticks is the same percentage at 20 dollars and at 20,000."
+  alt="The three fee tiers enabled by the Uniswap v3 factory — 500, 3000 and 10000 — with their tick spacings of 10, 60 and 200, the value of 1.0001 raised to that spacing minus one, and the resulting 0.10, 0.60 and 2.02 per cent gaps between initialisable ticks."
+/>
+
+The pairing is a deliberate coupling of two costs. A one per cent fee tier exists for volatile or
+illiquid pairs, where nobody wants a range narrower than two per cent anyway — so the spacing is
+coarse and swaps cross few initialised ticks. A five basis point tier exists for stable pairs where
+ranges are tight, and there the fine spacing is worth paying for. **Fee tier and tick spacing are one
+decision, not two.**
+
+### The gas consequence, stated carefully
+
+Here is the part that changes how you think about swap cost. Crossing an initialised tick is the only
+moment the pool's active liquidity changes; the whitepaper states that whenever the price crosses an
+initialised tick, virtual liquidity is kicked in or out, and — importantly — that the gas cost of an
+initialised tick crossing is constant and does not depend on how many positions are kicked in or out
+at that tick.<Cite src="uniswap-v3-whitepaper" />
+
+So swap gas is driven by **how far the price moves**, not by notional size. A ten-million-dollar
+trade in a deep stable pool may cross no initialised ticks and cost about what a hundred-dollar trade
+costs. A small trade in a thin pool whose liquidity is scattered across dozens of narrow positions
+can cross many and cost several times more.
+
+Finding the next initialised tick is made cheap by a packed bitmap: `TickBitmap` stores one bit per
+usable tick, keyed by `int16` because ticks are `int24` and there are 256 values per
+word.<Cite src="uniswap-v3-core-tickbitmap" /> Each word therefore answers "is there an initialised
+tick in the next 256 spacings?" in a single storage read.
+
+That is as far as this lesson will go on cost, deliberately. Quoting a gas figure per tick crossing
+would mean quoting a number that depends on which slots are already warm within the transaction. What
+is safe to say is the shape: each crossing touches at least one storage slot that the transaction has
+not touched before, and the first touch of a slot costs 2,100 gas against 100 for a warm one on the
+configuration this curriculum measures against.<Cite src="measured-gas-constants" /> Combine that with
+[cold versus warm access](/c/cold-vs-warm-access) and the pattern is clear: the *first* swap through a
+region of the tick space is the expensive one, and a router splitting a large order into several
+transactions pays that cost again each time.
+
+<Misconception
+  belief="A bigger swap costs more gas, the way it costs more fee."
+  reality="Gas tracks the number of initialised ticks crossed, which tracks price movement. Size and price movement are correlated in a thin pool and almost uncorrelated in a deep one."
+  why="Fee scales with notional, so gas is assumed to as well. They are charged by different mechanisms — the fee by the pool, the gas by the number of storage slots the swap loop had to visit."
+  src="uniswap-v3-whitepaper"
+/>
+
+## What this unlocks
+
+You can now read a pool's state and reconstruct its price by hand, in both encodings, including the
+decimals correction that breaks most first attempts.
+
+- **`L` next.** The third lesson defines the liquidity parameter properly and shows that with
+  `sqrt(P)` in hand, a position collapses to a single number plus two bounds — a bar, not a curve.
+- **The swap loop after that.** The fourth lesson walks the price across ticks and shows that the
+  whole of v3 is the previous lesson's curve, re-parameterised by this lesson's integers, restarted
+  at every initialised tick.
+- **Oracles.** The tick-index accumulator you met in passing here is what makes a v3 TWAP a
+  *geometric* mean rather than an arithmetic one, because averaging a logarithm and exponentiating is
+  a geometric mean by construction.<Cite src="uniswap-v3-whitepaper" /> If you took the security
+  track, that connects directly to [oracle manipulation](/c/oracle-manipulation) — the cost of moving
+  a TWAP is the cost of holding the price away from equilibrium across the whole window, and the
+  window is measured in ticks-seconds rather than dollars.
+
+The concrete exercise worth doing before the next lesson: pick any v3 pool, read `slot0`, and
+reproduce both the tick and the square-root price from the token decimals and a price you get from an
+exchange. When the two agree to within a tick, the representation has stopped being a wall of digits.

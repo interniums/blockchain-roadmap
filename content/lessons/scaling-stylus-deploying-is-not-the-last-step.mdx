@@ -1,0 +1,331 @@
+---
+id: scaling-stylus-deploying-is-not-the-last-step
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [arbitrum-stylus-activation, arbitrum-stylus-gentle-intro, arbitrum-stylus-gas-metering, arbitrum-stylus-commands-reference, arbitrum-stylus-cli-overview, arbitrum-stylus-caching-contracts, arbitrum-precompiles-reference]
+stack: {}
+---
+
+Here is a custom error from the `ArbWasm` precompile's published interface:
+
+```solidity
+error ProgramExpired(uint64 ageInSeconds);
+```
+
+Read it as a bug report about your mental model. The EVM has no counterpart, because in the EVM a
+deployed contract has no age that anything checks and no state in which it stops working. Code goes
+in, code stays, code runs. That property is so reliable it stopped being a fact and became an
+assumption, and it is the assumption this lesson removes.
+
+The same precompile publishes four siblings — `ProgramNotWasm`, `ProgramNotActivated`,
+`ProgramNeedsUpgrade(uint16 version, uint16 stylusVersion)`, and
+`ProgramInsufficientValue(uint256 have, uint256 want)`.<Cite src="arbitrum-stylus-activation" /> Every
+one of them describes a way a Stylus contract can exist on-chain and not run. Working through them
+is working through the lifecycle.
+
+## Deployment and activation are two transactions
+
+Arbitrum's activation page states the split directly: deployment stores the compressed WASM bytecode
+on-chain at a contract address; activation converts that bytecode into an executable Stylus program
+by registering it with the `ArbWasm` precompile at
+`0x0000000000000000000000000000000000000071`.<Cite src="arbitrum-stylus-activation" /><Cite src="arbitrum-precompiles-reference" />
+Each is one transaction, and neither can be skipped — deployment always, because it stores the code;
+activation always, because it makes the code executable.<Cite src="arbitrum-stylus-activation" />
+
+The documentation gives three reasons for the split.<Cite src="arbitrum-stylus-activation" />
+**Gas optimisation**: activation is one-time processing and caching that would be expensive to repeat
+on every call. **Code reuse**: multiple contracts can share the same activated codehash. **Version
+management**: it lets the chain track which Stylus protocol version a contract targets — which is
+what `ProgramNeedsUpgrade` reports on.
+
+The pipeline before either transaction is more involved than `solc` producing a runtime blob.
+`cargo stylus check` compiles Rust to the `wasm32-unknown-unknown` target, then processes the binary:
+removing dangling references, adding a project-hash metadata section, stripping unnecessary custom
+sections, Brotli-compressing at maximum level 11, prefixing the `EFF00000` marker, and validating that
+the *decompressed* WASM fits within the chain's `MaxWasmSize`
+parameter.<Cite src="arbitrum-stylus-activation" /> Deployment then wraps that in an EVM initcode
+prelude — 43 bytes, ending in `RETURN` — and sends it to the Stylus deployer
+contract.<Cite src="arbitrum-stylus-activation" />
+
+Two operational notes fall out of the compression step.
+
+**Your contract may be several contracts.** Compressed WASM exceeding the 24 KB single-contract code
+limit is deployed by fragmentation, with no flags required: `cargo stylus deploy` splits the binary
+into the smallest number of fragments that each fit, deploys each in its own transaction, then deploys
+a root contract holding the ordered list of fragment addresses and activates
+that.<Cite src="arbitrum-stylus-cli-overview" /> Activation reads all the fragments through the
+collection, concatenates and decompresses. The address `cargo stylus deploy` prints at the end is the
+root, and from a caller's position a fragmented contract is indistinguishable from a
+single-deployment one: same ABI, same call semantics, same
+lifecycle.<Cite src="arbitrum-stylus-cli-overview" />
+
+**Fragments cost you at activation.** A fragmented contract's activation costs roughly one
+`EXTCODEREAD` per fragment on top of the standard overhead, because ArbOS must read each fragment from
+state before reassembling it.<Cite src="arbitrum-stylus-caching-contracts" /> Bigger binary, more
+fragments, more activation gas — a direct incentive to keep the WASM small that has no Solidity
+analogue beyond the 24 KB ceiling itself.
+
+## Activation is keyed on the codehash, not the address
+
+This is the single most useful structural fact in the lesson, and it changes how you write a
+deployment script.
+
+You do not have to activate future copies of the same program: the same template can be deployed many
+times without paying the activation cost more than
+once.<Cite src="arbitrum-stylus-gas-metering" /> `cargo stylus check` reports it explicitly — if a
+contract with the same codehash is already activated, it tells you so and says no activation is
+needed.<Cite src="arbitrum-stylus-activation" />
+
+So a factory pattern looks like this:<Cite src="arbitrum-stylus-activation" />
+
+```shell
+# First instance: deploy and activate (the default behaviour).
+cargo stylus deploy --private-key-path=wallet.txt
+
+# Every later instance of the same code: deploy only.
+cargo stylus deploy --private-key-path=wallet.txt --no-activate
+```
+
+All of them share one codehash and one activation, and the data fee is paid once. Given that
+activation carries a fixed computation charge of 1,659,168 gas on top of the configurable
+`ActivationGas` — which defaults to 0 — and a dynamic data fee that scales with compiled program
+size, that is not a small saving on a system that deploys per-user or per-market
+contracts.<Cite src="arbitrum-stylus-gas-metering" />
+
+It also has an edge that catches people: an *upgrade* changes the codehash. New bytes, new hash, new
+activation, new fee. There is no partial reactivation of a changed program.
+
+## The data fee is ETH, and it is a simulation result
+
+Activation is a payable call. The precompile's signature is
+`activateProgram(address program) external payable returns (uint16 version, uint256 dataFee)`, and the
+value sent must equal the calculated data fee, in wei.<Cite src="arbitrum-stylus-activation" />
+
+Where that number comes from is worth knowing, because it explains a flag you will otherwise
+mis-tune. The fee is estimated using state-override simulation with no transaction sent, and the
+tooling applies a bump percentage — 20% by default — to protect against
+variance.<Cite src="arbitrum-stylus-activation" /> An estimate plus a safety margin, in other words,
+against a value that can move between the estimate and the transaction landing.
+
+Under-send and you get `ProgramInsufficientValue(uint256 have, uint256 want)`, which is at least a
+courteous error: it tells you both numbers.<Cite src="arbitrum-stylus-activation" /> The documented
+remedies are to re-check the current fee with `cargo stylus check`, raise the bump percentage, or fund
+the wallet with more ETH.<Cite src="arbitrum-stylus-activation" />
+
+<Aside kind="note">
+`cargo stylus deploy` performs both steps by default, so the two-transaction structure is invisible
+until something goes wrong.<Cite src="arbitrum-stylus-activation" /> That is convenient and it is
+exactly why the structure needs to be in your head rather than in your tooling. The moment you deploy
+through a factory, a CREATE2 deployer, a multisig, or anything other than the CLI's happy path, you
+own the second transaction.
+</Aside>
+
+## And then it expires
+
+An activated program does not stay activated.
+
+Programs expire after the chain's `ExpiryDays` parameter, which defaults to 365 days. The minimum age
+before a program can be kept alive, `KeepaliveDays`, defaults to 31 days. Both are configurable ArbOS
+parameters.<Cite src="arbitrum-stylus-activation" /> The gentle introduction states the consequence in
+one sentence: if a contract is not reactivated, it becomes
+uncallable.<Cite src="arbitrum-stylus-gentle-intro" />
+
+Two chain functions manage this, and they are asymmetric in a way that trips people up:<Cite src="arbitrum-stylus-activation" />
+
+- `programTimeLeft(address program) external view returns (uint64 timeLeft)` — seconds until
+  expiration, keyed on the **address**.
+- `codehashKeepalive(bytes32 codehash) external payable` — resets the expiration timer, keyed on the
+  **codehash**, paying the data fee in `value`, returning nothing.
+
+Read one by address, write one by codehash. `cargo stylus codehash-keepalive --codehash <HASH>` wraps
+the second.<Cite src="arbitrum-stylus-commands-reference" /> The asymmetry is the same codehash-not-
+address property from two sections ago, seen from the maintenance side: one keepalive covers every
+instance sharing that code.
+
+There is also `codehashVersion(bytes32)`, which returns the Stylus protocol version a codehash was
+activated against and reverts if the code is not activated, needs an upgrade, or has
+expired.<Cite src="arbitrum-stylus-activation" /> One call, three distinct failure states, and no way
+to distinguish them from the revert alone — which is why `programTimeLeft` is the one you actually
+monitor.
+
+Arbitrum gives its reasons for the expiry: it prevents abandoned contracts from consuming ArbOS
+resources, encourages active maintenance, and allows protocol
+upgrades.<Cite src="arbitrum-stylus-activation" /> That is a coherent trade. The chain is paying to
+hold compiled native code for every activated program, and a permanent obligation to hold it for
+programs nobody calls is a real cost. The trade is defensible. It is also a change to a property most
+engineers have never had to think about.
+
+<Figure
+  caption="Two configurable defaults bracket the window: nothing can be kept alive before day 31, and nothing runs after day 365."
+  alt="A 365-day axis. A program cannot be kept alive until it is 31 days old, the KeepaliveDays default; the keepalive window runs from there to day 365, the ExpiryDays default, at which point the program becomes uncallable."
+>
+  <Timeline
+    from={0}
+    to={365}
+    unit="days"
+    ticks={[0, 31, 365]}
+    marks={[
+      { at: 31, label: 'KeepaliveDays', tone: 'accent' },
+      { at: 365, label: 'ExpiryDays — uncallable', tone: 'danger' },
+    ]}
+    spans={[
+      { label: 'too young to keep alive', start: 0, end: 31, tone: 'muted' },
+      { label: 'keepalive may be sent', start: 31, end: 365, tone: 'good', note: 'both bounds are configurable ArbOS parameters' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="Once deployed, a contract is live forever — that is what deploying means."
+  reality="For Stylus, activation expires. `ExpiryDays` defaults to 365 and an unreactivated program becomes uncallable. The default is a chain parameter, not a constant, so the number to trust is whatever `programTimeLeft` returns for your address on your chain."
+  why="EVM deployment genuinely is permanent, so 'how long is this live for' is not a question anyone learned to ask."
+  src="arbitrum-stylus-gentle-intro"
+/>
+
+Note carefully what the misconception's *fix* is, and is not. It is not "remember that Stylus
+contracts last 365 days". Both the expiry and the keepalive minimum are described as configurable
+chain parameters whose stated values are current defaults, on a chain whose owner can change
+them.<Cite src="arbitrum-stylus-gentle-intro" /><Cite src="arbitrum-stylus-activation" /> Hard-coding
+365 into a cron job is the same class of mistake as hard-coding a gas constant. Read
+`programTimeLeft`.
+
+<Figure
+  caption="Activation is a second transaction with a price of its own, and the arrow that returns to it is the one no Solidity runbook has."
+  alt="The Stylus lifecycle: cargo stylus check compresses and validates the WASM, transaction one deploys the bytes, transaction two activates them through the ArbWasm precompile at a fixed 1,659,168-gas charge plus a data fee paid in ETH, and the contract is then callable until its activation expires, at which point a keepalive or reactivation transaction returns it to the activated state."
+>
+  <Flow
+    lanes={['build', 'transaction 1', 'transaction 2', 'runtime']}
+    nodes={[
+      { id: 'check', label: 'cargo stylus check', note: 'compress, prefix, validate', col: 0 },
+      { id: 'deploy', label: 'deploy', note: 'stores the compressed WASM', col: 1 },
+      { id: 'activate', label: 'activate', note: '1,659,168 gas + data fee', col: 2, tone: 'warn' },
+      { id: 'live', label: 'callable', note: 'until the activation expires', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'check', to: 'deploy' },
+      { from: 'deploy', to: 'activate' },
+      { from: 'activate', to: 'live' },
+      { from: 'live', to: 'activate', label: 'keepalive, or reactivate after an upgrade', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+## What "uncallable" costs you
+
+Be precise about the failure, because it is less bad than it first sounds and worse than teams
+usually plan for.
+
+The contract code remains on-chain; only the activation state is cleared, and reactivating is one
+command — `cargo stylus activate --address=0x...`.<Cite src="arbitrum-stylus-activation" /> Nothing is
+destroyed. Storage is intact. Balances are intact.
+
+But between expiry and reactivation, every call reverts. If that contract is a vault, its withdrawals
+revert. If it is a price source, its consumers revert. If it is one leg of a liquidation path, the
+liquidation cannot execute — and liquidations are time-sensitive in a way that a maintenance ticket
+is not. A contract that holds no funds itself can still take down a system that does.
+
+The one genuinely reassuring property: activation is permissionless. The activation page's own
+comparison table gives "who can call" as *anyone, after deployment*, for
+activation.<Cite src="arbitrum-stylus-activation" /> So recovery does not require the original deployer,
+a multisig quorum, or a key someone left the company with. Anyone who notices — including a user
+losing money to the outage — can pay the data fee and bring it back.
+
+<Misconception
+  belief="If my Stylus contract expires, the deployment is lost and funds are stuck permanently."
+  reality="Only the activation state clears. The code and state stay on-chain, and reactivation is permissionless — anyone can pay the data fee and restore it. The loss is availability during the outage, not the assets."
+  why="'Expired' sounds like 'deleted', and the EVM has trained everyone that a broken contract is a permanent condition."
+  src="arbitrum-stylus-activation"
+/>
+
+## The runbook items Solidity never gave you
+
+Concretely, a Stylus contract adds these lines to a deployment and operations runbook. Arbitrum's own
+best-practice list covers the first and last of them; the rest follow from the mechanics
+above.<Cite src="arbitrum-stylus-activation" />
+
+**At deploy time.** Run `cargo stylus check` before deploying — it catches validation errors and
+reports whether matching code is already activated, avoiding a duplicated activation
+fee.<Cite src="arbitrum-stylus-activation" /> Budget ETH for the data fee separately from gas; it is a
+`value` payment, not a gas cost. Record the codehash, not just the address — the codehash is what
+keepalive takes.
+
+**Continuously.** Monitor `programTimeLeft` on every production Stylus address and alert well before
+zero.<Cite src="arbitrum-stylus-activation" /> "Well before" has a floor set by `KeepaliveDays`: a
+program must be at least that old before it can be kept alive, which is a constraint on the earliest
+you can act, not the latest.<Cite src="arbitrum-stylus-activation" /> Keep a funded wallet available to
+pay keepalive fees without a human approving a transfer at 3 a.m.
+
+**On chain upgrades.** Reactivation is required after a Stylus
+upgrade.<Cite src="arbitrum-stylus-gentle-intro" /> That means Arbitrum's release notes are now
+operationally relevant to you in a way they are not for a Solidity-only team, and
+`ProgramNeedsUpgrade(version, stylusVersion)` is the error you will see if you find out
+late.<Cite src="arbitrum-stylus-activation" />
+
+**Separately, the cache.** Caching is a second lifecycle with its own expiry pressure. It runs through
+the `ArbWasmCache` precompile at `0x0000000000000000000000000000000000000072`, its benefits are shared
+across all contracts with the same codehash, and — as the previous lesson covered — a decaying bid
+auction means position in it is lost by inaction rather than by
+error.<Cite src="arbitrum-stylus-activation" /><Cite src="arbitrum-stylus-caching-contracts" /> Losing
+the cache does not break the contract; it makes every call to it fixedly more expensive. Two different
+clocks, two different consequences, both on your rota.
+
+<Check type="explain" concept="reactivation">
+A protocol deploys a Rust settlement engine through a CREATE2 factory in March, at the same time as
+forty per-market adapter contracts built from the same Rust code. Everything works. In the following
+March, alerts fire: every settlement reverts.
+
+Explain what happened, why forty-one contracts failed together, what the on-call engineer runs, and
+the one thing that would have made this a non-event.
+
+<Answer>
+**What happened.** The activation expired. `ExpiryDays` defaults to 365 days, and an unreactivated
+program becomes uncallable.<Cite src="arbitrum-stylus-activation" /><Cite src="arbitrum-stylus-gentle-intro" />
+A call now fails with `ProgramExpired(uint64 ageInSeconds)` rather than executing the
+code.<Cite src="arbitrum-stylus-activation" />
+
+**Why all forty-one at once.** Because activation is keyed on the codehash, not the address. Building
+forty-one contracts from one Rust binary gives them one codehash, so they shared one activation — the
+saving that made the deploy cheap in March — and therefore they share one expiry
+date.<Cite src="arbitrum-stylus-gas-metering" /><Cite src="arbitrum-stylus-activation" /> The property
+that saved forty data fees also correlated forty-one failures into a single incident. Correlated
+saving, correlated failure; that is the same coin.
+
+**What on-call runs.** `cargo stylus activate --address=0x...` against the deployment, or a direct
+`activateProgram` call on `ArbWasm` at `0x...71` with the data fee as
+`value`.<Cite src="arbitrum-stylus-activation" /> Because activation is keyed on the codehash, one
+reactivation restores all forty-one. And because it is permissionless — "who can call: anyone, after
+deployment" — the engineer does not need the deployer key or a multisig
+quorum.<Cite src="arbitrum-stylus-activation" /> They do need ETH for the data fee, which is why a
+funded operations wallet belongs in the runbook.
+
+**The non-event version.** A monitor calling `programTimeLeft(address)` on the settlement engine, with
+an alert threshold measured in weeks, and a scheduled `codehashKeepalive` — which is what
+`cargo stylus codehash-keepalive --codehash <HASH>` performs — well before
+expiry.<Cite src="arbitrum-stylus-activation" /><Cite src="arbitrum-stylus-commands-reference" />
+Note the constraint on the other side: `KeepaliveDays` defaults to 31, so a program must be at least
+that old before it can be kept alive.<Cite src="arbitrum-stylus-activation" /> There is a window, and
+it is wide, but a keepalive attempted too early is not a valid strategy either.
+
+**The thing to carry away.** This incident has no Solidity equivalent. It is not a bug, an exploit or
+a bad deploy — it is a maintenance transaction nobody scheduled, on a system where every other
+contract genuinely does run forever. That asymmetry is the operational price of the second VM.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You now have the whole lifecycle: write, compile and compress, deploy, activate, cache, keep alive,
+reactivate on upgrade. Two of those seven steps have no Solidity counterpart, and one of them recurs
+on a clock.
+
+That completes the *mechanical* picture of Stylus. What is left is judgement, and it is the harder
+half.
+
+**The final lesson** takes three questions the mechanics do not answer. Which Solidity idioms simply
+do not exist on the other side, so a port is a rewrite rather than a translation. What the maximum
+contract size actually is — a question two Arbitrum pages currently answer with different numbers, and
+one this module will not paper over. And what "written in Rust" does and does not buy you in a domain
+where the losses have never come from memory-safety bugs, including one arithmetic default that runs
+in the opposite direction from the one you are used to.

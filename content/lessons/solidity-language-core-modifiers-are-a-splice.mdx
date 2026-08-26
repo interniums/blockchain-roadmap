@@ -1,0 +1,370 @@
+---
+id: solidity-language-core-modifiers-are-a-splice
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solidity-docs-contracts, solidity-changelog, measured-gas-constants, eip-1153, eip-2929]
+stack: { solidity: "0.8.36" }
+---
+
+The Solidity documentation contains a two-line modifier that has been copied into thousands of
+contracts. Here it is, unedited:<Cite src="solidity-docs-contracts" />
+
+```solidity
+contract priced {
+    modifier costs(uint price) {
+        if (msg.value >= price) {
+            _;
+        }
+    }
+}
+
+contract Register is priced, owned {
+    mapping(address => bool) registeredAddresses;
+    uint price;
+
+    function register() public payable costs(price) {
+        registeredAddresses[msg.sender] = true;
+    }
+}
+```
+
+Send `register()` a value below `price`. The call does not revert. It returns successfully. It
+consumes gas, produces a receipt with `status: 1`, and does not register you.
+
+Nothing here is a bug in the compiler and nothing is a bug in the documentation — the snippet
+illustrates exactly what it says it illustrates. It is a bug in how the shape gets read. A modifier
+looks like a guard, and it is not a guard. It is a **splice**, and a splice can quietly decline to
+splice.
+
+## `_;` is a hole the body gets pasted into
+
+The mechanism is stated plainly: "the placeholder statement (denoted by a single underscore
+character `_`) is used to denote where the body of the function being modified should be
+inserted."<Cite src="solidity-docs-contracts" /> Modifiers exist to "change the behavior of
+functions in a declarative way", and the underscore is where the declaration hands control
+back.<Cite src="solidity-docs-contracts" />
+
+The productive way to read any decorated function is to perform the substitution yourself. `register`
+above becomes:
+
+```solidity
+function register() public payable {
+    if (msg.value >= price) {
+        registeredAddresses[msg.sender] = true;
+    }
+}
+```
+
+Written out like that, nobody ships it. The `if` with no `else` is visible, and the missing revert is
+obvious. The modifier form hides the `else` branch behind a keyword-shaped call site, and the call
+site is where reviewers look.
+
+Code before `_;` is a precondition. Code after it is a postcondition. And a path through the modifier
+that never reaches `_;` is a path on which the function body never runs — with no error of any kind.
+
+<Figure
+  caption="The skipped path rejoins the modifier after the hole, so the postcondition still runs on a call that did nothing."
+  alt="Control enters the modifier's precondition, then either reaches the placeholder and runs the function body, or bypasses a guarded placeholder and skips the body entirely without reverting. Both paths continue into the modifier's postcondition."
+>
+  <Flow
+    nodes={[
+      { id: 'pre', label: 'before _;', note: 'precondition', col: 0 },
+      { id: 'body', label: 'function body', note: 'pasted in at _;', col: 1, tone: 'accent' },
+      { id: 'skip', label: 'body skipped', note: 'no revert, zero returns', col: 1, tone: 'danger', dashed: true },
+      { id: 'post', label: 'after _;', note: 'postcondition', col: 2 },
+    ]}
+    edges={[
+      { from: 'pre', to: 'body', label: 'reaches _;' },
+      { from: 'pre', to: 'skip', label: 'guarded _;', tone: 'danger' },
+      { from: 'body', to: 'post' },
+      { from: 'skip', to: 'post', tone: 'danger', dashed: true },
+    ]}
+  />
+</Figure>
+
+### What the caller gets back on the skipped path
+
+The docs are explicit about the return value on that path: the modifier "can, however, choose not to
+execute the function body at all and in that case the return variables are set to their default
+values just as if the function had an empty body."<Cite src="solidity-docs-contracts" />
+
+So a decorated function that returns `(bool success, uint256 amount)` returns `(false, 0)` when the
+modifier declines — indistinguishable, at the ABI level, from a body that ran and computed those
+values. Off-chain code decoding that return has no way to tell the two apart. Neither does an
+on-chain caller.
+
+Two more facts about returns, both consequences of the substitution model rather than special
+rules:<Cite src="solidity-docs-contracts" />
+
+- "An explicit return from a modifier with `return;` does not affect the values returned by the
+  function." A modifier cannot set your return values by returning.
+- "Explicit returns from a modifier or function body only leave the current modifier or function
+  body. Return variables are assigned and control flow continues after the `_` in the preceding
+  modifier."
+
+The second one is the useful one, and the docs demonstrate it with a mutex whose comment does the
+explaining: in a function guarded by `noReentrancy`, "the `return 7` statement assigns 7 to the
+return value but still executes the statement `locked = false` in the
+modifier."<Cite src="solidity-docs-contracts" /> A `return` inside the body is not a return from the
+function — it is a return from the *spliced-in block*, and the postcondition still runs. That is
+precisely what makes the unlock half of a reentrancy guard reliable.
+
+<Aside kind="note">
+The substitution is literal enough that the placeholder can appear more than once: "The `_` symbol
+can appear in the modifier multiple times. Each occurrence is replaced with the function body, and
+the function returns the return value of the final occurrence."<Cite src="solidity-docs-contracts" />
+A modifier can therefore run your function twice. This is almost never what you want, and it is a
+good demonstration that "modifier" is not a synonym for "check".
+</Aside>
+
+One boundary keeps the abstraction honest: "modifiers cannot implicitly access or change the
+arguments and return values of functions they modify. Their values can only be passed to them
+explicitly at the point of invocation."<Cite src="solidity-docs-contracts" /> `costs(price)` above
+works because `price` is passed in. Arbitrary expressions are allowed as modifier arguments, and
+every symbol visible from the function is visible in the modifier — but not the reverse: symbols
+introduced in the modifier are not visible in the function.<Cite src="solidity-docs-contracts" />
+
+## Ordering: left to right, each nested in the last
+
+"Multiple modifiers are applied to a function by specifying them in a whitespace-separated list and
+are evaluated in the order presented."<Cite src="solidity-docs-contracts" />
+
+Combine that with the splice model and the layout is forced. The second modifier's whole body is
+what gets pasted into the first modifier's `_;`, and the function body is what gets pasted into the
+last one's.
+
+### Worked example: desugaring two modifiers, then swapping them
+
+```solidity
+modifier whenNotPaused() {
+    require(!paused, "paused");
+    _;
+}
+
+modifier onlyOwner() {
+    require(msg.sender == owner, "not owner");
+    _;
+}
+
+function sweep() external whenNotPaused onlyOwner { ... }
+```
+
+**Subgoal 1 — expand the outer modifier first, because it is the one that owns the whole call.**
+`whenNotPaused` is written first, so everything else lives inside its `_;`:
+
+```solidity
+function sweep() external {
+    require(!paused, "paused");
+    /* onlyOwner and the body go here */
+}
+```
+
+**Subgoal 2 — expand the next one into that hole.** `onlyOwner` nests inside:
+
+```solidity
+function sweep() external {
+    require(!paused, "paused");
+    require(msg.sender == owner, "not owner");
+    /* body goes here */
+}
+```
+
+**Subgoal 3 — read off the observable consequence.** A non-owner calling a paused contract gets
+`"paused"`, not `"not owner"`. Swap the list and the same caller gets `"not owner"`. Both orders are
+equally correct as access control; they differ in **what the failure tells the caller**, and so in
+what an attacker learns from probing.
+
+**Subgoal 4 — find the case where the order is not cosmetic.** Give the outer modifier a
+postcondition and it stops being a pure ordering question:
+
+```solidity
+modifier nonReentrant() { require(!locked); locked = true; _; locked = false; }
+modifier onlyOwner()    { require(msg.sender == owner, "not owner"); _; }
+
+function sweep() external nonReentrant onlyOwner { ... }
+```
+
+Expanded, the lock is taken *before* the ownership check and released after it — so a failed
+ownership check reverts the whole frame and unwinds the lock with it. Reverse the list and the
+ownership check runs before the lock is taken. Both work. But now insert a modifier that catches
+rather than reverts, or one whose postcondition emits an event, and the nesting decides which state
+changes are inside the reverting region and which are not.
+
+**Subgoal 5 — extract the review question.** For any decorated function, ask two things: which
+modifier's `_;` contains the body, and does any modifier have code *after* its `_;`. If the answer to
+the second is yes, the order is semantic, not stylistic.
+
+<Aside kind="note">
+Two scoping details: write `C.m` to reference a modifier from a specific contract without virtual
+lookup, and note that only modifiers defined in the current contract or its bases are usable at
+all.<Cite src="solidity-docs-contracts" /> Modifiers may be defined in libraries, "but their use is
+limited to functions of the same library" — a library cannot hand you
+one.<Cite src="solidity-docs-contracts" />
+</Aside>
+
+## The reentrancy guard, and what it costs
+
+The postcondition half of a modifier is what makes the mutex pattern expressible at all — take the
+lock before `_;`, release it after — and it is the pattern the docs use to introduce the
+placeholder.<Cite src="solidity-docs-contracts" />
+
+The gas question attached to it has been answered badly almost everywhere, so here is what was
+actually measured on this toolchain, with the optimizer off.
+
+A guard backed by an ordinary storage slot cost **3,104 gas** over an unguarded call when the lock
+slot was already warm.<Cite src="measured-gas-constants" /> The same guard backed by
+[`TSTORE`/`TLOAD`](/c/tstore-tload) cost **284**.<Cite src="measured-gas-constants" /><Cite src="eip-1153" />
+
+The number you should carry, though, is a range rather than either of those. The storage guard's
+cost depends on whether the slot is cold on first touch, which makes it **roughly 3,100 to 7,100
+depending on cold versus warm**; the transient guard is flat at about
+284.<Cite src="measured-gas-constants" /> Every single-number figure in circulation for this
+comparison — the widely repeated ~7,100-versus-~200 pairing among them — was wrong for this
+configuration, and the ratio it implies is off by roughly a factor of
+three.<Cite src="measured-gas-constants" />
+
+The underlying constants are the ones you already know: `TSTORE` and `TLOAD` measured at 100 gas
+each, against an `SSTORE` schedule of 20,000 for zero to non-zero, 2,900 for non-zero to non-zero and
+100 for a warm no-op, each plus 2,100 when the slot is
+cold.<Cite src="measured-gas-constants" /><Cite src="eip-2929" />
+
+<Aside kind="warn">
+Do not quote a single gas number for a storage reentrancy guard, in a lesson or in a PR description.
+It is cold/warm dependent by construction: the first guarded call in a transaction pays the cold
+surcharge and every later one does not, so the "cost" changes with call ordering that neither the
+guard nor the function controls.
+</Aside>
+
+## Virtual modifiers are on the way out
+
+The docs still document Modifier Overriding, with `virtual` on the base modifier and `override` on
+the derived one, and the section still reads like current
+guidance.<Cite src="solidity-docs-contracts" /> It is not. The section carries a warning —
+"`virtual` modifiers are deprecated and scheduled for removal" — and the compiler has warned about
+them since solc 0.8.31, released 3 December 2025.<Cite src="solidity-docs-contracts" /><Cite src="solidity-changelog" />
+
+The replacement is composition rather than overriding: put the logic in an `internal` function, have
+the modifier call it, and let derived contracts override the *function*. That gets you the same
+extension point through the machinery lesson 6 is about, with none of the deprecated surface.
+
+<Misconception
+  belief="A modifier that fails just reverts, so a modifier is a safe place to put a check."
+  reality="A modifier that reaches its end without passing through `_;` — the `if (cond) { _; }` shape — skips the function body, does not revert, and returns the declared return types' zero values. The transaction succeeds."
+  why="Every modifier anyone writes on purpose contains a `require`, so the failure mode is never observed. And the shape that produces it is in the Solidity documentation's own `costs(uint price)` example, which is widely copied precisely because it is short and official-looking."
+  src="solidity-docs-contracts"
+/>
+
+<Misconception
+  belief="Marking a modifier virtual is how you make it overridable in derived contracts."
+  reality="Virtual modifiers are deprecated and scheduled for removal, and have emitted a compiler warning since solc 0.8.31. The current answer is to call an internal function from the modifier and override that function instead."
+  why="The Modifier Overriding section is still in the docs with working examples, so the feature looks supported. The deprecation appears as a Warning at the end of the section rather than at the top."
+  src="solidity-changelog"
+/>
+
+<Check type="spot-bug" concept="sol-modifier-placeholder">
+A withdrawal function on a vault, decorated three ways. Two of the three modifiers are unsound. Name
+them, say what a caller observes in each failure, and give the order in which the checks run.
+
+```solidity
+modifier rateLimited(address who) {
+    if (block.timestamp >= lastCall[who] + COOLDOWN) {
+        lastCall[who] = block.timestamp;
+        _;
+    }
+}
+
+modifier onlyMember() {
+    require(members[msg.sender], "not a member");
+    _;
+}
+
+modifier withinCap(uint256 amount) {
+    _;
+    require(dailyOut + amount <= CAP, "cap exceeded");
+    dailyOut += amount;
+}
+
+function withdraw(uint256 amount)
+    external
+    rateLimited(msg.sender)
+    onlyMember
+    withinCap(amount)
+    returns (uint256 sent)
+{
+    sent = _send(msg.sender, amount);
+}
+```
+
+<Answer>
+**`rateLimited` is unsound in the classic way.** The placeholder sits inside an `if` with no `else`,
+so a caller inside the cooldown window skips the body entirely, does not revert, and receives the
+declared return type's default — `sent == 0` — from a transaction with a success
+status.<Cite src="solidity-docs-contracts" /> A client that checks the receipt status and not the
+return value records a successful withdrawal of nothing. The fix is `require(block.timestamp >= ...)`
+followed by the update and an unconditional `_;`.
+
+**`withinCap` is unsound in a subtler way: its check is a postcondition.** Everything after `_;` runs
+*after* the body has already sent the funds.<Cite src="solidity-docs-contracts" /> The `require` does
+revert, so the transfer is undone and no value escapes — the money is safe. What is not safe is the
+gas and the reasoning: the function performs its effect before establishing that it is permitted to,
+which means every path from `_send` outward runs while the cap is unverified. If `_send` hands
+control to the recipient, that recipient executes inside a window where the cap has not been
+enforced and `dailyOut` has not been incremented. Move both statements before `_;`.
+
+**`onlyMember` is correct.** Unconditional `require`, then `_;`. Nothing after the placeholder.
+
+**Order of execution:** modifiers are evaluated in the order presented, each nested inside the
+previous one's placeholder.<Cite src="solidity-docs-contracts" /> Desugared:
+
+<Figure
+  caption="Nesting, not sequence: each modifier's placeholder contains everything the modifiers to its right expand into."
+  alt="A nested expansion. The cooldown test from rateLimited contains the lastCall update and onlyMember's require, and onlyMember's placeholder in turn contains the function body, withinCap's require and the dailyOut update."
+>
+  <Tree
+    root={{
+      label: 'rateLimited: cooldown test',
+      tone: 'danger',
+      children: [
+        { label: 'lastCall update' },
+        {
+          label: 'onlyMember: require',
+          children: [
+            { label: 'body: _send(…)', tone: 'accent' },
+            { label: 'withinCap: require', tone: 'danger' },
+            { label: 'dailyOut update' },
+          ],
+        },
+      ],
+    }}
+  />
+</Figure>
+
+So a non-member who is also inside their cooldown window sees no error at all — `rateLimited` skips
+first, and `onlyMember`'s `require` is never reached because it lives inside the block that was
+skipped. The unsound modifier being *outermost* is what makes the sound one unreachable, which is the
+reason the two defects interact rather than merely coexist.
+
+**The habit to build:** desugar before reviewing. Paste the body into the placeholder, top modifier
+first, and read the resulting function. Every defect above is obvious in the expanded form and
+invisible in the decorated form.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Inheritance** is next, and it is the same substitution question one level up: when several base
+contracts define the same function, which body ends up in the deployed contract, and what does
+`super` splice in after it.
+
+**OpenZeppelin's access-control contracts** are modifier factories — `onlyRole(SOME_ROLE)` is the
+`costs(price)` shape done correctly, with a `require` instead of an `if`. Reading them with the
+desugaring habit makes the difference between the two shapes immediate.
+
+**Reentrancy guards** are the standard postcondition modifier, and the measured range above is the
+number to bring to that discussion rather than any of the figures in circulation.
+
+**Audit checklists** get one concrete grep: find every `_;` in the codebase and check whether it is
+unconditional. A conditional placeholder is not automatically wrong, but it is always a decision
+someone should have written down.

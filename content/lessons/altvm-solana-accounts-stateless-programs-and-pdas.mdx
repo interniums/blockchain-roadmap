@@ -1,0 +1,383 @@
+---
+id: altvm-solana-accounts-stateless-programs-and-pdas
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solana-docs-pda, solana-docs-pda-derivation, solana-docs-pda-accounts, solana-docs-account-types, solana-docs-account-runtime, solana-docs-constants-reference, solana-docs-transactions, solana-sealevel-note, anchor-account-constraints, chainstack-solana-architecture, quicknode-solana-for-evm-devs]
+stack: {}
+---
+
+Deploy a Solana program and then go and look at the account you deployed to. Its `executable` flag
+is true, its owner is a loader, and its data is bytecode — or, under loader-v3, not even that, just
+a pointer to a second account that holds the bytecode.<Cite src="solana-docs-account-types" />
+
+What is not there is any place to put a number.
+
+An EVM contract account carries a storage root, and behind that root is a trie the contract can
+write into for as long as it exists. There is no equivalent field on a Solana account and no
+equivalent structure behind one. The design note that introduced this runtime says it in five words:
+programs are code and have no state.<Cite src="solana-sealevel-note" />
+
+So a program that manages a vault does not hold the vault. It does not hold the deposit ledger, the
+configuration, or the admin key. Every byte it reads or writes arrives as an account handed to it by
+whoever built the transaction. This lesson is about what that costs, and about the one mechanism —
+program derived addresses — that gives a stateless program something it genuinely controls anyway.
+
+## "Stateless" is a statement about reachability
+
+The word is easy to nod at and easy to under-read, so make it mechanical.
+
+When a program is invoked, the runtime serializes the accounts for that instruction into one
+contiguous buffer and hands the buffer to the VM. For each account the buffer carries a duplicate
+marker, `is_signer`, `is_writable`, `executable`, the 32-byte key, the 32-byte owner, the lamports,
+the data length, and the data. After all the accounts come the instruction data and the program
+id.<Cite src="solana-docs-account-runtime" />
+
+That buffer is the program's entire world.
+
+There is no syscall shaped like "give me the account at this address". A Solidity function reaches a
+state variable because the EVM will happily execute an `SLOAD` against any slot the contract names
+mid-execution; the machine finds the data on demand. Here the accounts were loaded before your first
+instruction ran — the runtime loads all referenced accounts up front, validates the fee payer, and
+checks the total loaded data size against a 64 MiB ceiling before execution
+begins.<Cite src="solana-docs-account-runtime" /><Cite src="solana-docs-constants-reference" />
+Anything not in that list is not merely expensive to reach. It is unreachable.
+
+Three consequences follow, and the third is the one that reshapes designs.
+
+**The client has to know the whole account set before it builds the transaction.** Not the program —
+the client. Address resolution moves off-chain, into your TypeScript or your Rust client, which is
+why Solana codebases have so much more client-side derivation logic than an equivalent EVM app.
+
+**Your program cannot choose an account based on what it computes.** In Solidity,
+`balances[msg.sender]` picks a location from a value that does not exist until the call is running.
+Nothing here can do that. The location was picked before the transaction was signed.
+
+**You cannot iterate over "all" of anything.** There is no in-program equivalent of a loop over a
+mapping — not slow, absent. If your matching engine needs to walk twenty maker orders, twenty maker
+accounts must be in the transaction, and the transaction is capped at 64 account locks and 1,232
+serialized bytes.<Cite src="solana-docs-transactions" /> Designs that assume unbounded on-chain
+iteration do not port; they get rebuilt around crank instructions, per-user accounts and off-chain
+selection. This is the deepest reason
+[a one-to-one Solidity rewrite produces bad Solana code](/c/declared-access-is-a-tax).<Cite src="quicknode-solana-for-evm-devs" />
+
+<Misconception
+  belief="A Solana program is a smart contract with different syntax — same object, different language."
+  reality="A contract owns a private store and decides at runtime what to touch. A program owns nothing and is handed everything, so the data model has to be redesigned rather than translated."
+  why="Both are 'code deployed on a chain that custodies user funds', and both are written by the same kind of engineer for the same kind of product."
+  src="quicknode-solana-for-evm-devs"
+/>
+
+## The two problems a stateless program has
+
+Suppose you want that vault anyway: an account holding SOL that only your program can move.
+
+**Problem one: where does it live?** You could generate a keypair and use its public key as the
+address. But now every client needs to be told that address out of band, and whoever holds the
+private key can sign for the account directly and take the funds. A keypair is a liability here, not
+an asset.
+
+**Problem two: who signs?** The System Program will move lamports out of an account, but only if the
+account signed the transaction. Your program has no private key. It is bytecode. It cannot produce
+an Ed25519 signature for anything.
+
+Program derived addresses solve both at once, and they do it with a trick that is worth
+understanding at the byte level rather than as an incantation.
+
+## The derivation, exactly
+
+A PDA is a 32-byte address derived deterministically from a program id and a set of seeds, and
+guaranteed not to lie on the Ed25519 curve — which means no private key exists for
+it.<Cite src="solana-docs-pda" />
+
+Here is what `create_program_address` actually does:<Cite src="solana-docs-pda-derivation" />
+
+1. Check that the number of seeds does not exceed `MAX_SEEDS` (16) and that no seed exceeds
+   `MAX_SEED_LEN` (32 bytes). If either fails, return `MaxSeedLengthExceeded`.
+2. SHA-256 hash all the seeds, the program id, and the literal string `"ProgramDerivedAddress"`
+   together, producing 32 bytes.
+3. Check whether those 32 bytes are a valid point on the Ed25519 curve.
+4. If they **are** on the curve, return `InvalidSeeds` — because that address would have a
+   corresponding private key, which destroys the property the whole mechanism rests on.
+5. If they are **not** on the curve, return them as the PDA.
+
+Step 4 is the interesting one. If the hash happens to land on the curve, the derivation fails and a
+different bump seed has to be tried.<Cite src="solana-docs-pda" /> So the usable function is
+`find_program_address`, which appends a one-byte **bump** to the seeds and searches from 255
+downwards, calling `create_program_address` with each value until one falls off the curve. The first
+value that succeeds is the **canonical bump**.<Cite src="solana-docs-pda-derivation" />
+
+That search is not free, and the pricing tells you where to run it. The on-chain
+`create_program_address` syscall charges 1,500 compute units per call; `try_find_program_address`
+charges 1,500 on entry and another 1,500 for every failed bump inside the
+loop.<Cite src="solana-docs-pda-derivation" /><Cite src="solana-docs-constants-reference" /> A
+derivation that needs four attempts costs six times what a direct derivation with a known bump
+costs. Which is why the standard pattern is: find the bump once, off-chain or at initialization,
+store it in the account, and afterwards derive with that stored bump only.
+
+<Figure
+  caption="Derivation is a search, and the off-curve check is the thing being searched for — every failed attempt is another 1,500 compute units."
+  alt="A flow: seeds plus a one-byte bump feed a SHA-256 over the seeds, the program id and the literal ProgramDerivedAddress; the 32-byte result is tested against the Ed25519 curve. On the curve returns InvalidSeeds and the bump is decremented and retried; off the curve returns the program derived address, for which no private key exists."
+>
+  <Flow
+    nodes={[
+      { id: 'seeds', label: 'seeds + bump', note: 'max 16 seeds, 32 bytes each', col: 0 },
+      { id: 'hash', label: 'SHA-256', note: 'seeds, program id, "ProgramDerivedAddress"', col: 1, tone: 'accent' },
+      { id: 'curve', label: 'on the curve?', note: '32 bytes tested against Ed25519', col: 2 },
+      { id: 'bad', label: 'InvalidSeeds', note: 'a private key would exist', col: 3, tone: 'danger', dashed: true },
+      { id: 'pda', label: 'the PDA', note: 'no private key exists', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'seeds', to: 'hash' },
+      { from: 'hash', to: 'curve' },
+      { from: 'curve', to: 'bad', label: 'yes', tone: 'danger', dashed: true },
+      { from: 'curve', to: 'pda', label: 'no', tone: 'good' },
+      { from: 'bad', to: 'seeds', label: 'next bump down, +1,500 CU', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="note">
+Compute units are not gas, and none of your EVM cost intuitions convert. There is no exchange rate
+and no shared denominator — the 1,500 above is 1,500 CU against a per-instruction budget, not 1,500
+of anything you have priced before. The parallel-execution module gives you the budget those numbers
+are spent against; until then, read CU figures as relative, not absolute.
+</Aside>
+
+## Signing without a key
+
+Deriving the address solves "where does it live". `invoke_signed` solves "who signs".
+
+When a program makes a cross-program invocation and needs the PDA to count as a signer, it calls
+`invoke_signed` and passes the PDA's seeds. The runtime re-derives the address from those seeds
+**using the calling program's id**, and if the result matches the account in question, it marks that
+account as a signer for the inner instruction.<Cite src="solana-docs-pda-accounts" />
+
+Read that again with the emphasis where it belongs: *using the calling program's id*. Program A
+cannot sign for a PDA derived from program B's id, no matter what seeds it supplies, because the
+program id is not one of the inputs it controls — the runtime substitutes its own. That is the whole
+authorization mechanism, and it is enforced by the runtime rather than by anything in your code. At
+most 16 PDA signers may be supplied to a single CPI.<Cite src="solana-docs-constants-reference" />
+
+So "the program signs for the PDA" is precise but slightly misleading. Nothing is signed. There is no
+signature. There is a runtime check that says: the program asking for this authority can reproduce
+the derivation, therefore it is the program that owns this address.
+
+Deriving does **not** create an account. That is a separate operation: the program CPIs into the
+System Program's `create_account` with `invoke_signed`, so the runtime can verify the program's
+authority over the address it is creating.<Cite src="solana-docs-pda-accounts" /> Derivation is pure
+computation over bytes, and it will happily hand you the address of an account that does not exist —
+which is exactly what a client needs when it is about to ask for the account to be created.
+
+<Misconception
+  belief="Deriving a PDA gives you the account."
+  reality="Derivation computes an address and nothing else. The account at that address must be created explicitly, by a separate instruction, with a funder who pays its rent-exempt deposit."
+  why="On the EVM, computing a CREATE2 address and deploying to it feel like one workflow, and 'derive' sounds like it produces an object rather than a number."
+  src="solana-docs-pda-derivation"
+/>
+
+### Walking one vault into existence
+
+The pieces are easier to hold in order once you have seen them run in sequence. Take a per-user
+vault under the seeds `["vault", user_pubkey]`.
+
+**Subgoal 1 — settle on the address, off-chain.** The client calls the SDK's
+`find_program_address`-equivalent with those seeds and the program id, and gets back an address and
+a bump.<Cite src="solana-docs-pda-derivation" /> Nothing exists on-chain yet. This is arithmetic
+over bytes, and it would return the same pair on a machine with no network connection.
+
+**Subgoal 2 — build the account list, because the program cannot.** The transaction must name the
+user (signer, writable, because they are funding this), the vault PDA (writable, because it is about
+to be created), and the System Program (the program that will do the creating). Miss one and the
+instruction fails on a missing account rather than on a logic error.
+
+**Subgoal 3 — let the program prove the address is its own.** Inside the handler, the program
+re-derives from the same seeds and compares against the key it was handed. A framework spells this
+as a `seeds` and `bump` constraint, which checks the account is a PDA derived from the currently
+executing program and the declared seeds.<Cite src="anchor-account-constraints" /> Without this step
+the program is operating on whatever account the caller chose to call "the vault".
+
+**Subgoal 4 — create the account with a signature that is not one.** The program CPIs into the
+System Program's `create_account` using `invoke_signed`, passing the seeds so the runtime can verify
+the calling program's authority over that address.<Cite src="solana-docs-pda-accounts" /> The System
+Program sees a properly signed request; no key was involved anywhere.
+
+**Subgoal 5 — record the bump so later calls are cheap and unambiguous.** Store the canonical bump
+in the account's own data.<Cite src="solana-docs-pda-accounts" /> Every subsequent instruction
+derives with a stored value instead of searching, and — the part that matters more than the compute
+saving — the bump it derives with is one the program established rather than one the caller sent.
+
+## Against CREATE2, which is the right comparison and the wrong intuition
+
+You already know an address derived from a hash of chosen inputs:
+[the CREATE2 address](/c/create2-address). The structural similarity is real — both take a
+deployer-or-program identity plus caller-chosen bytes, hash them, and get a deterministic address
+that anyone can compute before anything exists there. Hold onto that. Then notice four places where
+the analogy breaks, because each one is a design consequence.
+
+**What lives at the address.** A CREATE2 address is where *code* will be deployed. A PDA is where
+*data* will live, and the account there is not executable — it is an ordinary data account whose
+owner happens to be the deriving program.<Cite src="solana-docs-pda-derivation" />
+
+**Where control comes from.** Control of a CREATE2 address comes from the code deployed there: the
+contract at that address is the authority, and it authorises by executing. Control of a PDA comes
+from outside the address entirely — from the runtime, which will only honour `invoke_signed` from
+the program whose id was in the derivation.<Cite src="solana-docs-pda-accounts" /> There is no code
+at the PDA to consult.
+
+**How many you get.** A CREATE2 deployment is a deployment: it costs a transaction, it costs code
+deposit, and each address you want is a thing you actually built. A program can derive an unbounded
+number of PDAs and pay for none of them until it creates accounts there. Seeds are a per-call
+argument, not a deployment-time salt.
+
+**The off-curve check has no analogue.** EVM addresses are the low 20 bytes of a hash and nobody
+checks them against a curve; the concept does not exist. Here the check *is* the security property.
+An on-curve result is rejected precisely because somebody, somewhere, might hold the corresponding
+private key.<Cite src="solana-docs-pda-derivation" />
+
+## Seeds are the schema
+
+The practical payoff of all this: seeds are how you spell a data model.
+
+`mapping(address => Vault)` in Solidity becomes, on Solana, "one account per user, derived from the
+seeds `["vault", user_pubkey]`". The documented patterns line up almost one for
+one:<Cite src="solana-docs-pda-derivation" />
+
+<Matrix
+  corner="Shape"
+  cols={['Seeds', 'Solidity analogue']}
+  rows={[
+    { label: 'Program-wide singleton',
+      cells: [<code>["global"]</code>, { v: 'A storage variable at a fixed slot', tone: 'warn' }] },
+    { label: 'One record per user',
+      cells: [<code>["user", user_pubkey]</code>, { v: <code>mapping(address =&gt; T)</code>, tone: 'warn' }] },
+    { label: 'One record per user per asset',
+      cells: [<code>["vault", user_pubkey, mint_pubkey]</code>, { v: <code>mapping(address =&gt; mapping(address =&gt; T))</code>, tone: 'warn' }] },
+    { label: 'Sequential records',
+      cells: [<code>["order", user_pubkey, order_id_le_bytes]</code>, { v: <><code>mapping(address =&gt; T[])</code>, indexed</>, tone: 'warn' }] },
+  ]}
+  caption="A data model here is spelled in seeds, and the seeds are settled before any code runs."
+  alt="Four PDA seed patterns beside their Solidity analogues: the seed 'global' for a program-wide singleton against a storage variable at a fixed slot; 'user' plus a user pubkey for one record per user against mapping(address to T); 'vault' plus user and mint pubkeys for one record per user per asset against a nested mapping; and 'order' plus a user pubkey and a little-endian order id for sequential records against an indexed array."
+/>
+
+The right-hand column is why this feels familiar and the reason it is dangerous. It looks like a
+translation table. It is not one, because the left column has a property the right column never had:
+the address is a public, globally reachable name that anyone can compute, and anyone can pass any
+account they like into your instruction regardless of what the seeds say it should be.
+
+Which brings us to the two traps that follow directly from the derivation algorithm.
+
+**Seeds are concatenated before hashing.** The documentation states it plainly: `["ab", "cd"]` and
+`["abcd"]` produce the same PDA, and the recommendation is fixed-length seeds or an explicit
+separator.<Cite src="solana-docs-pda-derivation" /> Now imagine seeds of `[username, item_name]`
+with variable-length strings. Two distinct users can be made to land on one account. That is
+[PDA seed collision](/c/pda-seed-collision), and it is a data-modelling bug that a type system
+cannot see.
+
+**A non-canonical bump is still a valid address.** `find_program_address` returns the first bump that
+works, but lower bumps may also produce off-curve addresses, and each of those is a legitimate PDA
+for the same seed set.<Cite src="solana-docs-pda-derivation" /> If your program accepts a bump from
+the caller and derives with it, the caller can present a *different* account that derives correctly.
+The docs' instruction is unambiguous: always use the canonical bump, because using a non-canonical
+one creates a second valid address for the same seeds and lets an attacker substitute a different
+account than expected.<Cite src="solana-docs-pda-derivation" /> This is
+[canonical bump matters](/c/canonical-bump-matters), and it is the reason the stored-bump
+optimisation above must store the bump the program derived, never one it was handed.
+
+<Misconception
+  belief="A PDA is an account the program owns automatically, so an account passed in as a PDA is safe to trust."
+  reality="Anyone can pass any account into any instruction. A PDA is trustworthy only after your program re-derives the address from the seeds it expects and compares it to the key it was given."
+  why="'Program derived' sounds like a runtime guarantee about the account you received, when it is only a guarantee about who can sign — and only if you check that this is the account you meant."
+  src="chainstack-solana-architecture"
+/>
+
+The framework answer to that misconception is worth naming now, because you will meet it constantly:
+Anchor's `seeds` and `bump` constraint checks that a given account is a PDA derived from the
+currently executing program, the seeds you declared, and the bump if you supplied
+one.<Cite src="anchor-account-constraints" /> That is generated code performing exactly the
+re-derivation described above, on-chain, at your expense in compute units. The check is not optional
+because Anchor is present; it is present because Anchor generates it.
+
+<Check type="spot-bug" concept="pda">
+A lending program stores each user's position in a PDA. The instruction handler receives four
+accounts: `user` (a signer), `position`, `vault`, and the token program. Its validation is:
+
+```rust
+// 1. the caller told us which bump to use
+let expected = Pubkey::create_program_address(
+    &[b"position", user.key.as_ref(), &[args.bump]],
+    program_id,
+)?;
+require!(position.key == &expected, ErrorCode::BadPosition);
+
+// 2. the position account must belong to us
+require!(position.owner == program_id, ErrorCode::BadOwner);
+
+// ... then read position.data, compute a payout, and move funds out of `vault`
+```
+
+Both checks pass on every legitimate call. Name what an attacker can still do, and say which line
+is responsible.
+
+<Answer>
+**The bug is on line 1: `args.bump` comes from the caller.**
+
+`create_program_address` does not care whether a bump is canonical. It only refuses results that
+land on the Ed25519 curve.<Cite src="solana-docs-pda-derivation" /> So for the seed set
+`["position", user_pubkey]` there is the canonical bump that `find_program_address` would return,
+and there are typically further lower bumps that also produce valid off-curve addresses. Each one
+is a *different* address that this check will accept.
+
+**The attack.** The attacker calls the initialization instruction with a non-canonical bump,
+creating a second position account for their own pubkey at a different address. Both accounts are
+owned by the program, so the owner check on line 2 passes for both. Both derive correctly under
+line 1, because the caller supplies the bump that makes them derive correctly. The attacker now has
+two positions where the program's invariants assumed one — deposit into one, borrow against both,
+or repay one and close the other. Anything the program's accounting derives from "a user has at
+most one position" is now false, and nothing in the code says so.
+
+**Why the owner check does not save you.** It answers "did this program create this account", which
+is a real and necessary question — omit it and you get
+[missing owner check](/c/missing-owner-check) instead. It does not answer "is this the *one*
+account this user is supposed to have". Type and ownership are not identity.
+[Account substitution](/c/account-substitution) is the general form.
+
+**The fix, and its cost.** Either derive with `find_program_address` inside the handler and ignore
+whatever the caller sent — correct, and it costs 1,500 CU on entry plus 1,500 per failed
+bump<Cite src="solana-docs-pda-derivation" /> — or store the canonical bump in the position account
+at initialization and derive with the *stored* value on every later call, which costs one
+`create_program_address` at 1,500 CU.<Cite src="solana-docs-constants-reference" /> The second is
+the standard pattern. The distinction that matters is not "stored versus derived"; it is that the
+bump must come from a value the program established, never from the instruction arguments.
+
+**The EVM habit this breaks.** `positions[msg.sender]` has exactly one answer, forever, because the
+EVM computes the location. Here the location arrived in the transaction, so "is there exactly one of
+these" is a property you enforce, not one you get.
+</Answer>
+</Check>
+
+## What this unlocks
+
+A stateless program plus PDAs is a complete substitute for contract storage, and now you can read
+it as one: **the seeds are the key, the PDA is the address, the account is the value, and
+`invoke_signed` is the access control.** Every mapping you have written has that decomposition
+waiting for it.
+
+Three things this makes possible that the next lessons build on.
+
+**Programs as autonomous authorities.** Because a PDA has no private key and only the deriving
+program can sign for it, a program can hold a vault, be the mint authority of a token, or be the
+owner of another account, with no human key anywhere in the loop.<Cite src="solana-docs-pda" /> The
+EVM gets this from "the contract is the caller"; here it is a runtime check over a derivation, which
+is why the check has to be done right.
+
+**Clients that compute addresses offline.** The same seeds produce the same address everywhere, so a
+front end can derive the account it needs without an RPC round trip and without a registry. That is
+what makes direct account reads from the previous lesson practical at scale.
+
+**An account per record, each of which has a size.** You now have a data model made of many small
+accounts rather than one large contract. Each of those accounts must be created, funded, and
+eventually closed — and the funding is not a fee. The next lesson is about
+[rent exemption](/c/rent-exemption): who pays, how much, why it comes back, and why account closure
+turns out to be an economically meaningful act rather than a cleanup chore.

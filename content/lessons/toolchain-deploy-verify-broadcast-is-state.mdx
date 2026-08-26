@@ -1,0 +1,337 @@
+---
+id: toolchain-deploy-verify-broadcast-is-state
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [foundry-deploying, forge-script-reference, foundry-project-layout, foundry-issue-3088, foundry-cheatcodes-overview]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Eight transactions. The first five confirm. The sixth reverts because the fee parameter you passed is
+one basis point over a bound you forgot about. Transactions seven and eight never go out.
+
+The chain now holds five contracts you paid for, in a half-wired state, owned by a hot key. Your
+terminal has scrolled. The question is not "what went wrong" — you can read that in the revert. The
+question is *what exists, at which addresses, and how do I continue from here rather than start
+again*.
+
+The answer is on your disk, in a directory that looks like build output and is not.
+
+## What a run writes down
+
+A broadcast run writes JSON under `broadcast/`, keyed by the script file and the chain
+id.<Cite src="foundry-deploying" /><Cite src="foundry-project-layout" /> The path the docs use in
+their own example is the shape to memorise:
+
+<Figure
+  caption="A deployment record is addressed by script and by chain, never by contract name — which is why a later script has to find its addresses by counting."
+  alt="The path broadcast/Deploy.s.sol/1/run-latest.json broken into parts: an output directory, the script file name, the chain id as its own directory level, and run-latest.json, which names the most recent run."
+>
+  <Anatomy
+    value="broadcast/Deploy.s.sol/1/run-latest.json"
+    parts={[
+      { from: 0, to: 10, label: 'output dir', tone: 'muted' },
+      { from: 10, to: 22, label: 'script file' },
+      { from: 23, to: 24, label: 'chain id', note: 'a directory level', tone: 'accent' },
+      { from: 25, to: 40, label: 'the most recent run', note: 'a moving target', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+Two things about that path are worth pausing on.
+
+**The chain id is a directory level.** Run the same script against mainnet and against Base and you
+get two independent trees. Nothing merges them, nothing compares them, and nothing warns you that the
+two runs produced different addresses. The filesystem is telling you the truth this whole module
+keeps insisting on: a deployment is per-chain, and "the same script" does not imply "the same
+result".
+
+**`run-latest.json` is a moving target.** It names the most recent run for that script on that chain.
+Runs are also kept individually, so the history is there, but any tooling that hardcodes
+`run-latest.json` reads whatever you did last — including a run you did by accident.
+
+Inside, each entry records the transaction as sent, its receipt, and — for a creation — the resulting
+`contractAddress`.<Cite src="foundry-deploying" /> That is the record. It is the only local one.
+
+<Aside kind="note">
+Simulations write artifacts too, and that has historically made it possible to mistake a dry run for
+a real one when reading the directory. Foundry issue #3088 is exactly that complaint — that there was
+"no way to distinguish broadcasted logs from dry runs when looking at JSON files in the `broadcast`
+file" — and it is closed.<Cite src="foundry-issue-3088" /> The current scripting page does not
+document the resulting on-disk naming, so rather than trusting a remembered folder name, look at your
+own `broadcast/` tree once, after one dry run and one real run, and learn what your version
+does.<Cite src="foundry-deploying" />
+</Aside>
+
+## Reading addresses back out, and why that is different from logging them
+
+The docs show the mechanism in four lines: read the file, parse the address out of
+it.<Cite src="foundry-deploying" />
+
+```solidity
+function run() public {
+    string memory json = vm.readFile("broadcast/Deploy.s.sol/1/run-latest.json");
+    address counter = vm.parseJsonAddress(json, ".transactions[0].contractAddress");
+}
+```
+
+The difference between this and pasting the address into a constant is not convenience. It is that
+the deployment record becomes the single source of truth about what exists where, and every later
+step derives from it rather than from someone's memory of a terminal.
+
+A second script that wires a system deployed by the first, with each step named by its purpose:
+
+```solidity
+function run() public {
+    // Subgoal 1 — LOCATE THE RECORD. Chain id is part of the path, so this script cannot
+    // silently read mainnet's addresses while broadcasting to Base.
+    string memory path = string.concat(
+        "broadcast/Deploy.s.sol/", vm.toString(block.chainid), "/run-latest.json"
+    );
+    string memory json = vm.readFile(path);
+
+    // Subgoal 2 — RECOVER THE ADDRESSES the previous run produced.
+    address token = vm.parseJsonAddress(json, ".transactions[0].contractAddress");
+    address vault = vm.parseJsonAddress(json, ".transactions[1].contractAddress");
+
+    // Subgoal 3 — PROVE THEY ARE REAL BEFORE ACTING ON THEM. A record of a transaction is not
+    // proof the contract survives on the chain you are pointed at right now.
+    require(token.code.length > 0, "token missing on this chain");
+    require(vault.code.length > 0, "vault missing on this chain");
+
+    // Subgoal 4 — ONLY NOW send anything.
+    vm.startBroadcast();
+    Registry(registryAddr).register(token, vault);
+    vm.stopBroadcast();
+}
+```
+
+Subgoal 1 is the one people skip. Building the path from `block.chainid` rather than hardcoding `1`
+means a script run against the wrong network fails to find a file instead of quietly wiring in
+mainnet addresses.
+
+Subgoal 3 deserves a note of its own, because the check is weaker than it looks. `code.length > 0`
+tells you *something* is there. Since EIP-7702, a plain EOA can carry a
+[delegation designator](/c/delegation-designator) and report non-zero code length, so this is a
+liveness check, not an identity check. The identity check is comparing `extcodehash` against what you
+expect, and it belongs in the verification lesson at the end of this module.
+
+<Aside kind="warn">
+`.transactions[0]` is a positional path, and positions move. Add one transaction to the top of the
+first script — a token approval, a config write — and every index in every downstream script is
+wrong, silently, because index 1 still parses to *an* address. If your deployment is more than a
+couple of contracts, write your own `deployments/<chainid>.json` from inside the script and read
+*that*, keyed by name. The broadcast record stays the audit trail; your own file becomes the
+interface.
+</Aside>
+
+## The record is also what verification runs on
+
+`contractAddress` is the field you reach for by hand, but it is not the only reason the file matters.
+`forge script --verify` "verifies all the contracts found in the receipts of a script, if
+any".<Cite src="forge-script-reference" /> The receipts are in the broadcast record. Verification is
+therefore not a separate discovery step that goes and asks the chain what you deployed — it is a pass
+over what your run wrote down.
+
+Three consequences follow, and all three show up as confusing failures if you do not expect them.
+
+**Verification of a run you did not record cannot happen this way.** Deploy by some other route and
+`--verify` has nothing to iterate over; you are back to `forge verify-contract` with the address
+supplied by hand.
+
+**`--verify` needs the deployment to have been indexed by the explorer.** The broadcast finishes the
+moment the receipts arrive; the explorer's own indexing is a separate, slower process. Submitting
+verification immediately is a race, which is why `--watch` and retry behaviour exist. The last lesson
+in this module treats that properly.
+
+**A resumed run is a verification concern too.** That is precisely why `--multi` is documented as
+affecting "`--resume` or `--verify`" together<Cite src="forge-script-reference" /> — they are the two
+operations that read an existing set of runs rather than producing a new one.
+
+If you want a record shaped for humans rather than for tooling, write one from inside the script.
+Scripts have the full cheatcode surface,<Cite src="foundry-cheatcodes-overview" /> including file
+writes, and the docs' own scripting examples use `vm.writeFile` alongside the read
+cheatcodes.<Cite src="foundry-deploying" /> A dozen lines at the end of `run()` that emit
+`deployments/<chainid>.json` keyed by contract name gives you something a person can read under
+pressure, and something a later script can consume without counting array positions.
+
+## Build output, or state?
+
+Foundry's project-layout page is unambiguous about the default: add `out/`, `cache/` and `broadcast/`
+to `.gitignore`, and the default template does this automatically.<Cite src="foundry-project-layout" />
+It lists `broadcast/` under output directories, described as "transaction logs from script
+broadcasts".<Cite src="foundry-project-layout" />
+
+Plenty of teams override that for production deployments, and the reason is the argument this lesson
+is making: `out/` and `cache/` can be regenerated from source by running the compiler again, and
+`broadcast/` cannot be regenerated by anything, because the events it records happened once on a
+public chain and cost money. Two directories that sit side by side have opposite properties.
+
+Take the position deliberately rather than by default. If you gitignore it, you need some other
+durable record — your own committed deployments file, or an artifact uploaded by CI — and you need it
+before the first mainnet run, not after. If you commit it, you accept noisy diffs and you must keep
+dry-run output out of the commit.
+
+What is not a choice: **do not delete it after a failure.** It is the input to the recovery path, and
+the recovery path is the rest of this lesson.
+
+<Misconception
+  belief="The broadcast directory is disposable build output, like out/ and cache/."
+  reality="Foundry's own layout docs do recommend gitignoring it, but it cannot be regenerated: it is the only local record of which transactions were actually sent, and --resume reads it."
+  why="It sits next to out/ and cache/ in the same list of output directories, and those two genuinely are disposable."
+  src="foundry-project-layout"
+/>
+
+## Resuming, and the two conditions that make it work
+
+`--resume` "resumes submitting transactions that failed or timed-out previously. It DOES NOT simulate
+the script again and it expects nonces to have remained the same."<Cite src="forge-script-reference" />
+
+Both halves of that sentence are operational instructions in disguise.
+
+**It does not re-simulate.** The transactions that did not go out are replayed as recorded, against
+whatever the chain looks like now. If the reason your sixth transaction reverted was a bad constructor
+argument, resuming re-sends the same bad argument and it reverts again. Resume recovers from
+*transport* failures — a dropped transaction, a timeout, a node that stopped answering — and from
+failures you have fixed *on chain* since. It does not recover from a bug in the script. Fixing the
+script means the fixed transaction is a different transaction, and you are outside what resume covers.
+
+**It expects the nonces to have remained the same.** The pending transactions were built against a
+specific starting nonce for your deployer. Send anything else from that account in between — a manual
+`cast send`, a second attempt, someone else using the same key — and the recorded nonces no longer
+line up. This turns into a rule you can write on the incident checklist: **after a failed deploy,
+nobody touches the deployer account until resume has either worked or been abandoned.**
+
+<Figure
+  caption="Resume replays what the record says was never sent; anything that changed the script, or the deployer's nonce, puts you outside what it covers."
+  alt="A broadcast run of eight transactions splits into five confirmed, one reverted and two never sent. All of it lands in run-latest.json, from which two recoveries lead: --resume, which replays the recorded transactions unchanged and needs the nonces intact, or a new run that reads the record and redeploys the rest."
+>
+  <Flow
+    lanes={['the run', 'what happened', 'what is on disk', 'how you continue']}
+    nodes={[
+      { id: 'send', label: 'broadcast run', note: '8 transactions', col: 0, tone: 'accent' },
+      { id: 'ok', label: '5 confirmed', note: 'paid for, half-wired', col: 1, tone: 'good' },
+      { id: 'rev', label: 'tx 6 reverts', note: 'a bad fee parameter', col: 1, tone: 'danger' },
+      { id: 'never', label: 'tx 7–8 never sent', col: 1, tone: 'warn' },
+      { id: 'json', label: 'run-latest.json', note: 'receipts and addresses', col: 2, tone: 'accent' },
+      { id: 'resume', label: '--resume', note: 'replays as recorded', col: 3 },
+      { id: 'new', label: 'a new run', note: 'reads the record first', col: 3 },
+    ]}
+    edges={[
+      { from: 'send', to: 'ok' },
+      { from: 'send', to: 'rev' },
+      { from: 'send', to: 'never' },
+      { from: 'ok', to: 'json' },
+      { from: 'rev', to: 'json' },
+      { from: 'never', to: 'json' },
+      { from: 'json', to: 'resume', label: 'nonces intact' },
+      { from: 'json', to: 'new', label: 'script fixed' },
+    ]}
+  />
+</Figure>
+
+The command itself is the original one, plus the flag:<Cite src="foundry-deploying" />
+
+```bash
+forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast --resume
+```
+
+<Aside kind="note">
+`--multi` is documented as: "If present, `--resume` or `--verify` will be assumed to be a multi chain
+deployment."<Cite src="forge-script-reference" /> The scripting guide, separately, presents multi-chain
+deployment as running the same script once per RPC URL.<Cite src="foundry-deploying" /> These two
+descriptions have not been reconciled — the reference documents `--multi` as changing how resume and
+verification interpret an existing set of runs, while the guide never shows a single run targeting
+several chains. Whether one invocation can broadcast to multiple chains is not established by either
+page. Treat "one run per endpoint" as the workflow you can rely on, and check `--multi` against your
+own version before designing a pipeline around it.
+</Aside>
+
+## Slow mode, and what it buys
+
+`--slow` "makes sure a transaction is sent, only after its previous one has been confirmed and
+succeeded".<Cite src="forge-script-reference" />
+
+By default a script's transactions go out together, relying on nonce ordering to sequence them. That
+is fast and it is fine when every transaction is independent. It is wrong in two situations you will
+meet:
+
+- **When transaction N+1 depends on state written by transaction N** in a way the simulation cannot
+  guarantee — a factory whose output address the next call needs, a chain whose sequencer does not
+  preserve your intended ordering under load.
+- **When you want a precise failure point.** With everything in flight at once, a failure in the
+  middle leaves an ambiguous picture of what landed. Serialised, the failure is exactly one step and
+  the record says so.
+
+The cost is wall-clock: N transactions become N block times, plus confirmation waits. On a mainnet
+deploy that is minutes. It is usually the right trade for a deployment you will only do once.
+
+Pair it with `--gas-estimate-multiplier`, whose default is 130 — a 30% margin over the
+estimate.<Cite src="forge-script-reference" /> Serialised sends are more exposed to fee movement
+between the first and last transaction, because there is more time between them.
+
+<Check type="explain" concept="resume-and-slow">
+A five-contract deploy to a testnet fails at transaction four with `out of gas`. You investigate and
+find the RPC endpoint returned a stale estimate; the transaction itself is correct and, at a normal
+gas limit, would succeed.
+
+While investigating, a teammate — trying to help — sends a 0.01 ETH top-up **from the deployer
+account** to a colleague's address.
+
+Walk through what you can and cannot recover, and what you would change so this cannot recur.
+
+<Answer>
+**The failure itself is exactly what resume is for.** The transaction is correct; the estimate was
+wrong. Nothing about the script needs changing, and re-simulation is not needed. This is the
+transport-failure class that `--resume` handles.<Cite src="forge-script-reference" />
+
+**The top-up broke it anyway.** Resume "expects nonces to have remained the
+same".<Cite src="forge-script-reference" /> The deployer's nonce has now advanced by one beyond what
+the broadcast record assumes, so the recorded transactions four and five carry nonces that are already
+consumed. Resume will not replay them cleanly.
+
+**What you still have.** The broadcast artifact is intact, and it holds the addresses of contracts one
+through three, their receipts, and the exact transactions four and five that did not land. Nothing is
+lost — you know precisely what exists.
+
+**How to continue.** Re-run the deployment as a *new* run against the surviving state rather than as a
+resume: a script that reads contracts one through three out of the previous
+artifact,<Cite src="foundry-deploying" /> asserts each has code on this chain, and broadcasts only the
+remaining two deployments and the wiring. That is a script you should have anyway, because it is the
+same script you need for a partial redeploy later.
+
+**What to change.**
+
+*Serialise the run.* `--slow` waits for each receipt before sending the next, so the failure point is
+unambiguous and later transactions are not already in flight when an earlier one
+fails.<Cite src="forge-script-reference" />
+
+*Widen the margin, or pin it.* `--gas-estimate-multiplier` defaults to 130; a chain with unreliable
+estimates justifies raising it.<Cite src="forge-script-reference" />
+
+*Make the deployer single-writer during a deployment.* This is a process control, not a tool setting.
+The key is in use; nobody else sends from it. Announce it, and prefer a deployer account that exists
+only for deployments so there is nothing else anyone would plausibly want to send from it.
+
+*Write your own deployments file.* Recovering by hand from `.transactions[3]` under time pressure is
+how positional paths get misread. A name-keyed file you wrote yourself is readable by a person at 2am.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**In the next lesson:** the record tells you what was sent. It does not tell you who was allowed to
+send it or which network received it. Those are two separate flags, and one of them is named after
+the thing it does not do.
+
+**In multi-chain work:** the chain-id directory level is the smallest honest picture of what
+multi-chain deployment actually is — N independent deployments that you hope produced the same
+result. The last lesson in this module is about checking that hope.
+
+**In CI:** a broadcast artifact is a machine-readable statement of what a pipeline did, which makes
+deployment auditable in the same way test output is. It is also the thing to upload as a build
+artifact if you decided not to commit it.
+
+**In incident response:** the first question after any deployment failure is "what actually
+happened", and this directory is the only local answer. Practise reading it before you need to.

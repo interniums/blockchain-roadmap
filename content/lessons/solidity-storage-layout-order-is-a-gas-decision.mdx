@@ -1,0 +1,334 @@
+---
+id: solidity-storage-layout-order-is-a-gas-decision
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    solidity-docs-storage-layout,
+    solidity-docs-contracts,
+    solidity-changelog,
+    solidity-0836-release,
+    rust-reference-type-layout,
+    measured-gas-constants,
+    eip-2929,
+    eip-7201,
+    foundry-forge-inspect,
+    oz-docs-writing-upgradeable,
+    oz-issue-6362,
+  ]
+stack: { solidity: "0.8.36", foundry: "1.7.1" }
+---
+
+Two contracts. Identical six declarations, identical types, identical names. One occupies six storage
+slots and one occupies four.
+
+```solidity
+struct Window { int32 start; bool open; }
+
+contract Panel  { uint16 g; uint16 h; Window w; int8 k; bytes5[8] n; bytes5 o; }  // 6 slots
+contract Panel3 { uint16 g; uint16 h; int8 k; bytes5 o; Window w; bytes5[8] n; }  // 4 slots
+```
+
+Nothing in a code review distinguishes them. No warning fires. The compiler reports both as valid
+and, if you never ask for the layout, you will never learn which one you shipped.
+
+The previous lesson derived the packing rules. This lesson is the same rules read forwards — as a
+decision you are making every time you type a declaration, whether or not you know you are making it.
+
+## Why the compiler will not fix this for you
+
+In several systems languages, field order in the source is not field order in memory. Rust's default
+representation is explicit about it: the only layout guarantees are those required for soundness, and
+for structs "the ordering does not have to be the same as the order in which the fields are specified
+in the declaration of the type," and there are no other data-layout guarantees at
+all.<Cite src="rust-reference-type-layout" /> The compiler is free to reorder. Declaration order there
+really is a formatting choice.
+
+Solidity cannot do that, and the reason is the note from the end of the last lesson: the layout of
+state variables in storage is part of the external interface of the language, because storage pointers
+can be passed to libraries.<Cite src="solidity-docs-storage-layout" /> A compiler that reordered
+fields would be choosing a different external interface for the same source, silently. So the
+assignment is a single forward pass over your declarations in the order you wrote them, and it never
+backtracks.
+
+<Misconception
+  belief="Declaration order is stylistic — group variables however reads best, the compiler lays them out sensibly."
+  reality="Declaration order determines the slot count exactly, and therefore what deployment costs and what every first write costs. The compiler will not reorder, because the layout is part of the language's external interface."
+  why="In almost every other language this instinct is correct — field order is a formatting decision the compiler is free to override. The one place it is load-bearing here is also the one place the source file gives you no feedback at all."
+  src="rust-reference-type-layout"
+/>
+
+### The canonical pair
+
+The documentation states the smallest instance of this directly: declare storage variables in the
+order `uint128, uint128, uint256` rather than `uint128, uint256, uint128`, because the former takes
+two slots of storage and the latter takes three.<Cite src="solidity-docs-storage-layout" />
+
+Walk the cursor and it is obvious in hindsight.
+
+**Subgoal — the good order.** `a` at `(0, 0)`, 16 bytes used, 16 remaining. `b` needs 16 and 16
+remain, so `(0, 16)` and slot 0 is exactly full. `c` needs 32, so `(1, 0)`. **Two slots.**
+
+**Subgoal — the bad order.** `a` at `(0, 0)`, 16 remaining. `c` needs 32 and 16 remain, so it starts
+slot 1. `b` needs 16 — and slot 1 is full, and the compiler is not going back for slot 0's spare 16
+bytes. `(2, 0)`. **Three slots**, with 16 bytes of slot 0 permanently dead.
+
+That last clause is the mechanism in one sentence: **packing only combines items that are contiguous
+in the declaration list**, so any full-width variable in the middle is a wall.
+
+## What the extra slot costs
+
+Taking a storage slot from zero to non-zero costs 20,000, and the first touch of a slot in a
+transaction adds a cold surcharge of 2,100 — measured on solc 0.8.36 with Foundry 1.7.1 as 22,113 for
+the combined operation.<Cite src="measured-gas-constants" /><Cite src="eip-2929" /> Additional writes
+into a slot already touched in the same transaction are warm and comparatively negligible. So the
+arithmetic for a constructor that initialises everything is close to linear in the slot count:
+
+- `uint128, uint128, uint256` — two slots initialised, roughly **44,200**.<Cite src="measured-gas-constants" />
+- `uint128, uint256, uint128` — three slots initialised, roughly **66,300**.<Cite src="measured-gas-constants" />
+
+One reordering, about 22,100 gas, paid once at deployment and again on any code path that first writes
+those fields.<Cite src="measured-gas-constants" /> Panel versus Panel3 above is two slots' worth,
+roughly 44,200.
+
+<Aside kind="warn">
+Those are arithmetic compositions of measured per-opcode constants, not measurements of these
+contracts. A real `forge test --gas-report` lands near the figure and not on it: dispatch, calldata,
+masking arithmetic, and the compiler's choice of whether to fold two assignments into one `SSTORE` all
+ride along. Produce the number for your own contract rather than inherit one from a lesson.
+</Aside>
+
+## Structs and arrays are walls, on both sides
+
+Rules 4 and 5 from the last lesson are where the surprises live, because they are two rules and most
+people remember one. **Structs and array data always start a new slot**, and their items are packed
+tightly according to the same rules *within* the struct or array. **Items following struct or array
+data always start a new storage slot.**<Cite src="solidity-docs-storage-layout" />
+
+Packing happens inside the boundary and never across it, in either direction. A struct or array in the
+middle of your declarations is not one wall. It is two.
+
+### Working the panel
+
+Take `Panel` from the top of the lesson and lay the cursor over it.
+
+**Subgoal — fill the first slot until something blocks.** `uint16 g` at `(0, 0)`, `uint16 h` at
+`(0, 2)`. Cursor at `(0, 4)` with 28 bytes free.
+
+**Subgoal — hit the struct.** `Window w` is a struct, so rule 4 fires regardless of the 28 free bytes:
+it starts slot 1. Inside it, `int32 start` and `bool open` pack tightly at offsets 0 and 4 of that
+slot, using 5 of 32 bytes.
+
+**Subgoal — hit the far side of the struct.** `int8 k` needs one byte. Slot 1 has 27 free and slot 0
+has 28 free, and it gets neither: rule 5 puts it alone in slot 2. One byte, one slot, 31 bytes dead.
+
+**Subgoal — hit the array, and then its far side.** `bytes5[8] n` is 40 bytes, so it starts slot 3 and
+runs into slot 4 — six elements fill 30 bytes of slot 3, the two bytes left cannot hold a seventh, so
+the last two elements sit in slot 4. The compiler reports the type as 64 bytes: two whole
+slots.<Cite src="foundry-forge-inspect" /> Then `bytes5 o`, the same type as the array's own elements,
+with 22 bytes free in slot 4 — and rule 5 puts it in slot 5. **Six slots for 55 bytes of data.**
+
+Now `Panel3`, which changes nothing but the order: `g`, `h`, `k` and `o` are narrow and now
+contiguous, so they share slot 0 at offsets 0, 2, 4 and 5. `Window w` starts slot 1. `bytes5[8] n`
+starts slot 2 and runs into slot 3. **Four slots.**
+
+<Figure
+  caption="Six slots carry 55 bytes of data; the rest of every word is unreachable for the life of the contract."
+  alt="Panel's slot map. Slot 0 holds g and h with 28 bytes free, slot 1 the Window struct with 27 free, slot 2 holds k alone with 31 free, slots 3 and 4 hold the eight array elements, and slot 5 holds o alone with 27 free."
+>
+  <ByteLayout
+    unit="words"
+    offsets
+    caption="Panel — 6 slots"
+    fields={[
+      { label: 'g, h', size: 1, note: '28B free' },
+      { label: 'w.start, w.open', size: 1, note: '27B free' },
+      { label: 'k', size: 1, tone: 'warn', note: '31B free' },
+      { label: 'n[0..5]', size: 1, note: '2B unusable' },
+      { label: 'n[6..7]', size: 1, note: '22B free' },
+      { label: 'o', size: 1, tone: 'warn', note: '27B free' },
+    ]}
+  />
+</Figure>
+
+<Figure
+  caption="The same six declarations in a different order need four slots, because the narrow fields are now neighbours."
+  alt="Panel3's slot map. Slot 0 holds g, h, k and o together with 22 bytes free, slot 1 holds the Window struct, and slots 2 and 3 hold the eight array elements."
+>
+  <ByteLayout
+    unit="words"
+    offsets
+    caption="Panel3 — 4 slots"
+    fields={[
+      { label: 'g, h, k, o', size: 1, tone: 'good', note: '22B free' },
+      { label: 'w.start, w.open', size: 1, note: '27B free' },
+      { label: 'n[0..5]', size: 1, note: '2B unusable' },
+      { label: 'n[6..7]', size: 1, note: '22B free' },
+    ]}
+  />
+</Figure>
+
+The two stranded slots are `k` and `o` — each a variable of one and five bytes respectively, each
+given a whole slot because of what it happened to be declared *next to*.
+
+<Misconception
+  belief="Struct members pack, so putting fields inside a struct saves slots."
+  reality="Members pack with each other and with nothing outside. A struct is a boundary: the item before it cannot share with its first member, and the item after it cannot share with its last. Wrapping two narrow fields in a struct can cost you slots rather than save them."
+  why="'Packing happens inside a struct' is true and is the half people retain. The two exception rules are stated as separate bullets and read as one idea."
+  src="solidity-docs-storage-layout"
+/>
+
+## Inheritance writes the declaration list, not your file
+
+One more input decides the order, and it is not in the file you are editing.
+
+For contracts that use inheritance, the ordering of state variables is determined by the C3-linearised
+order of contracts **starting with the most base-ward contract**, and if the packing rules allow it,
+state variables from different contracts do share the same storage
+slot.<Cite src="solidity-docs-storage-layout" />
+
+Two consequences, both load-bearing.
+
+**Your contract's slot 0 belongs to your deepest base.** Everything you can see at the top of your own
+file is laid out after everything you inherit. In the documentation's own worked example a `bytes21`
+declared in the most derived contract shares a slot with an `int8` declared in a base — the boundary
+between contracts is not a boundary for packing.<Cite src="solidity-docs-storage-layout" />
+
+**Adding one variable to a base contract renumbers everything below it.** Not "shifts by one" —
+renumbers, and possibly re-packs, because a new narrow variable can absorb a neighbour that used to
+start a fresh slot. For a fresh deployment that costs nothing but a different layout. Behind a proxy it
+is a state-corruption bug, which is why the upgrade tooling enforces append-only layout rules rather
+than trusting review.<Cite src="oz-docs-writing-upgradeable" />
+
+<Aside kind="note">
+Inheritance order is delicate enough that the compiler itself got it wrong recently. Solidity 0.8.36
+lists as an important bugfix an unintentional reversal of the `linearizedBaseContracts` annotation
+when emitting the warning about a storage layout base slot being too close to the end of storage — a
+reversal that "would affect analysis and code generation dependent on the inheritance
+order."<Cite src="solidity-changelog" /><Cite src="solidity-0836-release" /> If you are on 0.8.31
+through 0.8.35 and using a custom storage layout, that is a reason to move.
+</Aside>
+
+### Moving the whole map at once
+
+Since 0.8.29 a contract can relocate its storage to an arbitrary base
+slot.<Cite src="solidity-changelog" /> The syntax is `layout at <base-slot-expression>` in the
+contract header, at most once; the expression must be evaluable at compile time and within `uint256`,
+and constants and the built-in `erc7201` function are allowed in it.<Cite src="solidity-docs-contracts" />
+That builtin, added in 0.8.35, computes the base slot of a storage namespace using the ERC-7201
+formula.<Cite src="solidity-changelog" /><Cite src="eip-7201" />
+
+Three constraints to carry now: it can only be specified for the **topmost** contract of an
+inheritance tree and moves every storage variable in that tree; it is not allowed on abstract
+contracts, interfaces or libraries; and it does not affect transient state
+variables.<Cite src="solidity-docs-contracts" /> It shifts the static variables uniformly and
+preserves their relative positions — it changes the origin, not the
+map.<Cite src="solidity-docs-storage-layout" /> The proxies module is where that becomes a design
+tool.
+
+<Aside kind="warn">
+`layout` and `at` are not yet reserved keywords, and 0.8.35 began warning about identifiers selected
+for future promotion to keywords — `at`, `error`, `layout`, `leave`, `super`, `transient` and
+`this`.<Cite src="solidity-changelog" /> If you have a variable named `layout`, that warning is the
+notice period.
+</Aside>
+
+## When you should not reorder
+
+The reflex after a lesson like this is to sort every contract's declarations by descending byte width
+and call it done. Three reasons that is wrong often enough to be worth naming.
+
+**A deployed upgradeable contract must never be reordered.** The proxy holds state at the old slot
+numbers and the new implementation would read them under new names. The OpenZeppelin issue tracker
+carries a live case of a proxy permanently deadlocked by a layout change across a major version bump —
+neither initializable, upgradeable, nor administrable by any on-chain
+transaction.<Cite src="oz-issue-6362" /> The optimisation window closes at first deployment.
+
+**Packing you never exploit is a tax.** If `feeBps` and `cap` share a slot but every code path reads
+exactly one of them, you bought no slot access and pay the masking anyway — the documentation puts
+this in the same warning as the advice to pack.<Cite src="solidity-docs-storage-layout" /> The right
+unit of grouping is **fields that change together in the same transaction**, not fields that happen to
+be small.
+
+**Cohesion is worth something.** A layout ordered purely by width scatters related fields, and the next
+person to add a variable will put it wherever it reads best and quietly undo your work. If the order
+is load-bearing, say so in a comment beside it — the compiler will not.
+
+<Check type="predict" concept="packing-order-matters">
+Here is a real-shaped accounting struct and the contract that holds one.
+
+```solidity
+struct Position {
+    address holder;   // 20 bytes
+    uint256 principal;// 32 bytes
+    uint40  openedAt; //  5 bytes
+    bool    closed;   //  1 byte
+}
+
+contract Book {
+    uint64   epoch;
+    Position p;
+    address  keeper;
+}
+```
+
+Give the slot map for `Book`, say how many slots it uses, and then give the best reordering you can
+and its slot count. State which rule forces each new slot.
+
+<Answer>
+**The map as written — five slots.**
+
+- `uint64 epoch` — `(0, 0)`, 8 bytes used, 24 free.
+- `Position p` — a struct, so **rule 4** starts a new slot regardless of those 24 free bytes. Its
+  members are then laid out by the same rules from `(1, 0)`:
+  - `holder` `(1, 0)`, 20 bytes, 12 free.
+  - `principal` needs 32, only 12 free, so **rule 3** — `(2, 0)`. Slot 2 is exactly full.
+  - `openedAt` `(3, 0)`, 5 bytes, 27 free.
+  - `closed` `(3, 5)`, 1 byte.
+  - The struct occupies slots 1 through 3.
+- `address keeper` — follows struct data, so **rule 5** starts a new slot: `(4, 0)`.
+
+**Five slots**, and three of them are mostly empty: 24 bytes free in slot 0, 26 in slot 3, 12 in
+slot 4.
+
+**A better version — three slots.** Two moves, and they are independent.
+
+*Inside the struct*, put the full-width member last so the narrow ones can share:
+`address holder; uint40 openedAt; bool closed; uint256 principal;` — `holder` at `(0, 0)`,
+`openedAt` at `(0, 20)`, `closed` at `(0, 25)` all in the struct's first slot, `principal` in its
+second. The struct drops from three slots to **two**.
+
+*Outside the struct*, move the struct last so `epoch` and `keeper` can share:
+`uint64 epoch; address keeper; Position p;` — `epoch` at `(0, 0)`, `keeper` at `(0, 8)`, then the
+struct starting at slot 1 and running to slot 2.
+
+**Three slots.** At roughly 22,100 per slot first initialised from
+zero,<Cite src="measured-gas-constants" /> that is on the order of 44,000 gas per `Book` you deploy or
+first populate — with no change to a single type or name.
+
+The general shape worth taking away: **a full-width member inside a struct is a wall inside the
+struct, and the struct itself is a wall outside it.** Full-width fields belong at the end of whatever
+list they are in.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Mappings and dynamic arrays** are next, and they are the types the running-total rule cannot
+handle at all. Notice that `Position p` above could be sized at compile time and a
+`mapping(uint256 => Position)` cannot — that difference is the whole of the next lesson.
+
+**Proxies and upgrades** turn this lesson's arithmetic into a safety property. Two contracts sharing
+one storage through `delegatecall` agree on nothing except slot numbers, so "which variable is at slot
+3" stops being a gas question and becomes a correctness one. The `layout at` specifier and ERC-7201
+namespaces are the current answers.<Cite src="eip-7201" />
+
+**Gas profiling** in the toolchain track is where the estimate above becomes a measurement, including
+the part this lesson deliberately refused to quote: how much the masking actually costs on your access
+pattern, and whether the slot you saved was worth it.
+
+**Vulnerability classes** in the security track include several whose root cause is a layout the
+author never computed — an inherited variable that moved, a struct that grew, an upgrade that
+renumbered. Computing it takes four seconds, and that is the entire defence.

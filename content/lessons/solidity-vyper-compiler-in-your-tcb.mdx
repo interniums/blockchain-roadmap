@@ -1,0 +1,350 @@
+---
+id: solidity-vyper-compiler-in-your-tcb
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [vyper-ghsa-reentrancy-lock, vyper-postmortem, blocksec-curve-compiler, somnus-vyper-bypass, curve-llamarisk-postmortem, vyper-versioning, vyper-security-policy, vyper-audits-repo, vyper-advisories-published, vyper-docs-compiling, solidity-0836-release, solidity-0834-release, solidity-known-bugs-list]
+stack: { vyper: "0.4.3", solidity: "0.8.36" }
+---
+
+Here is a fragment of the pETH/ETH Curve pool, as deployed:
+
+```python
+@external
+@nonreentrant('lock')
+def remove_liquidity(_burn_amount: uint256, _min_amounts: uint256[N_COINS],
+                     _receiver: address = msg.sender) -> uint256[N_COINS]:
+    total_supply: uint256 = self.totalSupply
+    amounts: uint256[N_COINS] = empty(uint256[N_COINS])
+    for i in range(N_COINS):
+        old_balance: uint256 = self.balances[i]
+        value: uint256 = old_balance * _burn_amount / total_supply
+        assert value >= _min_amounts[i], "Withdrawal resulted in fewer coins than expected"
+        self.balances[i] = old_balance - value
+        amounts[i] = value
+        if i == 0:
+            raw_call(_receiver, b"", value=value)
+```
+
+Read it as a reviewer. There is a checks-effects-interactions problem — the `raw_call` at `i == 0`
+hands control to `_receiver` while the loop is midway through updating `self.balances`. That is
+exactly why the function carries `@nonreentrant('lock')`, and every other function that shares the
+`'lock'` key is protected against being entered while this one is running.
+
+That is what the source says. On 30 July 2023 it was not what the bytecode did.<Cite src="blocksec-curve-compiler" />
+
+## What the compiler actually emitted
+
+The named key is the whole point of the feature. Its only purpose is cross-function protection:
+several functions declaring the same key share one lock, so entering any of them while another is
+running reverts.<Cite src="vyper-postmortem" />
+
+**Subgoal: compile a minimal case and read the IR.** Two functions, one key:
+
+```python
+@external
+@nonreentrant('lock')
+def test_funcA():
+    pass
+
+@external
+@nonreentrant('lock')
+def test_funcB():
+    pass
+```
+
+Compiled with Vyper 0.2.16, the generated intermediate representation checks and sets slot 0 on entry
+to `test_funcA`, and slot 1 on entry to `test_funcB`.<Cite src="blocksec-curve-compiler" />
+
+**Subgoal: state the consequence in one sentence.** Two functions that declared the same lock were
+given two different locks, so entering one did not lock the other.<Cite src="vyper-ghsa-reentrancy-lock" />
+
+**Subgoal: find the missing line.** The allocator introduced in pull request 2391 iterated over
+function definitions, and for each function carrying a `@nonreentrant` decorator it assigned the
+current slot and incremented — never consulting the key.<Cite src="blocksec-curve-compiler" /> The
+guard that had existed before the refactor was a lookup: if this key already has a slot, reuse it.
+That lookup was removed along with the data structure holding it.<Cite src="vyper-postmortem" />
+
+One dictionary lookup. The affected versions are 0.2.15, 0.2.16 and 0.3.0; the fix shipped in 0.3.1;
+the advisory is GHSA-5824-cm3x-3c38, CVE-2023-39363, severity
+Critical.<Cite src="vyper-ghsa-reentrancy-lock" />
+
+**Subgoal: reconstruct the attack path.** The advisory states the three conditions that make it
+profitable: a contract compiled with one of those three versions; a primary `@nonreentrant` function
+with a key that does not strictly follow checks-effects-interactions, meaning it makes an external
+call to an untrusted party before its storage updates; and a secondary function using the same key
+that is affected by the intermediate state.<Cite src="vyper-ghsa-reentrancy-lock" /> The pool above
+satisfies all three, and the `raw_call` is the door.<Cite src="somnus-vyper-bypass" />
+
+## Why the pools that broke were the ones paired with ETH
+
+The trigger was not "Curve used Vyper". It was a much narrower property, and naming it correctly is
+the difference between a story and a lesson.
+
+Curve's affected pools were paired with **native ETH**, and sending native ETH requires a
+context-transferring call — which is what the `raw_call` above is.<Cite src="vyper-postmortem" />
+Pools paired with WETH were not affected, because an ERC-20 transfer to a normal token contract hands
+control to nothing.<Cite src="curve-llamarisk-postmortem" /> Tokens implementing ERC-777, which adds
+callbacks, produced the same surface.<Cite src="curve-llamarisk-postmortem" />
+
+The pools drained on 30 July 2023 were pETH/ETH, msETH/ETH, alETH/ETH and CRV/ETH; an Arbitrum
+tricrypto pool was flagged as a precaution after auditors and Vyper developers could not find a
+profitable exploit against it.<Cite src="curve-llamarisk-postmortem" />
+
+<Aside kind="warn">
+Reported loss totals for this incident vary widely across sources, and a large but unquantified
+fraction was later returned — one white hat returned 2,879.65 ETH taken from the CRV/ETH pool to the
+Curve team.<Cite src="curve-llamarisk-postmortem" /> This module publishes no total, because the
+sources disagree and the number is not the lesson. The mechanism is not in dispute and it is the
+thing worth carrying.
+</Aside>
+
+## Why it survived two years in plain sight
+
+This is the part that changes how you work, and it is a story about diagnostic output.
+
+**The compiler's own layout report hid it.** The allocator wrote its results into a dictionary keyed
+by the lock name. Because the key was reused on every iteration, later writes overwrote earlier ones,
+so the compiler's `layout` output contained a *single* entry for `nonreentrant.lock` with a single
+slot number.<Cite src="vyper-postmortem" /> An engineer inspecting the layout to check the guard saw
+one lock, one slot — the correct picture — while the emitted code used a different slot per function.
+
+**So the fix was filed as an optimisation.** Pull request 2439, the first half of the repair, was
+described by its author as not a semantic bug but an optimisation bug: the allocator was reserving
+more slots than needed, leaving unused holes.<Cite src="vyper-postmortem" /> That description is
+exactly what the layout output supported. The security significance was invisible from the artefact
+everybody was reading.
+
+**Which meant nobody downstream got a signal.** The bug was introduced in 0.2.15 on 21 July 2021 and
+persisted through 0.2.16 and 0.3.0 until 30 November 2021. The maintainers' post-mortem states that
+while the bug was identified, fixed and tested within the compiler codebase, the impact on production
+contracts was not realised at the time and protocols using the affected versions were not explicitly
+notified.<Cite src="vyper-postmortem" /> The gap between the patch and the exploit is measured in
+years.
+
+**And the reason it was introduced at all was a missing test.** The Vyper test suite had no
+cross-function reentrancy test until pull request 2514 added one in
+0.3.1.<Cite src="vyper-postmortem" /> Cross-function protection is the only thing named keys were
+for. The one behaviour the feature existed to provide was the one behaviour nothing checked.
+
+<Figure
+  caption="The fix shipped first and the exploit came second, twenty months apart, and nothing in between connected them."
+  alt="A timeline in months: version 0.2.15 introduces the allocator bug on 21 July 2021, 0.3.1 fixes it on 30 November 2021, and the Curve pools are drained on 30 July 2023 — twenty months after the patch, during which no downstream protocol was notified."
+>
+  <Timeline
+    from={0}
+    to={25}
+    unit="months"
+    ticks={[0, 12, 24]}
+    caption="21 July 2021 (0.2.15) → 30 July 2023 (the drain)"
+    marks={[
+      { at: 0, label: '0.2.15', tone: 'warn' },
+      { at: 4.3, label: '0.3.1', tone: 'good' },
+      { at: 24.3, label: 'Curve pools drained', tone: 'danger' },
+    ]}
+    spans={[
+      { label: 'vulnerable versions shipping', start: 0, end: 4.3, tone: 'warn' },
+      { label: 'patched, and nobody downstream was told', start: 4.3, end: 24.3, tone: 'danger', note: 'twenty months' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="The Curve exploit was a Curve bug — they got reentrancy wrong."
+  reality="Curve's Vyper source declared a shared lock across the affected functions, which is the correct use of the feature. Three specific compiler versions emitted bytecode that gave those functions separate locks."
+  why="Incidents are named after whoever lost the money, and the post-incident coverage was about pools rather than about pull request 2391. The checks-effects-interactions violation in the source is real and was a necessary condition — but it was a condition the language's own guard was supposed to make survivable."
+  src="blocksec-curve-compiler"
+/>
+
+## The generalisation, which is the whole point
+
+Your trusted computing base is everything that has to be correct for your contract to behave as
+written: your code, your dependencies, the compiler, the client that executes the result, and the
+consensus rules underneath. A defect anywhere in that stack is your problem, and only the first two
+layers are ones you review.
+
+<Figure
+  caption="Three of these five are things you decided to trust without ever deciding."
+  alt="The trusted computing base as an ordered stack: your source and your dependencies, which you review, then the compiler, the client that executes the result, and the consensus rules underneath, which you assume."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'src', label: 'your source', note: 'you review this', col: 0, tone: 'accent' },
+      { id: 'dep', label: 'your dependencies', note: 'you review this', col: 1, tone: 'accent' },
+      { id: 'cmp', label: 'the compiler', note: 'you assume this', col: 2, tone: 'warn' },
+      { id: 'cli', label: 'the client', note: 'you assume this', col: 3, tone: 'warn' },
+      { id: 'con', label: 'the consensus rules', note: 'you assume this', col: 4, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+Solidity's own recent record makes the point without any need to score it.
+
+**February 2026, high severity.** Version 0.8.34 patched a bug in the IR code generator affecting
+0.8.28 through 0.8.33: when a contract clears both a persistent and a transient storage variable of
+the same type, the compiler could emit the wrong opcode — `sstore` instead of `tstore`, or the
+reverse — producing unintended writes to persistent storage or ineffective
+clearing.<Cite src="solidity-0834-release" /> It manifests only under the IR pipeline, which is not
+enabled by default.<Cite src="solidity-0834-release" />
+
+**July 2026, two medium-severity fixes.** One of them is worth reading beside the Vyper story: the
+Yul optimizer's call-cycle detection could misclassify mutually recursive functions as non-recursive,
+which let the stack-too-deep mitigation move their locals to memory — where multiple invocations of
+the same function used the same memory slots and overwrote each other's
+values.<Cite src="solidity-0836-release" />
+
+Line those two bugs up against the Vyper one and the family resemblance is exact. All three are
+**allocation** bugs. Vyper gave two things different slots when they should have shared one. The
+0.8.36 bug gave two things the same memory slots when they should not have. The 0.8.34 bug sent a
+write to the wrong storage domain at the same layout position. Compilers decide where values live,
+and where-values-live is where compiler bugs land.
+
+<Aside kind="note">
+A related caution, because it is the most-repeated wrong claim about the current Solidity release.
+The SSA-form code generator gained stack-to-memory spilling in 0.8.36, but the release announcement
+states it remains experimental, enabled with `--experimental --via-ssa-cfg`, and is not yet the
+default for `--via-ir`.<Cite src="solidity-0836-release" /> Stack-too-deep is not solved for the
+default pipeline, and a lesson claiming otherwise would be making the same mistake this module is
+about: taking a compiler's roadmap for its behaviour.
+</Aside>
+
+### What each project's process gives you
+
+The difference between the two incidents above is not competence — it is process, and process is the
+part you can actually depend on.
+
+Solidity publishes a machine-readable list of known security-relevant compiler bugs, `bugs.json`,
+alongside `bugs_by_version.json` for checking a specific version.<Cite src="solidity-known-bugs-list" />
+The documentation states the criteria verification tools should apply, and one of them is worth
+memorising: it is highly suspicious if a contract was compiled with a compiler containing a known bug
+and was created at a time when a fixed version had already been
+released.<Cite src="solidity-known-bugs-list" /> The 0.8.34 announcement shows the process working —
+the affected pattern was found across EVM-compatible chains, three deployed contracts matched, and
+the teams were notified.<Cite src="solidity-0834-release" />
+
+Vyper publishes its advisories as GitHub security advisories<Cite src="vyper-advisories-published" />
+and states its supported-version policy explicitly: when a compiler vulnerability is found, a new
+version ships with the patch, and **the vulnerable version itself is not
+updated**.<Cite src="vyper-security-policy" /> There is no backport. Moving forward is the only
+remediation. Its audits live in a public repository, and its bug bounty runs through the Ethereum
+Foundation, with experimental features such as `--experimental-codegen` explicitly out of
+scope.<Cite src="vyper-security-policy" /><Cite src="vyper-audits-repo" />
+
+And the audit promise has a qualifier that gets dropped constantly. Vyper's versioning guideline
+states that major x.0.0 releases will have an audit performed prior to release, with all moderate or
+severe vulnerabilities reported in the audit addressed.<Cite src="vyper-versioning" /> Minor releases
+carry a different commitment — they are *required* to fix moderate or severe vulnerabilities, and
+patch releases handle minor and informational ones.<Cite src="vyper-versioning" /> So "Vyper is
+audited" is true of x.0.0 and is not a statement about the point release you are about to pin.
+
+<Misconception
+  belief="Pinning a compiler version is a reproducibility nicety — good hygiene, not a control."
+  reality="It is a security control. The affected Vyper range was three specific versions, and the affected Solidity range in February 2026 was 0.8.28 through 0.8.33. A pin plus a periodic advisory check against that pin is exactly the mechanism that turns those ranges into an answerable question."
+  why="In most software, compiler versions carry performance and syntax implications rather than security ones, and a bad build gets redeployed. On-chain, the artefact is immutable and the bug ships forever, so which compiler produced it is a permanent property of the deployment."
+  src="vyper-security-policy"
+/>
+
+### The runbook this produces
+
+Vyper hands you most of the pieces in the compiler itself.
+
+**Pin in the source, not the build script.** `#pragma version` refuses to compile under any other
+version, and `#pragma evm-version` fixes the target ruleset. The documentation recommends the source
+pragma specifically when you want bytecode reproducibility — for example, when verifying code on a
+block explorer — and the compiler option when you want flexibility across
+chains.<Cite src="vyper-docs-compiling" />
+
+**Record an identity for the build.** `vyper -f integrity` emits an integrity hash, defined
+recursively as the SHA-256 of the source together with the integrity hashes of its imports and any
+storage-layout overrides.<Cite src="vyper-docs-compiling" /> Two builds that agree on it are the same
+build.
+
+**Ship the inputs, not just the output.** A Vyper archive is a ZIP whose `MANIFEST` directory carries
+the CLI settings, the compilation targets, the compiler version, the integrity hash, the search paths
+and any storage-layout overrides.<Cite src="vyper-docs-compiling" /> That is a reproducible-build
+bundle as a first-class compiler output.
+
+**Reproduce the deployed bytecode independently.** This is the step teams skip, and it is the only one
+that closes the loop, because [verification is bytecode
+matching](/c/verification-is-bytecode-matching) and matching requires a second party to compile the
+same inputs.
+
+**Check the pin against advisories on a schedule, not at deploy time.** The Vyper bug was patched
+twenty months before it was exploited. A pin that nobody re-examines converts a fixed bug into a
+permanent one.
+
+<Check type="explain" concept="compiler-is-part-of-tcb">
+Your team is deploying an immutable vault contract next week. The Solidity version is pinned in
+`foundry.toml`. The deployment runbook has a section for the multisig signers and one for the
+verification step on the block explorer.
+
+An engineer proposes adding a "compiler risk" section. Write it: say what it must contain, and for
+each item say what failure it catches. Then say which item your last project would have failed.
+
+<Answer>
+**1. Which compiler and version, exactly.** Not a caret range. The pin must resolve to one version
+with one commit hash, because the unit that carries a bug is a version, and the unit an advisory
+names is a version range.<Cite src="vyper-ghsa-reentrancy-lock" /><Cite src="solidity-0834-release" />
+*Catches:* the case where CI resolves to a different patch release than the one anybody reviewed.
+
+**2. Which non-default pipeline flags are on.** Both of the Solidity bugs above are pipeline-scoped:
+the 0.8.34 transient-clearing bug manifests only under the IR pipeline, and the SSA CFG backend is
+experimental and enabled by an explicit
+flag.<Cite src="solidity-0834-release" /><Cite src="solidity-0836-release" /> "We use `--via-ir`" is
+a security-relevant configuration fact, not a build preference.
+*Catches:* an advisory you correctly decided did not apply, because you did not know you had opted in.
+
+**3. Where the pin lives, and whether it is enforced.** A pin in a config file is advisory; a pin in
+the source is enforced by the compiler refusing to
+compile.<Cite src="vyper-docs-compiling" /> If your language offers the second, use it and say so
+here.
+*Catches:* a local build with a different toolchain producing different bytecode from CI.
+
+**4. Which advisory sources were checked, by whom, and on what date.** For Solidity that is
+`bugs_by_version.json`;<Cite src="solidity-known-bugs-list" /> for Vyper the published advisory
+list.<Cite src="vyper-advisories-published" /> Name a person and a date, because "we checked" with
+neither is not a control.
+*Catches:* deploying with a version that already had a published fix — the criterion the Solidity
+documentation itself calls highly suspicious.<Cite src="solidity-known-bugs-list" />
+
+**5. Whether the deployed bytecode was reproduced from source by a second party.** An independent
+rebuild from the recorded inputs, compared byte for byte.
+*Catches:* every category of "the artefact is not what the source says", including a compromised
+build machine, which is the case none of the items above touch.
+
+**6. What the re-check schedule is after deployment.** The contract is immutable; the advisory list
+is not. Twenty months elapsed between the Vyper patch and the
+exploit.<Cite src="vyper-postmortem" /> A quarterly re-check of the pinned version against new
+advisories is the entire difference between the two dates.
+*Catches:* the exact failure that produced this lesson.
+
+**And the honest part.** Most teams fail item 5, and nearly all fail item 6. Item 5 fails because
+explorer verification feels like it covers it — it does not; explorer verification proves the
+*published source* matches the deployed bytecode under some compiler settings, which is a different
+claim from a second party rebuilding from your recorded inputs. Item 6 fails because nothing in a
+deployment process is designed to fire twenty months later. If you want one change from this module,
+make it a calendar entry.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The module's reflection prompt is exactly the runbook above**, applied to something you have
+shipped. The value is in the row you cannot fill in.
+
+**The last lesson** puts the other side of the ledger on the table: what it costs to run a minority
+language whose compiler team is small, whose experimental backend is out of bounty scope, and whose
+production footprint is concentrated. The 2023 incident is an input to that decision, but so is the
+process the project built afterwards.
+
+**On the security track**, "the compiler is in your trusted computing base" is one instance of a
+general move: enumerate everything that must be correct, notice which parts you review and which
+parts you assume, and price the assumption. The client is in there too. So are the consensus rules.
+
+**And the reading skill** is the one this lesson opened with. You looked at a function, read the
+guard, and formed a correct belief about the source and an incorrect belief about the deployed code.
+Every artefact between source and chain — compiler, optimiser, linker, verifier — is a place those
+two can diverge, and each has its own diagnostic output that can be wrong in the same direction as
+the bug.

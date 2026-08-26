@@ -1,0 +1,294 @@
+---
+id: scaling-blobs-peerdas-how-a-batch-rides-a-blob
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-4844, eip-7594, op-specs-derivation, op-specs-glossary, op-specs-batcher, op-docs-configure-batcher, op-docs-tune-batcher-costs, op-docs-fee-parameters, arbitrum-batch-poster-blobs, arbitrum-data-availability]
+stack: {}
+---
+
+Open a batcher transaction on an L1 explorer and the first thing you notice is how little is there.
+The `to` address is an ordinary account with no code. The input data is `0x`. The transaction did
+nothing — no logs, no state changes, no internal calls — and it cost a few tens of thousands of gas
+plus a line item the explorer labels "blob fee".
+
+Somewhere in that transaction is an hour of another chain's history. None of it is in the part you
+can see.
+
+You already know the protocol side of this from the [blob](/c/blob) module: type-3 transactions,
+[KZG commitments](/c/kzg-commitment), [versioned hashes](/c/versioned-hash), sidecars that the EVM
+cannot touch. This lesson is the rollup's half — how a stream of L2 blocks becomes the bytes inside
+that blob, why the destination address is not a contract, and what the absence of a contract means
+for who is allowed to be wrong.
+
+## From L2 blocks to a payload, in four nested containers
+
+The derivation specification defines four levels, and confusing any two of them produces a wrong cost
+model.
+
+**A batch** is the list of transactions for one L2 block, plus the parent hash, the epoch number and
+hash of its L1 origin, and a timestamp.<Cite src="op-specs-derivation" /> One batch, one L2 block.
+
+**A channel** is a sequence of batches compressed together — grouped, the specification says, "simply
+to obtain a better compression rate."<Cite src="op-specs-derivation" /> A channel is the compression
+unit, and it is the reason the cost of your transaction depends on what everybody else's transaction
+looked like.
+
+**A frame** is a chunk of a channel. Its encoding is
+`channel_id ++ frame_number ++ frame_data_length ++ frame_data ++ is_last`, with `channel_id` a
+`bytes16`, `frame_number` a `uint16`, `frame_data_length` a `uint32` capped at 1,000,000 bytes, and
+`is_last` a single byte — **23 bytes of fixed overhead** per frame, deliberately fixed-size so that
+packing frames of varying content length does not create a circular dependency with the target total
+length.<Cite src="op-specs-derivation" />
+
+**A batcher transaction** is `version_byte ++ rollup_payload`, where version `0` means one or more
+concatenated frames and version `1` means an alt-DA commitment.<Cite src="op-specs-derivation" /> A
+single transaction may carry frames from more than one channel, which lets the batcher pack the small
+final frame of one channel beside frames of the next.<Cite src="op-specs-derivation" />
+
+Then, and only then, that payload is placed in blobs.
+
+The critical thing to hold: **the frame boundary and the blob boundary are different boundaries.**
+Frames exist because a channel may be larger than a transaction. Blobs exist because the L1 sells data
+in fixed lots. A channel can span many transactions; a transaction can carry many frames; and the
+mapping from frames to blobs is a packing decision, not a structural one. On the OP Stack it is a
+single setting: `OP_BATCHER_TARGET_NUM_FRAMES=6` targets six frames, which is six blobs per blob
+transaction.<Cite src="op-docs-configure-batcher" />
+
+<Misconception
+  belief="One batch goes in one blob."
+  reality="A batch is one L2 block's transactions. Many batches are compressed into a channel, the channel is cut into frames, frames are packed into transactions, and a transaction's payload is spread over as many blobs as it needs. All four boundaries are independent."
+  why="Every diagram of this draws one arrow labelled 'batch' from L2 to L1, and the word 'batch' then absorbs all four meanings — which is how people end up dividing an L2 transaction count by a blob count and calling the result a cost."
+  src="op-specs-derivation"
+/>
+
+<Figure
+  caption="One L2 block enters at the top; what leaves at the bottom is bought in whole blobs, and nothing in between divides evenly."
+  alt="Five nested containers running downward. A batch is one L2 block of transactions. A channel is many batches compressed together. A frame is a chunk of a channel behind a 23-byte header. A batcher transaction is a version byte followed by frames. Blobs carry that payload, at most six per transaction."
+>
+  <Flow
+    dir="down"
+    lanes={['one L2 block', 'the compression unit', 'the transaction unit', 'what L1 sees', 'what you buy']}
+    nodes={[
+      { id: 'b', label: 'batch', note: 'one L2 block of txs', col: 0 },
+      { id: 'ch', label: 'channel', note: 'many batches, compressed', col: 1, tone: 'accent' },
+      { id: 'fr', label: 'frame', note: '23 B header, then a chunk', col: 2 },
+      { id: 'tx', label: 'batcher transaction', note: 'version byte, then frames', col: 3 },
+      { id: 'bl', label: 'blobs', note: 'at most 6 per transaction', col: 4, tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+## How much fits, and why the answer is not 131,072
+
+A blob is `FIELD_ELEMENTS_PER_BLOB` = 4,096 field elements of `BYTES_PER_FIELD_ELEMENT` = 32 bytes
+each, so 131,072 bytes of raw structure.<Cite src="eip-4844" /> That is not the usable capacity, and
+the reason is arithmetic rather than convention.
+
+Each 32-byte word is not an arbitrary 256-bit string. It is an element of the field modulo
+`BLS_MODULUS`, which EIP-4844 gives as
+52435875175126190479447740508185965837690552500527637822603658699938581184513 — a prime slightly
+below 2<sup>255</sup>.<Cite src="eip-4844" /> Any 32-byte value at or above that modulus is not a
+valid field element, so an encoder cannot simply pour bytes in. It must guarantee every word lands
+below the modulus, and the cheap way to guarantee that is to leave part of each word unused.
+
+Operator documentation quotes the practical figure as **about 130 KB of usable capacity per blob,
+which must be bought whole whether or not you fill it**.<Cite src="op-docs-tune-batcher-costs" /> You
+can cross-check that against a live chain's own fee configuration: OP Mainnet's `blobbasefeeScalar` is
+1,014,213, and the L1 fee formula divides the scaled result by 10<sup>12</sup> against a size term
+scaled by 10<sup>6</sup> — so the chain is charging roughly 1.014 blob gas per compressed byte, which
+back-solves to 131,072 ÷ 1.014 ≈ **129,200 usable bytes**.<Cite src="op-docs-fee-parameters" /><Cite src="eip-4844" />
+Two independent routes to the same number is the level of confidence a capacity constant deserves
+before you build a cost model on it.
+
+The OP glossary states the transaction-level consequence directly: a data transaction is typically
+about 128 KB of calldata, or **800 KB of blobdata**.<Cite src="op-specs-glossary" /> Six blobs.
+
+<Figure
+  caption="The blob you buy and the blob you can fill are different sizes, and dividing by the wrong one puts a channel in four blobs when it needs five."
+  alt="A blob drawn to scale: about 129,200 bytes of usable payload, followed by a narrow band of headroom, out of 131,072 bytes of raw structure. The headroom is what keeps every 32-byte word below the BLS modulus."
+>
+  <ByteLayout
+    proportional
+    total={131072}
+    caption="131,072 bytes of blob, about 129,200 of them usable"
+    fields={[
+      { label: 'usable payload', size: 129200, tone: 'accent', note: 'what a channel gets' },
+      { label: 'headroom', size: 1872, tone: 'muted' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="warn">
+That six is a protocol limit, not a tuning choice. EIP-7594 introduces a limit of **6 blobs per
+transaction**, which clients enforce at submission, on receipt from the network, and during block
+production and processing.<Cite src="eip-7594" /> A batcher sized against the per-*block* maximum
+rather than the per-*transaction* limit builds transactions that are rejected before they are ever
+priced.
+</Aside>
+
+## The destination is not a contract, and that is the whole design
+
+Here is where the rollup side diverges most sharply from what a Solidity engineer expects.
+
+There is no L1 contract that receives a batch, validates it and stores it. A batcher transaction is
+authenticated by two address comparisons: its `to` must equal the batch inbox address, and its `from`
+must equal the batch-sender address recorded in the system configuration as of the L1 block the data
+is read from.<Cite src="op-specs-derivation" /> No EVM code executes. The specification is explicit
+that any data can be submitted at any time, and only data matching the derivation rules is valid from
+a verifier's perspective.<Cite src="op-specs-batcher" />
+
+Follow the consequences.
+
+**Malformed batches are not rejected — they are ignored.** Unknown transaction version bytes make the
+batcher transaction invalid; if any one frame in a transaction fails to parse, every frame in that
+transaction is rejected; unknown batch versions and malformed contents make a batch
+invalid.<Cite src="op-specs-derivation" /> All of that happens in nodes reading L1 afterwards, not in
+a revert. Your batcher can post garbage successfully and pay for it in full.
+
+**Cost is almost entirely data, not execution.** A blob transaction that does nothing pays the
+21,000-gas floor plus its data, which is precisely why this shape is affordable.
+
+**"Posted to L1" is a claim about bytes existing, not about anyone having checked them.** Verification
+is a separate activity performed by whoever cares, using data they fetch themselves.
+
+Not every stack makes the same choice. Arbitrum in Rollup mode has the sequencer submit the batch
+directly to the **sequencer inbox contract** on the parent chain, as calldata or blobs; in AnyTrust
+mode it submits a Data Availability Certificate instead, with the data held by a
+committee.<Cite src="arbitrum-data-availability" /> An inbox contract can enforce things an inbox
+address cannot. When you evaluate a chain you have not seen before, "what does the L1 endpoint
+actually execute" is a real question with different answers.
+
+<Misconception
+  belief="An L1 contract validates each batch, so a bad batch is rejected on-chain."
+  reality="On the OP Stack the batch inbox is an address, and authentication is a to/from comparison performed during derivation. A structurally invalid batch is discarded by nodes reading L1; nothing reverts and nothing is refunded."
+  why="Every other way of putting data on Ethereum goes through a contract, so 'submitted to L1' implies a callee that could have said no."
+  src="op-specs-derivation"
+/>
+
+## What a contract can do with data it cannot read
+
+The EVM's access to a blob is exactly two operations, and both work on the commitment rather than the
+content.
+
+`BLOBHASH`, opcode `0x49` at 3 gas, returns the versioned hash at a given index in the current
+transaction's `blob_versioned_hashes`.<Cite src="eip-4844" /> That hash is
+`VERSIONED_HASH_VERSION_KZG ++ sha256(commitment)[1:]` — version byte `0x01` followed by the last 31
+bytes of the SHA-256 of the KZG commitment.<Cite src="eip-4844" />
+
+The point-evaluation precompile at address `0x0A`, costing `POINT_EVALUATION_PRECOMPILE_GAS` = 50,000,
+verifies that a claimed value is the evaluation of the committed polynomial at a claimed
+point.<Cite src="eip-4844" /> That is a proof *about* the data, supplied by whoever wants to convince
+the contract, at a single point of their choosing or of the contract's.
+
+So a dispute over an L2 state transition never happens by reading the blob on-chain. It happens by
+someone asserting what a specific position in the data contains and being forced to prove that
+assertion against the commitment the chain already has. The commitment is the anchor; the bytes live
+off-chain, with everyone who bothered to keep them.
+
+And they are kept for a while and then not: blob sidecars are retained under a minimum-serving
+obligation of 4,096 epochs, described by the specification as around eighteen
+days.<Cite src="eip-4844" /> The rollup-side consequence, which the [pruning](/c/blob-pruning) lesson
+set up and this one cashes: a node syncing your chain from genesis cannot get old batches from the
+beacon network at all. Someone has to have archived them, and if that someone is only you, your chain
+is one backup away from being unreconstructable.
+
+## Worked example: sizing one hour of a chain
+
+Your chain produces, after span-batch encoding and Brotli, 520 KB of compressed channel data per hour.
+You want to know what the batcher will actually emit. Work it in the order that keeps the four
+containers separate.
+
+**Subgoal 1 — convert bytes to blobs, using usable capacity rather than raw.** 520,000 ÷ 129,200 ≈
+4.02, so five blobs, the last one 1% full.<Cite src="op-docs-tune-batcher-costs" /> Using 131,072 as
+the divisor gives 3.97 and the wrong answer — four blobs — which is how off-by-one capacity errors
+become "the channel did not fit" incidents.
+
+**Subgoal 2 — convert blobs to transactions, using the protocol limit.** Five blobs is under the
+six-per-transaction limit, so one transaction carries the hour.<Cite src="eip-7594" /> At 700 KB per
+hour it would be six blobs and still one transaction; at 800 KB it becomes two, and the second one
+pays its own 21,000-gas floor and its own priority fee.
+
+**Subgoal 3 — add the frame overhead, and check it is negligible.** Five frames at 23 bytes fixed
+overhead is 115 bytes against 520,000.<Cite src="op-specs-derivation" /> It is negligible *here*. On a
+chain posting 20 KB per hour it would not be, and neither would the 21,000-gas floor — which is the
+real reason low-throughput chains are told to accumulate for hours before posting.
+
+**Subgoal 4 — price the quantisation, because it is the line people forget.** You are buying five
+blobs' worth of blob gas — 5 × 2<sup>17</sup> = 655,360 blob gas — regardless of the fact that the
+fifth is nearly empty.<Cite src="eip-4844" /> The 129,200th byte and the 519,999th byte cost the same
+as the first byte of a fresh blob: nothing extra. The 129,201st byte costs an entire blob.
+
+**Subgoal 5 — state what you have and have not computed.** You have the *quantity*: five blobs, one
+transaction, per hour. You do not have a cost, because blob gas has a price that moves independently
+of everything in this calculation. Keeping the two apart is what makes the next lesson tractable —
+quantity is a property of your chain, price is a property of the market, and mixing them is why most
+published DA cost figures cannot be reproduced.
+
+<Aside kind="note">
+Verify the outcome rather than trusting the arithmetic. The op-batcher exports a `blob_used_bytes`
+histogram, and the documented health check is that it should sit near blob capacity; persistently
+part-empty blobs mean the channel duration or frame count is oversized for your
+throughput.<Cite src="op-docs-tune-batcher-costs" /> Arbitrum's equivalent is coarser but immediate:
+the batch poster logs a `numBlobs` field per submission, where `0` means a calldata transaction was
+posted instead.<Cite src="arbitrum-batch-poster-blobs" />
+</Aside>
+
+<Check type="predict" concept="blob-transaction">
+A team is building an L1 contract that pays a bounty when someone publishes a specific dataset as a
+blob. Their design: the publisher sends a type-3 transaction carrying the blob and calling
+`claimBounty()`; the contract reads the blob with `BLOBHASH`, hashes the contents, compares against
+the expected hash, and pays.
+
+Say what breaks, and what the closest workable design is.
+
+<Answer>
+**`BLOBHASH` does not return the contents.** It returns the versioned hash at an index — the byte
+`0x01` followed by the last 31 bytes of `sha256` of the KZG commitment.<Cite src="eip-4844" /> The
+contract can learn *that* a blob is attached and *which* commitment it has. It can never see a byte of
+it, so "hash the contents and compare" has no implementation.
+
+**The comparison they want is possible, but only against a commitment.** If the expected dataset is
+fixed and known in advance, compute its KZG commitment off-chain once, derive the versioned hash the
+same way the protocol does, and store that 32-byte value in the contract. Then `claimBounty()` is a
+comparison of `BLOBHASH(0)` against the stored constant — one opcode at 3 gas, no precompile
+needed.<Cite src="eip-4844" /> This is exact, cheap, and it is the design most people are reaching
+for when they say "verify what was posted".
+
+**If only part of the data is fixed, use the precompile instead of the whole-blob comparison.** The
+point-evaluation precompile at `0x0A`, at 50,000 gas, verifies that a claimed value is the committed
+polynomial's evaluation at a claimed point.<Cite src="eip-4844" /> The claimant supplies the point,
+the value and the proof; the contract supplies the versioned hash from `BLOBHASH` and chooses the
+point. That turns "prove you published the right thing" into a spot check the contract can afford.
+
+**Three things they must design around regardless.**
+
+*Retention.* The commitment is permanent and the data is not — the serving obligation is 4,096 epochs,
+around eighteen days.<Cite src="eip-4844" /> A bounty whose whole purpose is that the public can
+later fetch the dataset needs someone contractually obliged to keep it, because the protocol will not.
+
+*Cost model.* One blob is bought whole at 2<sup>17</sup> blob gas whether the dataset is 4 KB or
+129 KB.<Cite src="eip-4844" /><Cite src="op-docs-tune-batcher-costs" /> A bounty priced per byte will
+be wrong for small payloads by however much of the blob was left empty.
+
+*Failure semantics.* The blob fee is charged on the transaction regardless of what the call does. If
+`claimBounty()` reverts, the publisher has still paid to publish. Design the check so a failed claim
+is cheap to retry rather than expensive to repeat.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next**, the price of everything you just counted. Blob gas is metered by its own accumulator and
+priced by its own curve, and the arithmetic of that curve explains both why data posting has felt free
+for long stretches and why the moments it stops being free arrive faster than operators expect.
+
+**Later in this track**, the same containers reappear from the other direction. Forced inclusion is a
+path that bypasses the batcher entirely and lands transactions through L1; understanding what a
+batcher transaction *is* is what makes it obvious why forced inclusion has to be a different
+mechanism rather than a flag on this one.
+
+**And carry the boundary discipline.** Batch, channel, frame, transaction, blob. Whenever you read a
+per-transaction data cost, ask which of the five the author divided by. Most of the time they will not
+know they had a choice.

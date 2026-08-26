@@ -1,0 +1,361 @@
+---
+id: solidity-abi-selectors-how-dispatch-finds-you
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [solidity-abi-spec, solidity-docs-contracts, solc-contractcompiler-source, solc-irgenerator-source, solc-gasmeter-source, philogy-selector-switches, foundry-forge-inspect, solidity-0836-release, eip-1167, eip-2535]
+stack: { solidity: "0.8.36", forge: "1.7.1" }
+---
+
+Compile this and read what comes out.
+
+```solidity
+contract Four {
+    uint256 public s;
+    function a1() external { s = 1; }
+    function a2() external { s = 2; }
+    function a3() external { s = 3; }
+    function a4() external { s = 4; }
+}
+```
+
+Five external functions, counting the getter the compiler generates for `s`. Here is the head of the
+runtime object, from `forge inspect Four assembly` on solc 0.8.36 with the optimizer
+off:<Cite src="foundry-forge-inspect" /><Cite src="solidity-0836-release" />
+
+```text
+mstore(0x40, 0x80)
+callvalue
+dup1
+iszero
+tag_1
+jumpi
+revert(0x00, 0x00)
+tag_1:
+  pop
+  jumpi(tag_2, lt(calldatasize, 0x04))
+  shr(0xe0, calldataload(0x00))
+  dup1  0x119552a1  eq  tag_3  jumpi
+  dup1  0x86b714e2  eq  tag_4  jumpi
+  dup1  0x9426eef8  eq  tag_5  jumpi
+  dup1  0x969e9d0c  eq  tag_6  jumpi
+  dup1  0xf74ea418  eq  tag_7  jumpi
+tag_2:
+  revert(0x00, 0x00)
+```
+
+There is no table, no hash map and no runtime lookup. There is a `callvalue` check, a length guard, a
+shift, and then a straight line of comparisons ending in a revert. Everything you can say about
+dispatch follows from the fact that this is ordinary code that someone's code generator emitted.
+
+You already know the execution machinery underneath — [the loop, the frame, the jump](/c/evm-execution-loop).
+This lesson is about the four decisions the compiler makes on your behalf before your function body
+starts running, and about the one claim in this area that is genuinely contested.
+
+## What runs before your function does
+
+Read the listing top to bottom; each piece has a purpose that is not obvious from the opcodes.
+
+**Subgoal — reject value up front, once.** The `callvalue` check at the very top is not part of
+`a1`. `appendFunctionSelector` emits a single global check when the contract has no payable
+functions at all and its interface is non-empty, and then skips the per-function
+checks.<Cite src="solc-contractcompiler-source" /> "Non-payable" is therefore enforced by the
+dispatcher, before the selector is even read — which is why a contract with one `payable` function
+pays for that check differently from a contract with none. Adding `payable` to a single function
+changes the shape of code that runs on every call to every other function.
+
+**Subgoal — handle short calldata before trusting it.** `jumpi(tag_2, lt(calldatasize, 0x04))`
+sends calls with fewer than four bytes of calldata straight to the not-found path. The source
+comment says what it is for: jump directly to fallback or ether receiver if the data is too short to
+contain a function selector, and it also guards against short
+data.<Cite src="solc-contractcompiler-source" /> Without it, `calldataload` would happily
+zero-extend a two-byte call into a four-byte selector, because reading past the end of calldata
+yields zeroes.<Cite src="philogy-selector-switches" />
+
+**Subgoal — extract the selector.** `shr(0xe0, calldataload(0x00))` loads the first 32 bytes and
+shifts right by 224 bits, leaving the high-order four bytes as an
+integer.<Cite src="solc-contractcompiler-source" /> The selector is now a number on the stack, and
+from here nothing in the machine knows it was ever a hash.
+
+**Subgoal — search.** The comparisons run in ascending order of selector value. That is not
+incidental: the compiler collects the interface functions' four-byte ids and sorts
+them.<Cite src="solc-contractcompiler-source" /> Your declaration order is gone.
+
+**Subgoal — decide what "no match" means.** `tag_2` here is a bare `revert(0, 0)` — a revert with no
+data at all, because this contract defines neither `fallback` nor `receive`. That path is the
+subject of the last section.
+
+## The shape is a decision, and the compiler shows its work
+
+Add four more functions to the same contract and recompile. The comparisons no longer run in a
+straight line:
+
+```text
+tag_1:
+  pop
+  jumpi(tag_2, lt(calldatasize, 0x04))
+  shr(0xe0, calldataload(0x00))
+  dup1  0x6ad847ff  gt  tag_12  jumpi     <- pivot: split the range
+  dup1  0x6ad847ff  eq  tag_7   jumpi
+  dup1  0x86b714e2  eq  tag_8   jumpi
+  ...
+```
+
+A `gt` against a pivot appeared. `appendInternalSelector` is a recursive function whose source
+comment lays out both shapes it can emit: for `n` functions without a split, `n` times
+`dup1, push4 <id>, eq, push2/3 <tag>, jumpi` followed by a jump to not-found; with a split,
+`dup1, push4 <pivot>, gt, push2/3 <tag_less>, jumpi` and then the same routine on each
+half.<Cite src="solc-contractcompiler-source" />
+
+The decision between them is written down as arithmetic. The comment records that each split adds
+16 to 18 bytes of additional code, that the split is not profitable unless there are at least five
+functions, and gives the condition `_runs * 6 * (n - 4) > 17 * createDataGas`. The code implements
+it in three branches: never split at four ids or fewer; always split when
+`_runs > (17 * createDataGas) / 6`; otherwise evaluate the
+inequality.<Cite src="solc-contractcompiler-source" /> `_runs` is the optimiser's expected
+executions per deployment — the `--optimize-runs` setting.<Cite src="solc-contractcompiler-source" />
+
+That gives you a prediction you can check, without measuring anything. `createDataGas` is 200 — the
+compiler's name for the per-byte code-deposit cost<Cite src="solc-gasmeter-source" /> — so the
+"always split" threshold sits just above 566 runs. Below it, the inequality decides. At the
+default 200 runs: five interface functions gives `200 * 6 * 1 = 1200`, which does not exceed
+`17 * 200 = 3400`, so no split — matching the first listing. Nine interface functions gives
+`200 * 6 * 5 = 6000`, which does, so it splits. And the pivot is the id at index `n / 2` of the
+sorted list, which for nine sorted selectors is index 4 — `0x6ad847ff` in the listing
+above.<Cite src="solc-contractcompiler-source" />
+
+Predicting the exact pivot byte from a formula and finding it in the output is the strongest form of
+"I understand this" available here. It is also the last thing in this lesson that is uncontested.
+
+## The contested part, stated carefully
+
+Whether Solidity's dispatcher is a linear chain or a binary search is a claim you will find
+confidently asserted in both directions, and this curriculum's conflict register flags it as
+unresolved. Here is what each source actually says, read in full.
+
+Philippe Dumonet's widely-cited treatment introduces the "Linear If-Else Dispatcher" as the most
+straightforward and common form and attributes it to Solidity and Vyper — and, several sections
+later, states that the Solidity compiler will automatically create binary search switches once you
+have sufficient functions to justify the cost.<Cite src="philogy-selector-switches" /> Both
+sentences are in the same post. The compiler source describes exactly that conditional behaviour,
+with the threshold written out.<Cite src="solc-contractcompiler-source" />
+
+So on the legacy pipeline the disagreement is narrower than a summary of either source suggests: it
+is a difference of emphasis about which branch is typical, not a contradiction about the mechanism.
+
+The part that genuinely has not been reconciled is **legacy versus via-IR**. `IRGenerator`'s
+`dispatchRoutine` does not emit a search at all. It emits Yul —
+`if iszero(lt(calldatasize(), 4))`, then `let selector := shr224(calldataload(0))`, then
+`switch selector` with one `case` per function and an empty
+`default` — and leaves the lowering of that switch to the Yul code
+transform.<Cite src="solc-irgenerator-source" /> Nothing in that file decides between a chain, a
+tree or anything else.
+
+Compiling the nine-function contract above through both pipelines on this machine, the outputs
+differed: legacy emitted the `gt` pivot shown above, both with the optimizer off and with
+`--optimize --optimizer-runs 200`; via-IR emitted a linear chain of nine `eq` comparisons with no
+pivot at all, under both of those settings.<Cite src="foundry-forge-inspect" /> That is one contract
+on one compiler version. It is enough to show the pipelines can differ, and nowhere near enough to
+characterise how they differ in general — so treat it as a reason to look at your own bytecode, not
+as a rule.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Legacy pipeline', note: 'ContractCompiler', tone: 'accent' },
+    { title: 'via-IR', note: 'IRGenerator', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'What does the generator emit?', cells: ['Comparisons: a chain, or a gt pivot splitting the sorted range', 'A Yul switch on the selector, one case per function, empty default'] },
+    { label: 'Where is the shape decided?', cells: ['In the generator, by an inequality over optimiser-runs', 'Downstream, in the Yul code transform'] },
+    { label: 'What came out of the nine-function contract on this machine?', cells: ['A gt pivot, optimizer off and on', 'A linear chain of nine equality tests, optimizer off and on'] },
+  ]}
+  caption="Neither generator fixes the dispatcher shape, and the same nine functions came out split on one pipeline and chained on the other."
+  alt="Legacy and via-IR compared on what the generator emits, where the dispatcher shape is decided, and what each produced for the same nine-function contract on this machine."
+/>
+
+<Aside kind="warn">
+This module publishes **no** per-selector dispatch gas figure, and you should distrust any source
+that does without naming its configuration. The number depends on the pipeline, the optimiser-runs
+setting, the number of interface functions, where your selector sorts among them, and whether any
+function in the contract is payable. Every one of those is a property of your build, not of the ABI.
+`forge inspect <Contract> assembly` and `forge inspect <Contract> methodIdentifiers` answer it for
+your build in about a second.<Cite src="foundry-forge-inspect" />
+</Aside>
+
+## The consequence that survives the disagreement
+
+Strip away which shape your pipeline emits and one fact is left standing, because it holds for
+every shape except a true constant-time jump table: **the work done before your function body starts
+is a search, and searches are not uniform.**
+
+Chain each of the arguments together:
+
+1. A selector is the truncated hash of a canonical signature, so renaming a function or changing a
+   parameter type gives it a different four bytes.<Cite src="solidity-abi-spec" />
+2. The compiler sorts selectors as integers and emits comparisons in that
+   order.<Cite src="solc-contractcompiler-source" />
+3. Therefore a function's position in the search is a function of its *name*, via a hash, and moves
+   whenever the name or the signature changes.
+4. Therefore two functions with byte-identical bodies in the same contract need not cost the same to
+   call, and a rename with no semantic content can shift the cost of every call to the contract.
+
+Nothing in the ABI specification constrains any of this: the specification defines the four bytes
+and the argument encoding, and says nothing about how a contract finds a
+match.<Cite src="solidity-abi-spec" /> Dispatcher shape is a compiler property, and a compiler
+property is a thing that can change under you between releases.
+
+This is also why hand-written dispatchers exist. Once you accept that the search is code, you can
+write different code — an explicit `selector`-to-facet mapping, as a diamond
+does,<Cite src="eip-2535" /> or a minimal proxy whose entire runtime is a delegation with no
+dispatcher at all.<Cite src="eip-1167" />
+
+<Misconception
+  belief="Function dispatch is a switch statement, so every function in a contract costs the same to reach."
+  reality="It is compiled search code over selectors sorted as integers. Where your function sits in that order comes from a hash of its signature, and the shape of the search depends on the pipeline and the optimiser-runs setting."
+  why="The word 'switch' carries an O(1) promise from languages that compile it to a jump table. The EVM has no jump-table instruction to lower it to, so a switch on 32-bit values becomes comparisons — and via-IR's generator does emit a Yul `switch`, which is exactly the word that creates the expectation."
+  src="solc-contractcompiler-source"
+/>
+
+## When nothing matches
+
+The not-found path is not an error path. It is the mechanism proxies and routers are built on, and
+it has more structure than "there is a fallback".
+
+The compiler emits the branches in a fixed order.<Cite src="solc-contractcompiler-source" /> Follow
+a call through it:
+
+- **Calldata shorter than four bytes** — including empty — skips the selector search entirely and
+  lands on the not-found-or-receive path.
+- **If a `receive` function exists**, that path first checks `calldatasize`: non-zero calldata jumps
+  onward to the fallback path, and only genuinely empty calldata runs `receive`, which ends in a
+  `STOP`.
+- **Otherwise, if a `fallback` exists**, it runs — preceded by a callvalue check if it is not
+  payable. A fallback declared with no return parameters ends in `STOP`; one declared with a
+  `bytes memory` return returns that buffer.
+- **If neither exists**, the compiler emits a revert. There are two distinct messages in the source
+  for the two ways of arriving: *Contract does not have fallback nor receive functions*, and
+  *Unknown signature and no fallback defined*.<Cite src="solc-contractcompiler-source" />
+
+<Figure
+  caption="Four distinct arrivals, not two: calldata shorter than four bytes never reaches the selector search at all."
+  alt="Calldata arrives and is length-checked; anything shorter than four bytes goes straight to the not-found path, while four bytes or more reach the selector search, which either matches a function or falls through to the same not-found path. From there, empty calldata runs receive, calldata with data runs fallback, and a contract declaring neither reverts."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'in', label: 'calldata arrives', col: 0, tone: 'accent' },
+      { id: 'len', label: 'calldatasize < 4', note: 'the length guard', col: 1 },
+      { id: 'search', label: 'selector search', note: 'sorted ascending', col: 2 },
+      { id: 'body', label: 'your function', col: 3, tone: 'accent' },
+      { id: 'nf', label: 'not-found path', note: 'the proxy hook', col: 3, tone: 'warn' },
+      { id: 'rcv', label: 'receive()', note: 'only if declared', col: 4, tone: 'good' },
+      { id: 'fb', label: 'fallback()', note: 'only if declared', col: 4, tone: 'good' },
+      { id: 'rev', label: 'revert', note: 'neither declared', col: 4, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'in', to: 'len' },
+      { from: 'len', to: 'search', label: '4 or more' },
+      { from: 'len', to: 'nf', label: 'shorter', tone: 'warn' },
+      { from: 'search', to: 'body', label: 'match' },
+      { from: 'search', to: 'nf', label: 'no match', tone: 'warn' },
+      { from: 'nf', to: 'rcv', label: 'empty' },
+      { from: 'nf', to: 'fb', label: 'has data' },
+      { from: 'nf', to: 'rev', label: 'neither' },
+    ]}
+  />
+</Figure>
+
+The language documentation states the same routing from the declaration side: `receive` is executed
+on a call with empty calldata; if no such function exists but a payable fallback does, the fallback
+is called on a plain Ether transfer; if neither is present, the contract cannot receive Ether
+through a transaction that does not represent a payable function call and
+throws.<Cite src="solidity-docs-contracts" />
+
+Two details in that documentation are worth carrying, because both contradict common practice.
+
+**The parameterised fallback returns raw bytes.** Declared as
+`fallback(bytes calldata input) external [payable] returns (bytes memory output)`, `input` contains
+the full data sent to the contract — equal to `msg.data` — and the returned data **will not be
+ABI-encoded; it is returned without modifications, not even
+padding**.<Cite src="solidity-docs-contracts" /> That is precisely the behaviour a proxy needs:
+whatever the implementation returned goes back to the caller unaltered. It is also a trap if you
+expected `abi.encode` semantics on the way out.
+
+**The 2300-gas advice is now in tension with itself.** The same page states that in the worst case
+a `receive` function can only rely on 2300 gas being available, for example when `send` or
+`transfer` is used — and, three lines later, that `send()` and `transfer()` are **deprecated and
+scheduled for removal**.<Cite src="solidity-docs-contracts" /> The stipend constraint is real for
+callers that still use them; designing your `receive` around it in 2026 means designing around a
+pair of functions the compiler is retiring.
+
+<Misconception
+  belief="A call with unknown calldata reverts."
+  reality="It reaches fallback() if the contract defines one. That is not a degraded mode — it is how every proxy, every generic router and every multicall forwarder works."
+  why="Typed-language intuition: calling a method that does not exist is a compile error or a runtime exception. Here 'the method does not exist' is a runtime branch the contract author chose what to do with, and the most valuable thing to do with it is delegate."
+  src="solidity-docs-contracts"
+/>
+
+<Check type="spot-bug" concept="abi-fallback-receive">
+A team ships a forwarding contract. It compiles, and their tests pass.
+
+```solidity
+contract Forwarder {
+    address public immutable target;
+    constructor(address t) { target = t; }
+
+    receive() external payable {
+        (bool ok, ) = target.call{value: msg.value}("");
+        require(ok);
+    }
+
+    fallback() external {
+        (bool ok, bytes memory ret) = target.call(msg.data);
+        require(ok);
+        assembly { return(add(ret, 0x20), mload(ret)) }
+    }
+}
+```
+
+Two problems here are about dispatch specifically, not about proxies in general. Find them.
+
+<Answer>
+**Problem one: the fallback is not payable, so every value-bearing call with calldata reverts.**
+A `fallback` receives data always, but to also receive Ether it must be marked
+`payable`.<Cite src="solidity-docs-contracts" /> A non-payable fallback gets a callvalue check
+emitted in front of it, exactly like any other non-payable
+function.<Cite src="solc-contractcompiler-source" /> So `receive` handles plain transfers and the
+fallback handles data, and any call that has *both* — which is most of what a forwarder is for — is
+rejected before a byte of the body runs. Tests that send data or value but never both will not
+find this.
+
+**Problem two: calls with one to three bytes of calldata are silently misrouted.** The dispatcher
+sends anything with `calldatasize` below four straight to the not-found path *before* reading a
+selector, and the receive branch then tests `calldatasize` and jumps onward to the fallback only if
+it is non-zero.<Cite src="solc-contractcompiler-source" /> So a two-byte call reaches `fallback`,
+which forwards two bytes to the target — where the same length guard fires and the target's own
+fallback or revert answers. The forwarder does not distinguish "a call I could not name" from "a
+call too short to have a name", which for a contract whose whole job is faithful forwarding is a
+behavioural difference it has no way to express.
+
+**What to change.** Mark the fallback `payable` and forward `msg.value` from it, and be explicit
+about the short-calldata case rather than letting it fall through by accident. The general lesson:
+the four branches the compiler emits — short data, empty data, matched selector, unmatched
+selector — are four distinct cases, and a contract built on the not-found path has to have an
+answer for each of them. Reading `forge inspect <Contract> assembly` and finding the branches is
+the fastest way to see which ones you actually handled.<Cite src="foundry-forge-inspect" />
+</Answer>
+</Check>
+
+## Where this pays off
+
+Dispatch is the last piece of the four bytes. From here the module turns to the rest of the
+calldata: the argument block, its head-and-tail layout, and the offsets that make nested structures
+readable — or, read wrongly, make them look like something they are not.
+
+Two things you should now do reflexively. When someone quotes a dispatch gas number, ask for the
+pipeline and the optimiser-runs setting before believing it. And when you write a contract whose
+behaviour depends on what happens to unmatched calldata — a proxy, a router, a forwarder — read the
+compiled branches rather than the source, because the source does not show you the length guard, the
+callvalue check, or the order in which the two special functions are tried.

@@ -1,0 +1,422 @@
+---
+id: infra-monitoring-privileged-first
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [houston-ndss, seal-frameworks-monitoring-guidelines, seal-frameworks-monitoring, seal-frameworks-monitoring-tools, eip-1967, oz-docs-access-control, oz-governance-docs, oz-pausable, oz-monitor-docs, arxiv-cross-contract-detection, arxiv-administrated-erc20, chainlink-historical-data, chainlink-developer-responsibilities, tob-beyond-private-key-risk, viem-watch-contract-event, tenderly-simulations, eth-simulatev1-spec]
+stack: { viem: "2.x" }
+---
+
+The strongest published attack detector in the literature has a scope section, and the scope section
+contains a hole shaped exactly like your admin key.
+
+HOUSTON states that it considers out of scope threats whose root cause is actions performed by
+entities such as protocol administrators with a high level of privilege over the protocol, and it
+gives the reason in one sentence: an anomaly detection system has limited efficacy in addressing such
+issues, because past actions that were considered normal — the paper's own example is a protocol
+administrator updating an administration key — can now turn out to be
+malicious.<Cite src="houston-ndss" />
+
+That is not a limitation of one system. It is a statement about what learned detection *is*. A model
+of normal behaviour cannot flag the action whose defining property is that it looked normal last
+quarter. Every anomaly detector you might buy inherits this, and the better ones say so.
+
+Which produces the ordering this lesson argues for. The privileged-action category is the one with no
+automated detector, so it is the one you write by hand — and because those events are rare and
+unambiguous, writing them by hand is almost free.
+
+## The arithmetic that makes "no threshold at all" correct
+
+Lesson three's rule was: tier by expected false-positive rate, not by consequence. Apply it here and
+the answer falls out immediately.
+
+`Upgraded(address)` on your own proxy has a natural false-positive rate of zero. It fires when the
+implementation changed, and the implementation either changed or it did not. There is no baseline to
+compare against, no volatility to absorb, no threshold to tune. The same is true of
+`OwnershipTransferred`, `RoleGranted`, `RoleRevoked`, `Paused`, and a timelock queueing an operation.
+
+Now the frequency side. A protocol with a mature governance process performs a handful of these a
+year. Perhaps a dozen if it is busy. An alert that fires twelve times a year and is right twelve times
+costs your on-call roughly nothing, and it is a channel people will still be reading in eighteen
+months.
+
+**Alert on every one of them, unconditionally, including when it was you.** Especially when it was
+you — because the version of this alert that is filtered to "unexpected" callers requires you to have
+correctly enumerated the expected ones, and the whole scenario you are defending against is an
+expected caller being someone else today. An admin action you performed produces a page you
+acknowledge in four seconds. An admin action you did not perform produces the only warning you are
+going to get.
+
+The Security Alliance's monitoring checklist puts the same items in its named categories: changes in
+contract ownership or admin roles, contract upgrades and proxy implementation changes, access-control
+modifications such as role grants and revocations, oracle and governance monitoring including
+unexpected governance proposals or accelerated vote
+execution.<Cite src="seal-frameworks-monitoring-guidelines" />
+
+<Misconception
+  belief="We should be monitoring for reentrancy patterns and flash-loan-shaped call sequences."
+  reality="Those are the classes an anomaly detector, a fuzzer and an auditor all already work on, so instrumenting them by hand duplicates coverage. Privileged actions are the class every learned detector explicitly declares out of scope, and duplicating nothing means the uncovered category stays uncovered."
+  why="Reentrancy is the vulnerability every curriculum teaches first and the one with the most memorable diagrams, so it is the shape people reach for when asked what to monitor."
+  src="houston-ndss"
+/>
+
+## The catalogue, and where each event actually comes from
+
+The point of naming the standard is that it lets you watch contracts you did not write. A protocol
+you depend on did not agree to emit your custom event; it very likely does emit the standardised one.
+
+### Proxy and implementation
+
+ERC-1967 fixes three storage slots and names the event that should accompany each
+change:<Cite src="eip-1967" />
+
+| What changed | Slot | Event |
+|---|---|---|
+| Logic contract | `0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc` | `Upgraded(address indexed implementation)` |
+| Proxy admin | `0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103` | `AdminChanged(address previousAdmin, address newAdmin)` |
+| Beacon | `0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50` | `BeaconUpgraded(address indexed beacon)` |
+
+Read the specification's verb carefully: changes to each slot **SHOULD** be notified by the
+event.<Cite src="eip-1967" /> Not MUST. A proxy that writes the implementation slot without emitting
+is unusual and standards-compliant, and an event-only watcher on such a contract is silently blind.
+
+So watch both. Subscribe to the events for latency, and additionally sample the three slots with
+`eth_getStorageAt` on a slower cadence — every few minutes is plenty — comparing against the last
+known value. The event tells you within a block; the slot poll tells you eventually and cannot be
+skipped. On your own proxies the event alone is fine because you know what your code emits. On a
+[UUPS proxy](/c/uups-proxy) you do not control, the slot is the ground truth and the event is a
+courtesy.
+
+<Aside kind="note">
+The slot poll has a second use that is worth the cost on its own. It catches the case where your
+event pipeline is healthy but wrong — a bad ABI, a filter that lost an address during a config
+change, a subscription that silently dropped. Two independent paths to the same fact is the cheapest
+correctness check in monitoring, and here the second path costs one storage read per contract per
+poll.
+</Aside>
+
+### Roles and ownership
+
+OpenZeppelin's own documentation makes the design consequence explicit: the base `AccessControl`
+contract does not support on-chain enumeration of role members, and to track which accounts hold a
+role you should rely on the `RoleGranted` and `RoleRevoked` events, processed off
+chain.<Cite src="oz-docs-access-control" /> For `AccessManager`-based systems the same applies with
+`TargetFunctionRoleUpdated` added, because permissions live in one contract rather than being spread
+across many.<Cite src="oz-docs-access-control" />
+
+That is not a monitoring recommendation; it is a statement that **the event stream is the canonical
+read path for who can do what.** Your alerting layer and your access-control inventory are the same
+system, whether or not you built them that way.
+
+Add `RoleAdminChanged`, which is the one people forget. `DEFAULT_ADMIN_ROLE` acts as the default
+admin role for all roles and is its own admin, which OpenZeppelin flags as carrying significant
+risk.<Cite src="oz-docs-access-control" /> A change to *who administers a role* is a change to who can
+grant it tomorrow, and it produces no immediate visible effect at all — which is precisely the shape
+of a patient attacker.
+
+For `Ownable`, watch `OwnershipTransferred`, and note that `renounceOwnership` produces one too. The
+docs describe renouncing as a common pattern after an initial centralised stage, and also warn that
+removing the owner means administrative tasks become permanently
+inaccessible.<Cite src="oz-docs-access-control" /> An unplanned renounce is not a theft alert; it is a
+bricking alert, and it needs to fire just as fast.
+
+### Pause state
+
+`Paused` and `Unpaused` from `Pausable`.<Cite src="oz-pausable" /> Both directions. A pause you did
+not initiate is an incident; an *unpause* you did not initiate during an incident is a much worse
+one, because it is the attacker undoing your only containment step. The response-ladder design that
+makes unpausing harder than pausing is treated properly in the incident-response material — here the
+requirement is only that both transitions page.
+
+### Timelock
+
+Queue and execute both, with the queue as the one that matters. Watch the operation lifecycle on your
+`TimelockController` and note its role constants — `PROPOSER_ROLE`, `EXECUTOR_ROLE`, `CANCELLER_ROLE`
+and `DEFAULT_ADMIN_ROLE` — each of which is itself a grantable role and therefore already covered by
+the `RoleGranted` watcher above.<Cite src="oz-docs-access-control" /> One configuration deserves its
+own alert: granting the executor role to the zero address opens execution to anyone once the timelock
+has expired, which OpenZeppelin describes as useful but to be used with
+caution.<Cite src="oz-docs-access-control" />
+
+### Protocol-specific privileged setters
+
+Oracle source changes, fee parameters, collateral factors, cap adjustments, supported-asset
+additions. There is no standard for these, which means **the event has to exist because you decided
+it would**. If your `setOracle` function does not emit, no monitor can watch it without polling
+storage, and you have created work for your future self at the moment of highest leverage and lowest
+cost. The academic work on administrated tokens exists because privileged setters in deployed
+contracts are numerous, varied and frequently undocumented — enumerating your own is not a
+formality.<Cite src="arxiv-administrated-erc20" />
+
+## Alert on the queue, not the execution
+
+A timelock's entire value is the interval between an operation becoming scheduled and becoming
+executable. OpenZeppelin says what that interval is for: the delay protects the users of the smart
+contract by giving them time to review the maintenance operation and exit the system if they consider
+it is in their best interest to do so.<Cite src="oz-docs-access-control" /><Cite src="oz-governance-docs" />
+
+Time to review. Which means an alert wired to the *execute* event tells you about the change at the
+exact moment your review window closed. The delay ran, and nobody used it.
+
+This sounds obvious written down and it is one of the most common configurations in the wild, for a
+sympathetic reason: execution is the moment the state actually changes, so it looks like the event of
+interest. It is the event of *record*. The event of *interest* happened days earlier.
+
+<Misconception
+  belief="I should alert when the timelock executes — that is when the change lands."
+  reality="By execution the delay is already spent. Queueing is the alert that preserves the entire response window, and the window is the only thing the timelock was ever buying you."
+  why="Execution is the state transition, and state transitions are what monitoring is usually about. The timelock inverts the usual relationship between the interesting moment and the visible one."
+  src="oz-docs-access-control"
+/>
+
+The queue alert has a job attached, and it is the reason this matters most for timelocks you do not
+control. When a queue event fires on a dependency's governance, you have a fixed number of hours to
+decode the payload, simulate it against forked state, and decide whether it changes an assumption you
+depend on. That is a rehearsed procedure or it is nothing — the simulation machinery for it is
+[eth_simulateV1](/c/eth-simulatev1) and forked-state execution, and the calldata decoding is exactly
+the pre-execution verification the simulation module
+covers.<Cite src="eth-simulatev1-spec" /><Cite src="tenderly-simulations" />
+
+For your own governance you have a vote and a cancel path. For somebody else's, the delay is
+literally all the notice you are going to get.
+
+## Building the watcher
+
+### Subgoal — enumerate addresses, not contracts, because the interesting ones are not the ones you think of
+
+Write the list before you write any code, and be pedantic about it. For a single upgradeable
+protocol the list is longer than most people's first draft:
+
+- the proxy (where `Upgraded` fires)
+- the current implementation (where your own privileged setters live)
+- the ProxyAdmin, if the proxy is transparent rather than [UUPS](/c/uups-proxy)
+- the timelock
+- the multisig that holds the proposer role
+- every module, adapter, strategy or plugin the protocol registers
+- every one of the above for each chain you are deployed on
+
+The failure mode here is not subtle and it is nearly universal: teams enumerate the contracts that
+hold funds and miss the contracts that hold *authority*. A ProxyAdmin holds no value and can replace
+every line of code in the system.
+
+<Figure
+  caption="Exactly one box in this chain holds value, and every box above it can replace the code that moves it."
+  alt="A vertical chain of authority over an upgradeable protocol: the multisig holding the proposer role queues on the timelock, the timelock drives the ProxyAdmin, the ProxyAdmin sets the implementation behind the proxy, and the proxy is the contract holding the funds."
+>
+  <Flow
+    dir="down"
+    lanes={['signers', 'delay', 'admin', 'funds', 'code']}
+    nodes={[
+      { id: 'ms', label: 'multisig', note: 'holds the proposer role', col: 0, tone: 'accent' },
+      { id: 'tl', label: 'timelock', note: 'queue, delay, execute', col: 1 },
+      { id: 'pa', label: 'ProxyAdmin', note: 'holds no value at all', col: 2, tone: 'accent' },
+      { id: 'px', label: 'proxy', note: 'holds the funds', col: 3 },
+      { id: 'impl', label: 'implementation', note: 'every line of code', col: 4, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+### Subgoal — subscribe by topic across the whole address set, so a new contract cannot fall out of coverage
+
+One filter over the address set, keyed on the topic hashes, rather than one watcher per contract.
+Fewer subscriptions, one place to add an address, and no chance of a contract being added to the
+protocol and forgotten in the monitoring config.
+
+```ts
+const PRIVILEGED_EVENTS = parseAbi([
+  'event Upgraded(address indexed implementation)',
+  'event AdminChanged(address previousAdmin, address newAdmin)',
+  'event BeaconUpgraded(address indexed beacon)',
+  'event OwnershipTransferred(address indexed previousOwner, address indexed newOwner)',
+  'event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)',
+  'event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender)',
+  'event RoleAdminChanged(bytes32 indexed role, bytes32 previousAdminRole, bytes32 newAdminRole)',
+  'event Paused(address account)',
+  'event Unpaused(address account)',
+]);
+
+client.watchEvent({
+  address: PRIVILEGED_ADDRESSES,   // the full authority set, not just the value-holding contracts
+  events: PRIVILEGED_EVENTS,
+  onLogs: (logs) => logs.forEach(enrichAndPage),
+});
+```
+
+Two operational notes. A `watchEvent` subscription over WebSocket can drop and reconnect, and a
+reconnect that resumes from the current head has a gap in it — so reconcile on a slower timer with an
+`eth_getLogs` sweep over the last N blocks and deduplicate on the
+[log's natural key](/c/log-natural-key).<Cite src="viem-watch-contract-event" /> And keep this monitor
+on a different provider from your invariant monitor, so that one provider's outage does not take both
+layers of your detection with it.<Cite src="seal-frameworks-monitoring-tools" />
+
+### Subgoal — decode to a sentence a woken human can act on
+
+`RoleGranted(0x9f2df0…, 0x4a1b…, 0x77c3…)` is three opaque hex strings. Every one of them can be
+resolved by the detector, which already has the data.
+
+The role is `keccak256("MINTER_ROLE")` or similar — precompute the hashes of every role constant in
+your codebase and keep a reverse map, so the alert says `MINTER_ROLE` rather than a `bytes32`. The
+account and the sender resolve against your address book: label every known address, and make an
+*unlabelled* address the loudest part of the alert. "MINTER_ROLE granted to an address we have never
+seen, by the timelock" is a decision; the raw log is a research project.
+
+The Security Alliance's tooling guidance ranks channels by whether they escalate and confirm
+delivery, and this is the tier where that matters most — these alerts page.<Cite src="seal-frameworks-monitoring-tools" />
+
+### Subgoal — alert when the authority set itself changes, not only when it acts
+
+The subtlest and most valuable alert in this whole catalogue: fire when a privileged event names an
+address that is not in your inventory, *and* when your inventory contains an address that no longer
+holds the role you think it does.
+
+The first catches a grant to an attacker. The second catches the drift that makes your incident
+response wrong — the multisig signer who left the company, the deprecated module that still holds
+`PAUSER_ROLE`, the deployer EOA that was supposed to renounce two years ago and did not. Reconcile
+your written authority inventory against the on-chain event history on a schedule, and treat a
+divergence as a finding. Trail of Bits' position is that key-centric controls are the thing to mature
+past rather than to perfect, and reconciliation is how you find out how key-centric you still
+are.<Cite src="tob-beyond-private-key-risk" />
+
+## The contracts you do not control
+
+Your protocol's failure modes are not bounded by your protocol's code. If you read a price from an
+oracle, hold a yield-bearing token, route through a bridge or price against a pool, then that
+contract's upgrade, pause, parameter change or depeg is your incident — and detecting exploits that
+span contract boundaries is hard enough to be an open research problem, which tells you something
+about how well the per-contract view serves you here.<Cite src="arxiv-cross-contract-detection" />
+
+**Subgoal — write the dependency graph down as a list of trust statements, not a diagram.** Each row
+is one external contract, what you trust it for, and what breaks if it stops being trustworthy:
+
+<Matrix
+  corner="Contract"
+  cols={['What we trust it for', 'What breaks']}
+  rows={[
+    { label: 'Feed proxy', cells: ['the ETH/USD price used in liquidations', { v: 'liquidations misprice; bad debt or wrongful liquidation', tone: 'danger' }] },
+    { label: 'LST wrapper', cells: ['the exchange rate used to value collateral', { v: 'collateral is overvalued; unbacked borrowing', tone: 'danger' }] },
+    { label: 'Bridge', cells: ['that minted representations are backed', { v: 'unbacked supply enters as collateral', tone: 'danger' }] },
+    { label: 'DEX pool', cells: ['depth assumed by the liquidation path', { v: 'liquidations do not clear; positions go underwater', tone: 'danger' }] },
+  ]}
+  caption="One trust statement per dependency, in the form an alert can be attached to."
+  alt="Four external contracts a lending protocol depends on — a feed proxy, an LST wrapper, a bridge and a DEX pool — each with what the protocol trusts it for and what breaks when that trust fails."
+/>
+
+Teams consistently discover, during an incident, that the contract which failed was one nobody had
+written into this table. The exercise takes an afternoon and its output is the input to everything
+below.
+
+**Subgoal — apply the same privileged-action alerting to every row.** Watch each dependency's
+ERC-1967 slots and events, its role changes, its pause transitions and its timelock
+queue.<Cite src="eip-1967" /><Cite src="oz-docs-access-control" /> They did not agree to tell you, but
+they emit the standardised events, which is the entire reason the standard is worth knowing.
+
+For a price feed specifically, the aggregator behind a feed proxy can be replaced, and that is a
+change to what your protocol reads that involves no transaction against your protocol at
+all.<Cite src="chainlink-historical-data" /> The responsibility split is stated plainly by the feed's
+own documentation: developers are solely responsible for instituting the requisite risk mitigation
+processes including data quality checks, circuit breakers and appropriate contingency
+logic.<Cite src="chainlink-developer-responsibilities" />
+
+**Subgoal — add the dependency's own liveness to the row.** An oracle that stops updating, a bridge
+whose messages stop being delivered, a sequencer that stalls. These produce no event to subscribe to,
+because the defining characteristic is the absence of one. That is the next lesson, and the
+dependency table is where its alerts get their addresses.
+
+<Check type="predict" concept="admin-action-alerting">
+Eight things happen to your lending protocol in one week. Assign each to **page**, **review**, or
+**neither**, and where it pages, say what the first sixty seconds of the response is.
+
+1. `RoleGranted(KEEPER_ROLE, 0x8f…, timelock)` — the address is in your inventory as the new keeper.
+2. `RoleAdminChanged(PAUSER_ROLE, DEFAULT_ADMIN_ROLE, 0x00…dead)`.
+3. A single account withdraws 40% of one market's supply.
+4. `Upgraded(0x1c…)` on a Chainlink feed proxy your protocol reads.
+5. Your treasury multisig queues a timelock operation. The payload decodes to a fee change.
+6. `Unpaused(0x9a…)` at 04:00, where `0x9a…` is your guardian address.
+7. Your monitor observes a write to the ERC-1967 implementation slot of your own proxy, with no
+   `Upgraded` log in that block.
+8. A governance forum post proposes adding a new collateral asset.
+
+<Answer>
+**1 — page, and acknowledge in seconds.** This is the case for unconditional alerting rather than
+against it. The grant is expected, the address is known, the sender is the timelock, and the enriched
+alert says all three, so the page costs one glance. Filtering this out requires you to trust your
+inventory of expected callers, and an attacker with the timelock's proposer role produces an
+identically-shaped event. First sixty seconds: confirm the role name, the account label and the
+sender against the change you were expecting, and close it.
+
+**2 — page, loudly, and this is the sharpest item on the list.** The admin role for `PAUSER_ROLE` has
+been moved to an address that cannot act. Nothing visible breaks today. What has happened is that
+`PAUSER_ROLE` can now never be granted or revoked again, so if your pauser key is compromised or
+lost you have no path to change it. `DEFAULT_ADMIN_ROLE` is the default admin for all roles and
+carries significant risk precisely because of moves like this
+one.<Cite src="oz-docs-access-control" /> First sixty seconds: establish whether this was a governance
+action you authorised, and if not, treat every current `PAUSER_ROLE` holder as the complete and final
+set forever.
+
+**3 — review, not page.** A large withdrawal is a lagging, low-precision signal, and "40% of one
+market" is a normal Tuesday for a market with three depositors. It belongs on the reviewed channel,
+and if you want it to page it needs a second condition — a solvency predicate, a utilisation bound —
+so that the conjunction is what fires.
+
+**4 — page, and this is the one most teams have no alert for at all.** A dependency you did not write
+just changed its implementation, and the change alters the numbers your liquidation engine acts on.
+The event is standardised, so you can watch it without the feed operator's
+cooperation.<Cite src="eip-1967" /> First sixty seconds: read the current answer and its timestamp,
+compare against a second independent source, and decide whether to pause borrowing while somebody
+reads the new implementation.
+
+**5 — page, at the queue.** The delay exists to give you review time and that time only exists if
+queueing wakes someone.<Cite src="oz-docs-access-control" /> First sixty seconds: confirm the decoded
+target and calldata match the proposal that was discussed, then hand it to whoever simulates it
+against forked state before the window closes.<Cite src="eth-simulatev1-spec" /> A fee change is the
+benign case; the identical event shape carries an implementation swap.
+
+**6 — page, and treat it as more serious than a pause would be.** The guardian address unpausing at
+04:00 either means a human deliberately restored service, in which case one message confirms it, or
+means the guardian key is not exclusively yours and somebody has just removed your containment. First
+sixty seconds: reach the guardian holder on a channel that is not the one an attacker would have
+access to.
+
+**7 — page, and this is the item that justifies the storage poll.** The slot changed and no event
+fired. ERC-1967 says the event SHOULD accompany the change, not MUST, so this is possible without any
+bug.<Cite src="eip-1967" /> Two readings: a proxy implementation that legitimately writes the slot
+without emitting, or a monitoring path that lost the log. Both matter. First sixty seconds: fetch the
+code at the new implementation address and compare it to your expected deployment, then work out
+which of the two readings is true — because if it is the second, your event coverage has a hole in it
+right now.
+
+**8 — neither, for this system.** A forum post is not on chain and this is an on-chain monitor. It
+does belong in your process — the framework's guidelines list unexpected governance proposals or
+accelerated vote execution as a monitoring
+category<Cite src="seal-frameworks-monitoring-guidelines" /> — but the detector for it is the on-chain
+proposal event, not the discussion. Do not stretch an alerting system to cover things that are not
+signals; that is how the review channel becomes a feed nobody reads.
+
+**The pattern across the eight.** The three items with genuinely zero false-positive rate — 2, 5 and
+7 — are also the three that most teams have no alert for, and all three are *changes to authority*
+rather than changes to value. Value-shaped alerts are easy to imagine and expensive to run.
+Authority-shaped alerts are hard to imagine and nearly free.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**You now have the two highest-precision layers running**: the state predicate from lesson two and
+the privileged-action catalogue from this one. Between them they cover the failures that are
+definitionally wrong and the failures that are invisible to every learned detector.
+
+**Lesson five covers the third shape**, which is neither: things that fail by stopping. Your
+dependency table is where those alerts come from, because a dependency's liveness is not visible in
+any event it emits.
+
+**Lesson six turns a queue alert into an action.** Knowing that a dependency's timelock has queued
+something is worth exactly as much as your ability to decode it, simulate it and respond before the
+delay expires — which means the simulation work and the pre-authorised response path are part of this
+alert's design, not a separate project.<Cite src="tenderly-simulations" />
+
+**On tooling:** everything in this lesson is standard events and standard slots, which means it runs
+on anything that can filter logs and read storage — a self-hosted service with configurable trigger
+conditions, a managed platform, or a hundred lines of viem.<Cite src="oz-monitor-docs" /> Run two, on
+different providers, because the framework's redundancy recommendation applies most to the alerts you
+cannot afford to miss and this is that tier.<Cite src="seal-frameworks-monitoring" />

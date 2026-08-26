@@ -1,0 +1,287 @@
+---
+id: ledgers-mempool-why-it-is-stuck
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [geth-legacypool, geth-rpc-txpool, devp2p-eth-wire, geth-txpool-errors, geth-cli-options, eip-7702, flashbots-protect-nonce-management, eip-1559]
+stack: {}
+---
+
+A payout service fires fifty transfers from one address in a loop. Seven confirm. Forty-three do
+not, and stay that way.
+
+The on-call engineer does the obvious thing: resubmits all forty-three with triple the priority fee.
+Nothing changes. Triples it again. Nothing changes. Three hours later the forty-three are gone from
+every endpoint the team can query, no receipts exist, and the account nonce has moved by exactly
+seven.
+
+Every step of that debugging session was reasonable and every step was aimed at the wrong problem.
+The forty-three transactions were never competing for inclusion, so no bid could have helped. They
+were not slow. They were **ineligible**, and ineligibility and slowness are indistinguishable in
+every wallet interface ever shipped.
+
+<Figure
+  caption="One nonce that was never broadcast is what separates seven receipts from forty-two transactions nobody can select."
+  alt="Nonces zero through six are confirmed and the account nonce is now seven. Nonce seven was allocated but never broadcast. Nonces eight through forty-nine sit queued, neither announced to peers nor selectable by a block builder."
+>
+  <Flow
+    nodes={[
+      { id: 'done', label: 'nonces 0–6', note: 'confirmed; account nonce is now 7', col: 0, tone: 'good' },
+      { id: 'hole', label: 'nonce 7', note: 'allocated, never broadcast', col: 1, tone: 'danger', dashed: true },
+      { id: 'stuck', label: 'nonces 8–49', note: 'queued: not announced, not selectable', col: 2, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'done', to: 'hole' },
+      { from: 'hole', to: 'stuck', label: 'blocks all of them', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+## The pool has two halves, and only one of them is in the game
+
+go-ethereum splits its pool into two structures, and the JSON-RPC surface exposes the split directly:
+`txpool_content` returns an object with two fields, `pending` and `queued`, each mapping sender
+address to nonce to transaction.<Cite src="geth-rpc-txpool" />
+
+**Pending** means executable right now. The transaction's nonce follows contiguously from the
+account's current nonce, given whatever else the pool already holds for that sender. Nothing stands
+between it and a block except price and someone's decision to include it.
+
+**Queued** means held but not executable. Something is missing in front of it — a nonce the pool has
+never seen. The geth documentation describes these as transactions "being scheduled for future
+execution only".<Cite src="geth-rpc-txpool" />
+
+The distinction is not cosmetic. A queued transaction is:
+
+- **not propagated.** The wire protocol's guidance is that a node should announce hashes the peer
+  probably lacks, and it adds a revealing preference — "it is better to return more transactions than
+  to have a nonce gap in the pool".<Cite src="devp2p-eth-wire" /> Nodes work to avoid holes, because
+  a hole makes everything behind it dead weight.
+- **not available to a block producer.** Whoever builds the next block selects from executable
+  transactions. A queued one cannot be executed, so it cannot be selected.
+- **on a much smaller and shorter-lived shelf.** go-ethereum's defaults are 1024 non-executable slots
+  globally and 64 per account, against 4096 plus 1024 executable slots and 16 guaranteed per
+  account.<Cite src="geth-legacypool" /> Queued transactions also carry a `Lifetime`, three hours by
+  default, enforced by an eviction ticker that runs once a
+  minute.<Cite src="geth-legacypool" /><Cite src="geth-cli-options" />
+
+So the forty-three were sitting in a 1024-slot shared parking area, invisible to peers, with a
+three-hour clock running. That is the entire story of the incident.
+
+<Compare
+  caption="Queued is not a slower kind of pending: price is not an input to anything in the right-hand column."
+  alt="Pending and queued transactions compared by what puts one in each, whether it is announced to peers, whether a block producer can select it, how many slots exist globally and per account, whether raising the fee helps, and what moves it."
+  axis="Question"
+  columns={[
+    { title: 'Pending', note: 'executable now', tone: 'good' },
+    { title: 'Queued', note: 'held, not executable', tone: 'warn' },
+  ]}
+  rows={[
+    { label: 'What puts it here?', cells: ['Its nonce follows contiguously from the account nonce', 'A nonce in front of it is missing from this pool'] },
+    { label: 'Is it announced to peers?', cells: ['Yes — this is what gossip carries', 'No; nodes work to avoid propagating holes'] },
+    { label: 'Can a block producer select it?', cells: ['Yes, it is in the candidate set', 'No, it cannot be executed, so it is never compared'] },
+    { label: 'How many slots globally?', cells: ['4096 plus 1024 executable', '1024, shared by every account'] },
+    { label: 'How many per account?', cells: ['16 guaranteed executable', '64, and delegated accounts get one slot in total'] },
+    { label: 'Does raising the fee help?', cells: ['Yes — that is the auction it is entered in', 'No; it buys a more expensive transaction in the same hole'] },
+    { label: 'What moves it?', cells: ['Someone including it', 'Landing the missing nonce, which promotes the whole run at once'] },
+  ]}
+/>
+
+## The protocol does not define this — clients do
+
+Worth pausing on, because it determines how much of this you may assume.
+
+The wire specification's transaction validity rules cover signature, intrinsic gas, sender balance,
+and the requirement that the nonce "must be equal or greater than the current nonce of the sender
+account".<Cite src="devp2p-eth-wire" /> Note what that permits: a transaction with a nonce far in the
+future is a *valid* transaction. It is not garbage and nodes do not treat it as an attack.
+
+What happens to it next is explicitly delegated: it is "up to implementations to determine how many
+'future' transactions with nonce greater than the current account nonce are valid, and to which
+degree 'nonce gaps' are acceptable".<Cite src="devp2p-eth-wire" />
+
+Two consequences you can act on. First, there is no consensus rule to appeal to and no EIP to cite —
+"queued" is a go-ethereum concept, and another client may hold, drop or bound future transactions
+differently. Second, the amount of gap tolerance you get is a property of whichever node received
+your transaction, which by the previous lesson you do not know.
+
+## Why a fee bump cannot help
+
+Run it as a decision procedure, in the order the node applies it.
+
+**Subgoal 1 — establish eligibility, before price is considered at all.** The pool asks whether this
+transaction's nonce is reachable from the account's current nonce through transactions it already
+holds. If the answer is no, the transaction goes to the queued structure. Price has not entered the
+question.
+
+**Subgoal 2 — notice that the queued structure is not an input to block building.** Builders select
+from executable transactions. A transaction that is not executable is not in the candidate set, so
+its fee fields are not compared against anything.
+
+**Subgoal 3 — see what a bump actually does.** Raising the fees on a queued transaction and
+rebroadcasting produces a replacement of a queued transaction with a more expensive queued
+transaction. It is still behind the same hole. The only thing that changed is the maximum you have
+committed to pay if it ever becomes eligible.
+
+**Subgoal 4 — identify the only move that works.** Land the missing nonce. The instant the gap
+closes, everything behind it is promoted to pending in nonce order, in one step, and only then does
+price start to matter.
+
+<Misconception
+  belief="Raising the priority fee gets a queued transaction included faster."
+  reality="A tip is only compared against competitors for the same block. A transaction behind a nonce gap is not a competitor for any block, so the comparison never happens. The fix is to land the missing nonce, not to bid more on the transaction behind it."
+  why="'Priority fee' reads as a speed control, and wallets present it as a slider from slow to fast. The slider is real, but it only operates inside the eligible set — and it is a bid in an auction, not a purchase of position."
+  src="eip-1559"
+/>
+
+## Where gaps come from when nobody made an obvious mistake
+
+The textbook case — deliberately sending nonce N+1 before N — is rare in production. The five below
+are not.
+
+**Reading `latest` and caching it.** `eth_getTransactionCount` with the `latest` tag returns the
+nonce as of the last block, which ignores everything you have in flight. A service that reads it once
+and increments locally is fine; a service that re-reads it per transaction under concurrency issues
+duplicate nonces. Some are rejected as `already known` or replacement-underpriced, some
+replace each other, and the surviving set has holes.<Cite src="geth-txpool-errors" />
+
+**Concurrency without an allocator.** Fifty goroutines, fifty calls to "get next nonce", no
+serialisation. This is the failure at the top of this lesson. The fix is a single-writer nonce
+allocator that hands out numbers and can reclaim one when a send fails before broadcast.
+
+**A transaction in the middle disappearing.** This is the cruel one, because it opens a gap *after*
+you did everything correctly. If nonce N is dropped — evicted on capacity, expired, or rejected on
+price at the node that mattered — then N+1 through N+9 were pending a moment ago and are queued now.
+Your sequence developed a hole without you doing anything, and the next lesson's list of ways a
+transaction leaves a pool is the list of ways this happens.
+
+**Private submission invisible to the nonce query.** A transaction sent to a private endpoint is not
+in any public pool, so a `pending` nonce query answered by a public node cannot know about it.
+Operators go further and treat the derived nonce as sensitive: Flashbots Protect includes such
+transactions in `eth_getTransactionCount` only for the `pending` tag, and only when the request is
+signed by the sender's key and carries the signature in an `X-Flashbots-Signature`
+header.<Cite src="flashbots-protect-nonce-management" /> Query it unsigned and you get a nonce that
+counts only public transactions — then you sign at that number and collide with your own in-flight
+transaction.
+
+**EIP-7702 authorizations moving the nonce.** Since Pectra, a type-4 transaction carries an
+`authorization_list`, and processing an authorization increments the **authority's** nonce as part of
+execution — which is exactly what makes self-sponsored delegation
+work.<Cite src="eip-7702" /> A wallet that models the nonce as "count of transactions I sent" is
+wrong for any address that has ever authorised a delegation, and computes a next nonce one too low.
+
+That last one has a second half that is easy to miss and expensive to discover. go-ethereum's pool
+treats delegated accounts as a churn risk and applies a much tighter limit to them: any account with
+a deployed delegation, or with an in-flight authorization to deploy one, is allowed a **single**
+transaction slot rather than the standard number, because the account can be swept by an unrelated
+party.<Cite src="geth-legacypool" /> Within that single slot, replacement at the same nonce is
+allowed and stacking is not, and a gapped-nonce transaction from such an account is refused outright
+with `gapped-nonce tx from delegated accounts`.<Cite src="geth-legacypool" /> A batch sender whose
+address is delegated does not get sixteen executable slots. It gets one, and the second concurrent
+send is rejected rather than queued.
+
+<Misconception
+  belief="My wallet says pending, so it is pending."
+  reality="Wallets show one spinner for at least four different states: signed but not broadcast, accepted into some node's pending set, sitting in a queued structure behind a nonce gap, and submitted privately and therefore absent from every public pool. Only the second is 'pending' in the pool's sense."
+  why="The states are indistinguishable from a wallet's vantage point without a `txpool_content` call the wallet cannot make against a load-balanced endpoint, and a four-way status would confuse far more users than it helps. The simplification is defensible in the interface and indefensible in your backend."
+  src="geth-rpc-txpool"
+/>
+
+## Diagnosing it in ninety seconds
+
+The procedure is short because there are only two numbers.
+
+**Compare the two nonce views.** `eth_getTransactionCount(address, "latest")` and the same call with
+`"pending"`. If they are equal, the node believes you have nothing in flight — which means either you
+genuinely do not, or everything you sent is queued rather than pending, or it went somewhere private.
+If `pending` exceeds `latest` by less than the number of transactions you sent, the difference is the
+size of your visible in-flight set and the rest are unaccounted for.
+
+**Read the queued half directly.** `txpool_content` gives you `queued` keyed by address and
+nonce.<Cite src="geth-rpc-txpool" /> Your address appearing there settles the diagnosis instantly.
+The lowest nonce present in `queued` minus one is the transaction you actually need to land. Note the
+caveat from the previous lesson: this answers for whichever node you reached, so a negative result
+proves nothing.
+
+**Then act on the gap, not on the backlog.** Sign and broadcast the missing nonce with fees that
+clear the current base fee comfortably. Do not touch the queued transactions; they promote on their
+own.
+
+<Check type="spot-bug" concept="nonce-gap">
+A batch service manages one hot EOA. Its nonce allocator is:
+
+```ts
+let next: number | null = null;
+
+async function nextNonce(): Promise<number> {
+  if (next === null) {
+    next = await client.getTransactionCount({ address, blockTag: "pending" });
+  }
+  return next++;
+}
+
+async function send(tx: Tx) {
+  const nonce = await nextNonce();
+  try {
+    return await client.sendRawTransaction({ ...tx, nonce });
+  } catch (e) {
+    next = null;            // resync on any failure
+    throw e;
+  }
+}
+```
+
+It works in testing and produces long-lived nonce gaps in production. Identify the two defects and
+say what each one does at the protocol level.
+
+<Answer>
+**Defect 1 — the failure path abandons a nonce it already allocated.** When `sendRawTransaction`
+throws, the allocated nonce is discarded and `next` is reset. The reset re-reads the `pending` count,
+which is computed from what that node holds — and it holds every transaction you successfully sent
+*after* the failed one, if any were in flight concurrently. The abandoned nonce is now a hole that
+nothing will ever fill, and everything above it is queued: parked in a 1024-slot shared structure,
+not announced to peers, on a three-hour clock.<Cite src="geth-legacypool" /><Cite src="devp2p-eth-wire" />
+
+Correct behaviour is to distinguish two error classes. If the node rejected the transaction before
+accepting it into a pool — malformed, underpriced, `already known`<Cite src="geth-txpool-errors" /> —
+the nonce was never consumed anywhere and belongs back at the head of your allocator's free list. If
+the send failed on a network timeout, you do not know whether it was accepted, so the nonce must be
+treated as spent and retried at the same nonce as a replacement.
+
+**Defect 2 — resyncing from `pending` is resyncing from a cache.** The `pending` count is that node's
+opinion. Against a load-balanced endpoint the resync may hit a node that has none of your in-flight
+transactions and return the `latest` value, at which point the allocator hands out nonces you have
+already used. If any of your flow is submitted privately, the public `pending` count cannot include
+it at all unless the query is signed to the operator's
+requirements.<Cite src="flashbots-protect-nonce-management" />
+
+The allocator must be authoritative locally and reconcile against the chain, not against a pool. The
+shape that works: a single writer, durable local record of every allocated nonce and its signed
+transaction, promotion driven by receipts, and `latest` — the on-chain count, which is a consensus
+fact — as the only external input. `pending` is useful for a warning banner and useless as a source
+of truth.
+
+**Bonus defect worth naming.** If this address ever signs an EIP-7702 authorization, its nonce
+advances by one during that transaction's execution without a transaction of its own appearing, and
+an allocator that models the nonce as "transactions I sent" drifts one behind
+permanently.<Cite src="eip-7702" />
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Replacement** is the next lesson, and it is the operation you reach for when the missing nonce is
+itself stuck. The two are easy to confuse and have opposite fixes: a gap wants a *new* transaction at
+a *lower* nonce, a stuck pending transaction wants a *different* transaction at the *same* nonce.
+
+**The blob pool** treats gaps far more harshly than the legacy pool does, and an L2 batcher that
+tolerates a gap for three hours on the ordinary pool loses the transaction in about a minute on the
+blob pool.
+
+**Eviction and disappearance** is the last lesson in this module, and it is the direct cause of the
+third gap source above — the one where a hole opens in a sequence you built correctly.
+
+**Account abstraction** exists partly to escape this. A smart account's nonce space is its own design
+choice rather than a single strictly incrementing counter, which is why parallel nonce keys are one
+of the first things every account-abstraction standard specifies.

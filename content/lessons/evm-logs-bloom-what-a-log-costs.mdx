@@ -1,0 +1,263 @@
+---
+id: evm-logs-bloom-what-a-log-costs
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [execution-specs-osaka-log, execution-specs-osaka-gas, execution-specs-osaka-transactions, measured-gas-constants, eip-7708, eip-7668, eip-2929, yellow-paper]
+stack:
+  forge: "1.7.1"
+  solc: "0.8.36"
+---
+
+"Events are basically free, so let's emit the whole struct and let the indexer sort it out."
+
+That sentence appears in design documents constantly, and it is wrong in a way that only shows up at
+volume. It is not wrong by a factor of two. For a contract that emits a kilobyte on every call it is
+wrong by more than the cost of the call's actual logic — and because the mistake compounds per
+transaction rather than per deployment, nobody notices until the gas report on a busy day makes
+somebody ask where it all went.
+
+This lesson prices a log exactly, from the specification, and then does the only comparison that
+matters: the same value, put in three different places.
+
+## The charge, term by term
+
+The executable specification's `log_n` charges one expression, and every term in it is
+visible:<Cite src="execution-specs-osaka-log" />
+
+```python
+charge_gas(
+    evm,
+    GasCosts.OPCODE_LOG_BASE
+    + GasCosts.OPCODE_LOG_DATA_PER_BYTE * Uint(size)
+    + GasCosts.OPCODE_LOG_TOPIC * Uint(num_topics)
+    + extend_memory.cost,
+)
+```
+
+The constants, from the same fork's gas table:<Cite src="execution-specs-osaka-gas" />
+
+| Term | Constant | Value |
+|---|---|---|
+| Base, charged once per `LOG` | `OPCODE_LOG_BASE` | 375 |
+| Per topic | `OPCODE_LOG_TOPIC` | 375 |
+| Per byte of data | `OPCODE_LOG_DATA_PER_BYTE` | 8 |
+| Memory expansion, if the data buffer grows memory | `MEMORY_PER_WORD` plus a quadratic term | 3 per word, plus words²/512 |
+
+Two independent cross-checks, because gas constants circulate in stale form and a single source is
+not enough.
+
+**Measured on this machine.** Wrapping the opcodes in `gasleft()` deltas on Foundry 1.7.1 with solc
+0.8.36, optimiser off, the sequence `LOG0` → `LOG1` → `LOG2` came out at 784 → 1162 → 1540 gas: a
+clean increment of 378 per topic, of which about 3 is the extra stack work the harness itself does to
+supply the topic. The constant is 375.<Cite src="measured-gas-constants" />
+
+**Stated in a live EIP.** EIP-7708's security considerations price `LOG3` at 1500 gas while arguing
+that the proposal does not raise the worst-case log count per block.<Cite src="eip-7708" /> That is
+exactly `375 + 3 × 375`, from an author who needed the number to be right for a different argument.
+
+Three sources, one answer. Use it.
+
+## The same value, three homes
+
+Take one 32-byte value — an amount, an order id, anything that fits in a word — and price the three
+places a contract could put it. All arithmetic below is on the constants in the table
+above.<Cite src="execution-specs-osaka-gas" />
+
+**As an indexed parameter.** A non-anonymous event with one indexed parameter compiles to `LOG2`:
+topic0 for the signature, topic1 for the value, and an empty data field.
+
+```text
+375 base + 2 topics × 375 = 1,125 gas
+```
+
+**As a non-indexed parameter.** The same event with the parameter unmarked compiles to `LOG1` —
+topic0 only — with 32 bytes of data.
+
+```text
+375 base + 1 topic × 375 + 32 bytes × 8 = 1,006 gas
+```
+
+Plus memory expansion, which is 3 gas for the first fresh word and usually zero in practice because
+the compiler is writing into memory the frame has already paid to touch.<Cite src="execution-specs-osaka-gas" />
+
+**As a [storage write](/c/storage-is-the-expensive-one).** Into a slot that was previously zero and
+has not been touched this transaction, the charge is 20,000 for the set plus 2,100 for the cold-slot
+access introduced by EIP-2929:<Cite src="measured-gas-constants" /><Cite src="eip-2929" />
+
+```text
+20,000 + 2,100 = 22,100 gas
+```
+
+So the headline comparison is roughly **twenty to one**: a log carrying a word costs about a
+twentieth of creating a fresh storage slot to hold the same word. That is the number people are
+reaching for when they say events are cheap, and it is real.
+
+Now the number they are not reaching for. Overwriting a slot that is already non-zero and already
+warm costs 2,900.<Cite src="measured-gas-constants" /> Against *that* baseline, a two-topic log at
+1,125 is cheaper by a factor of about 2.6 — the same order of magnitude, not a different one. A
+contract that updates a counter it already owns and also emits an event about the update is spending
+about 28% of that pair — 1,125 out of 4,025 — on the event, which is not a rounding error in anyone's
+budget.
+
+**The right frame is not "log versus free". It is "log versus `SSTORE` versus calldata, each measured
+on your own code."** Which storage baseline applies — fresh cold slot or warm overwrite — changes the
+answer by an order of magnitude on its own, and it depends on your access pattern, not on a constant
+anyone can look up for you.
+
+<Matrix
+  numeric
+  corner="One 32-byte value, placed in…"
+  cols={['Terms', 'Gas']}
+  rows={[
+    { label: 'a data field (LOG1)', cells: ['375 + 375 + 32 × 8', { v: '1,006', tone: 'good' }] },
+    { label: 'an indexed topic (LOG2)', cells: ['375 + 2 × 375', { v: '1,125', tone: 'good' }] },
+    { label: 'a warm slot, already non-zero', cells: ['2,900', '2,900'] },
+    { label: 'a cold slot, previously zero', cells: ['20,000 + 2,100', { v: '22,100', tone: 'warn' }] },
+  ]}
+  caption="The two storage rows are an order of magnitude apart, which is why 'cheaper than storage' is not a number until you say which storage."
+  alt="One 32-byte value priced in four placements. In a log's data field with one topic it costs 375 base plus 375 for the topic plus 8 gas for each of 32 bytes, or 1,006 gas. As an indexed topic it costs 375 base plus two topics at 375, or 1,125 gas. Overwriting a warm, already non-zero storage slot costs 2,900 gas. Creating a fresh slot on a cold access costs 20,000 plus 2,100, or 22,100 gas."
+/>
+
+<Misconception
+  belief="Emitting an event is basically free, so emit generously and let consumers filter."
+  reality="Every topic costs 375, every data byte costs 8, and the base costs 375 again. A log is cheap against a fresh storage slot and only modestly cheaper than a warm overwrite."
+  why="The contrast with a cold SSTORE is so large that it reads as zero — and the cost is per emission, so it hides in the per-transaction budget rather than showing up as a line item anywhere."
+  src="yellow-paper"
+/>
+
+## Where the money actually goes: the blob
+
+The per-byte term is the one that turns a rounding error into a real number, because it is the only
+term that scales with anything a developer controls loosely.
+
+A kilobyte of data in a single log, with one topic:
+
+```text
+375 base + 375 topic + 1,024 bytes × 8 = 8,942 gas
+plus memory: 32 words × 3 + 32² ÷ 512 = 96 + 2 = 98 gas
+```
+
+Around 9,000 gas, every call. That is roughly eight `LOG2` emissions' worth, and it is the shape of
+the "emit the whole struct" decision once someone puts a dynamic array in the struct. The quadratic
+memory term is negligible at a kilobyte and stops being negligible in the tens of kilobytes, which is
+worth knowing before someone proposes logging a batch.
+
+The comparison that usually settles the design argument is with calldata, because a payload being
+logged almost always arrived as calldata first. Under the current rules a transaction's calldata is
+charged in tokens — one token per zero byte, four per non-zero byte — at 4 gas per token, with a
+floor price of 10 gas per token applied to the transaction as a whole.<Cite src="execution-specs-osaka-transactions" />
+So a non-zero byte of calldata costs 16 gas at standard pricing, and a log data byte costs 8.
+
+Read that carefully, because the intuitive conclusion is backwards. Logging is cheaper *per byte*
+than receiving — but you do not get to choose one instead of the other. If a payload came in as
+calldata and you echo it into a log, you paid 16 and then 8 for the same bytes: 24 gas per non-zero
+byte to make data that was already permanently in the transaction also appear in a receipt. Whether
+that is worth it depends entirely on whether your consumers can read calldata, which for most
+indexing setups they can, and for most contract-to-contract emissions they cannot because there was
+no calldata.
+
+<Figure
+  caption="A byte that arrives as calldata and leaves as a log is charged twice — 16 gas at the door and 8 more at the emit — for one journey."
+  alt="A non-zero calldata byte costs 16 gas of intrinsic gas to enter the transaction, where it is already provable against transactionsRoot. Echoing it into a log costs a further 8 gas per byte to place the same byte in a receipt, where a filter can find it."
+>
+  <Flow
+    nodes={[
+      { id: 'in', label: 'calldata byte', note: '16 gas at the door', col: 0, tone: 'warn' },
+      { id: 'tx', label: 'in the transaction', note: 'provable already', col: 1 },
+      { id: 'lg', label: 'echoed into a log', note: '8 more gas', col: 2, tone: 'warn' },
+      { id: 'rc', label: 'in the receipt', note: 'now filterable', col: 3, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="note">
+This is the one design question in this lesson with no general answer. Data that arrives in a
+transaction is already in the block and already provable against `transactionsRoot`; re-emitting it
+as a log buys you discoverability, not availability. Data produced *during* execution — a computed
+price, a resulting balance, an id assigned by the contract — exists nowhere else, and a log is the
+only cheap way to publish it.
+</Aside>
+
+## Removing the bloom would not make LOG cheaper
+
+Worth pre-empting, because the next lesson is about a filter that has stopped working and the obvious
+inference is wrong.
+
+Part of what a log's price has historically been paying for is the externality of polluting the
+block's bloom filter. EIP-7668, which proposes forcing those filters empty, explicitly declines to
+reduce `LOG` gas costs on the grounds that the hashing costs have gone *up* for zero-knowledge EVM
+implementations even as the bloom externality disappears.<Cite src="eip-7668" /> Whatever happens to
+the filter, assume the price stays.
+
+<Check type="predict" concept="logs-are-cheap">
+A team is designing a settlement contract that will run roughly 200,000 times a month. Each
+settlement must record: the settlement id (`bytes32`), the counterparty (`address`), the amount
+(`uint256`), and a free-form 300-byte memo supplied by the caller in calldata.
+
+Two proposals are on the table.
+
+**A.** One event, `Settled(bytes32 indexed id, address indexed counterparty, uint256 amount, bytes memo)`.
+
+**B.** The same event without the memo, plus the memo written into contract storage across ten fresh
+32-byte slots so that a later on-chain dispute function can read it.
+
+Price one settlement under each, using the constants in this lesson, and say what the difference
+buys.
+
+<Answer>
+**Proposal A.** The event has two indexed parameters, so it compiles to `LOG3` — topic0 plus two
+topics, charged at 375 base plus 375 each plus 8 per data byte.<Cite src="execution-specs-osaka-gas" /> The data field holds the ABI encoding of `(uint256 amount, bytes memo)`: one word for the
+amount, one word for the memo's offset, one word for its length, and 300 bytes of memo padded up to
+320. That is 32 + 32 + 32 + 320 = 416 bytes.
+
+```text
+375 base + 3 × 375 topics + 416 × 8 = 375 + 1,125 + 3,328 = 4,828 gas
+```
+
+Plus memory expansion for 13 words if that memory is fresh — 13 × 3 + 13² ÷ 512 = 39 + 0 = 39 gas.
+Call it roughly 4,870.
+
+**Proposal B.** The event is now `LOG3` with 32 bytes of data:
+
+```text
+375 + 1,125 + 32 × 8 = 1,756 gas
+```
+
+The storage is ten fresh slots, each 20,000 to set plus 2,100 for the cold access: 10 × 22,100 =
+221,000 gas.<Cite src="measured-gas-constants" />
+
+```text
+1,756 + 221,000 ≈ 222,800 gas
+```
+
+**The ratio is about 46 to 1**, and at 200,000 settlements a month the difference is roughly
+43.6 billion gas of monthly spend that exists solely so that contract code can read the memo back.
+
+**What it buys.** Exactly one thing: the dispute function can read the memo. That is not a small
+thing, and it is not obtainable any other way — proposal A's memo is unreadable to every contract on
+the chain forever, because [there is no log-reading instruction](/c/logs-are-write-only). The
+question the team has to answer is not "which is cheaper" but "does on-chain logic need this value".
+
+**The likely right answer, and why it is not on the list.** Store `keccak256(memo)` in one slot —
+22,100 gas — and emit the memo in the log. The dispute function then verifies a memo the disputant
+supplies as calldata against the stored commitment, which is enough for every dispute that matters
+and costs a twentieth of proposal B. That is a [commitment](/c/commitment-scheme) doing the work of
+storage, and recognising when it applies is most of what this trade-off is about.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The bloom filter**, next, is what part of the topic charge has been paying for — and the argument
+that it stopped earning its keep.
+
+**The log gas model** on the Solidity track takes these constants into the compiler's actual output:
+what `emit` costs including the memory the compiler allocates, and how that changes with the
+optimiser and via-IR.
+
+**Storage versus events** is a recurring decision for the rest of this curriculum. The rule that
+survives: values contract logic must read go in storage, values only humans and off-chain systems
+read go in logs, and a hash in storage plus the value in a log often gets you both for the price of
+the smaller one.

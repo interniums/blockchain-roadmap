@@ -1,0 +1,320 @@
+---
+id: ledgers-blocks-how-logs-become-provable
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [execution-specs-osaka-blocks, execution-specs-osaka-bloom, execution-specs-osaka-fork, eip-658, eip-2718, yellow-paper, manbytesgnu-log-bloom, eip-7668, eip-7745, eip-7773, eip-7708]
+stack: {}
+---
+
+Your service credits a user's account when a `Deposit` event fires on a contract you do not control.
+You subscribe to logs through a provider, the event arrives, you credit the account, the user
+withdraws.
+
+Now ask the uncomfortable question. What exactly did you verify before moving money?
+
+You verified that a machine at the other end of a WebSocket sent you a JSON object. That machine is
+usually honest, usually correct, and occasionally serving you a block that was reorged out ninety
+seconds ago. Nothing in the message you received distinguishes those cases.
+
+This lesson is about what exists in the header so that it *can* be distinguished — how an event that
+happened inside execution becomes a fact you can prove to somebody who never ran the block. And about
+the 256-byte object that makes searching for such events tractable while being wrong in one direction
+by design.
+
+## A receipt is the block's record of what a transaction did
+
+Execution produces two kinds of output. The state changes go into the world state and are committed
+to by the state root, which the previous lesson covered. Everything else — did it succeed, what did
+it cost, what did it announce — goes into a **receipt**.
+
+A receipt is four fields:<Cite src="execution-specs-osaka-blocks" />
+
+- **`succeeded`** — a status flag. This field used to be an intermediate state root; EIP-658 replaced
+  it with a boolean, because the root was expensive to produce and told clients less than a plain
+  success bit.<Cite src="eip-658" />
+- **`cumulative_gas_used`** — total gas consumed in the block *up to and including* this transaction.
+- **`bloom`** — a filter over this transaction's own logs. More on it below.
+- **`logs`** — the log records this transaction emitted, in order.
+
+And a log is three fields: the address of the contract that emitted it, up to four topics, and an
+arbitrary data payload.<Cite src="execution-specs-osaka-blocks" /> The topic/data split is the ABI's
+doing — indexed event parameters become topics, the rest become data — and Track 01 covered why the
+first topic is normally the keccak of the event signature.
+
+<Aside kind="warn">
+`cumulative_gas_used` is cumulative, not per-transaction. The gas your transaction actually used is
+the difference between its receipt's value and the previous receipt's — and for index 0 it is the
+value itself. Cost-attribution code that reads the field directly overstates every transaction in the
+block except the first, and the error grows with position, so it looks like a plausible gas trend
+rather than a bug.
+</Aside>
+
+Receipts go into an index-keyed trie exactly like transactions: key `rlp(index)`, value the encoded
+receipt, and the root of that trie is the header's receipts root.<Cite src="yellow-paper" /> Since
+typed transactions, a receipt for a typed transaction is serialised with the transaction's type byte
+in front of the RLP, mirroring the transaction envelope
+format.<Cite src="execution-specs-osaka-blocks" /><Cite src="eip-2718" /> If you are building the
+trie yourself and your root is wrong for a modern block, that missing prefix byte is the first place
+to look.
+
+## What the receipts root actually buys
+
+Here is the payoff, and it is worth stating as a single sentence you can carry around.
+
+**A Merkle proof against the receipts root, plus a header you already trust, establishes that a
+specific log was emitted by a specific transaction at a specific position in a specific block — to a
+verifier who has none of the block's data and did not execute anything.**
+
+Walk it as a procedure, because the steps each do a distinct job.
+
+**Subgoal: get an anchor you did not have to trust anyone for.** The verifier needs the block's
+header, and needs it from somewhere other than the party making the claim. A light client following
+the header stream has it. A contract holding a recent beacon block root can get to it. A bridge
+contract that has been fed and verified headers has it. Without this step nothing else means
+anything, because every subsequent check is *against* this header.
+
+**Subgoal: turn the claim into a trie key.** The claim is "transaction at index `i` produced this
+log". The trie key is `rlp(i)`. Note that the index is part of the claim, not a lookup detail — the
+proof establishes position, because position is the key.
+
+**Subgoal: supply the path.** The prover hands over the [node list](/c/mpt-proof-is-node-list) from
+the root down to the leaf at that key. The verifier hashes each node, checks each child reference
+matches, and confirms the top node hashes to the receipts root in the header. This is ordinary
+Merkle-Patricia proof verification from Track 01, with nothing special about receipts.
+
+**Subgoal: decode and bind.** The leaf is the encoded receipt. Strip the type byte if present,
+RLP-decode, take `logs[j]`, and check its `address` is the contract you care about and its `topics`
+are the event you care about. Skipping this step is how a proof of *a* log gets accepted as proof of
+*the* log.
+
+Five inputs, no trust in the prover, and the only thing the verifier had to obtain independently was
+32 bytes.
+
+<Figure
+  caption="Position is not metadata attached to the proof — it is the key the leaf sits at, so proving the receipt proves the index."
+  alt="A path from the receipts root down to the leaf stored at key rlp(i): at each level the off-path sibling node is supplied by the prover and hashed, and the leaf decodes into the receipt's four fields, one of which is the logs array containing the log being claimed."
+>
+  <Tree
+    root={{
+      label: 'receiptsRoot',
+      note: 'from a header you trust',
+      tone: 'accent',
+      children: [
+        { label: 'sibling', note: 'supplied, hashed', tone: 'muted', dashed: true },
+        {
+          label: 'branch node',
+          children: [
+            { label: 'sibling', note: 'supplied, hashed', tone: 'muted', dashed: true },
+            {
+              label: 'leaf at rlp(i)',
+              note: 'the encoded receipt',
+              tone: 'accent',
+              children: [
+                { label: 'succeeded', tone: 'muted' },
+                { label: 'cumulativeGas', tone: 'muted' },
+                { label: 'bloom', tone: 'muted' },
+                { label: 'logs[j]', note: 'address + topics', tone: 'accent' },
+              ],
+            },
+          ],
+        },
+      ],
+    }}
+  />
+</Figure>
+
+### What the proof does not tell you
+
+It tells you the log is in *that block*. It says nothing about whether that block is on the canonical
+chain, and nothing about whether it is final.
+
+This is the single most expensive omission in the bridge and oracle literature. A perfectly valid
+receipt proof against a header that was later reorged out proves an event that, as far as the network
+is now concerned, never happened. The proof does not become invalid — the block still exists, its
+receipts root still commits to that log — it just stops being about the history everyone else agrees
+on.
+
+So a complete verification is two independent checks: *this log is in this block* (a Merkle proof)
+and *this block is in the history I accept* (a finality or confirmation-depth check). The second one
+is the subject of a later module, and the reason it gets its own module is that people keep shipping
+only the first.
+
+## The bloom filter: an index that is allowed to lie one way
+
+Proving a specific log is one problem. *Finding* logs is a different one, and it is the problem the
+header's bloom filter exists for.
+
+Consider what an event scan would cost without one. To answer "did any block in this range emit
+`Transfer` from this address", a client would have to fetch every block's receipts and look. The
+bloom exists so that most blocks can be eliminated without fetching anything at all.
+
+### How it is built
+
+The construction is small enough to hold entirely in your head, and the specification is the clearest
+statement of it.
+
+The filter is a 256-byte array — 2048 bits, all zero to start. For every log in the block, the
+emitting **address** is added, and then **each topic** is added. Adding an entry means: take
+`keccak256(entry)`, take the first three 16-bit words of the digest, mask each down to its low 11
+bits, and set the bit at that index.<Cite src="execution-specs-osaka-bloom" /> Eleven bits address
+exactly 2048 positions, which is where the filter's size comes from.
+
+Three bits set per entry, three hash functions, one 2048-bit filter — this is a textbook Bloom filter
+with the hash functions carved out of a single keccak digest rather than computed
+separately.<Cite src="manbytesgnu-log-bloom" />
+
+<Figure
+  caption="Thirty-three of a digest's 256 bits reach the filter — eleven from each of the first three 16-bit words, and nothing else."
+  alt="The keccak digest of an address or topic, split into three 16-bit words followed by the remaining 208 bits. Each of the first three words contributes its low 11 bits as a position in the 2048-bit filter; the remaining 208 bits are never consulted."
+>
+  <ByteLayout
+    unit="bits"
+    caption="keccak256(address or topic)"
+    fields={[
+      { label: 'word 0', size: 16, tone: 'accent', note: 'low 11 bits used' },
+      { label: 'word 1', size: 16, tone: 'accent', note: 'low 11 bits used' },
+      { label: 'word 2', size: 16, tone: 'accent', note: 'low 11 bits used' },
+      { label: 'rest of the digest', size: 208, tone: 'muted', note: 'never consulted' },
+    ]}
+  />
+</Figure>
+
+There are two levels of it. Each receipt carries a bloom over its own transaction's logs, and the
+header's bloom covers every log in the block.<Cite src="execution-specs-osaka-fork" /> Because adding
+an entry only ever sets bits and never clears them, the block-level filter is exactly the union of
+the receipt-level ones — a detail that lets a client narrow from block to transaction with the same
+mechanism.
+
+### The asymmetry, and why it is the whole point
+
+Bits are only ever set, never cleared. Therefore:
+
+- **A miss is conclusive.** If any of an entry's three bits is zero in the block's filter, that entry
+  was definitively not added, so no log in that block carried that address or that topic. You can
+  skip the block without fetching one byte of its body.
+- **A hit is a maybe.** The three bits could have been set by three unrelated entries. You have
+  learned only that the block is worth downloading.
+
+Every log-scanning system is built on that asymmetry, whether or not its authors know it. `eth_getLogs`
+is not a database query against an index of events; it is a bloom scan over headers followed by
+receipt fetches on the hits followed by exact filtering. That is why a wide block range is slow in
+proportion to the range rather than to the number of matches, why providers cap ranges, and why the
+same query is fast on a quiet contract and slow on a busy one.
+
+<Misconception
+  belief="A bloom hit means the event is in that block."
+  reality="It means the event's address and topics might be in that block. You must fetch the receipts and check exactly. A miss, by contrast, is proof of absence."
+  why="The filter is described as a 'log filter', and filters in every other context return matches. The false-positive behaviour is invisible until an indexer built on hits alone starts producing phantom events."
+  src="execution-specs-osaka-bloom"
+/>
+
+### The filter degrades as the chain gets busier, and the arithmetic is unforgiving
+
+Two constants are fixed for all time: 2048 bits, three bits per entry.<Cite src="execution-specs-osaka-bloom" />
+The number of entries per block is not fixed — it grows with how much the chain is used, and every
+log contributes one entry for its address plus one per topic.
+
+The standard Bloom-filter estimate applies. With `m` bits, `k` bits set per entry, and `n` entries,
+the expected fraction of set bits is `1 - e^(-kn/m)`, and the false-positive rate is that fraction
+raised to the power `k`. Put the protocol's constants in — `m = 2048`, `k = 3` — and a block with
+around 500 entries has roughly half its bits set, which puts the false-positive rate near one in
+seven. That number is arithmetic on the two constants above, not a measurement; run it for your own
+blocks with real entry counts before quoting it.
+
+The direction, though, is not in doubt: a fixed-size filter with a growing population saturates, and
+a saturated filter eliminates nothing. That is why proposals to replace it keep appearing.
+
+### What is actually happening to the bloom
+
+The status here is worth getting right, because the ecosystem's summary of it has been wrong for a
+while.
+
+Two proposals target the filter. EIP-7668 would remove blooms outright, forcing them
+empty.<Cite src="eip-7668" /> EIP-7745 would replace them with a light-client-friendly, provable log
+and transaction index.<Cite src="eip-7745" /> As of 26 August 2026, EIP-7668 is marked **Stagnant**,
+EIP-7745 is **Draft**, and the Glamsterdam meta EIP lists *both* under **Declined for
+Inclusion**.<Cite src="eip-7773" /> The meta EIP is itself a Draft with no activation epoch on
+mainnet, so even its declinations are not final — but "the bloom is being removed in the next fork"
+is not a claim any current document supports.
+
+Something adjacent *is* scheduled. EIP-7708 would make every non-zero ETH transfer emit a log, so
+that ETH movement becomes traceable through the same mechanism as ERC-20 movement; it is in Review
+and listed as scheduled for Glamsterdam.<Cite src="eip-7708" /><Cite src="eip-7773" /> If it ships,
+log volume goes up, which pushes on the saturation arithmetic above from the other side.
+
+<Check type="spot-bug" concept="logs-bloom">
+An engineer on your team ships an indexer that reconstructs token balances from `Transfer` events.
+The hot path is:
+
+```js
+for (const header of headers) {
+  if (!bloomMayContain(header.logsBloom, TRANSFER_TOPIC)) continue;
+  if (!bloomMayContain(header.logsBloom, tokenAddress)) continue;
+  const receipts = await provider.getBlockReceipts(header.number);
+  for (const r of receipts)
+    for (const log of r.logs)
+      if (log.topics[0] === TRANSFER_TOPIC) applyTransfer(log);
+}
+```
+
+It runs clean in testing against a fork of mainnet. In production it reports balances that drift
+upward over time for a handful of tokens, and the drift never corrects itself.
+
+Find the defect. Then say which of the two bloom checks is load-bearing and which is an
+optimisation, and whether the `continue` can ever skip a block it should not have.
+
+<Answer>
+**The defect is in the inner loop, not the bloom.** The bloom checks correctly narrow to candidate
+blocks. But once the receipts are fetched, the code filters on `topics[0]` alone and never checks
+`log.address`. Any contract can emit a log whose first topic is the `Transfer` signature hash —
+there is no protocol-level ownership of a topic value. So every unrelated token's transfers, and
+every deliberate impostor's, get applied to the balances of `tokenAddress`. That is the upward drift,
+and it never corrects because nothing ever removes the bogus credits.
+
+This is the "decode and bind" step from earlier in the lesson, skipped. The bloom told you the block
+*might* contain something relevant; only an exact check on address *and* topics establishes that a
+particular log is the one you meant.
+
+**Which check is load-bearing.** Neither, for correctness — both are pure optimisations, and deleting
+both leaves the indexer just as correct and much slower. That is the right way to hold it: the bloom
+never contributes to correctness in either direction, because a hit proves nothing and a miss only
+saves work. Correctness lives entirely in the exact filter after the fetch. An indexer whose
+correctness depends on a bloom result is already wrong.
+
+**Can the `continue` skip a block it should not?** No, and this is the one guarantee the bloom does
+give. A miss is conclusive: bits are only ever set, so if any of the three bits for an entry is zero,
+that entry was never added to this block's filter. Skipping on a miss cannot lose a real event —
+provided `bloomMayContain` implements the derivation correctly, taking the low 11 bits of each of the
+first three 16-bit words of the keccak digest. An implementation that took the wrong three words, or
+masked to the wrong width, would produce false *negatives*, and those are silent and unrecoverable.
+That function deserves a test against a block whose logs you already know.
+
+**Second-order note.** Two separate `bloomMayContain` calls, each passing on a hit, is not the same
+as asking whether one log carried both the address and the topic. The filter has no notion of which
+entries came from the same log — it is a flat union of every address and every topic in the block. A
+block where contract A emitted `Transfer` and contract B (your token) emitted something else passes
+both checks. Harmless here, since it only costs a fetch, but worth understanding before anyone tries
+to build a stronger inference out of a bloom hit.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Bridges and cross-chain messaging** are receipt proofs with a finality check bolted on. Once you
+can state the two halves separately, most bridge designs become readable and most bridge failures
+become classifiable.
+
+**Any indexer you build or debug.** Knowing that `eth_getLogs` is a bloom scan explains the shape of
+its latency, the provider range caps, and why an events-only reconstruction of state can be both
+cheap and subtly incomplete.
+
+**The next lesson** is the incompleteness case in its purest form: a category of balance change that
+emits no log, produces no receipt, and has no transaction hash — and which, by the admission of the
+very EIP designed to make all ETH movement loggable, still has no natural place to be logged.
+
+**Light clients** are where the bloom's successor will come from, if it ever arrives. The whole
+motivation for a replacement index is to make the log layer provable end to end, rather than provable
+only for someone who already holds a header and can be handed receipts on
+request.<Cite src="eip-7745" />

@@ -1,0 +1,347 @@
+---
+id: altvm-solana-accounts-everything-is-an-account
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solana-docs-accounts, solana-docs-account-structure, solana-docs-account-types, solana-docs-account-modification-rules, solana-docs-account-runtime, solana-docs-constants-reference, solana-sealevel-note, solana-program-token, solana-program-ata, chainstack-solana-architecture, quicknode-solana-for-evm-devs, measured-gas-constants, eip-2929]
+stack: {}
+---
+
+Ask two chains the same question: *how many USDC does this wallet hold?*
+
+On Ethereum you call the token contract. `balanceOf(addr)` runs inside the contract, which computes
+a slot from the key and the mapping's position and does one `SLOAD`. The number lives at a location
+that only that contract's code knows how to compute and only that contract's code is allowed to
+read. You reach it by asking the contract, because there is no other way to reach it.
+
+On Solana you do not call anything. The balance is a separate account, at its own address, and you
+fetch it the way you would fetch a wallet: one `getAccountInfo` on that address. The token program
+is not invoked. It is not consulted. It does not need to be running, and it does not need to exist
+for the read to succeed.
+
+That is the whole contrast of this track in one comparison, and everything else in Track 12 is a
+consequence of it. This lesson makes it precise: what an account actually is, which field does the
+work, and why the instinct to map storage slots onto accounts produces bad Solana code every time.
+
+## The unit of state is a whole record, not a cell
+
+Start with the data structure, because it is smaller than you expect.
+
+The network stores all state in a key-value store where each key is a 32-byte address and each
+value is an account.<Cite src="solana-docs-accounts" /> That address is displayed as a
+base58-encoded string, and it is one of two things: an Ed25519 public key, which has a
+corresponding private key, or a program derived address, which deliberately does
+not.<Cite src="solana-docs-account-structure" /> The second kind is the subject of the next lesson.
+
+Every account — every single one, with no exceptions and no subtypes — has the same five
+fields:<Cite src="solana-docs-account-structure" />
+
+<Matrix
+  corner="Field"
+  cols={['Type', 'What it is']}
+  rows={[
+    { label: <code>lamports</code>, cells: [<code>u64</code>, 'Balance. 1 SOL = 1,000,000,000 lamports.'] },
+    { label: <code>data</code>, cells: ['byte vector', 'Account state, or program bytecode. Max 10 MiB.'] },
+    { label: <code>owner</code>, cells: [<code>Pubkey</code>, { v: 'The program allowed to write this account.', tone: 'accent' }] },
+    { label: <code>executable</code>, cells: [<code>bool</code>, { v: 'True means this account holds a program.', tone: 'accent' }] },
+    { label: <code>rent_epoch</code>, cells: [<code>Epoch</code>, { v: <>Deprecated. Set to the maximum <code>u64</code> value.</>, tone: 'muted' }] },
+  ]}
+  caption="The same five fields describe a wallet, a token balance and a program. Only the two shaded ones tell them apart."
+  alt="Five account fields: lamports, a u64 balance where 1 SOL is 1,000,000,000 lamports; data, a byte vector of at most 10 MiB holding state or bytecode; owner, a Pubkey naming the program allowed to write the account; executable, a bool that is true for programs; and rent_epoch, deprecated and set to the maximum u64."
+/>
+
+Two of those five will look familiar and three will not. Note what is *absent*: there is no code
+hash, no storage root, no nonce. An Ethereum account carries a pointer into a per-account storage
+trie, and that pointer is what makes contract storage a private sub-namespace. There is nothing
+here to hold such a pointer, because there is no such sub-namespace to point into. An account holds
+an opaque byte array and that is the end of it.
+
+The size limit on that byte array is a hard runtime constant: `MAX_ACCOUNT_DATA_LEN`, 10 MiB or
+10,485,760 bytes, with growth capped at 10,240 bytes per instruction and 20 MiB per
+transaction.<Cite src="solana-docs-constants-reference" /> A contract's storage on Ethereum has no
+size ceiling at all — you write slots until you run out of ether. The two designs disagree about
+whether an individual state object should be bounded, and lesson three explains why Solana thinks it
+should.
+
+<Aside kind="note">
+`rent_epoch` is on that list only because removing a field from a serialized struct is a hard fork.
+It once tracked when an account would next have lamports deducted to pay for its storage. Rent
+collection is gone, so the field is now a constant. Lesson three deals with what replaced it, and
+why the replacement is a deposit rather than a fee.
+</Aside>
+
+## The field that carries the whole security model
+
+Of the five fields, `owner` is the one that changes how you have to think.
+
+The owner is the program id of the program that governs the account. The rules the runtime enforces
+around it are short enough to quote in full:<Cite src="solana-sealevel-note" />
+
+- Programs can only change the data of accounts they own.
+- Programs can only debit accounts they own.
+- Any program can credit any account.
+- Any program can read any account.
+
+That list is from the 2019 design note, and the current runtime documentation states the same rules
+as enforcement points with specific error codes. Only the owner can modify data
+(`ExternalAccountDataModified`), only the owner can debit lamports
+(`ExternalAccountLamportSpend`), only the owner can resize data (`AccountDataSizeChanged`), and the
+lamport ledger must balance across an instruction or the transaction fails with
+`UnbalancedInstruction`.<Cite src="solana-docs-account-modification-rules" /> Ownership itself can be
+handed over, but only by the current owner, only on a writable account, and only when the data has
+been zeroed first — otherwise `ModifiedProgramId`.<Cite src="solana-docs-account-modification-rules" />
+
+Read the third and fourth rules again, because they are the ones without an EVM analogue.
+
+**Any program can read any account.** There is no `private` on Solana in the sense Solidity means
+it. Not "private is not confidential because the chain is public" — that caveat you already know.
+This is stronger: another *program*, mid-execution, can read your account's bytes as easily as an
+indexer can. Confidentiality was never on the table, so nothing in the design pretends otherwise.
+
+**Any program can credit any account.** You cannot prevent lamports arriving. The runtime's
+ownership check on `set_lamports` applies only when the new balance is *lower* than the current one;
+crediting needs no ownership at all, only that the account be
+writable.<Cite src="solana-docs-account-modification-rules" /> A Solidity contract without a
+`receive` function rejects plain ether transfers. No Solana account can refuse lamports.
+
+<Misconception
+  belief="An account address identifies code, the way a contract address does."
+  reality="Almost every account on Solana holds only data. Code lives in a separate account with executable = true, and the data account merely names it in the owner field."
+  why="On Ethereum an address either has code or it does not, and that is the entire taxonomy. The word 'address' carries that binary with it."
+  src="chainstack-solana-architecture"
+/>
+
+## A taxonomy the EVM does not have
+
+The `executable` flag splits every account into exactly two categories, and that split is what makes
+the model work: a program is deployed once and can manage any number of data
+accounts.<Cite src="solana-docs-account-types" />
+
+<Figure
+  caption="Nothing here is a subtype. It is one record type, read through two of its own fields."
+  alt="A tree: one account record splits on executable equals true into a program account owned by a loader and a program data account holding the bytecode, and on executable equals false into a system account owned by the System Program, a data account owned by the governing program, and a sysvar at a fixed address."
+>
+  <Tree root={{
+    label: 'one account', note: 'the same five fields', tone: 'accent',
+    children: [
+      { label: 'executable = true', tone: 'muted', children: [
+        { label: 'program', note: 'owned by a loader' },
+        { label: 'program data', note: 'loader-v3 bytecode' },
+      ] },
+      { label: 'executable = false', tone: 'muted', children: [
+        { label: 'system', note: 'owner = System Program' },
+        { label: 'data', note: 'owner = its program' },
+        { label: 'sysvar', note: 'fixed address' },
+      ] },
+    ],
+  }} />
+</Figure>
+
+**Program accounts** have `executable = true` and hold sBPF bytecode. Every one of them is owned by
+a *loader* program — one of the BPF Loader family or Loader V4 — rather than by a user or by
+itself.<Cite src="solana-docs-account-types" /><Cite src="solana-docs-constants-reference" /> Under
+loader-v3 the program account's data does not even hold the bytecode: it points at a separate
+program *data* account that does.<Cite src="solana-docs-account-types" /> So the thing you call "the
+program" is often two accounts, and the address you invoke is the one that does not contain the
+code.
+
+**Data accounts** have `executable = false` and hold program-defined state. Creating one takes two
+steps that never merge: the System Program creates the account and assigns ownership to the target
+program, and then the owning program initializes the
+data.<Cite src="solana-docs-account-types" /> Ownership assignment is a distinct operation from
+creation.<Cite src="solana-sealevel-note" />
+
+**System accounts** are accounts that stayed owned by the System Program after creation. Sending SOL
+to a fresh address creates one.<Cite src="solana-docs-account-types" /> Your wallet is this — not a
+special kind of entity, just an account with an empty data field owned by the System Program.
+
+**Sysvars** are read-only accounts at fixed addresses that expose cluster state — `Clock` at
+`SysvarC1ock11111111111111111111111111111111`, `Rent`, `EpochSchedule`, `SlotHashes`,
+`Instructions`, and a handful more.<Cite src="solana-docs-account-types" /> This is the piece that
+tends to land last for EVM developers. `block.timestamp` is not an opcode here. The current time is
+an account, and if your instruction wants it, the account has to be in the transaction's account
+list like everything else.
+
+## Now break the instinct
+
+You have been mapping this onto storage slots since the first paragraph. Name the mapping precisely,
+so you can see where it fails.
+
+Take `mapping(address => uint256) balances` in a Solidity contract. The slot for a given key is
+derived by hashing the key against the mapping's declared position — a computation you have already
+met in [mapping slot derivation](/c/mapping-slot-derivation). Three properties of that arrangement
+matter here:
+
+1. **The location is computed inside the contract.** The contract knows the mapping's slot number
+   because it declared it; nobody else needs to.
+2. **The location is inside the contract's own namespace.** Slot 7 of contract A and slot 7 of
+   contract B are unrelated storage, in different tries, under different account roots.
+3. **The contract decides at runtime which slots to touch.** `balances[msg.sender]` picks a slot
+   from a value that does not exist until the call is running.
+
+Now the Solana version. The per-user balance is its own account, at its own global address, owned by
+the token program, sitting outside it. Each of the three properties inverts:
+
+1. **The address is computed by the client**, before the transaction is built, and handed to the
+   program.
+2. **The address is in one global namespace** shared by every account on the chain. There is no
+   "inside contract A".
+3. **The program cannot decide at runtime which account to touch**, because the accounts arrived
+   with the instruction. This is the constraint that lesson four is about, and it is the single
+   biggest source of "why is this so awkward" when porting.
+
+<Misconception
+  belief="Solana accounts are just storage slots with a different name."
+  reality="A storage slot is addressable only through its contract and is chosen by the contract while it runs. An account is addressable globally, is chosen by the caller, and is handed to the program as an argument."
+  why="Both are 'where the numbers live', so the difference in who picks them and who can reach them is easy to miss until it produces a bug."
+  src="solana-sealevel-note"
+/>
+
+The practical consequence is the one this module's note leads with: **rewriting a Solidity contract
+one instruction at a time produces bad Solana code.** Not slower code — wrongly shaped code. The
+EVM's storage is private to the contract, so a Solidity data model can be as dynamic as it likes.
+Solana's storage is addressed globally and declared up front, so a data model that cannot be
+enumerated before execution cannot be expressed at all. The redesign is not stylistic. It is forced
+by where the state lives.<Cite src="quicknode-solana-for-evm-devs" />
+
+## What globally-addressed state buys
+
+Two things, and both are worth real money in production.
+
+**Reads do not need the program.** Any client can fetch any account by address and deserialize it —
+the docs describe reading account data as exactly two steps, fetch by address then deserialize the
+bytes into the program-defined structure.<Cite src="solana-docs-account-structure" /> No `eth_call`,
+no ABI-encoded selector, no execution. The chain's RPC surface serves state directly because state
+is a first-class addressable object rather than a private detail of some code.
+
+**State is enumerable by shape.** Because every SPL token account is a separate account owned by the
+token program, `getProgramAccounts` with a `dataSize` filter of 165 selects every token account on
+the chain, and a `memcmp` filter on the first bytes narrows that to a single
+mint.<Cite src="solana-program-token" /> Sit with that for a second. A single RPC call enumerates
+every holder of a token, filtered server-side, with no indexer, no event log replay and no archive
+node. The EVM's equivalent — reconstruct balances by replaying every `Transfer` event since
+deployment — exists only because balances are not addressable.
+
+That is also why address derivation had to become a convention. A wallet may hold arbitrarily many
+token accounts for the same mint, which makes it hard for anyone else to know where to send
+tokens.<Cite src="solana-program-ata" /> The Associated Token Account program fixes one canonical
+address per wallet-and-mint pair, derived deterministically from the wallet address, the token
+program id and the mint.<Cite src="solana-program-ata" /> Note the shape of that fix: global
+addressability creates the question "which of these accounts is the real one", and the answer is a
+derivation rule everyone agrees to compute the same way. The next lesson is the mechanism underneath
+it.
+
+## What it costs
+
+Here is the bill, and it is the reason the security module later in this track exists.
+
+When a program runs, the runtime serializes each account into a flat buffer and hands it over. The
+layout is public: for every account, one byte marking whether it is a duplicate, one byte
+`is_signer`, one byte `is_writable`, one byte `executable`, then the 32-byte key, the 32-byte owner,
+the lamports, the data length, and the data itself.<Cite src="solana-docs-account-runtime" />
+
+Look at what is in that buffer and what is not. The runtime tells your program the account's key,
+its owner, and whether it was signed and writable. The runtime does **not** tell your program
+whether this is the *right* account. It cannot: it has no idea what your instruction means.
+
+So the guarantee is narrow: you may not write to accounts you do not own, and the signatures on the
+transaction are valid.<Cite src="solana-docs-account-modification-rules" /> Everything else — is this
+the vault for *this* user, is this mint the one this pool was configured with, is this "admin"
+account really the admin — is a check your program performs or does not. The caller chose every
+account in the list, and a caller who wants your program to do something wrong will choose
+accordingly.
+
+On the EVM you rarely think about this, because the slot for `balances[msg.sender]` is derived from
+a value the EVM guarantees. Here the equivalent value is passed in. That shift — from *the machine
+computes the location* to *the caller supplies the location* — is where most of Solana's historical
+vulnerability classes come from, and [three questions per account](/c/three-questions-per-account)
+is the discipline that answers it.
+
+<Check type="explain" concept="state-externalized">
+A Solidity contract holds `mapping(address => Position) positions`, and a function
+`closePosition()` that reads `positions[msg.sender]`, computes a payout, zeroes the struct and
+transfers tokens out.
+
+You are told to describe the Solana equivalent. Answer three things:
+
+1. Which accounts exist, and who owns each?
+2. What replaces `msg.sender` as the thing that selects the right position?
+3. Name one check the Solidity version gets for free that the Solana version has to perform
+   explicitly, and say what happens if it is omitted.
+
+<Answer>
+**1 — the accounts.** At minimum: the user's signing account (a system account, owned by the System
+Program); a position account holding what the `Position` struct held, owned by your program; a
+vault token account holding the payout funds, owned by the token program; the destination token
+account, also owned by the token program; and the token program itself, which is a program account
+with `executable = true` owned by a loader.<Cite src="solana-docs-account-types" /> The mapping does
+not survive as an object. It becomes one account per entry, each with its own global address, each
+paid for separately.
+
+**2 — what replaces `msg.sender`.** Nothing replaces it as a *lookup key*, because there is no
+lookup. The client computes the position account's address before building the transaction and puts
+it in the account list; the program receives it as an argument. `msg.sender` also had a second job —
+proving who is asking — and that job is done by the `is_signer` byte the runtime sets on the
+account when the transaction carried a valid signature for it.<Cite src="solana-docs-account-runtime" />
+Those two jobs were fused in Solidity and are separate here, which is precisely why they can be got
+wrong independently.
+
+**3 — the free check.** In Solidity, `positions[msg.sender]` *cannot* return another user's
+position: the location is derived from a value the EVM computed and the slot lives in a namespace
+only this contract can reach. On Solana the program is handed a position account and must prove for
+itself that (a) its owner is this program — otherwise an attacker supplies an account they control
+with fabricated bytes<Cite src="solana-docs-account-modification-rules" /> — and (b) it is the
+position belonging to the signer, not somebody else's position that happens to be the right type and
+the right owner.
+
+Omit (a) and an attacker fabricates a payout of any size. Omit (b) and any signer can close any
+user's position and take the proceeds. Both are one missing `if`, and both are among the
+vulnerability classes catalogued for this runtime — see
+[missing owner check](/c/missing-owner-check) and [account substitution](/c/account-substitution).
+
+**The point to carry forward.** Externalising state does not delete the authorization work the EVM
+was doing. It moves it out of the machine and into your program, where it becomes visible, cheap to
+skip, and yours.
+</Answer>
+</Check>
+
+## One more difference worth pricing
+
+You know the EVM's state-access costs precisely: a cold `SLOAD` is 2,100 gas, a warm one 100, and an
+`SSTORE` into a zero slot is 20,000 plus the cold
+surcharge.<Cite src="measured-gas-constants" /><Cite src="eip-2929" /> Those numbers do not transfer,
+and not because Solana's are different.
+
+Solana does not meter gas. It meters **compute units**, a separate unit with its own budget, its own
+defaults and its own failure mode, and there is no exchange rate between the two. Reading an
+account's bytes is not a metered state-access opcode at all: the account was already loaded into
+memory before your program started. Nothing on Solana corresponds to `COLD_SLOAD_COST`, because
+nothing on Solana discovers state mid-execution.
+
+Carry the *habit* of pricing state access across from Track 02. Do not carry a single number. The
+parallel-execution module later in this track supplies the real units.
+
+## What this unlocks
+
+You now have the one substitution that the rest of Track 12 rests on: **where an EVM contract has a
+private storage trie, a Solana program has a set of accounts it happens to own, sitting in the same
+global namespace as everything else.**
+
+Three things follow immediately, one per remaining lesson in this module.
+
+**If state is outside the program, the program holds nothing.** So how does a program get state that
+only it can control, at an address a client can compute offline, when it has no keypair to sign
+with? That is [the PDA](/c/pda), and it is the next lesson.
+
+**If every state object is an account with a size, somebody pays for the bytes.** Ethereum charges
+once at write time and stores forever; Solana takes a refundable deposit sized to the data. Lesson
+three.
+
+**If the caller supplies the accounts, the caller must list them.** That list is the input to the
+scheduler, and it is why two transactions can run at the same time here and cannot there. Lessons
+four and five.
+
+And the first crack in the larger claim this track makes: contract storage is not a law of nature.
+It is a decision to keep state private to the code that owns it, and a chain that decided otherwise
+gets different properties and different bugs.

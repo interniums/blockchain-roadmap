@@ -1,0 +1,332 @@
+---
+id: evm-opcodes-memory-calldata-paid-at-the-door
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    yellow-paper,
+    execution-specs,
+    eip-211,
+    eip-2028,
+    eip-7623,
+    eip-7976,
+    eip-5656,
+    solidity-layout-calldata,
+    solidity-layout-memory,
+    solidity-docs-types,
+    solidity-abi-spec,
+  ]
+stack:
+  solc: "0.8.36"
+---
+
+A contract exposes `submit(bytes32[] proof, address to, uint256 amount)`. Someone changes one word in
+the signature — `bytes32[] memory` becomes `bytes32[] calldata` — and the function gets 8,000 gas
+cheaper on a typical proof. No logic changed. No optimiser setting changed.
+
+The same week, a different contract receives a call whose payload is thirty-six bytes shorter than a
+correct one. It does not revert. It decodes cleanly, with the missing argument reading as zero, and
+transfers to the zero address.
+
+Both of these are calldata behaving exactly as specified. The first is about where its price is
+charged; the second is about what happens when you read past its end. This lesson is about both, and
+they combine into the single highest-leverage keyword decision in a Solidity function signature.
+
+## What calldata is, at the machine level
+
+Calldata is the byte array supplied to the current frame as input. There is `CALLDATASIZE` to ask how
+long it is, `CALLDATALOAD` to read a word from an offset, and `CALLDATACOPY` to copy a range into
+memory.<Cite src="yellow-paper" />
+
+There is no instruction that writes to it. Not an expensive one, not a restricted one — the
+instruction does not exist.<Cite src="execution-specs" /> Calldata is the one location that is
+genuinely immutable for the duration of the frame, which is why the compiler can hand you a
+`calldata` reference without copying and still guarantee nobody mutates it underneath you.
+
+Two things follow that people commonly get backwards.
+
+**Where it comes from depends on the frame.** For the outermost frame, calldata is the transaction's
+`data` field. For an inner frame, it is a range of the *caller's memory*, named by the offset and
+length operands of the `CALL`.<Cite src="execution-specs" /> Same location, two different origins,
+two completely different cost stories — which is the subject of the pricing section below.
+
+**Reading past the end is not an error.** `CALLDATALOAD` at an offset beyond the array returns a word
+that is zero-padded, and `CALLDATACOPY` zero-fills the part of the destination that has no source
+bytes.<Cite src="yellow-paper" /><Cite src="execution-specs" /> No exception, no revert, no signal.
+
+## The zero-padding is a security property, not a convenience
+
+That second behaviour is worth dwelling on, because it is the mechanism behind the second incident in
+the opening.
+
+The ABI lays arguments out as 32-byte words.<Cite src="solidity-abi-spec" /> A decoder that wants the
+third argument reads the word at offset `4 + 64`. If the payload is only `4 + 64` bytes long, that
+read succeeds and yields zero. The decoder has no way to notice from the read itself that it invented
+the value.
+
+<Figure
+  caption="The payload stops at byte 68 and the read at byte 68 still succeeds, so the third argument arrives well-formed and invented."
+  alt="A 68-byte calldata payload holding a four-byte selector and two 32-byte words. The decoder reads a third word at offset 68, past the end of the payload, and that read returns zero-padded bytes rather than raising an exception."
+>
+  <ByteLayout
+    offsets
+    caption="a 68-byte payload, as a three-argument decoder reads it"
+    fields={[
+      { label: 'selector', size: 4, tone: 'accent', note: 'sent' },
+      { label: 'proof offset', size: 32, note: 'sent' },
+      { label: 'to', size: 32, note: 'sent' },
+      { label: 'amount', size: 32, tone: 'danger', note: 'never sent — reads as zero' },
+    ]}
+  />
+</Figure>
+
+So a call carrying a short payload decodes as a *valid* set of arguments in which the missing ones are
+zero. `address(0)`, `0`, `false`, an empty array — all perfectly well-formed, all fabricated. The only
+defence is checking the length, which is why a correct ABI decoder validates `CALLDATASIZE` rather
+than relying on the read to fail.<Cite src="solidity-abi-spec" /> Solidity's generated decoder does
+this. Hand-written assembly that reads `calldataload(4)` directly does not, unless you write the
+check.
+
+<Misconception
+  belief="Reading past the end of calldata reverts."
+  reality="It returns zeros. CALLDATALOAD zero-pads and CALLDATACOPY zero-fills, so a call with a truncated payload decodes as a complete set of arguments that happen to all be zero."
+  why="The obvious analogy is RETURNDATACOPY, which does fail — EIP-211 specifies that reading beyond the return data buffer's size stops the call in an out-of-gas condition. The two opcodes were designed in the same nibble block with deliberately similar semantics, so the asymmetry reads as an oversight rather than the intentional difference it is."
+  src="eip-211"
+/>
+
+The asymmetry is real and worth memorising as a pair, because it has produced bugs in both
+directions. EIP-211 states it precisely: accessing the return data buffer beyond its size stops the
+current call in an out-of-gas condition — reading zero bytes from the end of the buffer reads zero
+bytes, but reading zero bytes from one byte past the end raises an
+exception.<Cite src="eip-211" /> [Return data](/c/returndata-buffer) fails loudly. Calldata fails
+silently.
+
+<Aside kind="note">
+One layout detail that trips people writing constructors in assembly: constructor arguments are not
+calldata at all. They are appended to the end of the contract's creation code and read through a
+hard-coded offset, deliberately *not* via `CODESIZE`, because appending the arguments changes what
+`CODESIZE` reports.<Cite src="solidity-layout-calldata" />
+</Aside>
+
+## The price is charged at the door
+
+Now the first incident. Why does swapping one keyword save thousands of gas?
+
+Because calldata's per-byte price is paid **once**, at the transaction boundary, as part of intrinsic
+gas — before the first opcode executes. It is not charged per read.
+
+The reason that is where the price sits is that the boundary is where the real cost is. A byte in a
+transaction's `data` field is a byte that gets gossiped to every node, included in a block, and kept
+in the chain's history permanently. A byte read during execution is a lookup in an array the client
+already has in memory.<Cite src="eip-2028" />
+
+Inside execution, therefore, `CALLDATALOAD` is an ordinary cheap opcode and costs the same whether
+you read the array once or a hundred times.
+
+<Misconception
+  belief="Reading calldata inside a function costs gas per byte read."
+  reality="The per-byte charge happens once, when the transaction is admitted. CALLDATALOAD during execution is an ordinary cheap opcode regardless of how many times you read the same bytes."
+  why="Intrinsic gas and opcode gas are almost always taught in the same breath, and the per-byte figure is the memorable one. It attaches to the word 'calldata' rather than to the transaction boundary, so it seems to describe the location rather than the moment."
+  src="eip-2028"
+/>
+
+You have already met the numbers at the transaction boundary in the gas module: EIP-2028's 16 gas per
+non-zero byte,<Cite src="eip-2028" /> the 4 per zero byte that EIP-7623 restates as
+`STANDARD_TOKEN_COST` over a token count of `zero_bytes + 4 * nonzero_bytes`,<Cite src="eip-7623" />
+and the [floor price](/c/calldata-floor-price)
+EIP-7623 added, which charges data-dominated transactions at an effective 40 and 10 instead by taking
+the maximum of the ordinary formula and `TOTAL_COST_FLOOR_PER_TOKEN` times the token
+count.<Cite src="eip-7623" /> Two details from that EIP are worth carrying into this lesson
+specifically.
+
+**The floor must be reserved even when it is not spent.** A transaction whose gas limit is below
+`21000 + TOTAL_COST_FLOOR_PER_TOKEN * tokens_in_calldata` is invalid, because the floor has to be
+covered without relying on execution to cover it.<Cite src="eip-7623" /> A gas estimator that ignores
+this underestimates and the transaction is rejected rather than merely running short.
+
+**Which side of the maximum you land on depends on your execution cost.** The same payload costs 4/16
+in a computation-heavy transaction and 10/40 in a computation-light one.<Cite src="eip-7623" /> There
+is no per-byte price for calldata that is correct in isolation. There is a price for a *transaction*.
+
+<Aside kind="warn">
+EIP-7976 would raise the floor again, to a flat 64 gas per calldata byte for both zero and non-zero
+bytes.<Cite src="eip-7976" /> It is marked **Review** on eips.ethereum.org and is not scheduled to a
+named fork. Do not design around it, and do not teach it as coming.
+</Aside>
+
+## Inside a call, the arithmetic is different
+
+Here is the part that is genuinely under-taught, and it is why "calldata is cheap" is a claim that
+needs a boundary attached.
+
+When contract A calls contract B, B's calldata is a slice of A's memory. Nothing about that slice was
+charged at 4 or 16 gas per byte, because it never entered a transaction's `data` field. What it *did*
+cost is:
+
+- A's memory expansion to hold it, on the [quadratic curve](/c/memory-expansion-quadratic).
+- Whatever A spent assembling it — ABI encoding is a series of `MSTORE`s, and copying an existing
+  array into position is a copy charged per word.<Cite src="eip-5656" />
+- The `CALL`'s own memory accounting for the argument and return ranges.
+
+So the cost of an inner call's calldata is a *memory* cost paid by the caller, not an intrinsic cost
+paid by the sender. That is why forwarding a large payload through three contracts is expensive in a
+way that a large transaction payload is not: each hop that copies it into memory pays again, on a
+curve, while the sender paid once, flat, at the door.
+
+It is also why proxy fallbacks are written in assembly. A proxy that receives arbitrary calldata and
+forwards it copies once with `CALLDATACOPY` and delegates, rather than ABI-decoding and re-encoding,
+which would pay for the same bytes several times over.
+
+## `calldata` versus `memory` is a machine decision
+
+Now the keyword. In Solidity, a reference-type parameter's data location is part of its
+type.<Cite src="solidity-docs-types" />
+
+Declare it `memory` and the array is **copied** out of calldata into memory at function entry. You
+pay the copy, per word, and you pay the memory expansion the copy causes. Then you read from memory.
+
+Declare it `calldata` and nothing is copied. The parameter is an offset and a length into a region
+that already exists. Reads go straight to `CALLDATALOAD`.<Cite src="solidity-layout-memory" />
+
+**Subgoal — price the copy.** A 200-element `bytes32[]` is 6,400 bytes, or 200 words. The copy is
+charged at a base plus a per-word rate — `CALLDATACOPY` is `3 + 3 * ceil(amount / 32)`<Cite src="eip-211" /> —
+so roughly 600 gas of copying.
+
+**Subgoal — price the expansion.** Those 6,400 bytes plus the surrounding allocations push the
+high-water mark to something over 200 words. `C_mem(200) = 3 * 200 + 200**2 / 512`, about 678 gas, and
+that is on top of whatever the function was already using.
+
+**Subgoal — price the alternative.** With `calldata`, both of those numbers are zero. The array is
+already there and stays there.
+
+**Subgoal — notice what scales.** At 200 elements the difference is roughly 1,300 gas — real but not
+dramatic. At 2,000 elements the copy is about 6,000 gas and the expansion is about 13,800, for a gap
+near 20,000: ten times the elements, fifteen times the cost, because the expansion term has begun to
+bend. The gap between the two declarations grows superlinearly with the input, which is exactly the
+property that makes a benchmark at one size misleading.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'bytes32[] calldata', note: 'read in place', tone: 'good' },
+    { title: 'bytes32[] memory', note: 'copied at entry', tone: 'warn' },
+  ]}
+  rows={[
+    {
+      label: 'What happens at function entry?',
+      cells: ['Nothing — the parameter is an offset and a length', 'The whole array is copied into memory'],
+    },
+    {
+      label: 'What does reading one element compile to?',
+      cells: ['CALLDATALOAD', 'MLOAD, once the copy has happened'],
+    },
+    {
+      label: 'Can the function mutate it?',
+      cells: ['No — no opcode writes calldata', 'Yes, which is the reason to pay for it'],
+    },
+    {
+      label: 'What does receiving 200 elements cost?',
+      cells: ['Nothing', 'About 600 gas copying, about 678 expanding'],
+    },
+    {
+      label: 'What does receiving 2,000 elements cost?',
+      cells: ['Nothing', 'About 6,000 gas copying, about 13,800 expanding'],
+    },
+  ]}
+  caption="One keyword emits a copy loop and the other does not, and the gap between them widens faster than the array does."
+  alt="A calldata array parameter and a memory array parameter compared. The calldata parameter copies nothing at entry, compiles reads to CALLDATALOAD, cannot be mutated, and costs nothing to receive at any size. The memory parameter copies the whole array, compiles reads to MLOAD, can be mutated, and costs roughly 600 gas of copying plus 678 of expansion for 200 elements, rising to roughly 6,000 plus 13,800 for 2,000 elements."
+/>
+
+<Misconception
+  belief="Whether a parameter is declared memory or calldata is a style choice."
+  reality="memory copies the entire array and pays copy and expansion gas for it; calldata reads it in place and pays neither. The difference grows superlinearly with the array's size."
+  why="The two keywords sit in the type position and read like type annotations — as though they described what kind of thing the parameter is rather than which machine region it occupies. Nothing in the syntax signals that one of them emits a copy loop."
+  src="solidity-layout-memory"
+/>
+
+### When `memory` is still the right answer
+
+The rule is not "always use calldata". `calldata` is read-only, so:
+
+- If the function mutates the array, it needs `memory`. Sorting in place, filtering, normalising —
+  all require a mutable copy, and the copy is the price of the mutation.
+- If the array is passed to something that requires `memory`, you pay the copy at that boundary
+  anyway; better to pay it once at entry than repeatedly.
+- `calldata` is only available for external-facing parameters. An `internal` function called from
+  within the contract can take a `calldata` reference passed through from an external entry point,
+  but cannot conjure one.
+
+The decision procedure is short: **read-only and external? `calldata`. Otherwise `memory`, and know
+what the copy costs.**
+
+<Check type="spot-bug" concept="calldata-is-read-only">
+A router exposes this entry point and forwards to an internal verifier written in assembly for speed:
+
+```solidity
+function claim(bytes32[] calldata proof, address to, uint256 amount) external {
+    bytes32 leaf;
+    assembly {
+        // args start at 4; proof is dynamic so slot 0 holds its offset
+        leaf := calldataload(add(4, 0x40))   // read `amount`
+    }
+    require(_verify(proof, to, amount), "bad proof");
+    _pay(to, amount);
+}
+```
+
+An attacker sends a call with a correct selector and a `data` field that is exactly 68 bytes long.
+
+What happens, and what are the two separate defects?
+
+<Answer>
+**What happens: the call succeeds in reading arguments that were never sent.** At 68 bytes the
+payload contains the 4-byte selector and two words. Every read past that point — including the one at
+offset `4 + 0x40`, which is the third word — returns a zero-padded
+word.<Cite src="yellow-paper" /><Cite src="execution-specs" /> No exception is raised, because
+over-reading calldata is specified to zero-pad rather than fail. The assembly block therefore reads
+`amount` as zero, and the dynamic-array offset for `proof` is whatever the second word says, which
+the attacker also controls.
+
+**Defect one — the assembly block does not check `CALLDATASIZE`.** A hand-written decoder must
+validate the length itself, because the read will never tell it that the bytes were not
+there.<Cite src="solidity-abi-spec" /> This is the whole reason the padding behaviour is a security
+property rather than a curiosity: the failure is silent and produces well-formed values.
+
+**Defect two — the block bypasses the decoder that would have caught it.** Solidity's own generated
+decoding for `(bytes32[] calldata, address, uint256)` performs the bounds and offset checks. Dropping
+into assembly to read a parameter that the compiler has already decoded into a local variable removes
+those checks and saves essentially nothing, since reading a decoded `uint256` from the stack is
+cheaper than a `CALLDATALOAD`. The assembly here is not an optimisation; it is a removed check dressed
+as one.
+
+**Note what is *not* a defect.** Declaring `proof` as `calldata` is correct and is not implicated. The
+compiler's decoder validates the array's offset and length against `CALLDATASIZE` before handing you
+a `calldata` reference; the hazard came from reading around that decoder, not from the location.
+
+**The contrast worth carrying.** Had this been a read past the end of the return data buffer instead,
+the call would have halted in an out-of-gas condition and the bug would have been found by the first
+malformed input.<Cite src="eip-211" /> Calldata gives you no such favour, and the difference between
+the two is not a rule you can derive — it has to be memorised.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Six places a byte can live**, next lesson, puts calldata into the full table alongside stack,
+memory, return data, code and storage, with lifetime, writability, addressing and price on every row.
+Calldata's row is the odd one: read-only inside, written only at the boundary, and priced somewhere
+the other locations are not.
+
+**ABI decoding and selectors** in the Solidity track pick up the validation thread directly. The
+padding behaviour here is precisely why [a decoder must validate lengths](/c/abi-decode-validates)
+rather than trusting reads to fail.
+
+**Rollup economics** in the scaling track is this lesson's pricing story at the scale where it decides
+architectures. The floor price exists to bound block size for exactly the transactions that post data
+rather than compute, and it is why blobs exist as a separate lane.<Cite src="eip-7623" />
+
+**Proxy patterns** are where the inner-frame arithmetic pays. A forwarding fallback exists to avoid
+paying memory costs for bytes that are already sitting in calldata, and once you can price the two
+paths, the assembly stops being a mystery and becomes the obvious implementation.

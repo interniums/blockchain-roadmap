@@ -1,0 +1,450 @@
+---
+id: toolchain-fork-testing-many-worlds
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    foundry-fork-testing,
+    foundry-cheatcode-create-fork,
+    foundry-cheatcode-create-select-fork,
+    foundry-cheatcode-select-fork,
+    foundry-cheatcode-active-fork,
+    foundry-cheatcode-make-persistent,
+    foundry-cheatcode-is-persistent,
+    foundry-cheatcode-revoke-persistent,
+    foundry-cheatcode-roll-fork,
+    measured-fork-cache-1-7-1,
+    measured-forge-1-7-1,
+  ]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+The test is four lines long and it fails on the last one.
+
+```solidity
+function test_BridgeRoundTrip() public {
+    vm.selectFork(l1Fork);
+    Recorder recorder = new Recorder();   // a helper that logs what the bridge did
+    bridge.send(address(recorder), 100);
+
+    vm.selectFork(l2Fork);
+    assertEq(recorder.received(), 100);   // reverts
+}
+```
+
+The revert has no reason string. `recorder` is a valid address, the compiler is satisfied, the
+variable is in scope, and the object it names was constructed two statements ago. Every instinct built
+from ordinary programming says the problem is in `bridge.send`.
+
+It is not. `recorder` does not exist on the L2 fork. It never did. `vm.selectFork` did not switch a
+network connection — it replaced the entire state the EVM is executing against, and the helper you
+deployed a moment ago was part of the state that got replaced.
+
+This lesson is about that replacement: what survives it, what does not, and the one cheatcode that
+changes the answer.
+
+<Figure
+  caption="Each fork id names a complete world, and only the test contract and its caller stand outside all of them."
+  alt="The test contract sits above two coexisting forks. The mainnet fork at block 21,000,000 holds the L1 bridge and the Recorder the test deployed; the Optimism fork at block 128,000,000 holds a different bridge account and no Recorder at all."
+>
+  <Tree root={{
+    label: 'the test contract',
+    note: 'persistent, along with msg.sender',
+    tone: 'accent',
+    children: [
+      { label: 'fork l1', note: 'mainnet @ 21,000,000', children: [
+        { label: 'l1Bridge', note: 'real deployed code' },
+        { label: 'Recorder', note: 'deployed by the test', tone: 'warn' },
+      ] },
+      { label: 'fork l2', note: 'optimism @ 128,000,000', children: [
+        { label: 'l2Bridge', note: 'a different account' },
+        { label: 'Recorder', note: 'no code here', tone: 'danger', dashed: true },
+      ] },
+    ],
+  }} />
+</Figure>
+
+## A fork id is a handle to a world
+
+`vm.createFork` returns a `uint256`, and it is tempting to read that as a connection handle — a
+socket, a client, a thing you talk *through*. It is not. It identifies a complete EVM state: every
+account, every balance, every code blob, every storage slot, plus the block number and chain
+context.<Cite src="foundry-cheatcode-create-fork" />
+
+Three properties follow, and each one is load-bearing.
+
+**Forks coexist.** Creating a second one does not disturb the first. Foundry's own multi-chain example
+is exactly this shape: two `createFork` calls, then `selectFork` between them to read the same token's
+balance on two chains.<Cite src="foundry-fork-testing" />
+
+**Exactly one is active.** `vm.selectFork(id)` sets the corresponding forked state as
+active;<Cite src="foundry-cheatcode-select-fork" /> `vm.activeFork()` reports which, and reverts
+outright when there is none.<Cite src="foundry-cheatcode-active-fork" /> There is no concurrency here
+and nothing runs in parallel. Cross-chain logic in a Foundry test is always a *sequence of switches*.
+
+**Each fork keeps its own state across switches.** Leaving fork A does not discard fork A. Measured on
+forge 1.7.1: deploy a helper under fork A, write 7 into it, switch to fork B, switch back to A — the
+helper is there and still holds
+7.<Cite src="measured-fork-cache-1-7-1" /><Cite src="measured-forge-1-7-1" /> The worlds persist
+independently; what changes is which one your opcodes are addressing.
+
+That third property is what makes the failure at the top so disorienting. Nothing was destroyed. The
+helper is alive and well on fork A. You are simply standing somewhere else.
+
+## What a switch actually replaces
+
+Foundry's documentation states the rule in one sentence: each fork has its own independent storage,
+which is replaced when another fork is selected.<Cite src="foundry-cheatcode-make-persistent" />
+
+Expanded into the things a test can observe:
+
+- **Code.** `address(recorder).code.length` is zero under the other fork. Measured: deploy under one
+  fork, `createSelectFork` into another, and the deployed address has no
+  code.<Cite src="measured-fork-cache-1-7-1" />
+- **Storage.** Every slot of every account, including any state your setup wrote.
+- **Balances.** A `vm.deal` on one fork does not fund the same address on another.
+- **Block context.** Each fork carries its own number, and `vm.rollFork(forkId, blockNumber)` can move
+  a fork that is not even active.<Cite src="foundry-cheatcode-roll-fork" />
+
+And the consequence people trip over: **calls into an address with no code do not revert with a
+helpful message.** They do not revert at all at the EVM level — you already know that a call to an
+empty account succeeds and returns nothing ([the no-code case](/c/delegatecall-no-code-succeeds)). In
+Solidity, a high-level call through a typed interface inserts an `extcodesize` check and reverts
+without data, which is exactly the empty revert at the top of this lesson. The error you get is the
+absence of an error.
+
+## Why it looks like the world is intact
+
+Here is the detail that turns a clean rule into a confusing bug: **the test contract survives the
+switch.** So does the caller.
+
+Foundry documents the default persistent set as the test contract and `msg.sender`, and calls it out
+in a dedicated note.<Cite src="foundry-cheatcode-make-persistent" /> Confirmed on forge 1.7.1:
+`vm.isPersistent(address(this))` and `vm.isPersistent(msg.sender)` both return true with no setup at
+all.<Cite src="measured-fork-cache-1-7-1" /><Cite src="foundry-cheatcode-is-persistent" />
+
+That default is necessary — a test contract that vanished when it selected a fork could not run — but
+it produces a specific illusion. After `vm.selectFork`, the code you are executing is still there,
+your local variables are still there, `address(this)` still resolves, your storage still holds what
+you put in it. Everything you can see from inside the test looks continuous. The discontinuity is
+invisible until you reach *outward*, into an account that was never on the persistent list.
+
+<Misconception
+  belief="Contracts I deployed in the test are still there after vm.selectFork."
+  reality="Each fork has its own complete state, and selecting another one replaces it. Only persistent accounts survive a switch, and by default that set is exactly the test contract and the caller."
+  why="The test contract itself does survive — so the code you are reading while you debug is proof, apparently, that things survive. The one account that is guaranteed to persist is the one you are standing in."
+  src="foundry-cheatcode-make-persistent"
+/>
+
+## Persistence, precisely
+
+`vm.makePersistent(addr)` marks an account whose state is available regardless of which fork is
+active.<Cite src="foundry-cheatcode-make-persistent" /> It comes with three companions and four
+overloads, and the shape is worth knowing because it tells you the granularity:
+
+```solidity
+function makePersistent(address account) external;
+function makePersistent(address account0, address account1) external;
+function makePersistent(address account0, address account1, address account2) external;
+function makePersistent(address[] calldata accounts) external;
+
+function isPersistent(address account) external view returns (bool persistent);
+function revokePersistent(address account) external;
+function revokePersistent(address[] calldata accounts) external;
+```
+
+Per account, not per fork.<Cite src="foundry-cheatcode-make-persistent" /><Cite src="foundry-cheatcode-is-persistent" /><Cite src="foundry-cheatcode-revoke-persistent" />
+There is no "make this persistent between A and B but not C". An account is persistent or it is not,
+across every fork in the test, and `revokePersistent` is the documented way back — confirmed working
+on forge 1.7.1.<Cite src="measured-fork-cache-1-7-1" />
+
+So the fix for the opening test is two words, not a redeployment:
+
+```solidity
+Recorder recorder = new Recorder();
+vm.makePersistent(address(recorder));
+```
+
+That distinction matters more than it sounds. Redeploying the helper on the second fork *also* makes
+the test compile and run — and it silently changes what the test means, because the second instance is
+a different object with fresh state. The assertion then passes or fails for reasons unrelated to the
+bridge.
+
+## The part that is not in the sentence
+
+"Available regardless of which fork is active" is doing more work than it appears to. It does not mean
+each fork gets a copy. It means the account lives *outside* the fork worlds, and all of them see the
+same one.
+
+Measured on forge 1.7.1: deploy a helper on fork A, write 7, mark it persistent, switch to fork B,
+write 9 while B is active, switch back to A — and A reads **9**.<Cite src="measured-fork-cache-1-7-1" />
+The write travelled. There is one account, shared.
+
+For a scratch helper that is exactly what you want, and it is why a persistent recorder can observe
+both sides of a bridge. For anything with meaningful state it is a hazard, and the sharpest version is
+address collision. Deterministic deployment means a protocol can occupy the same address on several
+chains — which is the whole point of [CREATE2-derived addresses](/c/create-address-derivation) and the
+reason teams pursue [uniform addresses across chains](/c/deterministic-deployer-proxy). Mark such an
+address persistent and you have replaced the real L2 deployment with the L1 one for the rest of the
+test. Both forks now resolve that address to a single shared account, and every assertion you make
+about "the L2 contract" is an assertion about the L1 contract wearing its address.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'A fork-local account', note: 'the default' },
+    { title: 'A persistent account', note: 'makePersistent', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'How many exist across two forks?', cells: ['One per fork, independent of each other', 'Exactly one, shared by every fork in the test'] },
+    { label: 'What does a write under fork A do?', cells: ['Changes fork A and nothing else', 'Is visible from fork B afterwards'] },
+    { label: 'What does selectFork do to it?', cells: ['Replaces it, along with the rest of the world', 'Nothing at all'] },
+    { label: 'What belongs here?', cells: ['Anything you forked in order to observe — tokens, pools, bridges', 'Scratch you wrote yourself — helpers, recorders, actor addresses'] },
+  ]}
+  caption="One account, one set of writes, seen from every fork: the convenience and the hazard are the same property."
+  alt="Fork-local and persistent accounts compared on how many copies exist across two forks, what a write under one fork does, what selectFork does to them, and what kind of address belongs in each category."
+/>
+
+<Aside kind="warn">
+The rule to carry: **persist scratch, never persist a dependency.** Helpers, recorders, mocks you
+wrote, and the addresses you use as actors are safe. Tokens, routers, oracles, bridges and anything
+else that exists on both chains are not — those are precisely the accounts whose per-chain differences
+you forked in order to observe.
+</Aside>
+
+## `createSelectFork` is not a connection
+
+One more trap, and it is entirely a naming problem. `vm.createSelectFork(url)` reads like "connect to
+this chain", and connecting is naturally idempotent — calling it twice should be harmless.
+
+It is not. The reference says the call *creates* and selects a new
+fork.<Cite src="foundry-cheatcode-create-select-fork" /> Every invocation. Measured on forge 1.7.1:
+two calls with the identical URL *and* the identical block number return two different ids, and a
+contract deployed under the first has no code under the
+second.<Cite src="measured-fork-cache-1-7-1" /><Cite src="measured-forge-1-7-1" /> Same chain, same block, same endpoint — two worlds,
+and everything the test did in the first one is silently discarded.
+
+This bites hardest in a `setUp`-plus-test structure, where the two calls are in different functions
+and nobody reads them together:
+
+```solidity
+function setUp() public {
+    vm.createSelectFork("mainnet", 21_000_000);
+    vault = new Vault(USDC);
+    deal(USDC, address(vault), 1_000_000e6);
+}
+
+function test_Withdraw() public {
+    vm.createSelectFork("mainnet", 21_000_000);   // looks defensive; is destructive
+    vault.withdraw(1e6);                          // reverts: no code at that address
+}
+```
+
+The second call was added by someone making the test "self-contained". Keep the id and select it:
+
+```solidity
+uint256 mainnetFork;
+
+function setUp() public {
+    mainnetFork = vm.createSelectFork("mainnet", 21_000_000);
+    // ...
+}
+
+function test_Withdraw() public {
+    vm.selectFork(mainnetFork);   // idempotent, and free if already active
+    vault.withdraw(1e6);
+}
+```
+
+<Misconception
+  belief="Calling vm.createSelectFork with the same URL twice reconnects me to the same fork."
+  reality="It creates a second, independent fork with clean state — even with an identical URL and an identical pinned block. The first fork still exists, and everything the test did in it is now unreachable unless you kept the id."
+  why="The verb 'create' is in the middle of a name that reads as an action on a connection, and every other 'connect to X' API in a programmer's experience is idempotent."
+  src="foundry-cheatcode-create-select-fork"
+/>
+
+## Worked example: one test, two chains
+
+A deposit on L1 should credit a mirrored vault on L2 once the message is relayed. The purpose of each
+step is what makes this generalise.
+
+**Subgoal — create every world before entering any of them, so ids are stable and named.** Use
+`createFork`, not `createSelectFork`, so that nothing is activated as a side effect of setup
+order.<Cite src="foundry-cheatcode-create-fork" />
+
+```solidity
+uint256 l1;
+uint256 l2;
+
+function setUp() public {
+    l1 = vm.createFork("mainnet",  21_000_000);
+    l2 = vm.createFork("optimism", 128_000_000);
+}
+```
+
+**Subgoal — declare the accounts that must exist in both worlds, before deploying anything.** The
+actor is a persistent address so its balance and identity mean the same thing on both sides.
+
+```solidity
+address alice = makeAddr("alice");
+
+function setUp() public {
+    // ... fork creation above ...
+    vm.makePersistent(alice);
+}
+```
+
+**Subgoal — do L1 work with L1 selected, and treat everything deployed here as L1-only unless stated
+otherwise.**
+
+```solidity
+vm.selectFork(l1);
+vm.prank(alice);
+l1Bridge.deposit(alice, 100e6);
+```
+
+**Subgoal — carry across only the data, not the objects.** This is the discipline that keeps a
+cross-chain test honest. Read the message the L1 side produced into a plain local variable — `bytes`,
+a struct, a hash. Local variables live in the test contract, which is persistent, so they cross the
+switch without any cheatcode at all.
+
+```solidity
+bytes memory message = l1Bridge.lastMessage();
+```
+
+Anything you find yourself wanting to `makePersistent` in order to move it across is a signal to ask
+whether you meant to move the *object* or its *data*.
+
+**Subgoal — switch, and re-establish context deliberately.** Selecting `l2` replaces the world. The
+L2 bridge address, the L2 token, the L2 balances — all of them are the L2 ones now, and none of the L1
+handles mean anything here.
+
+```solidity
+vm.selectFork(l2);
+vm.prank(l2Relayer);
+l2Bridge.relay(message);
+assertEq(IERC20(L2_USDC).balanceOf(alice), 100e6);
+```
+
+**Subgoal — assert on the chain the claim is about.** `assertEq` runs in the test contract, but the
+`balanceOf` call inside it runs against whichever fork is active. An assertion written before the
+switch and an assertion written after it are claims about different chains, and nothing in the syntax
+distinguishes them. When a cross-chain test confuses you, the first question is always: which fork was
+active on this line?
+
+## What is still unsettled
+
+Two honest gaps, so you do not discover them as surprises.
+
+**Whether a fork's own local modifications survive a round trip is documented only by behaviour.** The
+measurement above says they do on forge 1.7.1 — leave fork A, come back, the helper still holds
+7.<Cite src="measured-fork-cache-1-7-1" /> No reference page states it as a guarantee. Depend on it in
+a test you own; do not build a framework on it.
+
+**Persistence and `vm.transact` interact in ways this module does not cover.** Replaying real
+transactions while a shared account is spanning two forks is a combination worth reasoning about
+carefully rather than assuming.
+
+<Check type="spot-bug" concept="fork-state-isolation">
+A test compares a lending protocol's behaviour on two chains. It passes, and the team is pleased with
+the coverage.
+
+```solidity
+contract CrossChainRateTest is Test {
+    uint256 l1;
+    uint256 l2;
+    address constant POOL  = 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2;
+    address constant WETH  = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    RateOracle oracle;
+
+    function setUp() public {
+        l1 = vm.createSelectFork("mainnet", 21_000_000);
+        oracle = new RateOracle();
+        vm.makePersistent(address(oracle));
+        vm.makePersistent(POOL);
+        vm.makePersistent(WETH);
+        l2 = vm.createSelectFork("optimism", 128_000_000);
+    }
+
+    function test_RatesAgree() public {
+        vm.selectFork(l1);
+        uint256 rateL1 = oracle.read(POOL, WETH);
+
+        vm.selectFork(l2);
+        uint256 rateL2 = oracle.read(POOL, WETH);
+
+        assertApproxEqRel(rateL1, rateL2, 0.05e18);
+    }
+}
+```
+
+The assertion passes. Explain why that is bad news, name every defect, and give the corrected `setUp`.
+
+<Answer>
+**It passes because the test is comparing the L1 pool with itself.**
+
+**Defect 1 — the dependencies were made persistent.** `vm.makePersistent(POOL)` and
+`vm.makePersistent(WETH)` mark those addresses as available regardless of which fork is
+active.<Cite src="foundry-cheatcode-make-persistent" /> They were populated from mainnet state during
+`setUp`, so after `vm.selectFork(l2)` those addresses still resolve to the *mainnet* pool and the
+*mainnet* WETH. Whatever Optimism has at those addresses — a different contract, or nothing — is
+masked. `rateL2` is a second reading of the L1 pool, so of course it agrees within five percent. It
+agrees exactly.
+
+**Defect 2 — the persistent accounts are shared, not copied, so the test also has a hidden write
+channel.** A persistent account is one account seen by every fork: measured on forge 1.7.1, a write
+performed while one fork is active is visible after switching to
+another.<Cite src="measured-fork-cache-1-7-1" /> If `oracle.read` were non-`view`, or if a later test
+supplied or borrowed through the "L2" pool, the mutation would land on the shared mainnet pool and
+leak across every subsequent switch.
+
+**Defect 3 — `setUp` ends on the wrong fork, invisibly.** The last statement is
+`createSelectFork("optimism", ...)`, so every test function begins with L2 active. `test_RatesAgree`
+happens to select explicitly, so it is unharmed; the next test someone adds will not, and will read L2
+state while believing it is on mainnet. A `setUp` that leaves a fork selected is a shared mutable
+default.
+
+**Defect 4 — `assertApproxEqRel` with a five percent tolerance cannot fail here, and could not detect
+much if it could.** Two chains' rates on the same asset genuinely differing by four percent is a real
+finding that this assertion swallows. Tolerances that wide are usually a sign the author did not know
+what number to expect.
+
+**Corrected `setUp`:**
+
+```solidity
+function setUp() public {
+    l1 = vm.createFork("mainnet",  21_000_000);
+    l2 = vm.createFork("optimism", 128_000_000);
+
+    vm.selectFork(l1);
+    oracle = new RateOracle();
+    vm.makePersistent(address(oracle));   // scratch helper: safe to share
+    // POOL and WETH are NOT persistent — each fork must resolve them itself.
+    // The L2 pool and L2 WETH are different addresses; the test should hold both.
+}
+```
+
+Then the test reads each chain's own pool address, with no fork selected on exit from `setUp` and an
+explicit `selectFork` at the top of every test.
+
+**The general rule this encodes:** persist what you *wrote*, never what you *forked for*. If an
+address is interesting because it differs between chains, making it persistent deletes the only thing
+the test was measuring — and the test goes green, which is the worst available outcome.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Immediately next:** forks move in time as well as across chains. `vm.rollFork` re-dates a fork and
+changes the real state it reads, while `vm.roll` only rewrites `block.number` locally — and combined
+with `vm.transact` this is how you reproduce a specific historical incident from real state.
+
+**Later in this module:** each fork you create is a separate cache key, so a two-fork test costs two
+cold fetch paths rather than one. Multi-fork tests are the most expensive shape in this module, and
+the cost lesson comes back to them.
+
+**In your own repositories:** the review question that catches most of these bugs is mechanical. For
+every `makePersistent` in a test, ask whether that address exists on more than one of the forks in
+play. If it does, the call is probably a bug, and the test is probably green.

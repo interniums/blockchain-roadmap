@@ -1,0 +1,452 @@
+---
+id: infra-simulation-sequences-and-overrides
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [measured-simulation-2026-08-26, eth-simulatev1-spec, execution-apis-execute-methods, execution-apis-execute-schemas, geth-ns-eth, viem-simulate-calls, viem-simulate-blocks, tenderly-simulations]
+stack: { viem: "2.x" }
+---
+
+The address `0x1111111111111111111111111111111111111111` is not yours, is not anybody's in
+particular, and looks empty. It was chosen for a two-call simulation because it was meant to be a
+blank slate: give it one ETH by overriding its balance, wrap the ETH into WETH, then read the WETH
+balance back. Expected answer: exactly one WETH.
+
+The measured answer, against mainnet at head on 26 August 2026:<Cite src="measured-simulation-2026-08-26" />
+
+<Figure
+  caption="Two calls in one block against one accumulating state — the arrangement a single eth_call cannot express."
+  alt="A balance override puts 1 ETH at 0x1111…1111 before anything runs. Call one, WETH.deposit with 1 ether, returns status 0x1 and gasUsed 0x6d22. Call two, WETH.balanceOf on the same address, returns status 0x1 and returnData 0x…0de0b6caefdae800, which is 1.0000001 WETH."
+>
+  <Flow
+    nodes={[
+      { id: 'ov', label: 'override balance', note: '1 ETH at 0x1111…1111', col: 0, tone: 'accent', dashed: true },
+      { id: 'c1', label: 'call 1 · deposit', note: 'status 0x1 · gasUsed 0x6d22', col: 1 },
+      { id: 'c2', label: 'call 2 · balanceOf', note: 'status 0x1 · 1.0000001 WETH', col: 2, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'ov', to: 'c1', label: 'before any call runs' },
+      { from: 'c1', to: 'c2', label: 'shared state' },
+    ]}
+  />
+</Figure>
+
+A hundred billion wei of WETH that nobody put there for this experiment — 0.0000001 WETH — was
+already sitting at that address on mainnet, and a direct `eth_call` at the same block confirms
+it.<Cite src="measured-simulation-2026-08-26" /> The neighbouring `0x2222…2222` turns out to hold
+0.618 ETH. There are no blank addresses on a chain that has been running for a decade; there are
+only addresses you have not looked at.
+
+Two things to take from that. The first is small and practical: an assertion of `== 1 ether` in that
+rehearsal would have failed, and you would have spent twenty minutes suspecting your override
+encoding. The second is the point of this lesson: **the simulation was right and the expectation was
+wrong, because the simulation ran against real state and the expectation was built against an
+imagined one.** That is exactly the trade you are making when you move up from `eth_call`, and it
+cuts both ways.
+
+## The method: a sequence of blocks, each containing a sequence of calls
+
+`eth_simulateV1` executes a sequence of message calls building on each other's state without creating
+transactions on the block chain, optionally overriding block and state
+data.<Cite src="eth-simulatev1-spec" /> It is part of the standard Ethereum execution API, not a
+vendor extension, and both public mainnet endpoints tried for this lesson answered
+it.<Cite src="measured-simulation-2026-08-26" />
+
+The payload has four fields.<Cite src="execution-apis-execute-schemas" />
+
+**`blockStateCalls`** (required) — an array of simulated blocks. Each one may carry
+`blockOverrides`, `stateOverrides`, and a list of `calls`.
+
+**`traceTransfers`** (default false) — adds ETH transfers to the logs as ERC-20 `Transfer` events,
+emitted by the pseudo-address `0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee`, so that ETH movement can
+be tracked with the same machinery as token movement.<Cite src="geth-ns-eth" />
+
+**`validation`** (default false) — when true, the simulation performs all the validation a normal EVM
+would, *except* contract-sender and signature checks. When false, it behaves like
+`eth_call`.<Cite src="execution-apis-execute-schemas" />
+
+**`returnFullTransactions`** (default false) — full transaction objects in the returned blocks rather
+than hashes.<Cite src="execution-apis-execute-schemas" />
+
+The second parameter is the block the whole thing is built on top of — the parent. Simulated blocks
+stack on it.<Cite src="geth-ns-eth" />
+
+### `validation` is the flag that decides what you are testing
+
+Leave it false and you are asking "does this code path work". Set it true and you are additionally
+asking "would these transactions have been *valid* — nonces in order, sender able to pay, intrinsic
+gas covered". Those are different questions and they fail differently.
+
+Measured, on a `deposit` call from an address with 0.618 ETH trying to send 1 ETH:<Cite src="measured-simulation-2026-08-26" />
+
+```text
+validation: false → -38014  insufficient funds for gas * price + value:
+                            have 618337620027187157 want 1000000000000000000
+validation: true  → -32000  intrinsic gas too high
+```
+
+Both are refusals; they are refusals about different things. With validation on, the call inherited
+the block gas limit as its own gas limit and was rejected before the funds check ever ran. If you
+turn validation on, you have opted into supplying realistic `gas`, `maxFeePerGas` and `nonce` values,
+and the errors you get back will be about those.
+
+<Aside kind="note">
+One consequence that surprises people: with `validation` false and no `baseFeePerGas` override, the
+simulated block's base fee came back as `0x0` in both measured runs.<Cite src="measured-simulation-2026-08-26" />
+Gas is effectively free inside the simulation. That is convenient — you do not have to fund every
+`from` address just to make a call go through — and it is a lie you must remember you told. Nothing
+in a default-configured `eth_simulateV1` result speaks to whether the sender could have afforded the
+transaction.
+</Aside>
+
+## Overrides: telling the EVM a different truth
+
+A state override replaces part of the state before execution. Per account you may set
+`nonce`, `balance`, `code`, `movePrecompileToAddress`, and **either** `state` **or**
+`stateDiff`.<Cite src="execution-apis-execute-schemas" />
+
+That last choice is the one that will hurt you, so take it slowly.
+
+- **`state`** — "key-value mapping to override **all** slots in the account storage before executing
+  the call".<Cite src="execution-apis-execute-schemas" /> The schema titles it *account override with
+  whole storage replacement*. Every slot you did not list is now zero.
+- **`stateDiff`** — "key-value mapping to override **individual** slots".<Cite src="execution-apis-execute-schemas" />
+  The schema titles it *account override with partial storage modification*. Everything else keeps
+  its real value.
+
+Here is what that difference does in practice. The same simulation twice against mainnet DAI: give
+`0x1111…1111` one million DAI by writing its balance slot, transfer 400,000 of it, then read
+`totalSupply()`.<Cite src="measured-simulation-2026-08-26" />
+
+<Compare
+  columns={[
+    { title: <code>stateDiff</code>, note: 'partial storage modification', tone: 'good' },
+    { title: <code>state</code>, note: 'whole storage replacement', tone: 'danger' },
+  ]}
+  rows={[
+    { label: 'Did the transfer succeed?', cells: [<>status <code>0x1</code></>, <>status <code>0x1</code></>] },
+    { label: 'What did it cost?', cells: [<>gasUsed <code>0xca6a</code></>, <>gasUsed <code>0xca6a</code></>] },
+    {
+      label: <>What does <code>totalSupply()</code> return?</>,
+      cells: [
+        <><code>0x0ec50a4acb7ba69181142f31</code> = 4,570,997,127.35 DAI</>,
+        { v: <><code>0x0</code> = 0 DAI</>, tone: 'danger' },
+      ],
+    },
+    {
+      label: 'What happened to every slot you did not name?',
+      cells: ['kept its real value', { v: 'zeroed', tone: 'danger' }],
+    },
+  ]}
+  caption="Zeroing the storage of a live token is a green result."
+  alt="The same DAI simulation run twice. Under stateDiff the transfer returns status 0x1 with gasUsed 0xca6a and totalSupply reads 0x0ec50a4acb7ba69181142f31, 4,570,997,127.35 DAI. Under state the transfer returns the identical status and gas, but totalSupply reads 0x0, zero DAI, because every slot not named was replaced with zero."
+/>
+
+**The transfer succeeded in both.** Identical status, identical gas. Nothing in the result of the
+call you cared about tells you that in the second run you had silently zeroed every other storage
+slot in the largest decentralised stablecoin on Ethereum — its total supply, its authorisation
+mapping, its rate accumulator, all of it.
+
+Two mental models to keep:
+
+**`stateDiff` is a patch. `state` is a replacement.** Reach for `stateDiff` by default. Reach for
+`state` only when you deliberately want a contract with nothing but the slots you named, which is
+rare and always worth a comment.
+
+**A green simulation says nothing about the fiction it ran on.** The result object reports what the
+calls did. It does not report what you told the EVM before they ran. If a rehearsal's overrides are
+not written down next to its result, the result is not evidence.
+
+<Misconception
+  belief="state and stateDiff are two spellings of the same override."
+  reality="`state` replaces the account's entire storage — every slot you did not list becomes zero — while `stateDiff` patches only the slots you name. Measured on DAI, the same transfer succeeded identically under both, and only `totalSupply` (4.57 billion versus 0) revealed which one had run."
+  why="They sit side by side in the same object, take the same shape of argument, and the call you are actually testing usually behaves the same under either, so nothing forces you to notice."
+  src="measured-simulation-2026-08-26"
+/>
+
+### The other overrides, briefly
+
+**`balance` and `nonce`** are the two that remove the most setup friction. A `from` address with
+funds and the right nonce costs one line instead of a funding transaction.
+
+**`code`** replaces a contract's bytecode. This is how you answer "what if this proxy already pointed
+at the new implementation" without deploying anything, and it is also how Geth's own documentation
+demonstrates reading a private field: swap in a contract with the same storage layout and an extra
+getter, then call the getter.<Cite src="geth-ns-eth" /> The storage is untouched; only the code that
+interprets it changed. Hold on to that idea — it is the entire mechanism of lesson five.
+
+**`movePrecompileToAddress`** relocates a precompile before the `code` override is applied, so you can
+put your own bytecode at a precompile's address and still call the original. The spec explicitly
+warns that pointing it at a non-precompile has undefined, client-dependent
+behaviour.<Cite src="execution-apis-execute-schemas" />
+
+## Block overrides, and the shape of a rehearsal in time
+
+Each simulated block can override `number`, `time`, `gasLimit`, `feeRecipient`, `baseFeePerGas` and
+`prevRandao`.<Cite src="execution-apis-execute-schemas" /> The rules for sequences are strict and the
+errors are exact.
+
+- Block numbers must increase; skipping is allowed and the skipped blocks are generated and included
+  in the response. If not specified, the number increments by one per block.<Cite src="geth-ns-eth" />
+- Timestamps must increase or stay the same. If not specified, time increments by one per
+  block.<Cite src="geth-ns-eth" />
+
+Measured, verbatim, against a public endpoint:<Cite src="measured-simulation-2026-08-26" />
+
+```text
+second block numbered below the first
+  → -38020  block numbers must be in order: 25837568 <= 25841664
+
+second block timestamped before the parent
+  → -38021  block timestamps must be in order: 1787744687 <= 1787745227
+```
+
+And the thing those two rules exist to enable — a jump forward in time, in one request:<Cite src="measured-simulation-2026-08-26" />
+
+<Figure
+  caption="Simulated time is a field you set, not a duration you wait out."
+  alt="Two simulated blocks in one request. The first is block 25,839,218 at timestamp 1,787,745,263; the second is block 25,841,664 at timestamp 1,788,793,263, twelve days later."
+>
+  <Timeline
+    from={0}
+    to={12}
+    unit="days"
+    ticks={[0, 12]}
+    marks={[
+      { at: 0, label: 'block 25,839,218', tone: 'accent' },
+      { at: 12, label: 'block 25,841,664', tone: 'accent' },
+    ]}
+    spans={[
+      { label: 'timestamp override', start: 0, end: 12, tone: 'warn', note: '1,787,745,263 → 1,788,793,263' },
+    ]}
+  />
+</Figure>
+
+That is the mechanical core of a governance rehearsal. Queue in the first block, advance the
+timestamp past the timelock delay in the second, execute in the second. No fork, no local node, one
+HTTP request. Whether that is *enough* for a real governance rehearsal is lesson six's question; that
+it is expressible at all is this lesson's.
+
+## Reading the result without over-reading it
+
+The response is an array of generated blocks — the same object `eth_getBlockByHash` returns, plus a
+`calls` field.<Cite src="geth-ns-eth" /> Per call, on success, you get `status: "0x1"`, `returnData`,
+`gasUsed`, `logs`, and optionally `maxUsedGas`; on failure, `status: "0x0"`, `returnData`, `gasUsed`,
+and an `error` object with a code, a message and data.<Cite src="eth-simulatev1-spec" />
+
+Three fields repay attention.
+
+**`gasUsed` versus `maxUsedGas`.** The spec describes `maxUsedGas` as the maximum gas used during
+execution *before refunds*.<Cite src="eth-simulatev1-spec" /> `gasUsed` is net; `maxUsedGas` is the
+peak. If you are sizing a gas limit rather than estimating a cost, the peak is the number that
+matters, because the limit has to cover the execution before any refund is applied.
+
+**`logs`, with `removed` always false.** Geth documents the field as a flag indicating whether a log
+was removed in a chain reorganisation, which cannot happen in `eth_simulateV1`.<Cite src="geth-ns-eth" />
+Harmless on its own, and a genuine trap if you feed simulated logs into the same pipeline that
+consumes real ones: your indexer's reorg-handling branch will never fire on simulated input, so it
+will never be exercised by this data.
+
+**The error `message` is a suggestion, the `code` is not.** The spec says the error messages are
+suggestions and clients might implement different ones, but the error codes are enforced by the
+spec.<Cite src="eth-simulatev1-spec" /> Branch on `-38014`. Never branch on
+`"insufficient funds for gas * price + value"`.
+
+And one structural point about ordering. All calls inside a single `blockStateCalls` entry share one
+block context: the same `number`, the same `timestamp`, the same base fee. They see each other's
+storage writes, but they do not see time pass. Anything that depends on a deadline, a cooldown, a
+TWAP window or a timelock has to be split across separate entries with a `time` override, or it will
+silently behave as if all of it happened in the same instant — which, inside that block, it did.
+
+## Whose transaction is it, anyway?
+
+There is no signature anywhere in this method. You put an address in `from` and the node executes as
+if that address had sent the message. That is the feature — it is what lets you rehearse as a
+multisig, a timelock or a protocol admin whose key you will never hold — and it is the source of the
+most common category error in simulation results.
+
+**A simulation proves the message would succeed. It proves nothing about authorisation to send it.**
+If your rehearsal impersonates the admin, the green result is conditional on the admin actually
+signing. Whether the admin's signers will, whether the multisig threshold is reachable, and whether
+the key is where you think it is are questions no simulator answers.
+
+The spec does define one refusal in this area: error `-38024`, *sender is not an
+EOA*.<Cite src="execution-apis-execute-methods" /> A transaction's sender is an externally owned
+account by definition, so a client validating that rule will reject a `from` pointing at a contract.
+Note what that does *not* rule out after [EIP-7702](/c/delegation-designator): an account carrying a
+delegation designator is still an EOA and can still originate a transaction — while executing the
+delegate's code. Simulating "a send from a user's wallet" may therefore run arbitrary contract logic,
+and the next lesson is where that stops being a curiosity and starts being a security property.
+
+## The limits are real, and they are per-endpoint
+
+The schema is explicit that the size of `blockStateCalls` may be limited depending on the client as
+DoS protection, and names 256 as a common and recommended limit because it matches the `BLOCKHASH`
+opcode's window.<Cite src="execution-apis-execute-schemas" /> Geth documents 256 as its total,
+including any gap blocks the client generated to fill a skipped range.<Cite src="geth-ns-eth" />
+
+Measured on both public endpoints:<Cite src="measured-simulation-2026-08-26" />
+
+```text
+300 blocks → -38026  too many blocks        (both endpoints)
+256 blocks → 200 OK, 256 blocks returned    (both endpoints)
+```
+
+Error `-38026` is spelled in the spec as *client adjustable limit
+exceeded*.<Cite src="execution-apis-execute-methods" /> The name is the warning: this is a knob, not
+a constant, and the operator turned it to whatever they turned it to.
+
+There is a second, quieter limit. Those 256 empty blocks came back as a **437,588-byte response
+body**.<Cite src="measured-simulation-2026-08-26" /> Each simulated block is returned as a full block
+object, header fields and all. A long multi-block rehearsal is a large response before it contains a
+single interesting result, and if you are metered by bandwidth or running this in a browser, that is
+the cost you will actually notice. Geth also notes that `eth_simulateV1`, like `eth_call`, is bounded
+by a maximum gas limit for the entire simulation, adjustable with `--rpc.gascap`.<Cite src="geth-ns-eth" />
+
+<Aside kind="warn">
+The block headers in the response are **synthetic, and clients fill them differently**. The same
+two-call payload sent to two endpoints returned blocks that agreed on `number`, `timestamp`,
+`gasUsed` and the call results — and disagreed on `hash`, on `stateRoot` (one returned all zeroes),
+on `extraData` (one echoed the parent builder's `Titan (titanbuilder.xyz)` tag, the other returned
+`0x`) and on `parentBeaconBlockRoot`.<Cite src="measured-simulation-2026-08-26" /> Assert on
+`calls`, `logs`, `gasUsed` and `status`. Do not assert on anything in the block header, and never
+treat a simulated transaction hash as an identifier for anything.
+</Aside>
+
+## What the standard method still does not give you
+
+Being exact about the remaining gap is what stops the rest of this module from being a sales pitch in
+either direction.
+
+`eth_simulateV1` returns raw logs and raw return data. It does not decode them. A vendor simulation
+API returns the same execution with the event name, the parameter names, the parameter values, the
+call tree with `method`, `decodedInput` and `decodedOutput` on every frame, and the balance changes
+computed for you.<Cite src="tenderly-simulations" /> Those products also let you simulate on the
+latest state through a single RPC URL and share the result as a page someone else can
+open.<Cite src="tenderly-simulations" />
+
+None of that is *capability*. It is presentation, persistence and sharing — which is precisely why
+the price gap between a raw method and a decoded one is roughly sixty-fold rather than infinite.
+The decision it forces is a real engineering decision and it recurs at every rung of this module:
+decoding is cheap to buy and tedious to build, and it is the difference between a result an engineer
+can debug and a result a treasury signer can approve.
+
+Two honest limits on the standard method, then, worth writing on the wall: **you supply the ABI, or
+you read hex**, and **nothing persists** — every `eth_simulateV1` result exists only in the HTTP
+response you received, so if you did not store the payload, the parent block and the result together,
+the rehearsal is gone.
+
+## Worked example: a sequence that only works as a sequence
+
+The scenario is the one a single call cannot express: an ERC-20 `approve` followed by the call that
+depends on it, for a user who does not currently hold the token.
+
+**Subgoal — make the user solvent without a funding transaction.** Compute the balance slot for the
+holder in the token's `balances` mapping and set it with `stateDiff`, not `state`. In Foundry terms
+this is `cast index address <holder> <slotNumber>`; the result is the 32-byte key you write. Use
+`stateDiff` so the token's supply, pause flag and blocklist stay real — the whole point of simulating
+against mainnet is that those values are the ones that will actually be there.
+
+**Subgoal — put the two calls in one block, in order.** Both go in the `calls` array of the same
+`blockStateCalls` entry. They execute in order against accumulating state, which is the only
+arrangement in which the second one means anything. Simulating them separately would tell you that
+each works *if the other already had*, which is not a claim about your flow.
+
+**Subgoal — turn on the reporting you will actually read.** Set `traceTransfers: true` so ETH
+movement appears as `Transfer` logs from `0xeeee…eeee` alongside the token
+logs.<Cite src="geth-ns-eth" /> Now one log stream answers "what moved", instead of two.
+
+**Subgoal — read per-call results, not just the last one.** The response gives every call a `status`
+of `0x1` or `0x0`, its `gasUsed`, its `returnData` and its `logs`.<Cite src="eth-simulatev1-spec" />
+A bundle where call three failed and call four succeeded anyway is a real and common outcome; only
+the per-call array shows it.
+
+**Subgoal — record what you lied about.** Alongside the result, store the parent block number, every
+override you applied, and the `validation` setting. Without those three, the result cannot be
+reproduced or reviewed, which means it cannot be used as evidence for sending anything.
+
+In viem 2.x this shape has two entry points: `simulateCalls` for one block's worth of calls, with a
+`stateOverrides` parameter and a `traceAssetChanges` option that returns per-token `pre`, `post` and
+`diff` balances;<Cite src="viem-simulate-calls" /> and `simulateBlocks` when you need several blocks
+with `blockOverrides`, which is where the queue-warp-execute shape lives.<Cite src="viem-simulate-blocks" />
+Both document themselves as using `eth_simulateV1` underneath.<Cite src="viem-simulate-calls" /><Cite src="viem-simulate-blocks" />
+
+<Check type="spot-bug" concept="state-overrides">
+A colleague's rehearsal script checks that a new liquidation path works. It overrides the borrower's
+collateral token balance, overrides the oracle contract's price slot to simulate a crash, and calls
+`liquidate`. The simulation returns `status: 0x1` and a plausible `gasUsed`, and the script prints
+`LIQUIDATION PATH OK`.
+
+Here is the override block:
+
+```json
+"stateOverrides": {
+  "0x…collateralToken": { "state": { "0x…borrowerSlot": "0x…1000e18" } },
+  "0x…oracle":          { "state": { "0x…priceSlot":    "0x…900e8"   } }
+}
+```
+
+Find the defect, say what the green result actually proved, and say what you would change.
+
+<Answer>
+**The defect is `state` where `stateDiff` was meant** — in both entries.
+
+`state` is whole-storage replacement: every slot in that account not listed becomes
+zero.<Cite src="execution-apis-execute-schemas" /> So this script did not simulate a price crash
+against a real lending market. It simulated a price crash against:
+
+*A collateral token with exactly one non-zero balance in existence.* Total supply zero. Every other
+holder's balance zero. Any allowance, pause flag or blocklist entry the token relied on, zero.
+
+*An oracle with one price and nothing else.* Staleness timestamps, round IDs, decimals if they live
+in storage, the aggregator address — all zero. An oracle whose `updatedAt` is zero either reverts a
+freshness check or, worse, passes one that was written as `block.timestamp - updatedAt < MAX_AGE`
+with an unsigned subtraction, and now you are testing a branch that cannot occur in production.
+
+**What the green result proved:** that `liquidate` completes when called against a token and an
+oracle that do not exist. That is not nothing — it exercises the arithmetic and the call graph — but
+it is not the claim the script printed.
+
+**How this stays invisible.** The measured DAI pair in this lesson is the general case: the transfer
+under `state` and the transfer under `stateDiff` returned the same status and the same
+gas.<Cite src="measured-simulation-2026-08-26" /> The call you are testing usually does not read the
+slots you destroyed. The *rest of the system* does, and the rest of the system is exactly what you
+came to mainnet state for.
+
+**The changes, in order of importance.**
+
+*Switch both to `stateDiff`.* One word, and the market becomes real again.
+
+*Add a canary read to the bundle.* Append a call that reads something the override should not have
+touched — the token's `totalSupply()`, the oracle's `latestRoundData()` — and assert it still
+matches the un-overridden value at the same block. That single extra call would have caught this
+immediately, and it costs one entry in the `calls` array.
+
+*Print the overrides with the verdict.* `LIQUIDATION PATH OK` should not be printable without the
+parent block number and the full override set beside it. A rehearsal result with the fiction stripped
+off is indistinguishable from a rehearsal result that was true.
+
+*Consider whether the price override is even the right tool.* Overriding the oracle's storage assumes
+you know its layout and that nothing else derives from those slots. On a fork you could instead move
+the actual market — trade the pool down, or roll time forward and let a TWAP catch up — which tests
+the paths that read the oracle rather than the value you jammed into it. That is a trade between
+speed and fidelity, and lesson four is about making it deliberately.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now express, without deploying anything and without a fork: a user who holds tokens they do
+not hold, a contract whose code is not the code that is deployed, a proxy that already points
+somewhere else, and a sequence of actions separated by days of block time — all against real mainnet
+state, in one request, on a standard method.
+
+That is a large amount of power, and it arrives with a matching amount of self-deception risk. Every
+override is a claim you asserted rather than observed. Every `status: 0x1` is conditional on all of
+them.
+
+**Next**: what a green simulation does and does not entitle you to say. Wallets now put this
+machinery in front of users as a safety feature, attackers have adapted to it specifically, and the
+state you simulated against is not the state your transaction will meet. The three failure modes in
+that sentence are the reason "we simulated it" is a beginning of an argument, not an end of one.

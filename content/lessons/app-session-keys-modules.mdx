@@ -1,0 +1,383 @@
+---
+id: app-session-keys-modules
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [erc-7579, erc-7562, eip-4337, erc-7710, erc-7715, erc-4337-session-keys-docs, eip-7951, eip-7702, metamask-caveat-enforcers, metamask-caveats-reference]
+stack: { solidity: "0.8.36" }
+---
+
+Read a session-key validator module for the first time and one thing stands out: it does not check
+the clock.
+
+The policy has a `validUntil`. The window is the whole point of the feature. And yet the contract
+contains no `require(block.timestamp < validUntil)`. Instead it packs the timestamp into the top bits
+of a `uint256` it returns, and hands that to somebody else to compare.
+
+That is not a stylistic choice, and it is not an artifact of some SDK. It is forced, by a rule that
+exists so a bundler can decide whether to include your operation **without executing it**. This
+lesson is about that rule and its siblings, and about the module architecture they are enforced
+against — because between them they explain almost every otherwise-arbitrary shape you will meet in
+this code.
+
+## Four module types, and why the numbers matter
+
+ERC-7579 specifies the minimal interfaces for modular smart accounts. It separates modules into four
+types, each with a unique incremental identifier that accounts, modules and other entities MUST use
+to identify the module type:<Cite src="erc-7579" />
+
+<Matrix
+  corner="Type id"
+  cols={['Module', 'What it is allowed to do']}
+  rows={[
+    {
+      label: '1',
+      cells: [
+        { v: <strong>Validator</strong>, tone: 'accent' },
+        'Decide whether a signature or permission authorises a call.',
+      ],
+    },
+    {
+      label: '2',
+      cells: [
+        { v: <strong>Executor</strong>, tone: 'danger' },
+        <>Make the account perform calls, via a callback into <code>executeFromExecutor</code>.</>,
+      ],
+    },
+    {
+      label: '3',
+      cells: [
+        <strong>Fallback handler</strong>,
+        "Extend the account's fallback for selectors the account does not implement.",
+      ],
+    },
+    {
+      label: '4',
+      cells: [
+        <strong>Hook</strong>,
+        <>Run <code>preCheck</code> before and <code>postCheck</code> after an execution.</>,
+      ],
+    },
+  ]}
+  caption="The number is the authorisation boundary: type 1 decides, type 2 acts, and an account that cannot tell them apart has no policy at all."
+  alt="The four ERC-7579 module types by identifier: 1 validator, which decides whether a signature or permission authorises a call; 2 executor, which makes the account perform calls through executeFromExecutor; 3 fallback handler, which extends the account's fallback; and 4 hook, which runs preCheck before and postCheck after an execution."
+/>
+
+A validator implements `IERC7579Validator`, which is two functions: `validateUserOp(PackedUserOperation, bytes32)`
+returning a `uint256`, and `isValidSignatureWithSender(address, bytes32, bytes)` for ERC-1271
+forwarding.<Cite src="erc-7579" /> The spec says a validator MUST validate that the signature is a
+valid signature of the `userOpHash`, and SHOULD return ERC-4337's `SIG_VALIDATION_FAILED` **without
+reverting** on a signature mismatch.<Cite src="erc-7579" /> That "without reverting" is not
+politeness — ERC-4337 asks accounts not to return early on a signature failure so that gas estimation
+of the validation function still works.<Cite src="eip-4337" />
+
+An executor implements only `IERC7579Module` and is granted something quite different: the account's
+`executeFromExecutor` is documented as intended to be called by executor modules, and MUST enforce
+`onlyExecutorModule`.<Cite src="erc-7579" />
+
+Now the sentence that makes the type ids load-bearing. ERC-7579's rationale, under *Differentiating
+module types*, states it directly: not differentiating between module types could present a security
+issue when enforcing authorization control — for example, if a smart account treats validators and
+executors as the same type of module, it could allow a validator to execute arbitrary transactions on
+behalf of the smart account.<Cite src="erc-7579" />
+
+Read that against what a session key is. A session-key validator is a module you install so that a
+*restricted* signer can authorise a *restricted* set of calls. If the account's module bookkeeping
+cannot tell type 1 from type 2, that same module address is now permitted to drive
+`executeFromExecutor`, which performs arbitrary calls with no policy in the path at all. The
+restriction was never removed. It was routed around.
+
+<Misconception
+  belief="Installing the wrong module type is a configuration error that will fail loudly."
+  reality="It is a privilege escalation. A module installed as both validator and executor keeps working perfectly on the happy path while holding a second, unpoliced route to the account's execution."
+  why="Installation succeeds, tests pass, and the wrong capability is only visible if someone asks what else this address can now call."
+  src="erc-7579"
+/>
+
+The spec's security considerations open with "Needs more discussion" and then list the failure modes
+anyway, and three of them are directly about installation.<Cite src="erc-7579" /> Modules' `onInstall`
+and `onUninstall` may lead to unexpected callbacks such as reentrancy, and **modules could maliciously
+revert on `onUninstall` to stop the account from uninstalling a module** — remember that one, it is
+the subject of the revocation lesson. For module types where only a single module is active at a time,
+calling `installModule` on a new one does not properly uninstall the previous one unless the account
+implements that, which can leave stale state that reappears if the old module is added again. And
+account configuration functions are designed for single operations, so an account that adds stricter
+authorization to `installModule` can have those measures bypassed by nesting calls to configuration
+options in calls to self.<Cite src="erc-7579" />
+
+<Aside kind="note">
+The account is calling into module code that it did not write, and the delegatecall question is the
+first one to ask. ERC-7579's execution mode encodes a `callType` byte where `0xff` means
+delegatecall, and the spec's security section says implementing delegatecall executions must be
+considered carefully, because an account that delegatecalls must ensure the target is safe.<Cite src="erc-7579" />
+Everything you know from [delegatecall as the proxy primitive](/c/delegatecall-is-the-proxy-primitive)
+applies unchanged: the module's code runs against the account's storage. A session-key policy that
+permits a delegatecall mode has not restricted anything.
+</Aside>
+
+## The reason validation cannot look at the clock
+
+Now the constraint that shapes the module's insides.
+
+ERC-4337's whole design rests on separating validation from execution so that a bundler can know an
+operation will pay before running it.<Cite src="eip-4337" /> That guarantee only holds if validation
+cannot become invalid between the bundler's check and the block. ERC-7562 is the specification of
+what validation code may therefore do, and it is explicit about the goal: the validation code is
+sandboxed, isolated from other UserOperations, external storage changes, **and environmental
+information like the current block timestamp**.<Cite src="erc-7562" />
+
+The concrete rules a session-key module runs into:
+
+**Blocked opcodes [OP-011].** `TIMESTAMP`, `NUMBER`, `BLOCKHASH`, `COINBASE`, `PREVRANDAO`,
+`GASLIMIT`, `BASEFEE`, `ORIGIN`, `GASPRICE`, `BLOBHASH`, `BLOBBASEFEE`, `CREATE` (with narrow
+exceptions), `INVALID` and `SELFDESTRUCT` are all forbidden during
+validation.<Cite src="erc-7562" /> The rationale spells out why: these opcodes access block-specific
+information that is not yet finalized, so a UserOperation could succeed off-chain and consistently
+revert on-chain — the example given is `require(block.number == 12345)` passing at mempool validation
+and failing when the transaction is eventually included in a later block.<Cite src="erc-7562" />
+
+So your validator cannot read `block.timestamp`. The expiry check has to happen somewhere else.
+
+**Where it happens instead.** ERC-4337 specifies that `validateUserOp`'s return value MUST be packed
+of an aggregator/authorizer value, a `validUntil` timestamp and a `validAfter` timestamp: the
+aggregator field is 0 for a valid signature and 1 to mark signature failure, otherwise an aggregator
+address; `validUntil` is a 6-byte timestamp value, or zero for "infinite"; `validAfter` is a 6-byte
+timestamp.<Cite src="eip-4337" /> The EntryPoint does the comparison, outside the sandbox, where
+reading the block's time is fine.
+
+Two details in that specification are the kind that bite once:
+
+- **Zero `validUntil` means infinite, not expired.** A struct that defaults to zero and is returned
+  unmodified grants a permanent authority. This is the single most dangerous default in the
+  interface.
+- **Block numbers are available, but not mixed.** To express a validity range using block numbers,
+  both `validUntil` and `validAfter` need their highest bit set to 1, and the range can be expressed
+  by two timestamps or two block numbers — **one timestamp and one block number cannot be mixed** in
+  the same operation's validity range.<Cite src="eip-4337" />
+
+**Storage rules [STO-010] through [STO-033].** Access to the account's own storage is always
+allowed.<Cite src="erc-7562" /> Access to *associated* storage of the account, in an external
+contract that is not an entity, is allowed if the account already exists.<Cite src="erc-7562" /> And
+"associated" has a precise definition: a storage slot of any contract is associated with address `A`
+if the slot's value is `A`, or if the slot was calculated as `keccak(A‖x)+n` where `x` is a `bytes32`
+and `n` is in the range 0 to 128.<Cite src="erc-7562" />
+
+That definition is why every session-key module you read keys its state by the account address. A
+`mapping(address account => SessionState)` in the validator hashes to `keccak(account‖slot)`, which
+lands inside the allowed range — so a cumulative spend counter for *this* account is readable and
+writable during validation. A global counter at a fixed slot is not associated with anything, and a
+bundler will drop the operation. The rationale is the mempool's: by restricting storage access to the
+account's associated storage, bundlers can guarantee the inclusion of at least one UserOperation per
+account in a bundle, so one storage write cannot invalidate a large number of queued
+operations.<Cite src="erc-7562" />
+
+**And a handful of rules that quietly forbid the obvious implementation:**
+
+- `BALANCE` and `SELFBALANCE` are allowed **only from a staked entity** [OP-080], so a validator
+  cannot check "does this account still have enough ETH" during validation.<Cite src="erc-7562" />
+- `CALL` with value is forbidden [OP-061], except to the EntryPoint.<Cite src="erc-7562" />
+- Accessing an address with no deployed code via `EXTCODE*` or `*CALL` is forbidden
+  [OP-041].<Cite src="erc-7562" />
+- Transient storage counts as storage: `TLOAD` and `TSTORE` are treated exactly like `SLOAD` and
+  `SSTORE` for these rules [OP-070].<Cite src="erc-7562" />
+- Only known precompiles that touch neither state nor environment are permitted [OP-062] — the core
+  precompiles `0x1`–`0x11`, **plus the `P256VERIFY` secp256r1 precompile defined in
+  EIP-7951**.<Cite src="erc-7562" /><Cite src="eip-7951" />
+- Between the first and second validation, the `EXTCODEHASH` of any visited address, entity or
+  referenced library may not change, or the operation is considered invalid
+  [COD-010].<Cite src="erc-7562" />
+
+<Figure
+  caption="The one clause of the policy the module may not evaluate is the one clause it returns."
+  alt="A validator running inside the ERC-4337 validation sandbox may not read TIMESTAMP, so instead of comparing the window it packs an authorizer field, a validAfter and a validUntil into its return value, and the EntryPoint — which is outside the sandbox — performs the comparison against the block."
+>
+  <Flow
+    lanes={['inside the sandbox', 'what it returns', 'outside the sandbox']}
+    nodes={[
+      { id: 'v', label: 'the validator', note: 'may not read TIMESTAMP', col: 0, tone: 'warn' },
+      { id: 'ret', label: 'packed return value', note: 'authorizer, validUntil, validAfter', col: 1, tone: 'accent' },
+      { id: 'ep', label: 'the EntryPoint', note: 'compares against the block', col: 2, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'v', to: 'ret', label: 'returns' },
+      { from: 'ret', to: 'ep', label: 'compares' },
+    ]}
+  />
+</Figure>
+
+That precompile carve-out is worth pausing on, because it is the only application-shaped exception in
+an otherwise mechanical list. A session key that signs on P-256 — because it is a passkey, or because
+it is a non-exportable browser key — can be verified inside validation with the
+[precompile at `0x100`](/c/eip-7951-precompile). Without that entry in [OP-062], the whole
+passkey-backed account design would have been pushed out of the validation phase and into execution.
+
+<Misconception
+  belief="A session-key policy can check whatever it likes, since it is just Solidity in a contract you wrote."
+  reality="During ERC-4337 validation it is Solidity running in a sandbox with an opcode denylist and a storage allowlist. Reading the clock, reading a balance, calling an arbitrary oracle and touching an unrelated contract's storage are all excluded."
+  why="Nothing about the Solidity source signals the restriction — the code compiles, and it runs fine in a unit test. It fails at the bundler, which is a component most teams never test against."
+  src="erc-7562"
+/>
+
+## What gets pushed into execution, and what that costs
+
+If a check cannot run during validation, it moves — to an ERC-7579 hook's `postCheck`, or to the
+`afterHook` of a delegation-framework caveat enforcer. Balance-change enforcers are exactly this
+shape: they verify a post-execution state change rather than inspecting the
+call.<Cite src="metamask-caveat-enforcers" /><Cite src="metamask-caveats-reference" />
+
+The all-or-nothing property is preserved. If any hook determines its conditions are not met it
+reverts, the entire redemption is cancelled, and no state changes from the attempted execution are
+committed.<Cite src="metamask-caveat-enforcers" /> So correctness survives the move.
+
+**Economics do not.** ERC-7562 states the consequence in one line: once a UserOperation is validated,
+it is guaranteed to pay, and there are no restrictions on execution — neither on the account's
+`callData` nor on the paymaster's `postOp`.<Cite src="erc-7562" />
+
+Put those together and the difference between a validation-phase check and an execution-phase check
+is not stylistic:
+
+<Compare
+  axis=""
+  columns={[
+    { title: 'Rejected in validation', tone: 'good' },
+    { title: 'Reverted in execution', tone: 'warn' },
+  ]}
+  rows={[
+    { label: 'Where it is caught', cells: ['Bundler, before inclusion', 'On-chain, after inclusion'] },
+    { label: 'Who pays', cells: ['Nobody', 'The account (or its paymaster)'] },
+    {
+      label: 'What the user sees',
+      cells: ['Nothing, or a client-side error', 'A failed operation and a gas charge'],
+    },
+    {
+      label: 'What an attacker can do with it',
+      cells: ['Nothing; the op never lands', "Repeat it to burn the account's gas budget"],
+    },
+  ]}
+  caption="Moving a check out of validation keeps it correct and changes who pays every time it fires."
+  alt="A check rejected during validation compared with the same check reverting during execution, across where it is caught, who pays, what the user sees, and what an attacker can do with it."
+/>
+
+That last row is the one to design against. A policy whose only teeth are in a post-execution hook is
+a policy an attacker can trigger repeatedly at your expense. It still prevents the theft. It does not
+prevent the [gas griefing](/c/gas-griefing), and if a [paymaster](/c/paymaster) is sponsoring, the
+bill is yours rather than the user's.
+
+<Aside kind="warn">
+There is an architectural fork here that is easy to miss. **The ERC-7562 rules bind you only when you
+route through the ERC-4337 alt-mempool.** They are rules bundlers enforce off-chain to protect the
+shared mempool — the specification is explicit that block builders and standalone bundlers enforce
+them off-chain.<Cite src="erc-7562" /> An application that redeems an ERC-7710 delegation by sending
+an **ordinary transaction** to a delegation manager has no bundler in the path, so a caveat enforcer
+running in that transaction may read `block.timestamp`, read balances, and call whatever it likes.
+Same account, same policy language, different rule set — decided by how the operation is delivered.
+Write down which path your product uses, because a module written for one and tested on the other
+will pass its tests and be dropped in production.
+</Aside>
+
+## Worked example: where does each check go?
+
+Take a policy with five clauses and place each one.
+
+**Subgoal — sort the clauses by what they need to read.** *Target address* and *function selector*
+read only the call being authorised. *Value cap per call* reads only the call. *Signature check* reads
+the operation hash and the stored session-key public key. *Cumulative spend this period* reads
+persistent state. *Resulting token balance must not fall below X* reads external contract state after
+the fact.
+
+**Subgoal — check each read against the storage rule.** Target, selector and value are in the calldata
+— no storage at all, always fine. The stored public key and the cumulative counter both live in the
+validator, keyed by the account address, so they fall inside associated storage and are readable and
+writable during validation.<Cite src="erc-7562" /> The token balance is a slot in the *token*
+contract, keyed by the account — which is also associated storage of the account in a non-entity
+contract, and therefore permitted if the account already exists.<Cite src="erc-7562" /> That is a
+genuinely useful surprise: a balance read on an ERC-20 is allowed where a native `BALANCE` opcode is
+not.
+
+**Subgoal — check each read against the opcode rule.** Nothing above needs `TIMESTAMP`, except the
+window — which is why the window is not a check at all but a return value.
+
+**Subgoal — place the leftovers.** The *resulting* balance cannot be known before the call runs, so it
+is an `afterHook`, and it inherits the economics from the table above.
+
+**Subgoal — write down the failure mode of each placement, because they differ.** A wrong target
+fails at the bundler, silently and free. A cumulative cap exceeded fails at the bundler too. A
+post-execution balance assertion fails on-chain, costs gas, and shows the user a reverted operation
+they did not cause. Three different support tickets, and the copy for each is different.
+
+<Check type="predict" concept="session-key-4337-validation-limits">
+A team's session-key validator works perfectly in Foundry. Every test passes, including the expiry
+test. Deployed to a testnet and driven through a bundler, roughly half the operations are silently
+dropped and never appear on-chain. The validator's relevant lines are:
+
+```solidity
+function validateUserOp(PackedUserOperation calldata op, bytes32 hash)
+    external returns (uint256)
+{
+    Session storage s = sessions[msg.sender][_signerOf(op)];
+    if (block.timestamp > s.validUntil) return SIG_VALIDATION_FAILED;
+    if (address(msg.sender).balance < s.minReserve) return SIG_VALIDATION_FAILED;
+    if (totalSpentThisEpoch > s.epochCap) return SIG_VALIDATION_FAILED;
+    return _checkSig(op, hash, s.signer);
+}
+```
+
+Predict which lines cause the drops, why the tests did not catch them, and rewrite the function's
+contract with the caller.
+
+<Answer>
+**Line 1 — `block.timestamp` — is a blocked opcode.** `TIMESTAMP` (0x42) is on the [OP-011] denylist,
+because a check against block-specific information can pass during mempool validation and fail on
+inclusion.<Cite src="erc-7562" /> The bundler's trace sees the opcode and drops the operation
+regardless of what the comparison would have returned.
+
+**Line 2 — `address(...).balance` — is `BALANCE` (0x31), allowed only from a staked
+entity.**<Cite src="erc-7562" /> A validator module is not an entity, so this is blocked too. The
+"check the account still has a reserve" idea has to move to execution or be abandoned.
+
+**Line 3 — `totalSpentThisEpoch` — is a global storage slot.** It is not associated with the account:
+it is not a slot whose value is the account address, and it was not computed as `keccak(A‖x)+n`. A
+bundler rejects it under the storage rules, and the rationale explains the motive — a single global
+counter is exactly the state whose modification would invalidate every queued operation at
+once.<Cite src="erc-7562" />
+
+**Why the tests passed.** Foundry executes the function. It does not trace it against a rule set. The
+bundler is a *different kind* of checker — a static-ish policy on the execution trace — and nothing in
+a unit-test harness models it. This is the same category of gap as testing a contract without ever
+running the deployment script: the artifact under test is not the artifact that ships. A bundler
+compatibility suite, or simply submitting through a real bundler in CI, is the only thing that closes
+it.
+
+**Why "roughly half."** Because the drops are not deterministic from the team's point of view.
+Different bundler implementations enforce with different strictness, some operations were submitted
+directly to a builder rather than through the shared mempool, and the ERC-7562 rules distinguish
+network-wide rules from local rules that each bundler applies against its own
+state.<Cite src="erc-7562" /> Partial failure is the signature of a policy-layer rejection, not of a
+logic bug — a logic bug would fail every time.
+
+**The rewritten contract with the caller.** The function does one thing: prove the signature is the
+session signer's, and check anything it is allowed to check from the calldata and from
+account-associated storage. Then it returns the window rather than enforcing it — pack `validAfter`
+and `validUntil` into the return value and let the EntryPoint compare against the block, remembering
+that a zero `validUntil` means infinite rather than expired.<Cite src="eip-4337" /> The epoch counter
+moves into `sessions[account][signer]` so it is associated storage. The reserve check either becomes a
+post-execution hook, with the gas economics that implies, or is dropped as a control that was never
+worth the complexity.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The next lesson** moves up a layer: instead of installing your own validator, you ask the user's
+wallet for a permission and get back an opaque context plus the address of a delegation manager. The
+module machinery here is what that context is redeemed against.
+
+**The expiry-versus-revocation lesson** builds directly on two facts from this one — that the window
+is a return value evaluated by the EntryPoint, and that a module can revert in `onUninstall` to resist
+being removed.
+
+**And on the security track**, the validator/executor separation is a textbook
+[access-control failure](/c/access-control-failure) in its most modern clothing: a capability granted
+through the wrong interface, invisible on the happy path, and enumerable only by asking what each
+installed address is now permitted to call.

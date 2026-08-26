@@ -1,0 +1,343 @@
+---
+id: app-wallet-capabilities-one-button-many-calls
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [eip-5792, eip5792-getting-started, eip5792-atomic-capability, viem-send-calls, viem-get-calls-status, viem-wait-for-calls-status, viem-get-capabilities, wagmi-use-send-calls, wagmi-core-send-calls, wagmi-use-wait-for-calls-status, wagmi-use-capabilities, wagmi-migrate-v2-v3, viem-wallet-client-doc, viem-send-transaction-doc, metamask-7702-upgrade]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The approve-then-swap double prompt is the most-analysed drop-off in this industry, and the analysis
+usually stops at the wrong place. It is not that two prompts are twice as annoying as one. It is that
+the interval *between* them is a state your product has to own: the user has granted an allowance and
+received nothing, your interface is showing a spinner it cannot cancel, and if they close the tab now
+they are left holding a standing approval to a contract they never used.
+
+ERC-5792 removes the interval by making the pair a single request. `wallet_sendCalls` hands the
+wallet an array of calls to submit as one action; `wallet_getCallsStatus` reports on that action as a
+unit.<Cite src="eip-5792" /> The last lesson was about asking whether that is available. This one is
+about spending the answer — and about the option that keeps the same code working for a wallet that
+has never heard of the method.
+
+## What you are actually sending
+
+The request is one object, and every field in it is load-bearing:
+
+```ts
+type SendCallsParams = {
+  version: string
+  id?: string
+  from?: `0x${string}`
+  chainId: `0x${string}`
+  atomicRequired: boolean
+  calls: {
+    to?: `0x${string}`
+    data?: `0x${string}`
+    value?: `0x${string}`
+    capabilities?: Record<string, Capability>
+  }[]
+  capabilities?: Record<string, Capability>
+}
+```
+
+<Cite src="eip-5792" />
+
+`from` and `chainId` are EIP-155 integers in hexadecimal, `0x`-prefixed with no leading zeroes in the
+chain id, and the items in `calls` are plain to/data/value tuples — no gas field, no fee
+fields.<Cite src="eip-5792" /> Those are absent by design. An earlier draft had a per-call `gas`
+value, which cannot work for an ERC-4337 wallet where one gas limit covers the whole user operation;
+a single shared value was tried next, which cannot work for an EOA wallet sending several
+transactions; and the field was removed altogether once both had to be supported.<Cite src="eip-5792" />
+Gas and fees are the wallet's business now, which is a smaller surface for you and one less place to
+be wrong.
+
+The rules the wallet MUST follow are short enough to hold in your head, and each one is a promise you
+can build a UI on:
+
+- Send the calls **in the order specified**.
+- Send them **on the chain named in `chainId`**, all of them.
+- Send them **from the address in `from`** — and if `from` is omitted, the wallet SHOULD let the user
+  pick during confirmation.
+- **MUST NOT await finalisation** of any call before completing the batch.
+- **MUST NOT send any call** if the user rejects the request.<Cite src="eip-5792" />
+
+That last one is the reason a batch is a genuine UX improvement rather than a repackaging. Rejection
+is all-or-nothing at the *consent* layer regardless of what happens at the execution layer, so the
+interval where a user has half-agreed to something no longer exists.
+
+There is also a MAY that will bite you in testing: a wallet **MAY reject the request if one or more
+calls in the batch is expected to fail when simulated sequentially**.<Cite src="eip-5792" /> A batch
+whose second call only becomes valid because the first one ran — the approve-then-transfer shape,
+exactly — is the case this permits a wallet to refuse. Whether any given wallet simulates
+sequentially or as a unit is not something the standard settles for you, so a batch that works in one
+wallet and is refused by another, with no on-chain trace, is behaviour you should expect rather than
+debug.
+
+## The identifier is not a transaction hash
+
+`wallet_sendCalls` returns `{ id, capabilities? }`.<Cite src="eip-5792" /> The `id` is the handle for
+everything that follows, and it has rules worth knowing before you store it:
+
+- It is **a unique string of up to 4096 bytes** — 8194 characters including the `0x` prefix.<Cite src="eip-5792" />
+- You **may supply your own**, and if you do the wallet MUST respect it and return it. App-provided
+  ids MUST be unique per sender per app, where an app SHOULD be identified by its domain, and wallets
+  **MUST reject requests with duplicate ids** — error `5720`.<Cite src="eip-5792" />
+- Wallets SHOULD answer `wallet_getCallsStatus` for that id **within 24 hours** of the send.<Cite src="eip-5792" />
+
+Two consequences for a real product. First, supplying your own id turns the batch into something your
+backend can reconcile against without waiting for a hash — but it also means a naive retry that
+reuses the id gets rejected rather than deduplicated, so your idempotency key and the batch id should
+not be the same value unless you have thought about that. Second, the 24-hour window is a SHOULD on
+the wallet, not a durable record: if you need to know a month later what happened, the receipts you
+pulled out of the status response are your record, not the id.
+
+<Misconception
+  belief="The id that comes back is a transaction hash, so I can put it in a block-explorer link."
+  reality="It is an opaque batch identifier of up to 4096 bytes, meaningful to the wallet that issued it. Transaction hashes arrive later, inside the receipts array of the status response."
+  why="Every prior API in this space returned a hash from the send call, and the id is hex-shaped, so it looks like one."
+  src="eip-5792"
+/>
+
+## Sending it from viem
+
+viem's `sendCalls` takes `account`, `chain`, `calls`, `capabilities`, `forceAtomic`, `id` and
+`experimental_fallback`, and returns `{ id, capabilities? }`.<Cite src="viem-send-calls" /> `account`
+and `chain` are top-level rather than per-call, because every call in a batch goes from the same
+account on the same chain.<Cite src="viem-send-calls" />
+
+The `calls` array accepts raw `to`/`data`/`value` tuples, and it also accepts contract calls given as
+`abi`, `functionName` and `args`, which viem encodes into `data` for you.<Cite src="viem-send-calls" />
+Use the second form. You already know [how a call becomes bytes](/c/abi-encoding); what you gain here
+is that the ABI is in scope, so a wrong argument type is a compile error rather than a wallet prompt
+showing a user a transaction that will revert.
+
+```ts
+const { id } = await walletClient.sendCalls({
+  account,
+  calls: [
+    { to: token, abi: erc20Abi, functionName: 'approve', args: [vault, amount] },
+    { to: vault, abi: vaultAbi, functionName: 'deposit', args: [amount, account.address] },
+  ],
+  experimental_fallback: true,
+})
+```
+
+Then you wait. `waitForCallsStatus` polls until the batch reaches a non-pending status — its default
+predicate is `statusCode >= 200` — with a `pollingInterval`, a `retryCount` defaulting to `4`, and a
+`retryDelay` you can override.<Cite src="viem-wait-for-calls-status" /> What it resolves to is the
+same object `getCallsStatus` returns:
+
+```ts
+// { atomic: false, chainId: 1, id: '0x…', statusCode: 200, status: 'success', receipts: [{ … }] }
+```
+
+<Cite src="viem-get-calls-status" />
+
+Both a numeric `statusCode` and a string `status` are present, and they are not redundant. The
+numeric code is the wire value from the specification; the string is viem's normalisation of it.
+Branch on the numeric code when you care about the distinctions the spec draws, which — as the next
+lesson will show — is more often than you would like.
+
+The specification's codes are grouped: `1xx` pending, `2xx` confirmed, `4xx` off-chain failures, `5xx`
+chain-rules failures. Five are defined today: `100` received but not yet executed on chain, `200`
+included with no reverts, `400` not included and the wallet will not retry, `500` reverted completely
+with only gas-related changes possibly on chain, and `600` **reverted partially, with some changes
+related to the batch calls possibly included on chain**.<Cite src="eip-5792" /> Hold on to `600`.
+
+<Matrix
+  corner="statusCode"
+  cols={['What the wallet is reporting', 'What may be on chain']}
+  rows={[
+    { label: '100', cells: ['Received, not yet executed on chain', 'Nothing yet'] },
+    { label: '200', cells: ['Included with no reverts', { v: 'Every call in the batch', tone: 'good' }] },
+    { label: '400', cells: ['Not included, and the wallet will not retry', 'Nothing'] },
+    { label: '500', cells: ['Reverted completely', { v: 'Gas-related changes only', tone: 'warn' }] },
+    { label: '600', cells: ['Reverted partially', { v: 'Some of the batch calls', tone: 'danger' }] },
+  ]}
+  caption="Collapsing everything above 400 into 'it failed' discards the only signal that separates nothing happened from something did."
+  alt="The five defined ERC-5792 call status codes, each with what the wallet is reporting and what may already be on chain."
+/>
+
+## Degrading instead of breaking
+
+Now the part that decides whether any of this ships.
+
+If you send `wallet_sendCalls` to a wallet that does not implement it, you get an error — the EIP
+says wallets that do not support these methods SHOULD return error responses when they are
+called, and it explicitly sanctions the two app responses: fall back to `eth_sendTransaction`
+serially, or tell the user their wallet is not supported.<Cite src="eip-5792" /> The second is not a
+choice most products can make.
+
+viem implements the first for you. Passing `experimental_fallback: true` to `sendCalls` lets viem
+fall back to executing the calls sequentially via `eth_sendTransaction` when the wallet does not
+support EIP-5792.<Cite src="viem-send-calls" /> One flag, one code path, two generations of wallet.
+
+The doc attaches a warning that matters more than the feature: when the fallback engages, viem
+returns **a custom bundle identifier**, and while that identifier works with viem's own
+`getCallsStatus` action, **it cannot be used with the native `wallet_getCallsStatus` RPC
+method**.<Cite src="viem-send-calls" /> So the id you receive is not always the same kind of object.
+If any part of your system takes that id and hands it to a raw provider — a debugging panel, a
+support tool, a serverless function that re-queries with its own transport — it will work in
+development against a modern wallet and fail in production against an old one. Keep the id inside the
+viem client that produced it.
+
+<Figure
+  caption="One call site, two mechanisms — and the identifier that comes back is only meaningful to the one that produced it."
+  alt="sendCalls with the fallback enabled either issues one wallet_sendCalls request returning a wallet-issued id answerable by wallet or viem, or issues one eth_sendTransaction per call returning a viem bundle id that only viem can resolve."
+>
+  <Flow
+    lanes={['your call site', 'what goes out', 'the id you get', 'who can answer it']}
+    nodes={[
+      { id: 'call', label: 'sendCalls(calls)', note: 'experimental_fallback', col: 0, tone: 'accent' },
+      { id: 'native', label: 'wallet_sendCalls', note: 'one request', col: 1 },
+      { id: 'fb', label: 'eth_sendTransaction', note: 'one per call, in order', col: 1, dashed: true, tone: 'warn' },
+      { id: 'wid', label: 'wallet-issued id', col: 2 },
+      { id: 'vid', label: 'viem bundle id', col: 2, dashed: true, tone: 'warn' },
+      { id: 'both', label: 'wallet or viem', col: 3 },
+      { id: 'only', label: 'viem only', note: 'raw RPC: error 5730', col: 3, dashed: true, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'call', to: 'native' },
+      { from: 'call', to: 'fb', dashed: true },
+      { from: 'native', to: 'wid' },
+      { from: 'fb', to: 'vid', dashed: true },
+      { from: 'wid', to: 'both' },
+      { from: 'vid', to: 'only', dashed: true },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="Adopting sendCalls breaks every wallet that predates EIP-5792."
+  reality="viem's experimental_fallback executes the same calls one at a time over eth_sendTransaction, so the old wallet keeps working with N prompts instead of one."
+  why="A new RPC method usually means a hard compatibility break, and the flag is easy to miss in the parameter list."
+  src="viem-send-calls"
+/>
+
+<Aside kind="warn">
+The fallback flag is on **viem's** action. The documented parameters for wagmi's `sendCalls` action —
+the one `useSendCalls` wraps — are `account`, `calls`, `capabilities`, `chainId` and `connector`;
+`experimental_fallback` and `forceAtomic` are not among
+them.<Cite src="wagmi-core-send-calls" /><Cite src="wagmi-use-send-calls" /> If you want the fallback
+in a wagmi app today, reach through to a viem wallet client and call the viem action, rather than
+assuming the hook forwards an option its own documentation does not list.
+</Aside>
+
+## Worked example: approve and deposit, on any wallet
+
+One flow, six steps, each named by what it is for rather than by what it does.
+
+**Subgoal 1 — decide what the batch is *for* before deciding whether to batch.** Write the sentence
+the user is agreeing to: "move `amount` of this token into this vault". If that sentence is true only
+when both calls land, you need atomicity and the next lesson is about how to ask for it. If it is
+merely nicer when both land together, you need batching and you do not need atomicity. These are
+different requests and the difference is one boolean.
+
+**Subgoal 2 — read the capability before building the request.** From the previous lesson: merge the
+`0x0` wildcard over the per-chain entry, treat pending and errored as absent, and reduce to your four
+states.<Cite src="eip-5792" /><Cite src="wagmi-use-capabilities" /> This decides the copy on the
+button, not whether the code path exists.
+
+**Subgoal 3 — build one call array, unconditionally.** The array is the same in every branch. This is
+the test of whether you have actually removed the vendor branch: if the array is constructed
+differently for different wallets, you have moved the sniff rather than deleted it.
+
+**Subgoal 4 — send with the fallback enabled and let viem decide.** `experimental_fallback: true`
+means the decision between one request and N requests happens inside viem, on evidence, at call
+time.<Cite src="viem-send-calls" /> Your component does not know which happened, and does not need
+to.
+
+**Subgoal 5 — wait on the batch, not on a transaction.** `waitForCallsStatus` is the right waiter
+here, not [`waitForTransactionReceipt`](/c/tx-lifecycle-states) — there may be one transaction, there
+may be several, and you were handed a batch id rather than a hash.<Cite src="viem-wait-for-calls-status" />
+In React, `useWaitForCallsStatus` is the query form of the same thing.<Cite src="wagmi-use-wait-for-calls-status" />
+
+**Subgoal 6 — read the receipts, not just the status.** The status response carries a `receipts`
+array whose logs MUST be restricted to the calls you submitted — for a batch that a bundler included
+alongside other user operations, the logs must exclude the unrelated ones, and if the user's wallet
+upgraded itself to support atomicity before submitting, the logs MUST NOT include the ones emitted by
+that upgrade.<Cite src="eip-5792" /> That filtering is what makes the receipts usable as your
+product's record of what happened, and it is a guarantee you would not get by scraping the block
+yourself.
+
+<Aside kind="note">
+wagmi also ships `useSendCallsSync`, and viem a `sendCallsSync` action, which wait for inclusion
+before returning instead of handing you an id to poll.<Cite src="wagmi-use-send-calls" /> Convenient
+on a fast chain, and the same caution applies as with any synchronous send: a request that blocks
+until a block arrives is a request that behaves badly wherever blocks are slow.
+</Aside>
+
+## One request is not one transaction
+
+The specification says this in its security considerations, in bold-faced normative language, and it
+is the sentence most implementations quietly violate:
+
+**Regardless of the `atomic` value specified, app developers MUST NOT assume that all calls will be
+sent in a single transaction.**<Cite src="eip-5792" /> The example the EIP gives is a reorg-resistant
+L2 implementing a `sendBundle` primitive — several transactions, one indivisible unit.
+
+The naming rationale says the same thing from the other side. The method is `wallet_sendCalls` rather
+than `wallet_sendTransaction` because for an EOA wallet one such request might send more than one
+transaction; and it is not `wallet_sendTransactions` because for an ERC-4337 wallet multiple calls
+could produce a single transaction.<Cite src="eip-5792" /> The word "calls" is doing precise work.
+Neither "one transaction" nor "N transactions" is a safe assumption, in either direction.
+
+Anything in your system keyed on "a user action produces one transaction hash" needs re-deriving:
+analytics events, webhook handlers, support tooling that looks up a user's last action, retry logic
+that reads a nonce. The `receipts` array is the shape to build on, and its length is not something
+you get to predict.
+
+<Check type="predict" concept="erc-5792-sendcalls">
+You ship the flow above. A user on a wallet with no EIP-5792 support runs it, and the approval lands
+while the deposit is rejected by the wallet's second prompt. Answer three things: what identifier
+does your code hold; what does calling viem's `getCallsStatus` with it return; and what does the same
+identifier do if your support tool passes it to `wallet_getCallsStatus` on a raw provider.
+
+<Answer>
+**What you hold: a viem-generated bundle identifier, not a wallet-issued one.** The fallback path was
+taken, so the calls went out as separate `eth_sendTransaction` requests and viem synthesised an id to
+give the caller a uniform return type.<Cite src="viem-send-calls" /><Cite src="viem-send-transaction-doc" />
+Your component cannot tell this apart from the native case by looking at the value, which is the
+point of the design and also the trap.
+
+**What viem's `getCallsStatus` returns: a real answer.** viem tracks the fallback bundle itself, so
+the action resolves with the same `atomic` / `statusCode` / `status` / `receipts` shape as the native
+path.<Cite src="viem-get-calls-status" /> Expect `atomic: false` and a receipts array shorter than
+your calls array — the approval has a receipt, the deposit never happened, so there is nothing to
+report for it. Note that this is *not* the `600` partial-revert case: nothing reverted. A call the
+user declined was never submitted, and a call that was submitted and reverted are different events
+that your UI will be tempted to render identically.
+
+**What the raw provider does with it: fails.** The viem doc is explicit that the fallback identifier
+works with viem's `getCallsStatus` action but cannot be used with the native `wallet_getCallsStatus`
+RPC method.<Cite src="viem-send-calls" /> A wallet asked about an id it never issued has a defined
+response for exactly this — error `5730`, *unknown bundle id*.<Cite src="eip-5792" /> The failure is
+clean, which is fortunate, because it will only ever appear against the wallets you are least likely
+to have installed while writing the support tool.
+
+**The design rule this produces.** The batch id is scoped to the client that created it. Persist the
+transaction hashes from `receipts` if you need something that survives the client — those are
+chain-level facts, and the id is not.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** picks up status code `600` and the `atomic` boolean in the status response, and
+asks the question this lesson deferred: what is on chain when a batch stops halfway, and what does
+your interface say to the person it happened to.
+
+**The EOA-upgrade module** is where `atomicRequired: true` leads when the connected account is an
+EOA. The wallet's answer to that request may be to offer the user an account upgrade, which is a
+consent surface with properties no prompt you have shipped before has had.<Cite src="metamask-7702-upgrade" />
+
+**Paymasters** enter through the `capabilities` field you have now seen twice — once on the request,
+once per call. The spec's own example of the field is an app supplying a paymaster service URL, and
+the `optional: true` flag is what stops a wallet that has never heard of your capability from
+rejecting the whole request.<Cite src="eip-5792" />
+
+**Transaction UX**, later in this track, generalises the shift you just made: from a hash you poll to
+an intent you track. Once one user action can be one call, several calls, one transaction or several,
+the unit your interface reasons about has to be the intent — and the receipts array is what closes
+the loop back to chain-level truth.

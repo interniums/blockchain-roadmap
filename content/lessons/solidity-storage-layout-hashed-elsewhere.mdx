@@ -1,0 +1,500 @@
+---
+id: solidity-storage-layout-hashed-elsewhere
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    solidity-docs-storage-layout,
+    solidity-abi-spec,
+    foundry-cast-storage,
+    foundry-forge-inspect,
+    execution-apis,
+    measured-gas-constants,
+    oz-issue-6362,
+    eip-1967,
+    eip-7201,
+  ]
+stack: { solidity: "0.8.36", foundry: "1.7.1" }
+---
+
+Here is a small ledger contract, deployed, with real balances in it.
+
+```solidity
+contract Ledger {
+    address owner;                                     // slot 0, offset 0
+    uint96  totalSupply;                               // slot 0, offset 20
+    mapping(address => uint256) balanceOf;             // slot 1
+    mapping(address => mapping(address => uint256)) allowance;  // slot 2
+    uint256[] history;                                 // slot 3
+    string  name;                                      // slot 4
+}
+```
+
+Ask the node for slot 1 — the slot the compiler assigned to `balanceOf`, a mapping with a non-zero
+entry in it — and it returns:
+
+```text
+0x0000000000000000000000000000000000000000000000000000000000000000
+```
+
+Slot 2, `allowance`, also non-empty, also returns zero. Slot 3, the array, returns `0x…03`: not an
+element, a count. Of the four, only slot 4 — a six-character string — holds the variable's actual
+contents.
+
+Four of your six declarations are laid out by the rules from the last two lessons. Two of them are
+somewhere else entirely, and one of them keeps its length here and its contents elsewhere. This
+lesson is where "elsewhere" is, why it has to be, and how to compute it by hand.
+
+## Why they cannot live in line
+
+The reason is stated in one sentence and is worth taking apart, because it explains the whole design
+rather than describing it.
+
+Due to their unpredictable size, mappings and dynamically sized array types **cannot be stored "in
+between" the state variables preceding and following them**. Instead they are considered to occupy
+only 32 bytes with regard to the packing rules, and the elements they contain are stored starting at
+a different storage slot computed using a Keccak-256 hash.<Cite src="solidity-docs-storage-layout" />
+
+Recall what the layout pass actually is: a cursor that walks the declaration list, adds each
+variable's size in bytes, and never backtracks.<Cite src="solidity-docs-storage-layout" /> That
+algorithm requires one thing from every variable — a size known at compile time. A `uint256[3]` has
+one: 96 bytes, three slots. A `uint256[]` does not. Its size is a runtime fact, and it can change
+after deployment.
+
+So imagine the compiler tried anyway. It would have to leave a hole after the array and, when the
+array grew past it, either move every subsequent variable or overwrite them. Moving variables is not
+available — slot numbers are the contract's only durable identity for its state, and a live contract
+cannot renumber the slots its existing data is already sitting in. Overwriting is a corruption bug.
+The only escape is to stop asking where the data goes *in the sequence* and put it somewhere the
+sequence does not reach.
+
+That somewhere is an address derived by hashing, and the property that makes it safe is the one you
+already have: a 256-bit digest space is large enough, and a collision-resistant hash spreads inputs
+across it evenly enough, that two independently derived regions [do not collide in
+practice](/c/collision-resistance). Nothing checks. Nothing has to.
+
+<Aside kind="note">
+This is the same move as [the secure trie's hashed keys](/c/secure-trie-hashed-keys) one layer down,
+for a related reason: when you cannot control or predict the keys, derive them from a hash and rely on
+the distribution rather than on bookkeeping. Ethereum makes this trade repeatedly, and it is worth
+recognising as a pattern rather than re-learning per data structure.
+</Aside>
+
+The declared slot is not wasted, though, and the reason differs between the two types.
+
+**For dynamic arrays, slot `p` stores the number of elements** — byte arrays and strings excepted, see
+below.<Cite src="solidity-docs-storage-layout" />
+
+**For mappings, the slot stays empty**, but it is still needed to ensure that even if there are two
+mappings next to each other, their contents end up at different storage
+locations.<Cite src="solidity-docs-storage-layout" />
+
+<Misconception
+  belief="A mapping's declared slot holds something, or could be reused since it is always zero."
+  reality="It stays permanently empty, and it still cannot be shared. Its slot number is an input to the hash that derives every one of that mapping's value locations — it is what makes two adjacent mappings produce two different distributions instead of one shared one."
+  why="Every other declared variable occupies the slot it is assigned, so an empty slot reads as a wasted one. The slot is doing work; the work just is not storage."
+  src="solidity-docs-storage-layout"
+/>
+
+## Mapping slot derivation
+
+The formula: the value corresponding to a mapping key `k`, for a mapping at slot `p`, is located at
+`keccak256(h(k) . p)` where `.` is concatenation and `h` is a function applied to the key depending
+on its type.<Cite src="solidity-docs-storage-layout" />
+
+`h` has exactly two cases.
+
+- **For value types**, `h` pads the value to 32 bytes in the same way as when storing the value in
+  memory.<Cite src="solidity-docs-storage-layout" /> That is the alignment you already know: numbers
+  and addresses right-align in their word.<Cite src="solidity-abi-spec" />
+- **For strings and byte arrays**, `h(k)` is just the unpadded
+  data.<Cite src="solidity-docs-storage-layout" />
+
+The slot number `p` is always a full 32 bytes. So for a value-typed key the preimage is exactly 64
+bytes: key first, slot second.
+
+<Figure
+  caption="The declared slot is never read; it is an ingredient in the address of every entry the mapping holds."
+  alt="The padded key and the padded declared slot number are concatenated into one 64-byte preimage, hashed once with keccak256, and the resulting 32-byte digest is the storage slot where that key's value lives."
+>
+  <Flow
+    nodes={[
+      { id: 'k', label: 'h(k)', note: 'the key, padded to 32B', col: 0 },
+      { id: 'p', label: 'p', note: 'the declared slot, 32B', col: 0, tone: 'muted' },
+      { id: 'kec', label: 'keccak256', note: 'one 64-byte preimage', col: 1, tone: 'accent' },
+      { id: 'slot', label: '0xa3c1…9502', note: 'holds 777', col: 2, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'k', to: 'kec', label: 'first' },
+      { from: 'p', to: 'kec', label: 'second' },
+      { from: 'kec', to: 'slot' },
+    ]}
+  />
+</Figure>
+
+### Working it, against a live chain
+
+The deployed `Ledger` above has `balanceOf[0xf39F…2266] = 777`, where that address is the deployer.
+
+**Subgoal — find the mapping's declared slot.** From `forge inspect Ledger storageLayout`,
+`balanceOf` is at slot 1.<Cite src="foundry-forge-inspect" /> Not from counting the source by eye —
+`owner` and `totalSupply` share slot 0, which is exactly the kind of thing eye-counting gets wrong.
+
+**Subgoal — pad both halves to 32 bytes.** The key is an `address`, a value type, so it right-aligns
+behind twelve zero bytes. The slot number is 1.
+
+```text
+h(k) = 0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266
+p    = 0x0000000000000000000000000000000000000000000000000000000000000001
+```
+
+**Subgoal — hash the concatenation, not the pair.** The two padded halves become one 64-byte preimage,
+and one `keccak256` over the whole thing yields one digest:
+
+```text
+preimage (64 bytes, key first):
+  000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266
+  0000000000000000000000000000000000000000000000000000000000000001
+
+keccak256 →
+  0xa3c1274aadd82e4d12c8004c33fb244ca686dad4fcc8957fc5668588c11d9502
+```
+
+`cast index address 0xf39F…2266 1` performs the same computation as one subcommand. It is the version
+you will use in practice, and the version to avoid while you are still learning to trust the formula.
+
+**Subgoal — confirm against the chain.** Read that slot on the deployed
+address:<Cite src="foundry-cast-storage" />
+
+```text
+$ cast storage <ledger> 0xa3c1274aadd82e4d12c8004c33fb244ca686dad4fcc8957fc5668588c11d9502
+0x0000000000000000000000000000000000000000000000000000000000000309
+```
+
+`0x309` is 777. The value was never anywhere near slot 1.
+
+### Nesting, and why the order of concatenation matters
+
+`allowance` is `mapping(address => mapping(address => uint256))` at slot 2. A mapping whose value type
+is another mapping is not special-cased: you apply the rule twice, and the *output* of the first
+derivation becomes the `p` of the second.
+
+**Subgoal — derive the inner mapping's base.** `keccak256(pad(owner) . pad(2))`:
+
+```text
+0xbc40fbf4394cd00f78fae9763b0c2c71b21ea442c42fdadc5b720537240ebac1
+```
+
+That 32-byte value is not a slot anyone reads. It is the slot number that the inner
+`mapping(address => uint256)` behaves as though it were declared at.
+
+**Subgoal — derive the value's slot from it.** `keccak256(pad(0x…BEEF) . thatValue)`:
+
+```text
+0x8373c8f36f8dbcf7251ab29653f896f13e1ce72adc865e80dd2b559815ab1510
+```
+
+**Subgoal — confirm.** That slot on the live contract reads `0x2a`, which is 42, which is what the
+constructor set `allowance[owner][0xBEEF]` to.
+
+Notice the shape of the preimage in both steps: **key first, base second.** Get the order backwards
+and you get a perfectly valid 32-byte number that addresses nothing, reads as zero, and gives you no
+error — the failure mode of every hash-derived address in this system. There is no such thing as a
+malformed slot number.
+
+<Aside kind="warn">
+If the mapping's value is a non-value type, the computed slot marks the *start* of the data. For a
+struct value you add the member's slot offset within the struct to reach the
+member.<Cite src="solidity-docs-storage-layout" /> The documentation's own example is a
+`mapping(uint => mapping(uint => S))` with `struct S { uint16 a; uint16 b; uint256 c; }` at slot 1:
+`data[4][9].c` sits at `keccak256(uint256(9) . keccak256(uint256(4) . uint256(1))) + 1`, because `a`
+and `b` pack into the struct's first slot and `c` is the second.<Cite src="solidity-docs-storage-layout" />
+The packing rules from the previous lesson apply unchanged inside the hashed region.
+</Aside>
+
+### One collision that does not happen
+
+`h(k)` for a string key is the *unpadded* data. That should make you nervous, because
+[an unpadded concatenation is exactly how packed encodings
+collide](/c/packed-hash-collision) — two different key pairs producing one byte string.
+
+Work it through and the hazard is closed, but by a detail rather than by luck. The preimage is
+`k . p` where `p` is always exactly 32 bytes and always last. So a decoder reading the preimage
+backwards can always split it unambiguously: the final 32 bytes are the slot, everything before is
+the key. Two entries can only collide if their full preimages are equal, which requires the same slot
+*and* the same key bytes.
+
+The fixed-width trailing field is doing the work that a length prefix would otherwise have to do. That
+is the same structural fix you would reach for anywhere else, and it is worth noticing that the
+Solidity designers had to reach for it here — the ambiguity is real and the layout avoids it on
+purpose.
+
+## Dynamic arrays
+
+For a dynamic array at slot `p`, slot `p` stores the number of elements, and array data is located
+starting at `keccak256(p)`, laid out the same way statically sized array data would be: one element
+after the other, potentially sharing storage slots if the elements are not longer than 16
+bytes.<Cite src="solidity-docs-storage-layout" />
+
+Two differences from the mapping case are worth stating explicitly, because they are easy to blur.
+
+**The preimage is the slot alone**, not key-then-slot. `keccak256(uint256(p))`, 32 bytes in.
+
+**Indexing is arithmetic on the result**, not another hash. Element `i` of a `uint256[]` is at
+`keccak256(p) + i`. For narrower elements you divide: the elements pack, so the slot is
+`keccak256(p) + floor(i / perSlot)` and the element is a bit-range within that word.
+
+### Working it
+
+`history` is `uint256[]` at slot 3, holding `[11, 22, 33]`.
+
+**Subgoal — read the length from the declared slot.** Slot 3 reads `0x…03`. Three elements. Note what
+that slot does *not* hold: a capacity, a pointer, or a type tag. Just a count — and only `bytes` and
+`string`, below, put anything else in a dynamic type's declared slot.
+
+**Subgoal — derive the data root.** `keccak256` of the slot number padded to 32 bytes:
+
+```text
+keccak256(0x0000000000000000000000000000000000000000000000000000000000000003)
+  = 0xc2575a0e9e593c00f959f8c92f12db2869c3395a3b0502d05e2516446f71f85b
+```
+
+**Subgoal — walk forward by index.** `uint256` elements are one per slot, so element 0 is at that
+digest, element 1 at digest plus one, element 2 at digest plus two. Reading those three slots on the
+live contract returns `0x0b`, `0x16`, `0x21` — 11, 22, 33.
+
+**Subgoal — notice what nobody is checking.** The element addresses run *forward* from a hash. A long
+enough array walks a long way forward, and nothing in the EVM or the compiler verifies that the walk
+has not wandered into another array's region or onto a statically assigned slot. The guarantee is
+statistical, not enforced. For arrays of the sizes real contracts hold, that is fine. It is also why a
+proxy cannot just pick a low slot number and hope: EIP-1967's slots are derived from a hash rather
+than assigned sequentially, precisely so that no sequentially numbered variable can land on
+them.<Cite src="eip-1967" />
+
+<Aside kind="note">
+Nested dynamic arrays apply the rule recursively. For `x` of type `uint24[][]` at slot `p`, the
+element `x[i][j]` lives at `keccak256(keccak256(p) + i) + floor(j / floor(256 / 24))`, and is
+extracted from the slot's value `v` as `(v >> ((j % floor(256 / 24)) * 24)) & type(uint24).max`.<Cite src="solidity-docs-storage-layout" />
+
+Work out `floor(256 / 24)` and it is 10, not 10.67 — ten `uint24` values per slot, with 16 bits of
+every slot left permanently empty because a partial element is never split across a slot boundary.
+That is a 6% overhead on top of everything else, invisible in the source.
+</Aside>
+
+## `bytes` and `string`, which are neither
+
+`bytes` and `string` are encoded identically, and their encoding is a hybrid the other three
+encodings do not prepare you for.<Cite src="solidity-docs-storage-layout" />
+
+- **At most 31 bytes of data:** the elements are stored in the higher-order bytes of the declared slot
+  — left-aligned — and the lowest-order byte stores `length * 2`.
+- **32 bytes or more:** the main slot `p` stores `length * 2 + 1` and the data is stored as usual at
+  `keccak256(p)`.<Cite src="solidity-docs-storage-layout" />
+
+So the low bit of the declared slot is a tag: clear means short and inline, set means long and
+elsewhere.<Cite src="solidity-docs-storage-layout" />
+
+Both forms, from the same live contract. First, `name = "Ledger"` — six bytes:
+
+<Figure
+  caption="A short string and its own length marker share one word, and the data never leaves the declared slot."
+  alt="The word at slot 4 holds the six bytes of Ledger left-aligned at the high-order end, twenty-five unused bytes, and 0x0c in the lowest byte, which is six times two."
+>
+  <Anatomy
+    value="0x4c6564676572000000000000000000000000000000000000000000000000000c"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 14, label: '"Ledger"', note: 'left-aligned', tone: 'accent' },
+      { from: 14, to: 64, label: 'unused', note: '25 bytes', tone: 'muted' },
+      { from: 64, to: 66, label: 'length × 2', note: '0x0c = 12', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+Then the same variable set to a 59-byte string, which takes the long form — `59 * 2 + 1` in the
+declared slot, data at `keccak256(4)`:<Cite src="solidity-docs-storage-layout" />
+
+```text
+slot 4: 0x0000000000000000000000000000000000000000000000000000000000000077
+                                                     0x77 = 119 = 59 * 2 + 1
+
+keccak256(uint256(4)) = 0x8a35acfbc15ff81a39ae7d344fd709f28e8600b4aa8c65c6b64bfe7fe36bd19b
+  +0: 0x54686973206e616d652069732064656c696265726174656c7920666172206c6f
+  +1: 0x6e676572207468616e207468697274792d6f6e652062797465732e0000000000
+```
+
+Two consequences follow from the `*2` and the `+1`.
+
+**The maximum inline length is 31, not 32.** The length marker needs the lowest byte, so 31 bytes of
+data is the most that can share the slot.<Cite src="solidity-docs-storage-layout" /> A string that
+crosses from 31 to 32 characters changes storage *encoding*, not just storage contents — one write
+moves the data to a different address and rewrites the declared slot into a completely different
+meaning.
+
+**A slot can be invalidly encoded, and the compiler says so.** Handling invalidly encoded slots is
+currently not supported; if you are compiling via IR, reading an invalidly encoded slot results in a
+`Panic(0x22)`.<Cite src="solidity-docs-storage-layout" /> Writing a raw slot with inline assembly, or
+inheriting one from a different contract's layout, can leave a `string` whose length marker
+contradicts its contents — and the failure surfaces on the next *read*, far from the write that caused
+it.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'at most 31 bytes', note: 'the short form' },
+    { title: '32 bytes or more', note: 'the long form' },
+  ]}
+  rows={[
+    {
+      label: 'What does the declared slot hold?',
+      cells: [
+        'The data itself, left-aligned, with length × 2 in the lowest byte',
+        'length × 2 + 1, and nothing else',
+      ],
+    },
+    {
+      label: 'Where does the data live?',
+      cells: ['In the declared slot', 'At keccak256(p) and onward'],
+    },
+    {
+      label: 'How does a reader tell which form it is?',
+      cells: ['The lowest bit is clear', 'The lowest bit is set'],
+    },
+    {
+      label: 'What does one more character cost?',
+      cells: ['Nothing, until the 32nd', 'A whole extra slot, plus rewriting the declared one'],
+    },
+  ]}
+  caption="One bit of one byte decides whether the data is in the slot you asked for or nowhere near it."
+  alt="The short and long forms of a bytes or string variable compared on what the declared slot holds, where the data lives, how a reader distinguishes them, and what adding one more character costs."
+/>
+
+<Aside kind="stop">
+That second consequence has already destroyed a live contract. An OpenZeppelin issue documents a UUPS
+proxy on BNB Smart Chain permanently deadlocked by an upgrade in which a v4 initialization flag
+holding `0x01` landed at the same slot as a v5 namespaced string, violating this encoding invariant.
+The contract cannot be initialized, upgraded, or administered by any on-chain
+transaction.<Cite src="oz-issue-6362" /> A single low bit, set by a variable that no longer exists,
+against a reader that assumes the invariant holds.
+
+The proxies module takes that case apart slot by slot. What you need from it here is the shape: string
+encoding is a *contract between the writer and the reader of a slot*, and a layout change replaces the
+writer without telling the reader.<Cite src="eip-7201" />
+</Aside>
+
+## The four encodings, in one place
+
+Every state variable in Solidity falls into one of four encodings, and the compiler names them for you
+in the layout artifact — `inplace`, `mapping`, `dynamic_array`, or
+`bytes`.<Cite src="solidity-docs-storage-layout" />
+
+| Encoding | Declared slot holds | Data lives at |
+| --- | --- | --- |
+| `inplace` | the data | the declared slot and following slots |
+| `mapping` | nothing, permanently | `keccak256(h(k) . p)` per key |
+| `dynamic_array` | the element count | `keccak256(p)` onward, packed |
+| `bytes` | data plus `len*2`, or `len*2+1` | inline, or `keccak256(p)` onward |
+
+Reading a contract's storage from outside is exactly this table plus `eth_getStorageAt`, which is why
+every block explorer and indexer that decodes raw state implements the same four
+cases.<Cite src="execution-apis" />
+
+One gas note, because the derivation is free but the access is not. All of these addresses are still
+ordinary storage slots: a first read costs the cold 2,100 and later reads in the same transaction cost
+100.<Cite src="measured-gas-constants" /> Hashing a mapping key is a handful of gas; touching the slot
+it names is not. A loop over a hundred mapping entries pays a hundred cold reads, and no amount of
+clever derivation avoids that.
+
+<Check type="predict" concept="mapping-slot-derivation">
+A staking contract, deployed and in use:
+
+```solidity
+struct Stake { uint128 amount; uint64 since; bool locked; }
+
+contract Staking {
+    address           admin;
+    uint64            epoch;
+    uint256[]         checkpoints;
+    mapping(address => Stake) stakes;
+    mapping(address => mapping(uint256 => uint256)) claimed;
+}
+```
+
+1. Give the declared slot of every state variable.
+2. Write the expression for the slot holding `stakes[A].since`, for some address `A`.
+3. Write the expression for the slot holding `claimed[A][7]`.
+4. `checkpoints` currently has 5 elements. Where is `checkpoints[4]`, and what does its declared slot
+   read as?
+5. Someone proposes deleting `epoch`, which is unused, to save a slot. Does it, and is the edit safe?
+
+<Answer>
+**1 — the declared slots.**
+
+- `admin` `(0, 0)` — 20 bytes, 12 remaining.
+- `epoch` `(0, 20)` — 8 bytes, fits. Cursor at `(0, 28)`, 4 bytes remaining.
+- `checkpoints` — a dynamic array, considered to occupy 32 bytes for layout purposes. Four bytes
+  remain in slot 0, so it starts **slot 1**, and it takes the whole slot: a dynamic array's or
+  mapping's slot cannot be shared with any other variable, because the addresses derived from it must
+  be unique.<Cite src="solidity-docs-storage-layout" />
+- `stakes` — **slot 2**.
+- `claimed` — **slot 3**.
+
+Counting declarations rather than computing the layout gives 2, 3 and 4 here. The pairing of `admin`
+and `epoch` in one slot is exactly the step that eye-counting drops.
+
+**2 — `stakes[A].since`.** A struct value means the derived slot marks the *start* of the data, and
+you add the member's offset within the struct.<Cite src="solidity-docs-storage-layout" /> Inside
+`Stake`, `amount` is 16 bytes at offset 0, `since` is 8 at offset 16, `locked` is 1 at offset 24 —
+all three fit in one slot, so the struct occupies a single slot and the member's slot offset is zero.
+
+`keccak256(pad32(A) . pad32(2))`, with `since` in bytes 16 through 23 of that word.
+
+The instructive part is that the answer required knowing the struct packs into one slot. Had `amount`
+been `uint256`, `since` would be one slot further on, at `keccak256(pad32(A) . pad32(2)) + 1`.
+
+**3 — `claimed[A][7]`.** Two applications, outer key first:
+
+`keccak256(pad32(7) . keccak256(pad32(A) . pad32(3)))`
+
+**4 — `checkpoints[4]`.** Slot 1 reads as `0x…05`: the element count, not an element. The data root is
+`keccak256(pad32(1))`, and `uint256` elements are one per slot, so `checkpoints[4]` is at
+`keccak256(pad32(1)) + 4`.
+
+**5 — it saves nothing, and whether it is safe depends on where the contract lives.**
+
+It saves nothing because `epoch` was sharing slot 0 with `admin`. Remove it and `admin` still occupies
+slot 0 by itself; `checkpoints` still starts at slot 1, `stakes` at 2, `claimed` at 3. Same slot count,
+same numbers, more wasted bytes. Confirm it with `forge inspect` rather than by
+argument.<Cite src="foundry-forge-inspect" />
+
+Whether it is *safe* is the more useful half. For a fresh deployment, nothing here moved, so nothing
+breaks. Behind a proxy, the edit is safe only because it happened to move nothing — and the same edit
+applied to a variable that was not sharing a slot would renumber every declaration after it. Every
+mapping and array below would then derive from a different `p`, and all existing entries would sit at
+addresses the new code will never compute again. **A mapping's or array's entire data region is a
+function of its declared slot number**, so changing that number does not migrate the data. It abandons
+it.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Transient storage**, the next lesson, has its own slot numbering and its own layout — and now you
+have the right question to ask about it, which is not "is it cheaper" but "which of these four
+encodings does it support".
+
+**Proxies and upgrades** are where every rule in this lesson becomes a safety property. ERC-1967's
+pseudo-random slots and ERC-7201's namespaced layouts are both answers to the same question this
+lesson raised: how do you place data at an address that no sequential layout will ever
+reach?<Cite src="eip-1967" /><Cite src="eip-7201" />
+
+**Indexing and state decoding** in the infrastructure track is this lesson pointed outward. An indexer
+that reads raw storage rather than events implements the table above, and the `bytes` row is where
+those indexers get it wrong.
+
+**Storage proofs**, which you met when the trie hashed its own keys, compose with this directly:
+proving a single mapping entry to a light client means deriving the slot here, then proving that slot's
+value against the account's storage root.<Cite src="execution-apis" /> The derivation is the part you
+now do by hand.

@@ -1,0 +1,373 @@
+---
+id: app-error-surfaces-zero-bytes
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [measured-revert-surfaces-1-7-1, solidity-docs-src-control-structures, geth-protocol-params, foundry-cast-reference, viem-src-contract-errors, sourcify-4byte]
+stack: { solidity: "0.8.36", foundry: "1.7.1", viem: "2.x" }
+---
+
+Six unrelated failures, one output, and a seventh case that does not fail at all.
+
+Same prober as the first lesson — a contract that makes a low-level call and returns the raw revert
+bytes without interpreting them. solc 0.8.36, anvil 1.7.1, 200,000 gas forwarded to each
+sub-call:<Cite src="measured-revert-surfaces-1-7-1" />
+
+<Matrix
+  corner="What the target ran"
+  cols={['ok', 'return data']}
+  rows={[
+    { label: <code>revert()</code>, cells: ['false', { v: '0x', tone: 'muted' }] },
+    { label: <><code>require(x &gt; 10)</code> — no message</>, cells: ['false', { v: '0x', tone: 'muted' }] },
+    { label: <code>assembly {'{'} invalid() {'}'}</code>, cells: ['false', { v: '0x', tone: 'muted' }] },
+    { label: 'infinite loop — out of gas', cells: ['false', { v: '0x', tone: 'muted' }] },
+    { label: <><code>ITarget(0x…1234).ping()</code> — no code there</>, cells: ['false', { v: '0x', tone: 'muted' }] },
+    { label: <><code>ITarget(proxy).ping()</code> — proxy impl = 0</>, cells: ['false', { v: '0x', tone: 'muted' }] },
+    { label: <code>address(0x…1234).call("…")</code>, cells: [{ v: 'true', tone: 'danger' }, { v: '0 bytes returned', tone: 'muted' }] },
+    { label: <code>address(0x…1234).delegatecall("…")</code>, cells: [{ v: 'true', tone: 'danger' }, { v: '0 bytes returned', tone: 'muted' }] },
+    { label: <code>proxy.call("…")</code>, cells: [{ v: 'true', tone: 'danger' }, { v: '0x', tone: 'muted' }] },
+  ]}
+  caption="Nine unrelated things happen and the return-data column never changes — including for the three that did not fail."
+  alt="Nine prober results: revert(), a message-less require, an INVALID opcode, an out-of-gas loop, a high-level call into codeless address and one through a zero-implementation proxy all return false with 0x; a low-level call, a delegatecall and a proxy call all return true with zero bytes."
+/>
+
+Six ways to fail that a decoder cannot tell apart, and three ways to *succeed* that produce
+byte-identical data to the six. This lesson is about the only revert shape where the bytes tell you
+nothing, and about the second thing four bytes cannot do: identify anything.
+
+## The six causes, and why each one is empty
+
+Two of them are deliberate. `revert()` and `require(cond)` with no second argument are the
+contract author choosing to say nothing. The documentation is explicit that the one-argument
+`require` reverts "with empty error data, not even including the error
+selector".<Cite src="solidity-docs-src-control-structures" /> That phrasing is worth keeping,
+because it names the exact loss: not just the message, the *selector too*. There is no shape-four
+fallback to inspect.
+
+Two of them are the machine running out of room. Out of gas and the `INVALID` opcode both terminate
+the frame with no return data. They differ from `REVERT` in what they do to gas, not in what they
+hand back: `REVERT` returns the unused remainder, while `INVALID` and an out-of-gas consume
+everything the frame was given. Measured on the same prober with a fixed forwarded-gas argument,
+the minimum top-level limit was 26,571 when the callee ended on `revert()` and 64,841 when it ended
+on `invalid()`.<Cite src="measured-revert-surfaces-1-7-1" /> Nothing in the bytes records that
+difference. The gas accounting does — the first hint about how you triage this shape.
+
+The last two are the interesting ones, and they are the ones that produce production incidents.
+
+**A high-level call into an address with no code.** Solidity inserts an `EXTCODESIZE` check before
+a high-level external call and reverts if the target is empty, because otherwise the call would
+succeed and the decode of its non-existent return value would produce nonsense. That inserted check
+reverts with no data.
+
+**A high-level call through a proxy whose implementation slot is zero.** This one deserves the full
+walk-through, because the mechanism is not what most people assume.
+
+## The empty proxy: nobody reverts, and yet the call fails
+
+Deploy a minimal proxy whose `implementation` is still `address(0)` and call it. What happens,
+measured:<Cite src="measured-revert-surfaces-1-7-1" />
+
+```text
+prober.call(proxy, "ping()")            → true, 0 bytes
+ITarget(proxy).ping()   from Solidity   → false, 0x
+```
+
+The low-level call **succeeds**. You already know why from
+[the delegatecall-into-empty-code case](/c/delegatecall-no-code-succeeds): `DELEGATECALL` to an
+address holding no code returns 1. The proxy's assembly sees `ok = 1`, takes the success branch,
+and `return`s a zero-length buffer. From the EVM's point of view nothing went wrong anywhere. The
+documentation states the general rule plainly: the low-level `call`, `delegatecall` and
+`staticcall` "return `true` as their first return value if the account called is
+non-existent".<Cite src="solidity-docs-src-control-structures" />
+
+The failure appears one frame up. A high-level Solidity call that expects a `uint256` receives zero
+bytes and cannot decode them, so the compiler-inserted return-data check reverts — with no data,
+because that check has no message to give. The revert you observe was not produced by the proxy, by
+the implementation, or by any business rule. It was produced by *your caller's* inability to parse
+a successful empty response.
+
+<Aside kind="warn">
+Which means the same misconfiguration presents in two completely different ways depending on who
+calls it. A contract calling through the broken proxy sees an empty revert. A client calling
+`eth_call` through the same proxy gets HTTP 200 and `"result": "0x"` — a **success** with an empty
+return value, which viem then fails to decode, raising `ContractFunctionZeroDataError` rather than
+any revert error.<Cite src="viem-src-contract-errors" /> Same broken deployment, two different error
+classes, depending on which side of the RPC boundary you stand on.
+</Aside>
+
+## The seventh case: the wrong address does not fail at all
+
+Point a client at an address that holds no code and call a function on it directly. Measured
+against anvil 1.7.1:<Cite src="measured-revert-surfaces-1-7-1" />
+
+```text
+eth_call        {"to":"0x…1234","data":"0x12345678"}  →  {"result":"0x"}
+eth_estimateGas {"to":"0x…1234","data":"0x12345678"}  →  {"result":"0x52a8"}
+```
+
+Both succeed. The estimate — 21,160 gas — is the intrinsic cost of a transaction carrying four
+bytes of calldata and nothing else, because nothing else happened: 21,000 for the transaction
+itself<Cite src="geth-protocol-params" /> plus the calldata. Send it and it mines with
+`status: 1`.<Cite src="measured-revert-surfaces-1-7-1" />
+
+This is the single most important consequence of "the EVM has no notion of an error". A typo in a
+contract address, a stale address from a config file, an address that is correct on mainnet and
+empty on the testnet you are pointed at — none of these produce an error anywhere in the stack.
+They produce a successful transaction that did nothing. Neither simulation nor estimation will
+catch it, because there is nothing to catch: calling an account with no code is a legal, successful
+operation that returns no data.
+
+<Misconception
+  belief="If the contract address is wrong, the call will fail and I will find out."
+  reality="Calling an address with no code succeeds and returns zero bytes. eth_call returns a result, eth_estimateGas returns 21,000-ish, and a sent transaction mines with status 1. Only a decode of the empty return value fails — and only if you were expecting a return value at all."
+  why="Every other client-server system in your experience 404s on a wrong endpoint. Addresses are not endpoints; they are just numbers, and most of them are empty."
+  src="solidity-docs-src-control-structures"
+/>
+
+The defence is a code-size check at configuration time, not at call time. Read `getBytecode` once
+per configured address, on the chain it will be used on, at startup or at build time, and refuse to
+render against an address that holds nothing. One RPC call, and it eliminates the entire class of
+"it succeeded but nothing happened" reports.
+
+## Triaging an empty revert by context
+
+Since the content carries nothing, everything has to come from context. In practice four questions
+separate the six causes, and all four are answerable from the client.
+
+**Does the target hold code?** One `eth_getCode`. Empty means the wrong-address branch — and note
+you should check the target you *actually* sent to, including the proxy, and separately the
+implementation the proxy points at if you can read the slot.
+
+**How much gas was available?** If the failure came from a sent transaction, compare `gasUsed`
+against the limit in the receipt. `gasUsed` essentially equal to the limit is an out-of-gas or an
+`INVALID`; a fraction of the limit is a deliberate early return. Highest-signal test on the list,
+and free — both numbers are already in the receipt.
+
+**Did it survive re-simulation with far more gas?** Re-run as `eth_call` with a much larger limit.
+Succeeds now: out of gas. Fails identically: not.
+
+**Is there a proxy in the path?** Read the implementation slot. A zero there explains everything
+and nothing else will.
+
+<Figure
+  caption="Every branch here is decided outside the payload, because the payload is the same in all six cases."
+  alt="A tree from empty return data through four context checks — code size zero at the target, a zero proxy implementation slot, gasUsed against the limit, and whether the call still fails with headroom — separating six causes: a wrong address, a broken proxy, out of gas, an INVALID opcode, revert() and a message-less require."
+>
+  <Tree root={{ label: 'empty return data', note: '0x, nothing to decode', tone: 'warn', children: [
+    { label: 'code size 0?', note: 'eth_getCode', tone: 'accent', children: [
+      { label: 'wrong address', tone: 'danger' },
+    ] },
+    { label: 'proxy impl slot?', note: 'read the slot', tone: 'accent', children: [
+      { label: 'impl slot = 0', tone: 'danger' },
+    ] },
+    { label: 'gasUsed vs limit?', note: 'from the receipt', tone: 'accent', children: [
+      { label: 'out of gas' },
+      { label: 'INVALID' },
+    ] },
+    { label: 'still fails with headroom', note: 're-simulate', tone: 'accent', children: [
+      { label: 'revert()' },
+      { label: 'require(cond)' },
+    ] },
+  ] }} />
+</Figure>
+
+```ts
+// Context, not content. None of this looks at the revert bytes, because there are none.
+async function triageEmptyRevert(client, { to, data, receipt }) {
+  const code = await client.getBytecode({ address: to })
+  if (!code || code === '0x') return 'wrong-address'          // nothing there to call
+
+  if (receipt && receipt.gasUsed >= receipt.gasLimit - 100n) return 'out-of-gas'
+
+  try {
+    await client.call({ to, data, gas: 30_000_000n })
+    return 'out-of-gas'          // succeeded with headroom, so gas was the constraint
+  } catch {
+    return 'deliberate-revert'   // fails at any gas: the contract chose to say nothing
+  }
+}
+```
+
+<Aside kind="note">
+`gasUsed >= gasLimit - 100n` is a heuristic with a real false-negative: a transaction that runs out
+of gas inside a *sub-call* can return to the outer frame with gas to spare and then revert for its
+own reasons, leaving `gasUsed` well below the limit. The reverse — a transaction that used
+essentially its whole limit and failed — has no innocent explanation. Treat the test as
+one-directional evidence.
+</Aside>
+
+## Four bytes, and what they cannot do
+
+The other half of this lesson is the shape-four fallback, and it fails for a different reason: not
+absence of data, but absence of a mapping.
+
+A custom-error selector is the first four bytes of a keccak hash. Hashes do not invert, and there is
+no on-chain registry — nothing in any contract, any precompile or any RPC method maps four bytes
+back to a signature. Every tool that appears to do so is querying a database somebody populated by
+scraping verified source. `cast 4byte` says so in its own help text: it gets signatures "from
+openchain.xyz".<Cite src="foundry-cast-reference" /><Cite src="measured-revert-surfaces-1-7-1" />
+viem does not query anything at all — when a selector is not in the ABI you supplied it raises
+`AbiErrorSignatureNotFoundError` and puts a link to `4byte.sourcify.dev` in the error's
+meta-messages so a human can go look.<Cite src="viem-src-contract-errors" /><Cite src="sourcify-4byte" />
+
+That is a design choice worth respecting rather than working around. A remote lookup inside your
+error path adds a network dependency to the code that runs when the network is already misbehaving,
+and it returns something weaker than an answer.
+
+**How much weaker.** Ask the lookup service for `0x00000000` and count what comes
+back:<Cite src="measured-revert-surfaces-1-7-1" />
+
+```text
+$ cast 4byte 0x00000000 | wc -l
+83
+
+fulfillBasicOrder_efficient_6GL6yc((address,uint256,…))
+mintEfficientN2M_001Z5BWH()
+execute_44g58pv()
+buyAndFree22457070633(uint256)
+…
+```
+
+Eighty-three signatures, one selector.<Cite src="measured-revert-surfaces-1-7-1" /> Most are
+deliberate — a `0x00000000` selector sorts first in a dispatch table and compresses well, so people
+brute-force names to reach it — but the arithmetic is the point: four bytes is a 2^32 space, and a
+lookup returns a *list*.
+
+**Collisions are not exotic.** They are what a 32-bit hash does. A brute-force search over
+signatures of the form `Err<n>(uint256)`, run in the EVM with `keccak256` and a transient-storage
+table, found its first collision after scanning 73,134
+candidates:<Cite src="measured-revert-surfaces-1-7-1" />
+
+```text
+Err70699(uint256)  →  0xc00eb440
+Err73134(uint256)  →  0xc00eb440
+```
+
+Both confirmed with `cast sig`.<Cite src="measured-revert-surfaces-1-7-1" /> That figure is not
+luck: the birthday bound for a 32-bit digest is around sqrt(pi/2 · 2^32) ≈ 82,000 samples, and
+73,134 sits just inside it. Any codebase whose error definitions plus its dependencies' error
+definitions plus its dependencies' dependencies number in the low tens of thousands is already in
+collision territory — and the number of distinct error signatures deployed across a chain is far
+past that.
+
+<Misconception
+  belief="A four-byte selector identifies an error, so a lookup service can tell me what went wrong."
+  reality="The selector is a truncated hash with no registry behind it. A lookup returns every known signature that hashes to those bytes — 83 of them for 0x00000000 — and a decode against the wrong candidate produces a plausible, wrong answer rather than an error."
+  why="Selectors are printed like identifiers and behave like identifiers right up to the moment two of them are not."
+  src="sourcify-4byte"
+/>
+
+## Worked example: a decode that lies
+
+The failure mode of a candidate signature is not "it errors". It is "it works". Take a real revert
+payload and decode it against a signature that is not the right one.
+
+**Subgoal 1 — establish the ground truth so you can see the damage.** The contract declares
+`error InsufficientBalance(uint256 available, uint256 required)`, selector `0xcf479181`, and the
+failure carried `available = 5`, `required = 100`. Full payload: selector plus two 32-byte
+words.<Cite src="measured-revert-surfaces-1-7-1" />
+
+**Subgoal 2 — take a lookup result at face value.** Suppose a service returns two candidates for
+these four bytes and you pick the first, which declares its second parameter as an `address`. A
+wrong *guess* would be caught by the hash; a genuine collision would not, and 83 signatures share
+one selector already.
+
+**Subgoal 3 — decode the second word as the wrong type and watch it succeed.** As a `uint256` the
+second word is 100. As an `address` the same 32 bytes are `0x00…0064`. As a `bool` they are `true`.
+The ABI encoding of a `uint256`, an `address` and a `bool` in a static slot are all "a 32-byte
+big-endian word", so nothing distinguishes them and no decoder can complain. You now have an error
+message naming an address that does not exist.
+
+**Subgoal 4 — see what happens with the wrong argument count.** Decode `InsufficientBalance(uint256)`
+against 68 bytes of data: it reads the first word, returns 5, and ignores the remaining 32 bytes.
+Decoding does not check that the payload length matches the declared types, so a signature with too
+few arguments silently truncates and a signature with too many throws only when it runs off the end
+of the buffer.
+
+**Subgoal 5 — name the rule this produces.** A selector obtained from a lookup service is a
+hypothesis. It becomes an identification only when you can point at the source or ABI that defines
+it. In an incident, "openchain says this is `X`" belongs in the notes with that attribution
+attached — never in the user-facing string, and never in an automated branch.
+
+**Subgoal 6 — say what to do instead.** Ship the definitions. The set of contracts your application
+can reach is finite and known at build time, and their ABIs are files you already have. The next
+lesson is about assembling exactly that set, including the parts of it that are not obvious.
+
+<Check type="spot-bug" concept="empty-revert-data">
+An application shows this to users whenever a transaction fails with no revert data:
+
+> **Not enough balance.** Add funds and try again.
+
+The team's reasoning was recorded in the pull request: they sampled a week of production errors,
+found that most empty reverts came from a `require(msg.value >= price)` with no message, and wrote
+copy for the common case rather than a generic one.
+
+Say what is wrong with the reasoning, not merely with the string. Then describe what the same
+application would show for each of the other causes if the empty-revert branch stayed exactly as
+written — and name the one cause that would never reach this branch at all.
+
+<Answer>
+**What is wrong with the reasoning.** They sampled the errors they *received*, which is not the same
+population as the errors that *occur*. Empty reverts from a `require` reach the error handler
+because the flow got far enough to send a transaction. The other causes are systematically
+under-represented in that sample: a wrong-address bug does not produce an error at all, so it never
+appears; an out-of-gas failure on a heavy call happens to a minority of users with unusual state; a
+zero implementation slot affects one deployment and is fixed before it accumulates volume. Sampling
+an error stream tells you about the errors that are easy to observe, and this shape is defined by
+being hard to observe.
+
+**What each other cause would show.**
+
+*Out of gas.* "Not enough balance. Add funds and try again." The user adds funds. It fails again,
+identically, because the constraint was gas and not balance. This is the worst outcome on the list:
+confident, wrong, and it costs the user money to discover.
+
+*`INVALID` opcode.* Same string. In practice this arrives from a contract compiled before 0.8.0, or
+from hand-written assembly, and it means a broken invariant — a panic in everything but
+encoding.<Cite src="solidity-docs-src-control-structures" /> It should have gone to the app-bug
+bucket and an alert.
+
+*High-level call into an address with no code.* Same string, and the address is wrong. The user
+cannot fix it by adding funds, by waiting, or by doing anything at all.
+
+*A proxy whose implementation slot is zero.* Same string. Every user is affected, every call fails,
+and the interface is telling all of them that they are personally short of money during what is
+actually a total outage.
+
+*A different `require` with no message.* Same string, and it may be a completely unrelated business
+rule — a paused contract, a closed sale window, an unmet allowlist condition.
+
+**The cause that never reaches this branch.** The plain wrong-address call with no return value
+expected. `eth_call` returns `0x` as a **success** and `eth_estimateGas` returns about 21,000, so
+the transaction is signed, sent, mined with `status: 1`, and reported to the user as
+confirmed.<Cite src="measured-revert-surfaces-1-7-1" /> There is no error to render. The bug shows
+up later as "I sent it and nothing happened", which is the hardest support ticket in this whole
+module to close.
+
+**What the branch should do.** Empty revert data means *unclassified*, and the honest message says
+so: "This transaction could not be completed and the reason was not reported." Then run the context
+checks — code size at the target, gas used against the limit, a re-simulation with headroom — and
+only after one of them returns a verdict do you replace the generic string with a specific one. A
+branch that guesses is worse than a branch that admits it does not know, because the guess costs
+the user an action.
+</Answer>
+</Check>
+
+## What this unlocks
+
+The two failures in this lesson have the same root: the client did not hold enough information, and
+nothing told it so. Empty data is missing information at the source. An unresolvable selector is
+missing information in your bundle.
+
+**The next lesson** is about the second one, and it is more solvable than it looks. The set of
+contracts a call can reach is finite, their ABIs are files you already have, and the reason
+production applications still print raw hex is almost never that the ABI was unavailable — it is
+that nobody assembled the union. You will see what viem does with a selector it cannot find, why
+the reverting contract is so rarely the one you called, and how to write the walk from a thrown
+action error down to the bytes exactly once.
+
+**After that**, gas estimation — where the failure modes in this lesson stop being edge cases. Two
+of the six empty-revert causes are gas-related, and estimation is the machinery that is supposed to
+prevent them. It is a search, it costs several executions, and its central assumption is one your
+contracts are allowed to violate.

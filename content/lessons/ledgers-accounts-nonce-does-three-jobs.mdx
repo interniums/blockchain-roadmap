@@ -1,0 +1,275 @@
+---
+id: ledgers-accounts-nonce-does-three-jobs
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [yellow-paper, ethereum-docs-accounts, ethereum-docs-json-rpc, eip-161, eip-1014, eip-2681, eip-7702, geth-txpool]
+stack: { cast: "1.7.1" }
+---
+
+Two incidents from the same week, on the same team.
+
+**Monday.** A payouts service that signs from one hot wallet starts returning `nonce too low` under
+load. Adding retries makes it worse. Adding parallelism makes it much worse.
+
+**Thursday.** A deployment script prints the address a contract *will* have, ninety seconds before it
+exists, so that two frontends can be configured ahead of time. The printed address is wrong. The
+contract lands somewhere else and both frontends point at nothing.
+
+These are not two bugs. They are two consequences of one integer field, which is quietly doing three
+different jobs at the same time.
+
+## The field
+
+For an externally owned account the nonce counts transactions it has originated. For a contract
+account it counts contracts it has created.<Cite src="ethereum-docs-accounts" /><Cite src="yellow-paper" />
+One field, two meanings, decided by which kind of account you are looking at.
+
+It is bounded. EIP-2681 retroactively limited the nonce to the range 0 to 2<sup>64</sup>−1: a
+transaction whose nonce reaches or exceeds 2<sup>64</sup>−1 is invalid, and `CREATE` and `CREATE2`
+push zero on the stack rather than creating anything when the account's nonce is at the
+limit.<Cite src="eip-2681" /> The motivation was not overflow paranoia — it was that arbitrary-length
+integers are awkward in state witnesses, so pinning the width makes proofs and clients
+simpler.<Cite src="eip-2681" />
+
+For scale, the EIP notes that reaching the limit through ordinary transactions would cost at least
+21,000 × (2<sup>64</sup>−1) gas, and that as of November 2020 the highest account nonce on mainnet was
+around 29 million.<Cite src="eip-2681" /> Twenty-nine million is a long way from
+eighteen quintillion, and it is also a long way from anything most people picture when they hear
+"a counter of transactions sent".
+
+## Job one: deciding whether a transaction exists at all
+
+The Yellow Paper's intrinsic validity tests, which every transaction passes before any execution
+happens, include this one: the transaction nonce must be valid, "equivalent to the sender account's
+current nonce".<Cite src="yellow-paper" />
+
+Not greater than. Not at least. **Equal.**
+
+That single word is the source of everything else in this lesson. A transaction whose nonce is lower
+than the account's current value is permanently dead — that value has already been consumed and never
+comes back. A transaction whose nonce is higher is not invalid forever; it is simply not eligible yet,
+and stays that way until every value between has been consumed by some other transaction.
+
+Once a valid transaction begins, the increment is the very first thing that happens. The Yellow Paper
+is emphatic about the ordering: execution "begins with an irrevocable change made to the state: the
+nonce of the account of the sender is incremented by one and the balance is reduced by part of the
+up-front cost".<Cite src="yellow-paper" /> Irrevocable means what it says. A transaction that reverts
+still consumed its nonce, and still consumed the gas it burned getting to the revert. Reverting is not
+undoing.
+
+## Job two: imposing a total order you did not ask for
+
+Because validity is exact equality, and because the value increments by exactly one, **the protocol
+will not execute a sender's transaction N until N−1 has landed.**
+
+Read that as an architectural statement rather than a rule of thumb. One sender is one strictly
+ordered, non-concurrent stream. There is no partial order, no independence, no "these two do not
+touch each other so they can go in either order" — the protocol has no idea what your transactions
+touch and does not care. Two payouts to two unrelated recipients from one key are as strictly ordered
+as two writes to the same storage slot.
+
+Three things follow, and they are the Monday incident.
+
+**A gap is a wall.** Broadcast nonces 5 and 7 with 6 missing and 7 will not execute. It has not failed.
+There is no receipt, no error, no timeout — it is a valid signed transaction sitting in an eligible-
+looking state that the protocol will never enter. What a client does with such a transaction is client
+policy rather than consensus: go-ethereum's pool, for instance, keeps executable and non-executable
+transactions in separate structures and promotes between them.<Cite src="geth-txpool" /> The mempool
+module in this track is where that policy gets taken apart.
+
+**There is no cancel; there is only replacement.** The only way to unblock nonce 6 is to get *some*
+transaction with nonce 6 included. What people call cancelling is publishing a different transaction at
+the same nonce with a high enough fee that nodes prefer it. Whether they do is, again, client
+policy.<Cite src="geth-txpool" />
+
+**Throughput from one key is an ordering problem before it is a gas problem.** No fee, no priority
+channel and no private relay makes two transactions from one sender execute concurrently. If you need
+concurrency you need more senders, and the moment you have more senders you have a fund-distribution
+problem, a key-management problem and a reconciliation problem. That trade is the whole content of
+this module's reflection prompt, and it is worth noticing that it is forced by the account model
+itself rather than by any implementation choice.
+
+<Aside kind="warn">
+`eth_getTransactionCount` takes a block parameter, and the options include `latest` and
+`pending`.<Cite src="ethereum-docs-json-rpc" /> `latest` gives you the nonce as of the last block;
+`pending` gives you that node's view including transactions it currently knows about. They diverge
+exactly when you have work in flight, which is exactly when you are asking. Neither is sufficient on
+its own for a multi-writer backend: `latest` ignores your own in-flight transactions, and `pending`
+reflects one node's local mempool view, which is not a global fact. A backend that sends at any rate
+has to track its own outstanding nonces and reconcile against the chain, not ask the chain what it
+should do next.
+</Aside>
+
+### The rule that stopped being true in 2025
+
+For a decade, "the nonce counts transactions sent" was a complete description. It is not any more.
+
+EIP-7702's authorisation processing ends by increasing the nonce of the authorising account by
+one.<Cite src="eip-7702" /> Signing an authorisation therefore consumes a nonce value, and anything you
+had queued at that value is now dead. The EIP is also precise about the ordering, in a way that matters
+if you ever build one of these: the authorisation list is processed after the sender's own nonce has
+been incremented but before execution begins.<Cite src="eip-7702" /> So in the self-sponsoring case —
+where the account authorising the delegation is also the account paying for the transaction — the
+transaction carries nonce N and the authorisation inside it must be signed at nonce N+1.
+
+One more detail from the specification, because it is the sort of thing tooling gets wrong: an
+authorisation tuple that fails any of its validation steps is abandoned immediately, and the nonce
+increment is the last step, so a rejected authorisation does not move the counter.<Cite src="eip-7702" />
+The transaction's sender still pays for it either way.<Cite src="eip-7702" />
+
+## Job three: naming the contracts an account creates
+
+The third job is the Thursday incident, and it is the one people do not see coming, because it looks
+like it belongs to a different subject entirely.
+
+The address of a contract created by `CREATE` is the rightmost 160 bits of the Keccak-256 hash of the
+RLP encoding of the creator's address together with the creator's nonce.<Cite src="yellow-paper" />
+ethereum.org says the same in words: the address comes from the creator's address and the number of
+transactions sent from that address.<Cite src="ethereum-docs-accounts" />
+
+The Yellow Paper adds the off-by-one that trips people up when they reimplement this: the nonce used
+is one *fewer* than the creator's nonce at the moment of derivation, because the nonce was already
+incremented — so the value in the preimage is the sender's nonce at the beginning of the responsible
+transaction.<Cite src="yellow-paper" /> Practically, that means the nonce in the preimage is the one
+the creating transaction itself carried.
+
+Derive one by hand. Computed with `cast` 1.7.1 on 26 August 2026, for a creator at
+`0x1111111111111111111111111111111111111111` sending its creation transaction at nonce 1:
+
+```text
+RLP([sender, 1])  = d694 1111111111111111111111111111111111111111 01
+keccak256(...)    = 862c3235017671edd4a6ed0815452ec016c4dc8c549e7fe6ff4b26324ea8b7a4
+last 20 bytes     = 0x15452ec016c4dc8c549e7fe6ff4b26324ea8b7a4
+```
+
+And the same creator at the next three nonces:
+
+```text
+nonce 2  ->  0x39c2540Cc64C8562269200ee459DC2853aAB9d87
+nonce 3  ->  0xb35b8b030a4BC592Ea8ccf3684512CE083f108dC
+nonce 4  ->  0xE52DD5d8BaB96cAcdE411Df0F1Fc4d5075eb563c
+```
+
+No shared prefix, no relationship of any kind. **Anything that changes the deployment order changes
+every subsequent address.** One extra transaction from the deployer key between computing the address
+and broadcasting the deployment — a gas top-up, a test, a colleague's script, a delegation
+authorisation — and the printed address is a number nothing will ever live at.
+
+<Misconception
+  belief="A contract's nonce is always zero, or at least irrelevant."
+  reality="A contract account's nonce starts at 1 and increments on every CREATE. It is what makes factory-deployed addresses predictable, and it is what makes them fragile."
+  why="The nonce is introduced everywhere as 'a transaction counter', and contracts do not send transactions, so the natural inference is that the field is unused for them. The Yellow Paper sets a newly created account's nonce to one on creation, and EIP-161 made that a consensus rule."
+  src="eip-161"
+/>
+
+Why start at 1? EIP-161 requires creation transactions and the `CREATE` operation to increment the new
+account's nonce above its normal starting value by one, prior to executing the initialisation
+code.<Cite src="eip-161" /> The stated reason connects directly to the previous lesson: it avoids the
+oddity of a freshly created account being reaped half-way through its own creation.<Cite src="eip-161" />
+An account with nonce 0, no code yet and possibly no balance would be *empty*, and empty accounts get
+deleted when touched. Starting at 1 makes a contract-in-progress ineligible for clearing.
+
+### The escape hatch
+
+`CREATE2` exists because this dependence was intolerable for a whole class of applications. It derives
+the address from `keccak256(0xff ++ address ++ salt ++ keccak256(init_code))`, taking the same last 20
+bytes — with no nonce anywhere in the preimage.<Cite src="eip-1014" /> The stated motivation is
+counterfactual interaction: being able to rely on an address that does not exist yet but can only ever
+contain code produced by a particular piece of init code.<Cite src="eip-1014" />
+
+Two details in that formula are worth keeping. The leading `0xff` is there so the two schemes can never
+collide, because `0xff` cannot begin the RLP encoding of anything short of many petabytes — so no
+`CREATE` address is ever a `CREATE2` address.<Cite src="eip-1014" /> And the preimage is always exactly
+85 bytes, by construction.<Cite src="eip-1014" />
+
+## The three jobs interfere, because it is one field
+
+This is the part worth carrying out of the lesson. The nonce is not three fields that happen to share
+a name. It is one counter, and moving it for one purpose moves it for all three.
+
+<Compare
+  caption="Only the naming job has an escape hatch that costs nothing; the other two are paid for in extra keys, or not at all."
+  alt="The nonce's three jobs — admission, ordering and naming — compared by what the field decides in each, what the rule is, what an unexpected increment costs you, and whether there is a way out."
+  axis="Question"
+  columns={[
+    { title: 'Admission', note: 'is this transaction valid?' },
+    { title: 'Ordering', note: 'which one runs next?' },
+    { title: 'Naming', note: 'where does a deployment land?' },
+  ]}
+  rows={[
+    { label: 'What does the field decide?', cells: ['Whether a signed transaction exists at all', "Which of one sender's transactions may execute", 'The address the next CREATE produces'] },
+    { label: 'What is the rule?', cells: ["The nonce must equal the sender's current value", 'N is ineligible until N−1 has been consumed', 'Last 20 bytes of keccak(rlp([sender, nonce]))'] },
+    { label: 'What does an unexpected increment cost you?', cells: ['A signed transaction that is now permanently dead', 'A queue stalled behind a value only you can fill', 'A printed address nothing will ever live at'] },
+    { label: 'Is there a way out?', cells: ['No. Equality is an intrinsic validity test', 'Only by signing from more than one key', 'Yes. CREATE2 keeps the nonce out of the preimage'] },
+  ]}
+/>
+
+A delegation authorisation is a statement about *account behaviour*. It consumes a nonce, so it
+invalidates a queued *payment* at that value, and it shifts the address of the next *contract* that
+account deploys. Three unrelated concerns, one integer, no isolation between them.
+
+That is a design property worth naming rather than working around silently: the account model gives one
+identity one sequence number, and every capability that identity has is serialised through it.
+
+<Check type="predict" concept="nonce-total-ordering">
+A payouts backend holds one key. Its account nonce is 10 and nothing is in flight. It signs and
+broadcasts four transactions, at nonces 10, 11, 12 and 13. Transaction 11 is badly underpriced and is
+not included for an hour.
+
+An operator notices, panics, and runs a cancel script from a second process. That script calls
+`eth_getTransactionCount(addr, "latest")`, gets `10`, and broadcasts a zero-value self-send at that
+nonce with a large fee.
+
+1. What did the cancel script actually cancel?
+2. What is happening to 12 and 13 during the hour?
+3. The team then decides to enable batching, and signs an EIP-7702 authorisation from the same key.
+   What does that do to the queue?
+
+<Answer>
+**1 — not what they intended.** `latest` reports the nonce as of the last block, and nothing had been
+included, so it returned 10 — the value transaction 10 is *already using*.<Cite src="ethereum-docs-json-rpc" />
+The script therefore published a competitor to transaction 10, not to 11. If nodes accept the
+replacement on fee grounds, the original payout at nonce 10 is silently discarded and never
+appears — a lost payment, with no error anywhere, followed a moment later by 11 becoming eligible and
+the queue draining. If nodes reject the replacement, nothing at all happens and the operator believes
+they cancelled something. Both outcomes are worse than doing nothing, and the root cause is reading a
+nonce from the chain instead of tracking it locally.
+
+**2 — nothing, and that is the point.** Transactions 12 and 13 are valid, correctly signed, sufficiently
+priced, and unexecutable, because 11 has not landed.<Cite src="yellow-paper" /> There is no state in
+which they are "failed". Any monitoring that alerts on reverted transactions will stay silent for the
+entire hour. The signal to alert on is the gap between the account's on-chain nonce and the highest
+nonce you have signed — a number only your own system knows.
+
+**3 — it takes the next value out of the queue.** The authorisation must be signed at the authority's
+current nonce and, if it succeeds, increments it.<Cite src="eip-7702" /> So it competes for a specific
+slot in the same sequence as the payouts, and whatever the backend had planned for that value is now
+invalid. If the authorisation is self-sponsored, the transaction carries nonce N and the authorisation
+inside it must carry N+1, because the sender's nonce is incremented before the authorisation list is
+processed.<Cite src="eip-7702" />
+
+The general lesson is the one this section named: the nonce is a single sequence per identity, and a
+change of account *behaviour* has to queue behind — and displace — pending account *payments*.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** takes the job this one deliberately left out. Because a nonce value is consumed
+exactly once, a signed transaction can be included at most once — and that is same-chain replay
+protection, which is only one of the three layers that keep a signature from being reused.
+
+**The mempool module** in this track is where nonce gaps stop being a protocol fact and become an
+operational one: pending versus queued, replacement rules, price bumps, eviction, and the reason a
+transaction can be in one node's pool and unknown to the next.
+
+**In Track 04**, `CREATE2` becomes the foundation of deterministic deployment, counterfactual
+addresses, and every factory pattern you will read — all of them buying independence from the counter
+on this page.
+
+**In Track 07**, you will meet a second, entirely separate notion of a nonce belonging to
+smart-contract accounts. It is not this field, it does not live in this record, and conflating the two
+is a reliable source of confusion. Knowing precisely what this one is makes that distinction easy
+instead of subtle.

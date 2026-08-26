@@ -1,0 +1,417 @@
+---
+id: evm-gas-fee-market-no-opcode-has-one-price
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    eip-1884,
+    eip-2200,
+    eip-2929,
+    eip-2930,
+    eip-3529,
+    eip-3651,
+    eip-1153,
+    eip-150,
+    measured-gas-constants,
+    foundry-issue-5494,
+    foundry-gas-tracking,
+    foundry-forge-test-reference,
+  ]
+stack:
+  forge: "1.7.1"
+  solc: "0.8.36"
+---
+
+A CI job fails on a gas regression. The function that regressed was not touched in the pull request.
+What changed was the test: somebody added an unrelated assertion a few lines earlier, that assertion
+read a storage slot, and now the function under test costs about two thousand gas less than it did
+yesterday.
+
+Nobody optimised anything. The slot was already warm by the time the function ran.
+
+So the team decides to stop arguing about tables on the internet and measure the number themselves,
+with a `gasleft()` probe around a single `SLOAD`. The first run reports that a cold storage read
+costs **9 gas**.
+
+Both of these are the same lesson from opposite ends. Gas costs for state access are not properties
+of an opcode; they are properties of an opcode *and the transaction it is running in*. And gas
+numbers are not properties of an opcode either; they are properties of a measurement, which can be
+wrong in ways that look plausible.
+
+## The set that makes the price move
+
+EIP-2929 gives every transaction two sets that live for its whole duration: `accessed_addresses` and
+`accessed_storage_keys`. The first time an item is touched it is **cold** and expensive; it is added
+to the set, and every later touch in that transaction is **warm** and cheap.<Cite src="eip-2929" />
+
+Three details about those sets do most of the work in practice.
+
+**They do not start empty.** At the beginning of execution, `accessed_addresses` already contains the
+sender, the target (or the address being created), and every precompile.<Cite src="eip-2929" />
+EIP-3651 later added the block's `COINBASE` address, on the reasoning that the addresses which start
+warm should be exactly the ones the client had to load anyway — the sender to check its balance
+against the gas limit, the target to begin execution, the coinbase to receive the
+fees.<Cite src="eip-3651" /> Everything else you touch, you touch cold once.
+
+**They are per transaction, not per call.** Warmth crosses call boundaries. A slot read cheaply in
+your function may have been paid for by a completely unrelated contract earlier in the same
+transaction, which is why the same call in a batch costs less than the same call alone.
+
+**They roll back with a reverting scope.** EIP-2929 specifies that if a scope reverts, the sets return
+to the state they were in before that scope was entered.<Cite src="eip-2929" /> A `try`/`catch`
+around a call that fails does not merely discard the callee's state changes; it discards the warmth
+that call paid for. Retrying the same call pays every cold charge a second time. This is the single
+most surprising consequence of the model and it is nearly absent from gas guides.
+
+<Figure
+  caption="The retry is priced as if the first attempt had never happened."
+  alt="A first call reads a cold storage slot and pays the cold price, which adds the slot to accessed_storage_keys and makes it warm. When that call reverts, the access sets are restored to their pre-call state, so a retry of the same call pays the cold price a second time."
+>
+  <Flow
+    lanes={['first attempt', 'during', 'the revert', 'retry']}
+    nodes={[
+      { id: 'c1', label: 'call reads a slot', note: 'cold — 2,100', col: 0, tone: 'warn' },
+      { id: 'w', label: 'slot is warm', note: 'in accessed_storage_keys', col: 1, tone: 'good' },
+      { id: 'rev', label: 'the scope reverts', note: 'sets restored to entry state', col: 2, tone: 'danger' },
+      { id: 'c2', label: 'same call again', note: 'cold — 2,100 again', col: 3, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+## The numbers, measured rather than looked up
+
+These constants were measured on this machine on 25 August 2026 with forge 1.7.1 and solc 0.8.36,
+optimizer off, each operation wrapped in `gasleft()` deltas inside inline assembly. The harness
+itself costs about 16 to 17 gas — two `GAS` opcodes plus the stack work — which is why the raw
+readings sit slightly above the constants.<Cite src="measured-gas-constants" />
+
+| operation | raw reading | constant |
+|---|---|---|
+| `SLOAD`, cold slot | 2116 | 2100 |
+| `SLOAD`, warm slot | 118 | 100 |
+| `BALANCE`, cold account | 2617 | 2600 |
+| `BALANCE`, warm account | 117 | 100 |
+| `EXTCODESIZE`, cold account | 2617 | 2600 |
+| `EXTCODESIZE`, warm account | 117 | 100 |
+| `TSTORE` | 114 | 100 |
+| `TLOAD` | 116 | 100 |
+
+Those match EIP-2929's parameters exactly: `COLD_SLOAD_COST` 2100, `COLD_ACCOUNT_ACCESS_COST` 2600,
+`WARM_STORAGE_READ_COST` 100.<Cite src="eip-2929" /> The transient-storage opcodes come in flat at
+100 with no cold tier at all, because transient storage never touches the trie.<Cite src="eip-1153" /><Cite src="measured-gas-constants" />
+
+Two cautions about that table, both of which matter more than the numbers.
+
+<Aside kind="warn">
+`BALANCE` and `EXTCODESIZE` are pure account-access opcodes, so their measurement isolates the
+cold/warm component cleanly. The call family shares that same 2,600/100 component, but a `CALL`'s
+total also layers on other terms, and this corpus has not verified against a current client that no
+later fork repriced them. Take 2,600 and 100 as the *access* component and measure the rest yourself
+rather than quoting a total for `CALL`.
+</Aside>
+
+<Matrix
+  numeric
+  corner="Operation"
+  cols={['Cold', 'Warm', 'Cold ÷ warm']}
+  rows={[
+    { label: 'SLOAD', cells: [{ v: '2,100', tone: 'warn' }, { v: '100', tone: 'good' }, { v: '21×' }] },
+    { label: 'BALANCE', cells: [{ v: '2,600', tone: 'warn' }, { v: '100', tone: 'good' }, { v: '26×' }] },
+    { label: 'EXTCODESIZE', cells: [{ v: '2,600', tone: 'warn' }, { v: '100', tone: 'good' }, { v: '26×' }] },
+    { label: 'TLOAD', cells: [{ v: '—', tone: 'muted' }, { v: '100', tone: 'good' }, { v: 'no cold tier' }] },
+    { label: 'TSTORE', cells: [{ v: '—', tone: 'muted' }, { v: '100', tone: 'good' }, { v: 'no cold tier' }] },
+  ]}
+  caption="The left column prices a disk seek and the right one prices a map lookup — which is why the two transient opcodes only ever pay the right-hand price."
+  alt="Measured gas for state access: SLOAD costs 2,100 cold against 100 warm, BALANCE and EXTCODESIZE cost 2,600 cold against 100 warm, and TLOAD and TSTORE have no cold tier at all, costing 100 every time."
+/>
+
+And the 9-gas reading from the opening. The probe was written as `pop(sload(0))`. That expression has
+no observable effect, so it was eliminated as dead code — even with the optimizer switched off. Every
+*read* in the first suite measured 9 gas, a number small enough to look like a plausible constant and
+large enough not to look like nothing. The fix was to assign each read into a storage sink so it
+could not be removed.<Cite src="measured-gas-constants" />
+
+Carry that as a rule rather than an anecdote: a gas probe that does not consume its result is
+measuring the compiler, not the EVM. Any measured number whose method you cannot describe is a number
+you have not measured.
+
+<Misconception
+  belief="A cold storage read costs 800 gas."
+  reality="It costs 2,100. Measured here at 2,116 with about 16 gas of harness overhead, and matching EIP-2929's COLD_SLOAD_COST exactly."
+  why="800 was the real, live, flat price of SLOAD for a while: EIP-1884 raised it from 200 to 800 in Istanbul, and EIP-2200 restated it as SLOAD_GAS. EIP-2929's own parameter table then lists SLOAD_GAS 800 as the old value being replaced. Gas tables written in that window were correct when published and were never revisited."
+  src="eip-1884"
+/>
+
+<Misconception
+  belief="Opcode gas costs are constants you can memorise from a table."
+  reality="Every state-access cost depends on what the transaction touched before, and an access list moves the boundary deliberately. A single number per opcode is wrong by construction, not merely out of date."
+  why="Every opcode reference prints one number per opcode, because a table with one column is the only shape a table can have. The dependency on transaction history has no column to live in."
+  src="eip-2929"
+/>
+
+## Why these prices and not others
+
+The cold/warm split is not a fee-extraction device. It is a load-shedding device, and EIP-2929 says
+so directly.
+
+The motivating history is the 2016 Shanghai denial-of-service attacks. Once the worst client bugs
+were fixed, the durable attack was simply to send transactions that touched a large number of
+accounts. The EIP quotes measurements of malicious transactions taking roughly 20 to 80 seconds to
+execute against a few milliseconds for an average transaction, because `EXTCODESIZE` forces the client
+to search for the contract on disk.<Cite src="eip-2929" /> Raising these costs by a factor of about
+three brought the worst case down to roughly 7 to 27 seconds.<Cite src="eip-2929" />
+
+So the price of a cold access is a statement about disk seeks and about how many bytes of witness a
+stateless client would need to prove the access. The price of a warm access is a statement about a
+hash-map lookup in memory. They differ by twenty-one times because the underlying operations differ
+by about that much, and the number will move again when the storage layer does.
+
+This is the mental model to keep: **the gas schedule prices the worst case the network must survive,
+not the average case you experience.** It explains the cold/warm split, and in the next lesson it
+explains both of the new ceilings.
+
+## `SSTORE` is priced on the transition, not the write
+
+Storage writes carry the same lesson at a larger amplitude. What a write costs depends on the value
+already in the slot and the value going in — a three-way branch, not a price.
+
+| transition | constant | measured (cold slot) |
+|---|---|---|
+| zero → non-zero | 20,000 | 22,113 |
+| non-zero → different non-zero | 2,900 | 5,012 |
+| same value (no-op) | 100 | 112 (warm) |
+
+The constants come from EIP-2200's `SSTORE_SET_GAS` of 20,000 and `SSTORE_RESET_GAS` of 5,000, with
+EIP-2929 redefining the reset case as `5000 - COLD_SLOAD_COST` and charging the 2,100 cold surcharge
+separately whenever the slot has not yet been touched.<Cite src="eip-2200" /><Cite src="eip-2929" />
+That is why the measured cold figures are 22,113 and 5,012: 20,000 + 2,100 and 2,900 + 2,100, plus
+harness overhead.<Cite src="measured-gas-constants" />
+
+The three-way branch is not arbitrary either. A [zero slot is not stored](/c/zero-slot-is-absent) —
+it is absent from the [account's storage trie](/c/per-account-storage-trie). Writing a non-zero value
+into a zero slot therefore *creates* a trie entry that every node must carry forever, which is the
+most expensive thing a transaction can do short of deploying code. Changing an existing entry rewrites
+a node that already exists. Writing the value already present changes nothing at all, and is priced
+like a read.
+
+<Misconception
+  belief="A storage write has one price, and it is 20,000 gas."
+  reality="Zero-to-non-zero, non-zero-to-different and no-op writes differ by more than two orders of magnitude — 20,000 against 2,900 against 100 — before the cold-slot surcharge is added."
+  why="20,000 is the number everyone remembers because it is the largest and the one every 'storage is expensive' explanation opens with. It is also the case that occurs least often in a mature contract, where most writes are updates to slots that already hold a value."
+  src="eip-2200"
+/>
+
+The practical consequence is that a counter's first increment costs an order of magnitude more than
+its second, that initialising a struct is not comparable to updating one, and that a benchmark run
+against a freshly deployed contract systematically over-states the cost of everything it does.
+
+### Refunds, and why clearing storage stopped paying
+
+Clearing a slot to zero deletes the entry and credits the refund counter. It used to credit a great
+deal: `SSTORE_CLEARS_SCHEDULE` was 15,000,<Cite src="eip-2200" /> and total refunds were capped at
+half the gas the transaction used.<Cite src="eip-3529" />
+
+EIP-3529 cut both. The clear refund became `SSTORE_RESET_GAS + ACCESS_LIST_STORAGE_KEY_COST`, which is
+4,800, and the total refund a transaction may receive became `gas_used // 5` rather than
+`gas_used // 2`. The `SELFDESTRUCT` refund was removed entirely.<Cite src="eip-3529" /> The stated
+motivation is worth knowing: refunds had produced GasToken, which used state slots as a battery to
+carry gas from cheap blocks to expensive ones, and had made the real gas consumed in a block nearly
+twice the nominal limit.<Cite src="eip-3529" />
+
+<Misconception
+  belief="Clearing storage refunds most of what you paid to set it."
+  reality="The per-clear refund is 4,800, against 20,000 to set the slot, and the total refund is capped at a fifth of the gas the transaction used."
+  why="Pre-London material described a 15,000 refund against a 50% cap, which made storage cleanup look close to free and made gas tokens viable. Both numbers changed in the same EIP and the guides did not."
+  src="eip-3529"
+/>
+
+One consequence that catches people in the next lesson: because the refund is subtracted from
+execution gas at the end, a large refund can push a transaction into a regime where a different
+pricing rule applies.
+
+## The reentrancy guard, and why you should not quote a number for it
+
+The clearest demonstration that these costs are situational is the reentrancy guard, where the
+circulating figures are all wrong in the same direction.
+
+Measured on the pinned toolchain, comparing a guarded call against the same call unguarded:
+
+| guard | guarded | unguarded | overhead |
+|---|---|---|---|
+| storage lock, warm slot | 4,312 | 1,208 | 3,104 |
+| transient lock (`TSTORE`/`TLOAD`) | 1,490 | 1,206 | 284 |
+
+The three numbers circulating in the ecosystem for these are roughly 7,100 and 5,000 for the storage
+guard and roughly 200 for the transient one. **None of them matched this configuration.**<Cite src="measured-gas-constants" />
+
+The ~7,100 figure is not fabricated: it assumes a *cold* lock slot, which is true on the first
+guarded call in a transaction and false on every one after it. So the honest statement is a range.
+The storage guard costs somewhere between roughly 3,100 and 7,100 depending on whether the lock slot
+is already warm; the transient guard is flat at about 284 because transient storage has no cold
+tier.<Cite src="measured-gas-constants" /><Cite src="eip-1153" />
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Storage guard', note: 'a uint256 lock slot', tone: 'warn' },
+    { title: 'Transient guard', note: 'TSTORE / TLOAD', tone: 'good' },
+  ]}
+  rows={[
+    {
+      label: 'What does one guarded call add?',
+      cells: ['Roughly 3,100 to 7,100 — a range', 'Roughly 284, flat'],
+    },
+    {
+      label: 'Why is that a range rather than a number?',
+      cells: [
+        'The lock slot is cold on the first guarded call of a transaction and warm on every one after',
+        'It is not a range — transient storage has no cold tier',
+      ],
+    },
+    {
+      label: 'Where does the lock live between calls?',
+      cells: ['A storage slot, written then cleared', 'Transient storage, discarded at end of transaction'],
+    },
+    {
+      label: 'What do circulating guides quote?',
+      cells: ['Around 7,100, or around 5,000', 'Around 200'],
+    },
+  ]}
+  caption="Neither guard costs what the ecosystem quotes, and only one of the two has a single price at all."
+  alt="The storage reentrancy guard adds roughly 3,100 to 7,100 gas depending on whether its lock slot is already warm, while the transient guard adds a flat 284; circulating figures of 7,100, 5,000 and 200 match neither."
+/>
+
+That makes transient roughly eleven times cheaper in the warm case, not the thirty-five times the
+7,100-against-200 pairing implies. If you have been justifying a migration to
+[transient guards](/c/transient-reentrancy-guard) with the larger ratio, the justification is real
+but a third the size you thought.
+
+## Access lists: a priced bet on your own call graph
+
+EIP-2930 lets a transaction declare, up front, the addresses and storage keys it intends to touch.
+Declared items start warm. The declaration is not free: 2,400 gas per address and 1,900 per storage
+key, charged as part of intrinsic gas whether or not the item is ever
+touched.<Cite src="eip-2930" /><Cite src="eip-2929" />
+
+Those prices are deliberately close to the cold prices they replace. The EIP describes it as roughly
+a 10% discount, chosen so that not bothering with an access list costs almost
+nothing.<Cite src="eip-2930" /> That design decision is the whole economics of the feature, and it
+runs the opposite way to how access lists are usually pitched.
+
+**Subgoal — price one correct prediction.** Declaring an address you would have touched cold: pay
+2,400, save `2,600 - 100 = 2,500`. Net gain **100 gas**. Declaring a storage key you would have read
+cold: pay 1,900, save `2,100 - 100 = 2,000`. Net gain **100 gas**.<Cite src="eip-2930" /><Cite src="eip-2929" />
+
+**Subgoal — price one wrong prediction.** An entry for something the transaction never touches saves
+nothing and still costs its full price. Net loss **2,400** or **1,900**.<Cite src="eip-2930" />
+
+**Subgoal — take the ratio.** One wrong address entry costs what twenty-four correct ones earn. One
+wrong storage key costs what nineteen correct ones earn. An access list is not an optimisation with a
+small downside; it is a bet at roughly 20-to-1 against you on every entry.
+
+**Subgoal — find the trap.** Storage keys in an access list are nested under an address, so listing a
+slot means listing its contract too. If that contract is the transaction's own target it was
+[already warm before execution began](/c/cold-vs-warm-access) — you pay 2,400 for nothing. At 100 gas
+of gain per correctly predicted slot, you now need **24 correctly predicted cold slots in that one
+contract** before the list breaks even.<Cite src="eip-2929" /><Cite src="eip-2930" />
+
+That last result is the reason access lists pay off for cross-contract call paths — a router touching
+several pools, a liquidation touching an oracle and two markets — and essentially never for a
+transaction that only touches its own target's storage. Duplicated entries are permitted and charged
+each time, by design: EIP-2930 chose simplicity over deduplication on the reasoning that there is
+never a gain in listing something twice.<Cite src="eip-2930" />
+
+<Misconception
+  belief="Adding an access list is a free optimisation you should apply everywhere."
+  reality="Entries cost 2,400 and 1,900 gas whether or not they are used, against a gain of 100 gas each when they are. An over-broad list is a straightforward net loss."
+  why="The word 'list' suggests metadata attached to the transaction rather than a priced, prepaid commitment. Tooling that generates a list from a trace also makes it look automatic, and a trace taken against different state produces a list that is wrong in exactly the expensive direction."
+  src="eip-2930"
+/>
+
+Note also the interaction with the 63/64 rule: EIP-2929 specifies that the cold-or-warm charge for a
+call target is applied before the forwardable share is computed.<Cite src="eip-2929" /><Cite src="eip-150" />
+Warming a target through an access list therefore does two things at once — it lowers the charge and
+leaves more gas available to forward into the call.
+
+## Measuring this honestly is harder than it looks
+
+Everything above is only useful if you can reproduce it, and the default local setup biases against
+you in a specific direction.
+
+Foundry's gas figures systematically under-report against mainnet, because test setup leaves accounts
+and slots warm before the measured call runs, and there is no cheatcode that forces a slot back to
+cold.<Cite src="foundry-issue-5494" /> Isolation mode is the correction: with `--isolate`, each
+top-level call runs as a separate transaction in a separate EVM context, which restores realistic
+cold/warm accounting.<Cite src="foundry-forge-test-reference" /> It also breaks tests that legitimately
+depend on warmth persisting across calls within one transaction, so it is a decision, not a default
+to switch on and forget.
+
+Three habits follow, and they are the point of this module:
+
+1. **Record the environment with the number.** A gas figure without a toolchain version, a solc
+   version, an optimizer setting and an EVM revision is an anecdote. Every number in this lesson
+   carries forge 1.7.1 and solc 0.8.36 with the optimizer off.<Cite src="measured-gas-constants" />
+2. **Check that the operation actually ran.** Consume the result. A suspiciously round or
+   suspiciously small reading is usually elimination, not efficiency.
+3. **Say which side of the cold/warm boundary you measured.** A gas report is
+   [shaped by the test that produced it](/c/gas-report-is-test-shaped), and the first call in a test
+   is not the call your users make.<Cite src="foundry-gas-tracking" />
+
+<Check type="spot-bug" concept="cold-vs-warm-access">
+A team wants to prove that batching helps. They write a contract that reads the same storage slot
+twice and one that reads two different slots once each, and they measure both inside the same
+Foundry test, one after the other, in the default configuration.
+
+They report: two reads of one slot cost 2,216; one read of each of two slots cost 4,216; batching
+saves 2,000 gas. Then they run the same code against a fork of mainnet and the saving is smaller and
+inconsistent.
+
+Name two separate problems with this experiment.
+
+<Answer>
+**Problem one — the second measurement inherited the first one's warmth.** The access sets are
+transaction-scoped, and by default Foundry runs the whole test body in a single EVM context, so
+whichever contract runs second may find its accounts already in `accessed_addresses`.<Cite src="eip-2929" />
+The numbers as reported happen to be internally consistent — 2,100 + 100 and 2,100 + 2,100, plus
+harness overhead — but nothing in the experiment establishes that, and reordering the two cases can
+change both readings. `--isolate` is what makes each top-level call its own transaction and restores
+the accounting.<Cite src="foundry-forge-test-reference" />
+
+**Problem two — the conclusion is stated as a property of batching rather than of state.** The 2,000
+gas saved is exactly `COLD_SLOAD_COST - WARM_STORAGE_READ_COST`, which is what you save the second
+time you touch *any* slot.<Cite src="eip-2929" /> It is available whenever a slot is read twice in one
+transaction and unavailable when it is not. Against a fork it becomes inconsistent because real
+mainnet transactions arrive with different histories: a slot a real user's transaction touches may
+already be warm because an earlier contract in the same call path touched it, in which case the
+"saving" the benchmark measured was already spent by someone else.
+
+A third problem is worth naming even though the question asked for two: if either contract's read had
+been written so that its result is discarded, the compiler may have removed it and the experiment
+would be measuring nothing at all.<Cite src="measured-gas-constants" />
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The two new ceilings**, next lesson, applies the same "price the worst case" logic to two limits
+that arrived after most gas material was written, and shows how the refund cap from this lesson can
+tip a transaction from one pricing regime into another.<Cite src="eip-3529" />
+
+**Slot packing** and **storage-dominates** are the design-level payoff: once you can price a
+transition rather than a write, packing several values into one slot stops being a folk optimisation
+and becomes an arithmetic question about how many zero-to-non-zero transitions you are about to buy.
+
+**Gas profiling** in the toolchain track turns the measurement discipline here into a CI gate, and it
+is where the warmth bias, isolation mode and snapshot diffing get their full treatment.
+
+**Vulnerability classes** in the security track inherits the reentrancy-guard measurement directly.
+Cheaper guards change attack economics, and a number that is wrong by a factor of three is a threat
+model that is wrong by a factor of three.
+
+Finally, [block-level access lists](/c/block-level-access-list) are the direction this is heading:
+the same declaration idea moved from the transaction to the block so that execution can be
+parallelised. EIP-2930's own rationale anticipated it — the format was designed to be repurposed for
+block-wide witnesses.<Cite src="eip-2930" /> It is a proposal, not a shipped feature, and this module
+teaches what is live today.

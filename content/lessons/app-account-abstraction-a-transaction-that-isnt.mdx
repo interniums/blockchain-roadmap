@@ -1,0 +1,408 @@
+---
+id: app-account-abstraction-a-transaction-that-isnt
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-4337, erc-4337-docs, erc-4337-bundlers, erc-7562, erc-7769, eip-712, eip-2718, viem-account-abstraction]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+You have a JSON object in hand. It has a `sender`, some `callData`, several gas fields, and a
+signature. It describes exactly what you want to happen on chain. You point it at a node and there is
+no method that will take it.
+
+Not `eth_sendTransaction` — the node would need the key, and the key is not a secp256k1 key. Not
+`eth_sendRawTransaction` — that wants RLP bytes carrying a
+[type byte from the EIP-2718 namespace](/c/eip-2718-envelope), and there is no type byte for this.
+The object is not a badly-formed transaction. It is not in the transaction namespace at all.<Cite src="eip-2718" />
+
+That is the fact the whole of ERC-4337 is built around, and it is worth sitting with before any of
+the machinery arrives. ERC-4337 does not extend the transaction format. It builds a parallel pipeline
+in contracts and off-chain services, and then — at the very last step — wraps the results in an
+ordinary transaction so that the chain will accept them. Everything strange about the system follows
+from that one design choice.
+
+<Figure
+  caption="Only the bottom two rows are contracts; everything above them is off-chain infrastructure that decides whether your operation ever reaches them."
+  alt="A vertical flow from a UserOperation through an alt mempool and a bundler into EntryPoint.handleOps, which calls the account's validateUserOp and optionally a paymaster."
+>
+  <Flow
+    dir="down"
+    lanes={['the object', 'the network', 'who packages it', 'the contract', 'what it calls']}
+    nodes={[
+      { id: 'uo', label: 'UserOperation', note: 'sender, nonce, gas fields, signature', col: 0, tone: 'accent' },
+      { id: 'mp', label: 'alt mempool', note: 'admission rules of its own', col: 1 },
+      { id: 'b', label: 'bundler', note: 'simulates, groups, submits', col: 2 },
+      { id: 'ep', label: 'EntryPoint.handleOps', note: 'one ordinary transaction', col: 3 },
+      { id: 'acct', label: 'your account', note: 'validateUserOp', col: 4 },
+      { id: 'pm', label: 'paymaster', note: 'optional — it pays', col: 4, dashed: true, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+## The object
+
+The spec keeps two shapes of the same thing, and confusing them is the first source of wasted hours.
+
+**What you submit** is a JSON object with named fields: sender, nonce, factory details, callData, gas
+limits for verification and execution, priority fees, paymaster information, and a
+signature.<Cite src="eip-4337" /> The wider documentation writes the interface out:<Cite src="erc-4337-docs" />
+
+```ts
+interface UserOperation {
+  sender: address
+  nonce: uint256
+  initCode: bytes
+  callData: bytes
+  callGasLimit: uint256
+  verificationGasLimit: uint256
+  preVerificationGas: uint256
+  maxFeePerGas: uint256
+  maxPriorityFeePerGas: uint256
+  paymasterAndData: bytes
+  signature: bytes
+}
+```
+
+**What the contracts see** is `PackedUserOperation`, in which several of those fields are compressed
+into single words: `sender`, `nonce`, `initCode`, `callData`, `accountGasLimits` (verification and
+call gas combined), `preVerificationGas`, `gasFees` (priority and max combined), `paymasterAndData`,
+and `signature`.<Cite src="eip-4337" />
+
+The packing is not cosmetic. Every one of those words arrives as
+[calldata paid at the door](/c/calldata-priced-at-the-edge) on the bundle transaction, and a bundle
+carries many of them. Two `uint128` halves in one `bytes32` is one word of calldata instead of two.
+You will meet both shapes in the same afternoon — the RPC-level object in your TypeScript, the packed
+struct in any Solidity you write against it — and they are the same operation.
+
+<Misconception
+  belief="A UserOperation is a transaction with some extra fields on it."
+  reality="It is not a member of the transaction type namespace. No node accepts it, it has no EIP-2718 type byte, and it reaches the chain only as calldata inside somebody else's ordinary transaction."
+  why="It has a sender, a nonce, calldata, gas limits and a signature, so it presents as a transaction with a longer field list. The fields rhyme; the plumbing does not."
+  src="eip-2718"
+/>
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'A transaction', note: 'what you already have' },
+    { title: 'A UserOperation', note: 'what this module is about', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'Who signs it, and who checks the signature?',
+      cells: [
+        'One secp256k1 key, checked by the protocol, identically everywhere',
+        "Whatever bytes the account's own code accepts — there is no universal verifier",
+      ],
+    },
+    {
+      label: 'How does it reach a node?',
+      cells: [
+        'eth_sendRawTransaction, under a type byte from the EIP-2718 namespace',
+        'No method takes it; a bundler carries it as calldata inside its own transaction',
+      ],
+    },
+    {
+      label: 'What is the mempool?',
+      cells: [
+        'The public one — membership is the validator set',
+        'An alt mempool of bundlers, where validity is that mempool\'s rules, not the chain\'s',
+      ],
+    },
+    {
+      label: 'What does the nonce mean?',
+      cells: [
+        'One strictly increasing counter, so one stuck item blocks the rest',
+        'A 192-bit key and a 64-bit sequence — independent ordering lanes on one account',
+      ],
+    },
+    {
+      label: 'How many gas numbers do you set?',
+      cells: ['One limit, and unused gas is not charged', 'Five, metered separately, with a penalty for unused excess'],
+    },
+    {
+      label: 'What does being valid get you?',
+      cells: ['Inclusion, if it pays enough', "Nothing until a bundler's rule set admits it as well"],
+    },
+  ]}
+  caption="Every field that rhymes with a transaction's is answering a different question, which is why none of your existing plumbing transfers."
+  alt="A transaction and a UserOperation compared across who signs, how it reaches a node, what the mempool is, what the nonce means, how many gas numbers there are, and what validity buys."
+/>
+
+## Five gas numbers where you are used to one
+
+An ordinary transaction has one `gas` field: a ceiling you set and a smaller amount you actually
+[spend](/c/tx-gas-limit-vs-used). A UserOperation splits that ceiling into pieces that are metered
+separately, because different parties are on the hook for different pieces.<Cite src="eip-4337" />
+
+- **`verificationGasLimit`** — gas allocated to the account's own validation logic.
+- **`callGasLimit`** — gas allocated to the main execution call.
+- **`preVerificationGas`** — extra gas paid to the bundler. The spec describes it as exactly that and
+  deliberately does not fix an estimation method for it.<Cite src="eip-4337" />
+- **`paymasterVerificationGasLimit`** — gas for the paymaster's validation, when there is one.
+- **`paymasterPostOpGasLimit`** — gas for the paymaster's post-operation hook, when there is one.
+
+<Figure
+  caption="Five limits instead of one, because the bundler, the account and the paymaster are each on the hook for a different phase."
+  alt="The five gas fields of a UserOperation arranged by phase: preVerificationGas paid to the bundler, verificationGasLimit and paymasterVerificationGasLimit during validation, callGasLimit during execution, and paymasterPostOpGasLimit in the post-operation hook."
+>
+  <Flow
+    dir="down"
+    lanes={['to the bundler', 'verification', 'execution', 'post-op']}
+    nodes={[
+      { id: 'pre', label: 'preVerificationGas', note: 'no opcode meters this', col: 0, tone: 'warn' },
+      { id: 'vgl', label: 'verificationGasLimit', note: "the account's validation", col: 1 },
+      { id: 'pvgl', label: 'paymasterVerificationGasLimit', note: 'when there is a paymaster', col: 1, dashed: true },
+      { id: 'cgl', label: 'callGasLimit', note: 'the main execution call', col: 2, tone: 'accent' },
+      { id: 'ppo', label: 'paymasterPostOpGasLimit', note: 'the post-operation hook', col: 3, dashed: true },
+    ]}
+  />
+</Figure>
+
+`preVerificationGas` is the one with no analogue anywhere in your existing model. The bundler pays
+real gas for work the EntryPoint cannot meter on your behalf: the calldata cost of your operation
+inside the bundle, the per-operation overhead of the loop, the bundler's own bookkeeping. That cost is
+real and it is not attributable to any opcode executed on your account's behalf, so the spec makes it
+a field you fill in and leaves the arithmetic to implementations.<Cite src="eip-4337" /> A number the
+spec declines to compute is a number that will differ between bundler vendors, which is the first hint
+that "the bundler" is a dependency and not a commodity.
+
+### The field that punishes you for guessing high
+
+Here is a rule with no counterpart in ordinary transactions, and it will come back in the paymaster
+lesson as an attack.
+
+A penalty of 10% (`UNUSED_GAS_PENALTY_PERCENT`) is applied to the amounts of `callGasLimit` and
+`paymasterPostOpGasLimit` that remain **unused**, and it applies only when the unused remainder is at
+least 40,000 (`PENALTY_GAS_THRESHOLD`).<Cite src="eip-4337" /> The stated reason: without it, a
+UserOperation could reserve a large slice of the bundle's gas space, leave it unused, and crowd other
+operations out.<Cite src="eip-4337" />
+
+Read that against the habit you already have. With an ordinary transaction, over-estimating the gas
+limit costs you nothing — unused gas is simply not charged. Here, over-estimating past a 40,000-gas
+margin costs you a tenth of the excess. Whoever pays for the operation pays that penalty, and in a
+sponsored flow that party is not the person who chose the number.
+
+## Two nonces in one word
+
+An EOA has a nonce that is a single strictly increasing counter, which is why
+[one stuck transaction blocks everything behind it](/c/nonce-gap).
+
+A UserOperation's `nonce` is one `uint256` split into a **192-bit key** and a **64-bit sequence**. For
+each key, the sequence is validated by the EntryPoint independently, and `getNonce(address sender,
+uint192 key)` returns the next valid value for a given key.<Cite src="eip-4337" />
+
+That is 2<sup>192</sup> independent ordering lanes on one account. A game that submits moves on one
+key and a treasury flow that submits withdrawals on another cannot head-of-line block each other. It
+also means "the account's nonce" is not a question with one answer, and any code you have that models
+an account's next nonce as a single integer is modelling the wrong thing here.
+
+## The signature means whatever the account says it means
+
+This is the sentence people quote when they say ERC-4337 "abstracts" accounts, and it is worth making
+mechanical rather than slogan-shaped.
+
+The `userOpHash` is computed as an [EIP-712 typed message hash](/c/eip-712-typed-data), and the spec
+states the requirement it is there to satisfy: to prevent replay attacks — cross-chain, or across
+multiple EntryPoint contract versions — the signature MUST depend on `chainid` and on the EntryPoint
+address.<Cite src="eip-4337" /><Cite src="eip-712" />
+
+Then the account is handed that hash and asked a question:
+
+```solidity
+function validateUserOp(
+    PackedUserOperation calldata userOp,
+    bytes32 userOpHash,
+    uint256 missingAccountFunds
+) external returns (uint256 validationData);
+```
+
+<Cite src="eip-4337" />
+
+Nothing in that signature says "secp256k1". Nothing says "one key". The `signature` field is
+`bytes`, and the account decides what those bytes have to be. A P-256 passkey assertion, a threshold
+signature, a Merkle proof against a set of authorised operations, a session key with a policy blob
+appended — all of them are the same shape from the protocol's point of view, because the protocol
+never looks inside.
+
+The consequence for you: **you cannot tell whether a UserOperation is validly signed without reading
+that account's code.** There is no universal verifier. This is the exact inversion of the EOA model,
+where signature validity is a property of the protocol and the same everywhere.
+
+## The bundler
+
+Something has to turn the object into a transaction. That something is a bundler, and the
+documentation's own list of what it does is short enough to quote whole: monitor the alt mempool for
+UserOperations, simulate operations using the EntryPoint's `simulateValidation`, group valid ops into
+bundles, submit via `handleOps()` to the EntryPoint, and pay gas and earn fees "like a
+miner".<Cite src="erc-4337-bundlers" />
+
+It is reimbursed out of the account's or the paymaster's deposit during execution, and it earns the
+priority fees specified in each UserOperation.<Cite src="erc-4337-bundlers" />
+
+### The alt mempool is a different network
+
+The spec's definition is precise and does most of the work: an alternative UserOperation mempool is
+"any other P2P mempool where the validity of UserOperations is determined by rules that are different
+from the shared set of rules."<Cite src="eip-4337" />
+
+Set that beside what you know about
+[the public mempool as a broadcast medium](/c/mempool-is-a-public-broadcast). The differences that
+matter to a product:
+
+- **Different membership.** The nodes carrying your UserOperation are bundlers, not the validator set.
+- **Different admission rules.** Validity here is not "the chain would accept this". It is "this
+  mempool's rule set accepts this", and the spec's own wording admits that more than one such rule set
+  can exist.<Cite src="eip-4337" />
+- **A different RPC surface, defined elsewhere.** ERC-4337 states outright that the full definition of
+  the JSON-RPC API is outside its scope.<Cite src="eip-4337" /> ERC-7769 — a **Draft** — is what
+  defines `eth_sendUserOperation`, `eth_estimateUserOperationGas`, `eth_getUserOperationByHash`,
+  `eth_getUserOperationReceipt` and `eth_supportedEntryPoints`, together with a `debug_bundler_*`
+  namespace used for conformance testing.<Cite src="erc-7769" />
+
+That last point deserves a beat. The method you will call every day in production is specified in a
+draft ERC that the core standard explicitly declines to own. That is not a reason to avoid 4337; it is
+a reason to treat your bundler endpoint as a vendor integration with a vendor's semantics, not as
+"the node".
+
+<Aside kind="note">
+In viem 2.x the client for this pipeline is a separate construction:
+`createBundlerClient` and `createPaymasterClient` are imported from `viem/account-abstraction`, not
+from `viem`, and the actions are `sendUserOperation`, `estimateUserOperationGas`,
+`getUserOperationReceipt` and `waitForUserOperationReceipt` rather than their transaction-shaped
+cousins.<Cite src="viem-account-abstraction" /> The import path is the API telling you the same thing
+this lesson is: it is a different pipeline.
+</Aside>
+
+## The bundler's veto is a rule set, not a whim
+
+The most consequential thing about bundlers is not that they exist. It is that a UserOperation which
+would execute perfectly well on chain can be refused by every bundler in the network, for reasons that
+have nothing to do with the EVM.
+
+The reason those rules exist is stated as the central problem of the whole design: how can a block
+builder including an operation make sure that it will actually pay fees, without having to first
+execute the entire operation?<Cite src="eip-4337" /> A bundler simulates validation, then submits.
+If validation behaves differently on chain than it did in simulation, the bundler has paid for
+nothing. So validation is fenced.
+
+ERC-7562 — the validation scope rules, currently **Draft** — is that fence.<Cite src="erc-7562" />
+
+**Banned opcodes during validation** (rule OP-011): `ORIGIN`, `GASPRICE`, `BLOCKHASH`, `COINBASE`,
+`TIMESTAMP`, `NUMBER`, `PREVRANDAO`/`DIFFICULTY`, `GASLIMIT`, `BASEFEE`, `BLOBHASH`, `BLOBBASEFEE`,
+`CREATE` (with exceptions), `INVALID`, and `SELFDESTRUCT`, plus unassigned
+opcodes.<Cite src="erc-7562" /> Every one of them is a value that can change between simulation and
+inclusion.
+
+**Storage is scoped by entity.** Access to the account's own storage is always allowed (STO-010).
+Associated storage in other contracts is allowed under conditions. A staked paymaster or factory may
+access its own storage, associated storage in non-entity contracts, and has read-only access to any
+non-entity contract's storage.<Cite src="erc-7562" /> An unstaked one may not.
+
+**Calling a codeless address is forbidden** (OP-041): `EXTCODE*` and `*CALL` against an address with
+no deployed code is refused during validation.<Cite src="erc-7562" />
+
+**And the mempool itself has quotas.** `SAME_SENDER_MEMPOOL_COUNT` is 4 — the maximum number of
+UserOperations allowed in the mempool from a single sender. `SAME_UNSTAKED_ENTITY_MEMPOOL_COUNT` is
+10. `THROTTLED_ENTITY_MEMPOOL_COUNT` is 4. `MIN_UNSTAKE_DELAY` is 86,400 seconds — one day — described
+as a sufficient withdrawal delay to prevent most Sybil attacks. `MIN_STAKE_VALUE` is adjustable per
+chain, with the recommendation being a non-trivial but not excessive amount, roughly $1,000 equivalent
+in native tokens.<Cite src="erc-7562" />
+
+<Misconception
+  belief="If my UserOperation is valid, it will be included."
+  reality="Validity on chain and admissibility to the alt mempool are different tests. A validation function that reads the block timestamp is perfectly legal Solidity and will be refused by rule OP-011 before any chain sees it."
+  why="With ordinary transactions the two tests nearly coincide — if it would succeed and pays enough, it gets in. ERC-4337 adds a second, stricter gate that exists purely to protect the party fronting the gas."
+  src="erc-7562"
+/>
+
+### Worked example: an account that cannot be included
+
+A team ships a smart account whose validation refuses operations outside business hours. The Solidity
+compiles, the unit tests pass, a fork test passes. Every bundler rejects it. Trace why, and what the
+fix has to be.
+
+**Subgoal 1 — name the guarantee the bundler needs.** The bundler must be able to conclude, from a
+simulation it runs now, that validation will still succeed when the bundle lands in a block. Anything
+the account reads that can differ between those two moments destroys that conclusion.
+
+**Subgoal 2 — find what the account reads.** "Business hours" is `block.timestamp`. In bytecode that
+is the `TIMESTAMP` opcode.
+
+**Subgoal 3 — check it against the rule.** `TIMESTAMP` is on the OP-011 banned list.<Cite src="erc-7562" />
+The refusal is not a heuristic or a vendor policy; it is a named rule with a number, and a bundler that
+ignored it would be exposed to exactly the failure the rule prevents.
+
+**Subgoal 4 — locate the sanctioned alternative.** The protocol did not remove time from validation;
+it moved where time is checked. `validateUserOp` returns a `validationData` word that encodes an
+aggregator address in twenty bytes — `0` for a valid signature, `1` to mark failure, otherwise the
+address of an aggregator contract — then a `validUntil` in six bytes and a `validAfter` in six bytes,
+which is exactly the thirty-two bytes of the word.<Cite src="eip-4337" /> The account states a time window as *data*; the EntryPoint enforces
+it. The account never reads the clock, so simulation stays deterministic, and the window is still
+honoured.
+
+**Subgoal 5 — state the general rule.** *Validation may not observe anything that changes between
+simulation and inclusion; where a time or state dependency is genuinely needed, it must be expressed
+as a value the EntryPoint checks or moved into the execution phase.* That sentence is the whole
+architecture of ERC-4337 validation in one line, and it is why so many "just add a check" features
+turn out to be structural work.
+
+<Misconception
+  belief="A bundler is a relay — it forwards what it is given."
+  reality="It simulates, applies a documented rule set with named rules and numeric mempool quotas, tracks reputation for the entities your operation references, and can throttle or ban them. Its acceptance criteria are part of your product's dependency surface."
+  why="'Bundler' names the packaging step, which is the least interesting thing it does. The interesting thing is the admission control that makes the packaging safe."
+  src="erc-7562"
+/>
+
+<Check type="predict" concept="user-operation">
+You are debugging a wallet whose users report that some actions "just never happen" — no receipt, no
+error, nothing on chain. You find that the account's `validateUserOp` calls a `PriceFeed` contract to
+reject operations while an oracle is stale, and that `PriceFeed` is deployed and working.
+
+Two variants of the wallet exist. In variant A the account is unstaked. In variant B the account's
+factory has staked at the EntryPoint. Users of variant B report the problem far less often.
+
+Explain what is happening, and say which of the two variants you would ship.
+
+<Answer>
+**What is happening.** The account's validation reads storage belonging to a contract that is not the
+account and not an entity named by the UserOperation. ERC-7562 always permits access to the account's
+own storage, and permits associated storage and read-only access to non-entity contract storage for a
+**staked** entity.<Cite src="erc-7562" /> An unstaked account gets no such allowance, so variant A's
+operations are refused at the mempool gate. Nothing is broadcast, so there is nothing to observe: no
+transaction hash, no receipt, no revert. The silence is the symptom.
+
+**Why variant B is better but not fine.** Staking buys the storage allowance and relieves the mempool
+quotas, at the cost of locking real value behind an unstake delay of at least
+`MIN_UNSTAKE_DELAY` = 86,400 seconds, with `MIN_STAKE_VALUE` recommended at roughly $1,000 equivalent
+per chain.<Cite src="erc-7562" /> That is a per-chain operating cost, and it does not remove the
+underlying fragility: the oracle's staleness can still flip between the bundler's simulation and
+inclusion, which is precisely the class of behaviour the rules exist to keep out of validation.
+
+**What I would ship.** Neither, as designed. The staleness check belongs in the **execution** phase —
+inside the call the account makes — where it can read anything it likes, revert if the oracle is
+stale, and produce a receipt the user and your support team can actually see. Move the check, keep the
+account unstaked, and the failure becomes a legible reverted operation instead of a disappearance.
+
+**The transferable point.** "It works on chain" and "a bundler will carry it" are separate
+properties, and a violation of the second produces no artefact anywhere. When a 4337 flow fails
+silently, suspect the validation rules before you suspect the chain.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** is the contract every one of these pieces trusts. The bundler calls one function
+on it; your account and your paymaster both hold a hard-coded reference to it; the `userOpHash` you
+just met binds to its address. It is also deployed at three different addresses under three different
+versions, and picking one is a decision you make once and live with.
+
+**The paymaster lesson** takes two things established here — that whoever pays does not choose the gas
+numbers, and that a 10% penalty applies to unused `callGasLimit` above a 40,000 threshold — and shows
+how they combine into a drain that looks, from the outside, exactly like normal usage.
+
+**The session-key module** later in this track is where the ERC-7562 restrictions stop being trivia.
+Every policy you want to enforce at signing time has to survive the banned-opcode list, which is why
+so many session-key implementations end up split across a validator module and an execution hook.

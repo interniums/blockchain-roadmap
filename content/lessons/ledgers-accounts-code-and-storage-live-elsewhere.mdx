@@ -1,0 +1,261 @@
+---
+id: ledgers-accounts-code-and-storage-live-elsewhere
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [yellow-paper, ethereum-docs-accounts, eip-170, eip-2929, eip-6780, eip-7702, eip-1014, ethereum-whitepaper, utxo-debt-representation, measured-gas-constants]
+stack: { cast: "1.7.1", forge: "1.7.1", solc: "0.8.36" }
+---
+
+Deploy the same contract twice, at two addresses, from two different factories.
+
+You now have two accounts. One of their four fields is byte-for-byte identical in both records and
+will stay identical for as long as both contracts exist. Another starts identical in both and
+diverges on the first write either of them takes.
+
+Which field is which — and *why* one is shared while the other is private — is most of what there is
+to know about how Ethereum stores a contract. Both answers come from the same structural fact: two of
+the four fields do not contain what they name. They point at it.
+
+## `codeHash` points at code, by its content
+
+`codeHash` is `keccak256` of the account's EVM bytecode. The bytecode itself is not in the account
+record. ethereum.org states the retrieval model directly: code fragments "are contained in the state
+database under their corresponding hashes for later retrieval", and it is that hash value which sits
+in the account.<Cite src="ethereum-docs-accounts" /> The Yellow Paper says the same thing formally —
+the account's fourth field is the hash of the code, and the code is whatever hashes to
+it.<Cite src="yellow-paper" />
+
+That is content addressing, and it has the property content addressing always has: identical inputs
+produce one entry, not two. Two accounts running byte-identical bytecode carry the same 32 bytes in
+`codeHash` and, in the state model, refer to one piece of code.
+
+<Aside kind="warn">
+Resist the temptation to turn that into a cost argument. "Identical contracts share one code entry"
+is a statement about the *state model* — about what the record commits to. How a particular client
+lays out its database on disk is an implementation choice that clients make differently, and no gas
+schedule prices deployment as though the second identical deployment were free. Treat the sharing as
+a fact about identity, not about bytes on a hard drive.
+</Aside>
+
+The size limit tells you why this indirection is not optional. EIP-170 caps deployed code at
+`MAX_CODE_SIZE = 0x6000` bytes — 24,576 — and did so specifically because calling a contract costs
+constant gas while forcing the node into work proportional to the code's length: reading it from
+disk, preparing it for execution, and adding it to the block's proof of
+validity.<Cite src="eip-170" /> Twenty-four kilobytes is three orders of magnitude larger than the
+78-byte account record from the last lesson. Code was never going to live inline.
+
+<Aside kind="note">
+There is a second reason to notice `codeHash` specifically. It is 32 bytes with a hash's
+distribution, which makes it a natural identity check — "is the thing at this address the code I
+audited?" That check is genuinely useful and genuinely load-bearing in production systems, and
+EIP-7702 changed the population of values it can hold. Hold that thought; the sixth lesson in this
+module is entirely about what it broke.
+</Aside>
+
+## `storageRoot` points at a whole other trie
+
+The third field is a 32-byte commitment to a completely separate Merkle-Patricia trie belonging to
+that one account. ethereum.org describes it precisely: a hash of the root node of a trie encoding the
+account's storage as a mapping from the Keccak-256 hash of the 256-bit keys to the RLP-encoded
+256-bit values, empty by default.<Cite src="ethereum-docs-accounts" />
+
+Read that twice, because two details in it matter.
+
+**The keys are hashed here too.** A storage slot number is not the trie path; `keccak256` of the slot
+number is. This is the same [secure-trie](/c/mpt-secure-trie) defence you met at the account level,
+applied one level down — and it has the same consequence, which is that a contract's storage is as
+un-enumerable from its root as the account set is from the state root.
+
+**Empty by default.** A slot that has never been written has no entry. There is no trie of
+2<sup>256</sup> zeroes waiting to be overwritten; there is a trie holding exactly the slots somebody
+has set.
+
+<Figure
+  caption="Identical bytecode means one shared codeHash. Storage stays private to the account whatever the code is."
+  alt="The account record's third and fourth fields are each 32 bytes. codeHash refers to bytecode held elsewhere in the state database under its own hash, so two accounts running identical code carry the same value. storageRoot refers to a separate Merkle-Patricia trie belonging to that one account, keyed by the keccak hash of the slot number."
+>
+  <Flow
+    nodes={[
+      { id: 'rec', label: 'account record', note: 'four fields, 78 bytes', col: 0, tone: 'accent' },
+      { id: 'ch', label: 'codeHash', note: '32 bytes', col: 1 },
+      { id: 'sr', label: 'storageRoot', note: '32 bytes', col: 1 },
+      { id: 'code', label: 'the bytecode', note: 'one entry per distinct code, max 24,576 bytes', col: 2 },
+      { id: 'trie', label: 'a storage trie', note: 'this account only, path = keccak256(slot)', col: 2 },
+    ]}
+    edges={[
+      { from: 'rec', to: 'ch' },
+      { from: 'rec', to: 'sr' },
+      { from: 'ch', to: 'code' },
+      { from: 'sr', to: 'trie' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="Contract storage is stored inside the account record."
+  reality="The account holds a 32-byte storageRoot and nothing else. The storage is a separate trie, which is why one storage write propagates all the way up to the world state root instead of staying local."
+  why="Ordinary English does the damage. 'The contract has storage' reads as containment, the same way 'the object has fields' does — and every runtime any of us has used really does lay an object's fields out next to its header."
+  src="yellow-paper"
+/>
+
+## The cascade one write sets off
+
+Take the misconception apart by tracing a single `SSTORE`. Follow it up, level by level.
+
+**Subgoal: change the value.** The slot's 32-byte value becomes something else. So far this is one
+key-value edit in one trie.
+
+**Subgoal: repair the storage trie.** That leaf's hash changed, so its parent's reference to it
+changed, so the parent's hash changed, and so on to the top. Every node on the path from the slot to
+this contract's storage root gets a new hash.
+
+**Subgoal: update the account record.** The storage root is one of the four fields, so the record
+changes. Not the balance, not the nonce, not the code hash — but the record's bytes are different, so
+its hash is different.
+
+**Subgoal: repair the state trie.** That account is a leaf in the world state trie under
+`keccak256(address)`, so every node on *that* path gets a new hash too, ending at the world state
+root.
+
+**Subgoal: notice the reach.** One 32-byte write moved the number that every node on the network will
+compare against the block header. There is no such thing as a local storage write. The commitment
+structure has no notion of "somewhere unimportant".
+
+That reach is the honest reason storage is the most expensive thing the EVM does. Measured on this
+repository's harness — forge 1.7.1, solc 0.8.36, optimiser off — an `SSTORE` writing a zero slot to
+non-zero costs 20,000 gas, overwriting an existing non-zero value costs 2,900, and a warm no-op costs
+100; each of those pays an additional 2,100 when the slot is cold.<Cite src="measured-gas-constants" />
+Reads follow the same shape: a cold `SLOAD` is 2,100 and a warm one is
+100.<Cite src="measured-gas-constants" /> The cold/warm split is EIP-2929's: the first touch of a
+storage slot or an account in a transaction is charged far more than every later
+touch.<Cite src="eip-2929" />
+
+Two things in that table are worth reading as consequences of the structure rather than as arbitrary
+prices. The gap between 20,000 and 2,900 is the gap between adding an entry to a trie and changing a
+value already in it. The gap between 2,100 and 100 is the gap between fetching a node from disk and
+finding it in a cache the transaction already warmed.
+
+<Aside kind="warn">
+Those numbers were measured on this machine, at the versions pinned in this lesson's frontmatter,
+because the circulating figures for several of them disagreed with each other and with the drafts
+they came from. Gas constants are repriced by forks. Treat any number you read in a tutorial —
+including this one, a year from now — as a claim with a date attached.
+</Aside>
+
+## Why the indirection is the point
+
+Everything above sounds like an implementation detail. It is not; it is the entire reason contracts
+exist on this chain and not on the one Ethereum was reacting to.
+
+The whitepaper's complaint about the UTXO model is short and specific. A UTXO is spent or unspent, and
+"there is no opportunity for multi-stage contracts or scripts which keep any other internal state
+beyond that" — so UTXO supports "simple, one-off contracts and not more complex 'stateful'
+contracts".<Cite src="ethereum-whitepaper" /> The same limitation shows up in the research literature
+on encoding richer objects into UTXO chains, where representing an ongoing obligation means carrying
+it forward as a chain of outputs that some specific party has to keep
+advancing.<Cite src="utxo-debt-representation" />
+
+Now put the two halves of this lesson together and see what the account model bought.
+
+Storage hangs off a **persistent identity** rather than being consumed and recreated. The account at
+address `A` will still be at address `A` next year, and its storage trie is reachable from its record
+whether it was written yesterday or in 2016. Nobody has to hold a token, keep a pointer, or be online
+to keep the state alive.
+
+Because of that, **arbitrary unrelated parties can each mutate the same state in place**. A lending
+pool's utilisation, a registry's mapping, an order book's depth — all of these are one storage trie
+that thousands of mutually unknown addresses write to, in a sequence the protocol chooses on their
+behalf. Neither party has to know the other exists, or coordinate, or hand anything over.
+
+That is the whole basis of every application in Tracks 05 and 06. And it is worth naming the bill in
+the same breath, because it comes due in the last lesson of this module: the same property forces a
+**global ordering** over everything that touches shared state. If strangers mutate one slot in place,
+somebody has to decide who goes first — and that decision has value, which is where contention over
+hot state and extractable value both come from.
+
+## "Code is immutable" has exactly two edges
+
+The code at a given `codeHash` never changes; that is what a hash means. But "a contract's code cannot
+change" is a claim about an account's fourth *field*, and there are two places where the intuition
+misleads.
+
+**Upgradeable contracts do not change any code hash.** A proxy has its own fixed bytecode and its own
+fixed `codeHash`, and it `DELEGATECALL`s into an implementation address it keeps in storage. Changing
+which implementation runs is a storage write. Every account's code hash in that arrangement stays
+exactly where it was — the mutable part was never the code field. Track 04 builds this properly; the
+reason to see it here is that it explains why "check the code hash" and "check what the contract
+does" are different checks.
+
+**`SELFDESTRUCT` mostly does not erase anything any more.** Since EIP-6780, the opcode only removes an
+account's code and storage when the account was created in the same transaction; otherwise it sweeps
+the balance and leaves the record standing.<Cite src="eip-6780" /> The pre-2023 mental model of
+contracts that can vanish is now wrong in almost every case.
+
+And the third edge, which is not an edge in the intuition but a genuine change to the rule: since
+EIP-7702, an account controlled by a private key can carry a non-empty code
+hash.<Cite src="eip-7702" /> That is the sixth lesson.
+
+<Check type="predict" concept="account-storage-root">
+A factory deploys two copies of the same contract, at addresses `X` and `Y`. Both accounts now exist
+and neither has ever been written to. Then one transaction calls `X` and sets a single storage slot
+that was previously zero.
+
+Answer four questions.
+
+1. Immediately after deployment and before any call, which of `X`'s and `Y`'s four fields are equal?
+2. After the write to `X`, which of `X`'s four fields changed?
+3. How many trie roots changed as a result of that one write?
+4. Did anything about `Y` change?
+
+<Answer>
+**1 — three of four.** `nonce` is equal (both 1, for reasons the next lesson explains). `storageRoot`
+is equal — both are the empty-trie root, because storage is empty by
+default.<Cite src="ethereum-docs-accounts" /> `codeHash` is equal, and that is the interesting one:
+the bytecode is identical, so the hash is identical, so the two records are content-addressing the
+same code.<Cite src="yellow-paper" /> Only `balance` need differ, and only if the deployments were
+endowed differently.
+
+The addresses differ, of course — but the address is not one of the four fields. `CREATE` derived each
+from the factory's address and its nonce at the time.<Cite src="eip-1014" />
+
+**2 — exactly one: `storageRoot`.** The balance did not move, the nonce did not move (the account
+created nothing), and the code hash cannot move from a storage write. One field of one record.
+
+**3 — two.** `X`'s own storage root, then the world state root. There is no third: `X`'s account leaf
+is a value inside the state trie, not a root of its own, and the intermediate nodes between the leaf
+and the state root are re-hashed rather than being roots in their own right. The number to carry is
+that a single `SSTORE` is a two-trie operation, which is the mechanical reason it costs 20,000 gas
+into a fresh slot rather than something proportional to 32 bytes.<Cite src="measured-gas-constants" />
+
+**4 — no, and this is the sharp end of content addressing.** `Y`'s record is byte-identical to what it
+was. Its `codeHash` still points at the same code, and that code did not change because code never
+changes; what changed was one account's private storage trie. Two contracts sharing bytecode share
+*behaviour*, not *state* — which is exactly the separation that makes a factory pattern viable, and
+exactly the separation people lose when they say "the contract has storage" and hear the storage as
+belonging to the code.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Lesson three** is the one field that is neither a pointer nor a counter. ETH sits in `balance`
+directly, and the asymmetry between that and every other asset — which lives in a storage trie
+somewhere, under somebody else's rules — is one your product will meet on its first day.
+
+**In Track 03**, storage proofs stop being theory. Because the storage trie is committed to by the
+account record which is committed to by the state root, you can prove one slot of one contract to
+someone who holds only a block header — two nested proofs, and the nesting is the structure on this
+page.
+
+**In Track 04**, the storage layout rules for Solidity are a naming scheme over these 32-byte keys.
+Every packing rule, every `mapping` slot derivation, every proxy storage collision is an argument
+about which keccak preimage a variable lands on.
+
+**In Track 06**, the same structure is a security surface. Storage collisions between a proxy and its
+implementation, and between an account and successive delegation targets, are the same bug: two
+pieces of code disagreeing about what a slot number means, in a trie that has no opinion.
+
+And in the last lesson of this module, the property this lesson celebrated — shared mutable state
+under a stable identity — is presented with its invoice.

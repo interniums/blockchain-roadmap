@@ -1,0 +1,353 @@
+---
+id: altvm-parallel-execution-only-the-leader-schedules
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [solana-cookbook-retry, solana-swqos-guide, agave-banking-stage-source, agave-greedy-scheduler, anza-central-scheduler, solana-cookbook-confirmation, agave-validator-block-production, firedancer-repo, lightspeed-local-fee-markets, solana-docs-fee-structure, helius-local-fee-markets]
+stack: {}
+---
+
+An engineer joins a team shipping a Solana product and does what they have always done first: opens a
+mempool explorer to watch pending transactions.
+
+There isn't one. Not "there isn't a good one" — the object it would display does not exist. Solana's
+own documentation states it flatly in the guide on retrying transactions: on Solana there is no
+concept of a mempool, and transactions are routed to leaders directly instead of gossiped to
+everyone.<Cite src="solana-cookbook-retry" />
+
+That single absence rearranges a surprising amount. No pending pool means no global queue to inspect,
+no `eth_getTransactionByHash` returning a transaction that has not landed, no
+[mempool broadcast](/c/mempool-is-a-public-broadcast) for searchers to watch, and no shared view that
+your monitoring can query. It also means the thing you actually care about — will my transaction be
+in the next block — is decided inside one machine's process memory, for a few hundred milliseconds,
+and then that machine stops being the one that matters.
+
+This lesson follows a transaction from your client into that machine and out the other side.
+
+## The path, end to end
+
+**Client to RPC.** The overwhelming majority of transactions are submitted by proxy: the client calls
+`sendTransaction` on an RPC node.<Cite src="solana-cookbook-retry" /> The alternative is speaking the
+leader's transport directly with a TPU client, in which case rebroadcast and leader forwarding become
+your own software's job.<Cite src="solana-cookbook-retry" />
+
+The critical property of `sendTransaction`: it relays, and that is all it does. A successful response
+returns the transaction id and says nothing about whether the transaction will be processed or
+finalized.<Cite src="solana-cookbook-retry" /> Treating a 200 from `sendTransaction` as "submitted, now
+poll for the receipt" is the single most common porting error from the EVM, and lesson seven is about
+what it costs.
+
+**RPC to leader.** Because the leader schedule for an epoch — about two days — is known in advance,
+the RPC does not gossip. It sends the transaction directly to the current leader and the next
+one.<Cite src="solana-cookbook-retry" /> By default it re-forwards every two seconds until the
+transaction is finalized or its blockhash expires, and if its outstanding rebroadcast queue exceeds
+10,000 transactions, newly submitted ones are dropped.<Cite src="solana-cookbook-retry" />
+
+Stop on that number. **Your transaction can be discarded by your own RPC provider, before it ever
+reaches a validator, because someone else's traffic filled a queue.** Nothing on-chain records this.
+No fee is charged. `sendTransaction` already returned success.
+
+**Into the leader.** Arriving traffic hits the leader's Transaction Processing Unit, which is
+organised into five stages — Fetch, SigVerify, Banking, Proof of History Service, Broadcast — with the
+Fetch stage sorting inbound packets across three ports: `tpu` for ordinary transactions, `tpu_vote`
+for consensus votes, and `tpu_forwards` for packets a leader could not process and is passing
+on.<Cite src="solana-cookbook-retry" />
+
+Forwarding is deliberately weak. There is a limit on how much can be forwarded, and **each forward is
+a single hop**: a transaction received on `tpu_forwards` is not forwarded again.<Cite src="solana-cookbook-retry" />
+So "the leader was too busy, it will get passed along" buys you exactly one more attempt at exactly
+one more validator.
+
+<Aside kind="warn">
+Ingress is not first-come-first-served. Leader connection capacity is rationed by stake:
+stake-weighted quality of service gives a stake-weighted share of the leader's TPU capacity to peers,
+with a validator holding 1% of stake entitled to transmit up to 1% of packets to the
+leader.<Cite src="solana-swqos-guide" /> The documentation records the current allocation as covering
+**80% of a leader's TPU capacity**, split proportionally among peers by stake, with configuration
+options that can assign virtual stake to specific peers.<Cite src="solana-swqos-guide" /> The practical
+effect is that *which RPC you send through* is an input to whether you land. Lesson seven takes this
+apart properly.
+</Aside>
+
+## Inside the banking stage
+
+Everything so far was transport. The scheduling happens in the Banking stage, and this is where the
+account locks from lesson one get used.
+
+Agave's structure at the version this lesson was checked against, v4.2.0, is a set of named threads
+spawned per scheduler:<Cite src="agave-banking-stage-source" />
+
+- **one scheduling thread** (`solBnkTxSched`), which holds the buffered set and decides everything;
+- **four consume workers** (`solCoWorker00`–`03`) — `DEFAULT_NUM_WORKERS` is 4 — which execute the
+  batches they are handed;
+- **one vote worker**, kept separate from non-vote traffic;
+- **eight check workers**, which do the pre-scheduling validity checks;
+- **bounded channels of capacity 10,000** between the scheduler and each worker.
+
+<Figure
+  caption="Every thread here is spawned per scheduler, and exactly one of them ever chooses anything."
+  alt="The Agave banking stage at v4.2.0: a buffered transaction set held by one scheduling thread named solBnkTxSched, eight check workers running pre-scheduling validity checks ahead of it, and downstream four consume workers named solCoWorker00 to solCoWorker03 plus a separate vote worker, each connected to the scheduler by a bounded channel of capacity 10,000."
+>
+  <Flow
+    nodes={[
+      { id: 'buf', label: 'buffered set', note: 'held by the scheduler', col: 0 },
+      { id: 'chk', label: 'check workers × 8', note: 'pre-scheduling validity', col: 1 },
+      { id: 'sch', label: 'solBnkTxSched', note: 'one thread, one priority order', col: 2, tone: 'accent' },
+      { id: 'con', label: 'consume workers × 4', note: 'solCoWorker00–03', col: 3, tone: 'good' },
+      { id: 'vot', label: 'vote worker', note: 'kept off the non-vote path', col: 3, tone: 'muted' },
+    ]}
+    edges={[
+      { from: 'buf', to: 'chk' },
+      { from: 'chk', to: 'sch' },
+      { from: 'sch', to: 'con', label: 'channel, cap 10,000', tone: 'good' },
+      { from: 'sch', to: 'vot', tone: 'muted' },
+    ]}
+  />
+</Figure>
+
+The scheduler's loop is the machine you should carry. It pops the highest-priority transaction from a
+container, asks the lock table whether any worker can take it, and either dispatches it into a batch
+or sets it aside — repeating until the block budget is spent, until it has scanned its per-pass limit
+of 100,000 transactions, until every worker is saturated, or until the buffer is
+empty.<Cite src="agave-greedy-scheduler" />
+
+Two of those stopping conditions deserve names.
+
+**Worker saturation is a compute-unit condition, not a queue-length condition.** The scheduler tracks
+compute units in flight per thread and removes a thread from the schedulable set once its in-flight
+CU reaches a per-thread target derived from the configured `target_scheduled_cus`, whose default is
+the block unit constant divided by four, split again across the workers.<Cite src="agave-greedy-scheduler" />
+A single very expensive transaction can therefore take a worker out of circulation on its own.
+
+**Set-aside is not rejection.** Transactions that cannot be placed accumulate in an `unschedulables`
+list and are pushed back into the priority queue when the pass ends — the pessimistic behaviour from
+lesson one, visible in the control flow.<Cite src="agave-greedy-scheduler" />
+
+### One queue, four workers
+
+The architectural fact to hold above all the thread counts: **there is one priority-ordered view of
+all buffered traffic, and one thread walking it.**
+
+That was the point of the redesign. The client team's write-up of the original central scheduler
+describes the predecessor as four non-vote threads pulling from a common queue and independently
+attempting to lock transactions, with the root cause of its slowdowns being that no working thread
+had any context about what the others were doing.<Cite src="anza-central-scheduler" /> The fix was to
+add one thread that does have that context, and demote the workers to executing what they are
+handed.<Cite src="anza-central-scheduler" />
+
+Hold onto this, because it is the mechanism behind the most-repeated overclaim in the ecosystem. A
+single global priority queue means priority is compared *across the whole buffer*, not within a lane.
+Your transaction on a quiet account is ordered against every transaction on the busiest account in the
+same list. Lesson six is entirely about what that does to "local" fee markets.
+
+### Putting a clock on it
+
+The pipeline is easier to reason about with durations attached, and the durations are derivable from
+two published facts.
+
+**Subgoal 1 — establish the slot budget.** Slots are configured to last about 400 ms and may run
+between 400 and 600 ms in practice.<Cite src="solana-cookbook-confirmation" /> A validator produces
+blocks for four consecutive slots before the next leader takes over.<Cite src="solana-cookbook-confirmation" />
+So **a given leader owns roughly 1.6 to 2.4 seconds**, and then the machine holding your transaction
+in its buffer stops being the one that can include it.
+
+**Subgoal 2 — compare that to your retry cadence.** The RPC re-forwards every two
+seconds.<Cite src="solana-cookbook-retry" /> Those two numbers are the same order of magnitude, which
+is the whole reason submission is sent to the current *and next* leaders rather than just the
+current: at a two-second cadence against a roughly two-second leader window, a retry that targets only
+"whoever is leader right now" would frequently arrive during a handover.<Cite src="solana-cookbook-retry" />
+
+**Subgoal 3 — establish the total budget.** A blockhash is valid for 150 slots, and because the age
+is zero-indexed there are actually 151 blockhashes recent enough to process; at 400–600 ms slots that
+is roughly **60 to 90 seconds** of usable life.<Cite src="solana-cookbook-confirmation" /> Divide by
+the retry cadence: somewhere between thirty and forty-five delivery attempts, spread across on the
+order of twenty to fifty distinct leaders.
+
+**Subgoal 4 — subtract what you spend before you start.** Fetching a blockhash at the default
+`finalized` commitment costs you time: the finalized block typically trails the most recent confirmed
+block by at least 32 slots, which the documentation puts at roughly **13 seconds** of your expiration
+window, and more when the cluster is unsteady.<Cite src="solana-cookbook-confirmation" /> Add human
+signing latency and a wallet round trip and a naive client can burn a quarter of its budget before the
+first packet leaves.
+
+**Subgoal 5 — read off the design rule.** *Fetch the blockhash as late and as recently as your
+fork-risk tolerance allows, then spend the entire remaining window resubmitting the same signed
+bytes.* The documentation's own recommendation is `confirmed` for almost all requests: only a few
+slots behind `processed`, with a very low chance of belonging to a dropped fork, where `processed`
+gives you the longest window but exposes you to the roughly 5% of blocks that never get
+finalized.<Cite src="solana-cookbook-confirmation" />
+
+That last figure is worth carrying on its own. **About one block in twenty does not end up finalized**,
+and a transaction whose blockhash came from an abandoned block can never be considered recent by any
+block on the finalized chain.<Cite src="solana-cookbook-confirmation" /> On the EVM you learned to
+worry about reorgs as a settlement risk after inclusion; here forks additionally poison the
+*prerequisite* your transaction carries before inclusion.
+
+<Figure
+  caption="Everything a client can do happens inside one fixed window — and the window starts before the user has signed."
+  alt="A timeline of a transaction's blockhash lifetime in seconds. One leader's turn covers roughly the first two and a half seconds, four slots. Fetching a blockhash at the default finalized commitment spends about the first thirteen seconds. The remaining window is spent resubmitting, with the relaying RPC re-forwarding every two seconds. The blockhash expires at about sixty seconds if slots run at 400 milliseconds, and at about ninety seconds if they run at 600 milliseconds."
+>
+  <Timeline
+    from={0} to={90} unit="seconds" ticks={[0, 13, 30, 60, 90]}
+    marks={[
+      { at: 60, label: 'expiry at 400 ms slots', tone: 'danger' },
+      { at: 90, label: 'expiry at 600 ms slots', tone: 'danger' },
+    ]}
+    spans={[
+      { label: "one leader's turn", start: 0, end: 2.4, tone: 'accent', note: 'four slots — 1.6 to 2.4 s' },
+      { label: 'spent on a finalized blockhash', start: 0, end: 13, tone: 'warn', note: 'at least 32 slots behind confirmed' },
+      { label: 'left to resubmit in', start: 13, end: 60, tone: 'good', note: 'the RPC re-forwards every 2 s' },
+      { label: 'only if slots run long', start: 60, end: 90, tone: 'muted' },
+    ]}
+  />
+</Figure>
+
+## The scheduler is software, and it has already changed
+
+Now a discipline point that matters more than any specific algorithm.
+
+The central scheduler shipped in Agave v1.18 as an **opt-in** feature: disabled by default, enabled
+with `--block-production-method central-scheduler`, with the previous
+`thread-local-multi-iterator` method as the default and a stated intention to flip that
+later.<Cite src="anza-central-scheduler" /> The same release changed how priority was computed, moving
+from a formula dividing the priority fee by compute units to one incorporating requested compute and
+the base fee.<Cite src="anza-central-scheduler" />
+
+What is true today, read from the source rather than from any blog: Agave v4.2.0 exposes exactly two
+values for `--block-production-method`, `central-scheduler` and `central-scheduler-greedy`. The greedy
+one carries the `#[default]` attribute, and selecting the other logs a warning that it is deprecated
+and will be removed in a future release.<Cite src="agave-validator-block-production" /> In the same
+tag, the dispatch function routes *both* values to the same `GreedyScheduler`, with a source comment
+saying exactly that.<Cite src="agave-banking-stage-source" /> The `thread-local-multi-iterator` option
+the v1.18 blog documents is gone entirely.<Cite src="agave-validator-block-production" />
+
+<Aside kind="stop">
+**One thing this curriculum could not settle.** The greedy scheduler replaced an earlier prio-graph
+dependency-ordering algorithm as the shipped default at some point between v1.18 and now. Search
+results attribute the flip to a specific release in the 2.x series; that pin was not confirmed against
+release notes for this course and is therefore not printed here. The *existence* of the change is well
+supported and directly visible in the code above; the version is not. If you need the version, read
+the release notes yourself — and notice that you had to, which is the actual lesson.
+</Aside>
+
+And Agave is not the only client. Firedancer is a second production implementation with its own
+banking and scheduling design.<Cite src="firedancer-repo" /> Which makes any sentence beginning
+"Solana's scheduler…" a category error. There is no such object. There are clients, each of which
+schedules, and the protocol validates the *block*, not the algorithm that produced it.
+
+<Misconception
+  belief="Solana's transaction scheduling algorithm is part of the protocol."
+  reality="It is client software. Agave has changed its default block production method more than once and currently deprecates one of its own two options, and Firedancer implements its own scheduler independently. Consensus checks the resulting block against the cost model and the runtime; it does not check how the leader chose the ordering."
+  why="For most of Solana's history one client produced nearly all blocks, so client behaviour and protocol rules were indistinguishable in practice. That has stopped being true, and the habit has not caught up."
+  src="agave-validator-block-production"
+/>
+
+<Misconception
+  belief="A transaction that has been sent but not confirmed is 'pending' somewhere, the way an EVM transaction sits in the mempool."
+  reality="It exists in three places, none of them shared: your client, the RPC nodes relaying it, and possibly one leader's buffer. There is no network-wide pending state, and no query returns one. Until a leader records it, no record of the transaction exists outside the parties handling it."
+  why="Every EVM tool assumes a mempool, so its absence is invisible until you go looking for pending state and find that the API you want was never defined."
+  src="solana-cookbook-retry"
+/>
+
+## What this changes about your product
+
+**Pre-confirmation is a different animal.** Solana leaders build blocks continuously as transactions
+arrive rather than assembling one at a fixed interval, which is why confirmation can be close to a
+single round trip between client and leader.<Cite src="lightspeed-local-fee-markets" /> The same
+property means a high-fee transaction that arrives late in a slot may miss it regardless of
+what it paid, because the space it wanted has already been recorded.<Cite src="lightspeed-local-fee-markets" />
+Fee is a ranking input, not a guarantee of inclusion.
+
+**Your observability has to be built from confirmations, not from a pool.** There is no equivalent of
+"how many transactions like mine are waiting". What you can measure is landing rate — signatures
+submitted versus signatures confirmed inside the blockhash lifetime — and that is the metric to
+instrument from day one, because it is the one that degrades under exactly the conditions where your
+users complain.
+
+**Leader identity is an operational variable.** Since the schedule is known an epoch ahead, both the
+transaction's route and its odds change over a timescale you can predict rather than a random one.
+Two operators running different validator software, different hardware and different stake-weighted
+peering arrangements will not give your traffic the same treatment, and the schedule tells you in
+advance which of them your next few seconds belong to. Nothing equivalent exists on Ethereum, where
+the proposer for the next slot is known but the mempool is common property and reaching it is not the
+hard part.
+
+**RPC topology becomes part of the design.** The retry guide is explicit that nodes serving
+data-intensive requests can fall behind and are poorly suited to also forwarding transactions, and
+recommends dedicated nodes that only handle `sendTransaction` for latency-sensitive
+work.<Cite src="solana-cookbook-retry" /> It also names a failure mode with no EVM analogue: an RPC
+*pool* where one backend runs ahead of another, so a blockhash fetched from the advanced node is
+unrecognised by the lagging node you submit through, and the transaction is dropped before it goes
+anywhere.<Cite src="solana-cookbook-retry" /> Preflight checks catch that one; skipping preflight
+hides it.<Cite src="solana-cookbook-retry" />
+
+<Aside kind="note">
+The retry guide's description of the RPC-to-leader hop says the node converts the transaction into a
+UDP packet before forwarding.<Cite src="solana-cookbook-retry" /> The stake-weighted quality of
+service documentation, on the same site, describes leader ingress in terms of QUIC connections and a
+QUIC TPU port.<Cite src="solana-swqos-guide" /> These two first-party pages disagree because one of
+them predates the transport change and has not been fully revised. Where two pages from the same
+publisher conflict, prefer the one describing the mechanism you can independently confirm — here, the
+one whose configuration flags you can read in a validator's help output.
+</Aside>
+
+<Check type="predict" concept="banking-stage-pipeline">
+Your team ports an EVM monitoring stack to Solana. Three of its components are:
+
+1. a mempool watcher that alerts when a competitor's transaction targeting your pool appears pending;
+2. a "stuck transaction" detector that alerts when a submitted transaction stays pending for more than
+   thirty seconds;
+3. a fee-bumping worker that replaces an under-priced pending transaction with a higher-fee copy.
+
+What happens to each, and what replaces it?
+
+<Answer>
+**1 — the mempool watcher has no input and cannot be repaired.** There is no gossiped pending pool to
+watch; transactions go to the current and next leaders directly.<Cite src="solana-cookbook-retry" />
+The information it consumed is not merely hard to get, it is not published. What partially replaces it
+is *post-hoc*: read confirmed blocks and detect the competitor's activity after it lands, which is a
+different product with a different latency budget. Anything promising you a Solana mempool feed is
+selling a view of one operator's own inbound traffic, which is a sample, not the pool.
+
+**2 — the stuck detector has the wrong clock and the wrong terminal state.** "Pending" is not a state
+the network reports. The correct construction is: capture `lastValidBlockHeight` when you fetch the
+blockhash, poll block height, and treat *blockhash expiry* as the terminal
+outcome.<Cite src="solana-cookbook-retry" /> The window is short by EVM standards — a blockhash is
+valid for 150 slots, roughly 60 to 90 seconds depending on how slot times are running — so a
+thirty-second threshold is not a warning, it is half the total budget.<Cite src="solana-cookbook-confirmation" />
+
+**3 — the fee-bumping worker is the dangerous one, because it looks like it works.** There is no
+nonce-ordered queue and no replace-by-fee: a Solana transaction is not superseded by a higher-fee
+copy, so the "replacement" is a second, independently valid transaction. If both reach a
+leader before the shared blockhash expires, both execute. On the EVM the [nonce](/c/nonce-gap) makes
+replacement safe by construction; here nothing does.
+
+What replaces it is a *resubmission* loop of the identical signed transaction — same signature, so
+duplicate execution is prevented by the runtime's own deduplication — repeated at a chosen interval
+until the blockhash expires, with `maxRetries` set to 0 so the RPC's generic retry logic does not
+fight your own.<Cite src="solana-cookbook-retry" /> If you want a different fee, you must let the
+first transaction expire before signing a new one, and the retry guide's warning is exactly this:
+confirm the original blockhash has expired before re-signing anything.<Cite src="solana-cookbook-retry" />
+
+**The pattern behind all three.** Each component depended not on a chain feature but on a *shared,
+queryable, ordered waiting area*. Solana has no waiting area, so the port is not a translation — it is
+a redesign around a different question: not "where is my transaction in the queue" but "has it landed
+yet, and how much of its blockhash lifetime is left".
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next**, the currency the scheduler ranks with. Compute units are not gas with a different name: you
+are billed on the budget you *request*, unused units are not refunded, and the request itself changes
+your position in the queue you just watched the scheduler walk.<Cite src="solana-docs-fee-structure" />
+
+**Three lessons out**, this lesson's one-global-queue observation becomes the honest correction to
+local fee markets — the argument that shared workers and shared block space leak contention across
+accounts that never touch each other.<Cite src="helius-local-fee-markets" />
+
+**And carry the shape.** Ethereum publishes a waiting area and lets everyone see and bid into it.
+Solana publishes a leader schedule and lets you send directly to whoever is next. Everything else in
+this module — landing rates, RPC choice, retry logic, fee estimation — is downstream of which of those
+two designs you are standing in.

@@ -1,0 +1,341 @@
+---
+id: evm-logs-bloom-the-filter-that-stopped-working
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [execution-specs-osaka-bloom, yellow-paper, pureth-logs-bloom, manbytesgnu-log-bloom, eip-7745, eip-7668, eip-7773, eip-7919, eip-658, eip-7708, measured-forge-1-7-1]
+stack: {}
+---
+
+An engineer builds the obvious optimisation. Their service watches one contract's events, and rather
+than pulling every block's receipts it will read the 256-byte `logsBloom` in each header, test it for
+the contract's address, and skip the block when the filter says no. The protocol put that field there
+for exactly this. The implementation is forty lines.
+
+It ships, and the bandwidth graph does not move.
+
+Not because the code is wrong — it is correct, and it skips every block it is allowed to skip. The
+filter simply says "maybe" to almost everything now. It is a probabilistic structure whose size was
+fixed at 2048 bits and never revisited, meeting a log volume that was not fixed, and the arithmetic
+of Bloom filters is unforgiving about that.
+
+This lesson is the structure, exactly; the arithmetic that killed it; and an honest account of what is
+and is not happening about it, because this is the part of the module most likely to be reported to
+you incorrectly.
+
+## The general idea, and the one asymmetry that matters
+
+A Bloom filter answers set membership in constant space. Fix an array of *m* bits, all zero. To insert
+an item, hash it to *k* positions and set those bits. To test an item, hash it the same way and look:
+
+- **If any of its bits is zero, the item is definitely not in the set.** No insertion ever clears a
+  bit, so a zero bit is proof that nothing which would have set it was ever inserted.
+- **If all of its bits are one, the item is probably in the set.** Or several other items happened to
+  set those bits between them. The filter cannot tell the two apart.
+
+False positives are possible; false negatives are not. That asymmetry is the entire value
+proposition: a *miss* is conclusive and lets you skip work, a *hit* is a hint that obliges you to do
+the work anyway.
+
+<Misconception
+  belief="A bloom filter hit means the item is in the set."
+  reality="A hit means 'maybe'. Only a miss is conclusive. Every hit must be followed by a real lookup against the underlying data."
+  why="Probabilistic data structures are rare in application code, and the word 'filter' suggests a sieve that lets through only what matches."
+  src="yellow-paper"
+/>
+
+The false-positive rate is not a constant. It rises as the array fills, which means it rises with the
+number of items inserted into a filter whose size is fixed. Hold that thought.
+
+## Ethereum's construction, exactly
+
+The Yellow Paper defines it in section 4.3.1 as `M₃:₂₀₄₈`, and — this is worth knowing — that is the
+only normative prose definition there has ever been.<Cite src="yellow-paper" /> The one engineer who
+wrote up a friendly version in 2022 noted that the Yellow Paper was the only source they could find,
+and that the bit-ordering had to be recovered by trial and error.<Cite src="manbytesgnu-log-bloom" />
+That is why independent re-implementations disagree in the details more often than you would expect
+for something this small.
+
+The executable specification is unambiguous, so read that instead:<Cite src="execution-specs-osaka-bloom" />
+
+```python
+def add_to_bloom(bloom: bytearray, bloom_entry: Bytes) -> None:
+    hashed = keccak256(bloom_entry)
+    for idx in (0, 2, 4):
+        bit_to_set = Uint.from_be_bytes(hashed[idx : idx + 2]) & Uint(0x07FF)
+        bit_index = 0x07FF - int(bit_to_set)
+        byte_index = bit_index // 8
+        bit_value = 1 << (7 - (bit_index % 8))
+        bloom[byte_index] = bloom[byte_index] | bit_value
+```
+
+Four facts fall out of those six lines.
+
+**The array is 2048 bits — 256 bytes.** Fixed, and never changed by any fork.<Cite src="execution-specs-osaka-bloom" />
+
+**k is three, taken from one hash.** Not three hash functions: one [keccak256](/c/hash-function), from
+which the first three 16-bit big-endian words are each masked to their low 11 bits. Eleven bits
+addresses exactly 2048 positions.
+
+**"Up to three" bits, not three.** The three slices are independent draws from the same 2048-value
+space and can collide with each other, in which case a single item sets two distinct bits or one.
+Sources phrase this inconsistently; the code is what settles it.
+
+**The bit ordering is the trap.** `bit_index = 0x07FF - bit_to_set` reverses the index before it is
+used, because the Yellow Paper indexes bits from zero at the *right* end of the byte
+array.<Cite src="yellow-paper" /><Cite src="manbytesgnu-log-bloom" /> Every
+implementation that gets 2048-bit blooms wrong in a subtly self-consistent way gets it wrong here.
+
+<Figure
+  caption="One entry, one keccak, three eleven-bit draws from the same 2048-value space — which is why 'up to three bits' is literal rather than cautious."
+  alt="How an address or topic becomes bloom bits. The 32-byte entry is hashed with keccak256. The first three 16-bit big-endian words of that hash are each masked to their low 11 bits, giving three positions in a 2048-bit array. Those positions may collide, so an entry sets at most three bits and sometimes fewer."
+>
+  <Flow
+    nodes={[
+      { id: 'e', label: 'address or topic', note: '32 bytes', col: 0, tone: 'accent' },
+      { id: 'k', label: 'keccak256', note: 'hashed again', col: 1 },
+      { id: 's', label: 'hashed[0:2] [2:4] [4:6]', note: 'masked to 11 bits each', col: 2 },
+      { id: 'b', label: 'up to 3 bits set', note: 'of 2048', col: 3, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+### What goes into it
+
+The entries are the emitting address, and every topic of every log.<Cite src="execution-specs-osaka-bloom" />
+That is all. The data field is never entered, and neither is the transaction hash, the block number,
+or anything else.
+
+So the filter's coverage is exactly the set of things `eth_getLogs` can filter on, which is not a
+coincidence — it is the same design decision seen from the storage side.
+
+<Misconception
+  belief="The block's bloom filter covers the logs, so you can pre-filter on anything in a log."
+  reality="Only the emitting address and the topics are entered. A non-indexed parameter in the data blob is invisible to the filter, exactly as it is invisible to eth_getLogs."
+  why="The field is called logsBloom and is described as a filter over 'the logs', which is true of the record but not of every field in it."
+  src="yellow-paper"
+/>
+
+### One item, worked through
+
+Take the `Transfer` signature topic from the previous lesson,
+`0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef`. Note that the bloom hashes the
+topic *again* — topic0 is already `keccak256` of a signature string, and `add_to_bloom` applies
+`keccak256` to whatever 32 bytes it is handed.
+
+Computed with `cast` from Foundry 1.7.1 on this machine:<Cite src="measured-forge-1-7-1" />
+
+```console
+$ cast keccak 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+0xada389e1fc24a8587c776340efb91b36e675792ab631816100d55df0b5cf3cbc
+```
+
+| Byte pair | Value | Low 11 bits | Reversed index | Byte | Mask |
+|---|---|---|---|---|---|
+| `hashed[0:2]` | `0xada3` | 1443 | 604 | 75 | `0x08` |
+| `hashed[2:4]` | `0x89e1` | 481 | 1566 | 195 | `0x02` |
+| `hashed[4:6]` | `0xfc24` | 1060 | 987 | 123 | `0x10` |
+
+Three bits, in three different bytes of the 256. Any block whose header bloom has a zero at bit 1443,
+481 or 1060 provably contains no `Transfer` event of any kind, from any contract. Any block with all
+three set might contain one, or might contain a few thousand other logs that happened to light those
+bits between them.
+
+The same procedure applied to the address `0xfffffffffffffffffffffffffffffffffffffffe` — the system
+address EIP-7708 would use as the emitter for protocol-generated ETH transfer
+logs<Cite src="eip-7708" /> — gives bits 1213, 435 and 262. Nothing about an address is special; it
+goes through the identical function.
+
+## The header filter is a union
+
+Every receipt carries its own bloom over its own logs, as the third field of
+[the receipt](/c/receipt-contents).<Cite src="eip-658" /> The header's `logsBloom` is the bitwise OR
+of every receipt bloom in the block.<Cite src="execution-specs-osaka-bloom" />
+
+The intended workflow is hierarchical, and on paper it is elegant. Read 256 bytes of header. If the
+filter misses, discard the whole block without downloading anything. If it hits, fetch the receipts
+and check each receipt's own smaller filter to find which transaction to look at.
+
+Two things break that in practice.
+
+**OR only ever adds bits.** The block-level filter is at least as saturated as the most saturated
+receipt in the block, and typically far more so, because it accumulates every address and topic from
+every transaction. The union degrades faster than any individual filter in it — the level at which
+you most want the filter to work is the level at which it works worst.
+
+**For a client that actually verifies, the receipt-level filter saves nothing.** To trust a receipt's
+bloom you must first confirm the receipt is genuine, which means fetching *all* the block's receipts,
+re-deriving the receipts trie and checking it against `receiptsRoot`. At that point you are holding
+the raw logs, so consulting the inner filter is pure overhead.<Cite src="pureth-logs-bloom" /> The
+per-receipt bloom is useful only to a node that already has the data and is indexing it for itself.
+
+<Figure
+  caption="Every transaction's addresses and topics land in the same 256 bytes, and no step in the construction ever takes a bit back."
+  alt="Each receipt carries its own 2048-bit bloom over its own logs. The header's logsBloom is the bitwise OR of all of them, so it is at least as saturated as the most saturated receipt in the block and usually far more so."
+>
+  <Flow
+    nodes={[
+      { id: 'r1', label: 'receipt 1 bloom', col: 0 },
+      { id: 'r2', label: 'receipt 2 bloom', col: 0 },
+      { id: 'rn', label: 'receipt n bloom', col: 0, dashed: true },
+      { id: 'or', label: 'bitwise OR', note: 'no bit is ever cleared', col: 1, tone: 'warn' },
+      { id: 'hd', label: 'header logsBloom', note: 'the most saturated', col: 2, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="Filtering by the header bloom saves you from fetching receipts."
+  reality="It does — when the filter misses. At current saturation levels it hits on a large fraction of blocks anyway, so the receipts get fetched regardless and the field is header bytes you paid for and did not use."
+  why="The design's intent is documented far more often than its current effectiveness, and the intent is genuinely sound at the log volumes it was sized for."
+  src="pureth-logs-bloom"
+/>
+
+## The arithmetic that killed it
+
+With *m* = 2048 bits, *k* = 3 bits per entry and *n* entries in a block, the standard estimate of the
+false-positive rate is:<Cite src="pureth-logs-bloom" />
+
+```text
+P(fp) = (1 − e^(−kn/m))^3 = (1 − e^(−3n/2048))^3
+```
+
+Here *n* counts unique addresses and topics across all logs in the block — so a single `Transfer` log
+contributes up to four entries: its emitting address plus topic0, topic1 and topic2.
+
+Running that formula gives the shape of the problem. These are arithmetic on the expression above,
+not measurements:
+
+<Matrix
+  numeric
+  corner="Entries in the block"
+  cols={['Fraction of bits set', 'False-positive rate']}
+  rows={[
+    { label: '100', cells: ['0.14', { v: '0.3%', tone: 'good' }] },
+    { label: '250', cells: ['0.31', { v: '2.9%', tone: 'good' }] },
+    { label: '500', cells: ['0.52', { v: '14.0%', tone: 'warn' }] },
+    { label: '800', cells: ['0.69', { v: '32.9%', tone: 'warn' }] },
+    { label: '1,000', cells: ['0.77', { v: '45.5%', tone: 'danger' }] },
+    { label: '1,500', cells: ['0.89', { v: '70.2%', tone: 'danger' }] },
+  ]}
+  caption="The decay is not gentle: doubling the entries from 250 to 500 multiplies the false-positive rate by nearly five."
+  alt="False-positive rate of a 2048-bit, three-hash bloom filter against the number of address and topic entries in a block. At 100 entries 14% of bits are set and the rate is 0.3%. At 500 entries 52% of bits are set and the rate is 14.0%. At 1,000 entries 77% of bits are set and the rate is 45.5%. At 1,500 entries 89% of bits are set and the rate is 70.2%."
+/>
+
+The 800 row reproduces the worked figure in the Pureth guide, which reaches "already at ~33%" from a
+deliberately conservative 100 transactions per block each emitting two logs with a unique address and
+three indexed topics.<Cite src="pureth-logs-bloom" />
+
+And the conservative case is not the case. EIP-7745 states that mainnet blocks add over 1,000 log
+addresses and topics on average, that the filter would need to grow roughly tenfold to recover an
+acceptable false-positive rate, and that doing so would push the block header to about three
+kilobytes.<Cite src="eip-7745" /> It also gives the number that makes header-only search
+uninteresting even if the rate were fixed: scanning just the most recent year of history means
+downloading the entire header chain for that year, over six gigabytes, before any receipts are
+fetched at all.<Cite src="eip-7745" />
+
+Notice that nothing here is a bug. The construction is correct and the implementations agree. A
+fixed-size filter met a growing workload, and the fixed size lost.
+
+<Aside kind="note">
+This is a good instance of a pattern worth recognising generally: a probabilistic structure sized
+against an assumed load does not fail loudly when the load changes. It keeps returning correct
+answers — no false negatives, ever — while the *work it saves* decays toward zero. There is no error
+to alert on. The only symptom is a graph that stops improving, which is exactly what the engineer in
+the opening saw.
+</Aside>
+
+## What is actually happening about it
+
+Here the reporting and the reality diverge, so be precise.
+
+**EIP-7668** proposes the blunt fix: require the header's and every receipt's `logsBloom` to be empty,
+on the reasoning that the mechanism is too slow to be used and that virtually all applications reach
+history through centralised services instead.<Cite src="eip-7668" />
+
+**EIP-7745** proposes the replacement: drop `logsBloom` from the header in favour of a
+`log_index_root`, committing to an adaptive two-dimensional filter-map structure hashed into a Merkle
+tree. Its point is not only a better false-positive rate but *provability* — a query result would come
+with a Merkle proof, so a light client could verify that a log set is complete rather than trusting a
+server.<Cite src="eip-7745" />
+
+**Neither is going into the next upgrade.** As of the date on this lesson, the Glamsterdam hardfork
+meta lists EIP-7668, EIP-7745 and EIP-7919 — the Pureth meta that collects this whole agenda — under
+*Declined for Inclusion*.<Cite src="eip-7773" /><Cite src="eip-7919" /> EIP-7668's own status is
+Stagnant; EIP-7745 remains Draft.<Cite src="eip-7668" /><Cite src="eip-7745" /> Glamsterdam itself has
+not shipped and has no announced mainnet activation.
+
+So the working assumption for anything you build now is: **the 2048-bit bloom is what exists, it does
+not save you much, and nothing scheduled replaces it.**<Cite src="eip-7773" /> Which is why essentially all real traffic goes
+somewhere else entirely.
+
+<Misconception
+  belief="Bloom filters are how applications find events on Ethereum."
+  reality="Almost all real traffic goes through eth_getLogs against a provider, or through a dedicated indexer that maintains its own database. The bloom is a protocol-level pre-filter that is now widely regarded as failed."
+  why="It is prominent in the Yellow Paper and appears in every architecture diagram of a block header, which makes it look load-bearing. Its prominence is historical."
+  src="eip-7745"
+/>
+
+<Misconception
+  belief="The bloom filter is being removed in the next hard fork."
+  reality="Both proposals — EIP-7668 to empty the filters and EIP-7745 to replace them — are listed as declined for Glamsterdam. One is Stagnant, the other is Draft, and neither has a fork assignment."
+  why="'Proposed for' a fork is routinely reported as 'included in', and the removal has been discussed long enough that people remember the discussion as a decision."
+  src="eip-7773"
+/>
+
+<Check type="explain" concept="bloom-saturation">
+A colleague proposes: "Our contract emits a rare event. Let's give it a dedicated indexed marker
+value in topic1 — a constant nobody else would ever use — so the header bloom will almost always miss
+and our scanner can skip nearly every block."
+
+Will it work? Explain what the marker does and does not do, and what would have to be true for the
+idea to pay off.
+
+<Answer>
+**It will not work, and the reason is that the marker is not the thing being tested.**
+
+The scanner's question to the header bloom is "are all three bits for my query value set". Those bits
+are set by *any* entry in the block that happens to hash into them — every address and every topic of
+every log from every contract. Choosing a rare marker changes which three bits you check. It does not
+change how many of the 2048 bits are already set by the block's other thousand-plus entries.
+
+Run the table above at the 1,000-entry average EIP-7745 reports for mainnet<Cite src="eip-7745" /> and
+the set-bit fraction lands near 0.77, at which three arbitrary bits are all set roughly 45% of the time — regardless of how
+carefully the marker was chosen. Rarity of the *value* buys nothing; only sparsity of the *filter*
+would, and the filter is shared.
+
+**What the marker does buy.** Real things, just not this. It gives a precise `eth_getLogs` filter, so
+the provider returns only your logs rather than everything from your address. It survives the
+contract being redeployed at a new address, since the filter is on a topic rather than on the emitter.
+And in the roughly 55% of blocks where the bloom does miss, the scanner genuinely skips them — the
+optimisation is real, just far smaller than "almost every block".
+
+**What would have to be true.** Either a much smaller *n* per block — which is a property of mainnet,
+not of your contract — or a larger filter, which is what EIP-7745 proposes and what is currently
+declined.<Cite src="eip-7745" /><Cite src="eip-7773" /> On a quiet L2 with few logs per block the same trick works well, and that is worth knowing:
+the header bloom is not uniformly dead, it is dead *at mainnet log volumes*. Measure the set-bit
+fraction on the chain you are actually on before deciding.
+
+**The check that settles it in five minutes.** Fetch a hundred recent headers, count the set bits in
+each `logsBloom`, and divide by 2048. That number, cubed, is your skip rate's complement. No modelling
+required.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Querying logs for real**, next, is what everybody does instead: `eth_getLogs` against a node or a
+provider, with a filter whose grammar you now know the shape of, because it is the same address-and-
+topics structure the bloom indexes.
+
+**The block header** you met on the state-tries module has one field whose purpose you can now
+evaluate rather than recite — and one candidate replacement for it, if EIP-7745 ever lands.
+
+**Indexing** on the infrastructure track is the industry that exists because this filter does not
+work. Every indexer is, at bottom, a service that maintains the queryable log database the protocol
+declined to maintain, and the reason that is a business rather than a library call is on this page.
+
+**Light clients and provable queries** are the other branch: EIP-7745's real ambition is proofs, not
+speed,<Cite src="eip-7745" /> and the gap between "the log is committed" and "your client verified it" is a gap the protocol
+does not currently close.

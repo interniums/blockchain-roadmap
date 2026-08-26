@@ -1,0 +1,380 @@
+---
+id: altvm-move-three-ways-to-parallelise
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [block-stm-paper, aptos-docs-execution, aptos-move-book-global-storage, sui-docs-object-ownership, sui-docs-move-differences, sui-docs-ptb, sui-lutris, sui-docs-concepts, solana-sealevel-note, anza-central-scheduler]
+stack: {}
+---
+
+One AMM pool. A price moves on some other venue, and for the next four hundred milliseconds every
+arbitrage bot in the world wants to write to the same piece of state.
+
+That is the workload. It is not exotic — it is the ordinary shape of a busy minute on any chain with
+a market on it — and it is the workload that separates three designs that all describe themselves as
+"parallel execution" in their marketing and mean three different things by it.
+
+The reason to study all three together is not to rank them. It is that each one pays for concurrency
+in a different currency, and once you can name the currency you can predict what your users
+experience when the pool gets hot. That prediction is the deliverable of this lesson.
+
+## The problem all three are solving
+
+Executing transactions in parallel is easy until two of them touch the same state. Then the engine
+needs an answer to one question: *how does it know that two transactions conflict?* There are exactly
+three families of answer.
+
+1. **Ask before running.** Require every transaction to declare what it will touch, and schedule so
+   that conflicting transactions never run at the same time.
+2. **Find out by running.** Run everything speculatively, record what each transaction read and
+   wrote, detect collisions afterwards, and re-run the losers.
+3. **Make most transactions structurally incapable of conflicting.** Partition state by ownership so
+   that the common case has no possible contender, and reserve the expensive path for the rest.
+
+Solana, Aptos and Sui each picked one. Every one of them pays somewhere.
+
+There is a fourth answer, and you have been using it for the whole curriculum: **do not run them in
+parallel.** The EVM executes a block's transactions one after another, and every mental model you
+have — that state at the top of your transaction reflects everything before it in the block, that a
+flash-loan sandwich is a matter of ordering rather than of concurrency, that reentrancy is about
+control flow rather than about threads — rests on that. Solana's own introduction of Sealevel was
+framed explicitly against runtimes that process transactions one at a
+time.<Cite src="solana-sealevel-note" />
+
+That fourth answer is not stupid. It is the reason EVM semantics are simple enough to reason about
+and the reason nobody writing Solidity has ever had to think about a read/write set. Every design
+below is buying throughput and paying for it with a mental model that is harder to hold.
+
+## Solana: declare and lock, and never retry
+
+You already know this one. The client submits the account list with the transaction, and the runtime
+derives reader/writer locks from that list — the design Solana described from the
+beginning.<Cite src="solana-sealevel-note" /> Transactions whose write sets overlap are simply not
+co-scheduled.
+
+The word to hold onto is **pessimistic**. Conflicts are *avoided*, not detected. There is no
+speculative execution to roll back and no work to redo, because the engine never starts work it might
+have to throw away.<Cite src="anza-central-scheduler" />
+
+<Misconception
+  belief="Solana runs transactions optimistically and re-runs them when they conflict."
+  reality="Solana takes reader/writer locks derived from the declared account list and does not co-schedule conflicting transactions. There is no abort-and-retry step in this model at all."
+  why="Every other parallel-execution story in this space is optimistic, so the optimistic mental model gets ported onto Solana by default."
+  src="anza-central-scheduler"
+/>
+
+Two things about this design are easy to state wrongly, so state them carefully.
+
+**The scheduler is client software, not protocol.** How pending transactions are ordered and handed
+to worker threads is a decision made by the validator client, and different clients make it
+differently.<Cite src="anza-central-scheduler" /> A sentence of the form "Solana's scheduler does X"
+is nearly always a sentence about one client's scheduler. When precision matters, name the client and
+the version.
+
+**Solana meters compute units, not gas.** Nothing you know about EVM gas costs transfers — not the
+constants, not the ratios, not the intuition about which operations are expensive. A compute unit is
+a different unit measuring a different machine, and the budget interacts with parallelism through a
+per-writable-account cap that has no EVM equivalent. That interaction is what
+[local fee markets](/c/local-fee-market) and the
+[per-account write cap](/c/per-account-write-cu-cap) are about, and it is covered where those
+concepts live. Do not carry a gas number across this boundary in either direction.
+
+**What the user experiences under contention.** The hot account's writers queue behind each other,
+priority fees on that account rise independently of the rest of the chain, and a transaction that
+does not win a slot does not land. The failure is *inclusion*, and it arrives as a transaction that
+never confirmed rather than as one that confirmed slowly.
+
+## Aptos: execute optimistically, then re-execute the losers
+
+Aptos took answer two. Its documentation describes Block-STM as combining "Software Transactional
+Memory techniques with a novel collaborative schedule", and frames the goal as "dynamically detecting
+dependencies and avoiding conflicts during execution" while ensuring "the execution output is
+consistent with executing transactions according to a preset
+order".<Cite src="aptos-docs-execution" />
+
+That last clause is the important one and it is the source of the name. The block already has an
+order. Block-STM's job is not to *find* an order — it is to produce, in parallel, exactly the result
+that sequential execution in the preset order would have produced. The paper's title says it as a
+joke that is also the design: turning the ordering curse into a performance
+blessing.<Cite src="block-stm-paper" />
+
+**Subgoal: see why the storage model forced this choice.** In the Aptos lineage a module reaches into
+global storage by (address, type) at run time.<Cite src="aptos-move-book-global-storage" /> The
+addresses it reaches for can be computed. So nothing outside the execution knows the read/write set
+in advance, and answer one — declare and lock — is not available without changing the language. Given
+that constraint, optimistic execution is not a preference; it is the only door left.
+
+<Figure
+  caption="Re-execution is the mechanism, not the error path."
+  alt="Block-STM's loop: execute every transaction speculatively, record what each read and wrote, detect where a lower-indexed transaction invalidated a read, and re-execute those. The loop exits when the output matches what sequential execution in the block's preset order would have produced."
+>
+  <Flow
+    nodes={[
+      { id: 'exec', label: 'execute speculatively', note: 'every transaction at once', col: 0 },
+      { id: 'rec', label: 'record reads and writes', note: 'what each transaction actually saw', col: 1 },
+      { id: 'det', label: 'detect invalidation', note: 'a lower-indexed transaction wrote what this one read', col: 2, tone: 'warn' },
+      { id: 'out', label: 'output', note: "consistent with the block's preset order", col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'exec', to: 'rec' },
+      { from: 'rec', to: 'det' },
+      { from: 'det', to: 'out' },
+      { from: 'det', to: 'exec', label: 're-execute', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+**Subgoal: price the optimism.** Speculative execution that turns out to be wrong is work already
+done and thrown away. Under low contention almost nothing is wasted and the parallelism is close to
+free. Under high contention on one hot value, transactions read a version of state that a
+lower-indexed transaction then invalidates, and they run again. The engine still produces the correct
+answer; it burns CPU getting there.
+
+**Subgoal: read the published numbers with the right frame.** The Block-STM paper reports up to
+110,000 transactions per second in Diem benchmarks — about 20 times a sequential baseline — and up to
+170,000 in Aptos benchmarks, about 17 times; on contended workloads it reports 50,000 and 80,000
+respectively.<Cite src="block-stm-paper" />
+
+<Aside kind="warn">
+Those are the paper's own benchmarks on the paper's own hardware and workloads, and they are the only
+numbers in this lesson for a reason. They are **not** mainnet throughput, they are **not** comparable
+to a figure published by another chain measured another way, and the useful information in them is
+not the headline — it is the ratio between the uncontended and the contended rows. Roughly half the
+throughput under contention, in the authors' own measurements, is the honest shape of the trade.
+Never place a number from one chain's benchmark beside a number from another chain's benchmark and
+call the result a comparison.
+</Aside>
+
+**What the user experiences under contention.** The transaction lands. Nothing was rejected for
+touching a hot value; it simply cost the network more work to include. Degradation shows up as
+throughput falling and latency rising across the block, not as one account's users being unable to
+get in. That is a genuinely different operational story from Solana's, and it is better or worse
+depending entirely on whether your product would rather be slow or be unavailable.
+
+## Sui: partition by ownership, and skip consensus where you can
+
+Sui took answer three, and it took it in the data model rather than in the scheduler.
+
+Because Sui has no global storage and every touched object is a transaction
+input,<Cite src="sui-docs-move-differences" /> the read/write set is visible before execution. But
+Sui does not spend that property on a lock scheduler. It spends it on a much larger claim:
+transactions that touch only objects owned by their sender have no ordering conflict with anyone
+else, so they do not need consensus at all. The documentation states the consequence plainly —
+"Address-owned objects skip consensus, so transactions against them have the lowest latency", while
+"Shared objects go through consensus, which adds latency but enables concurrent
+access".<Cite src="sui-docs-object-ownership" /> The peer-reviewed account of how a system can combine
+a broadcast fast path with a consensus path, and remain safe across both, is the Sui Lutris
+paper.<Cite src="sui-lutris" />
+
+**Subgoal: understand what "no ordering conflict" means.** If an object has exactly one owner and only
+that owner can authorise operations on it, then two conflicting transactions on that object can only
+come from the same signer — who is in a position to order their own transactions. There is no global
+agreement to reach because there is no disagreement possible between distinct parties. Consensus
+exists to order *competing* accesses; where competition is structurally excluded, so is the need.
+
+**Subgoal: price it.** Sharing is expensive by construction. Any state that several users must mutate
+becomes a shared object and re-enters the consensus path.<Cite src="sui-docs-object-ownership" /> The
+current ownership taxonomy has five kinds — address-owned, shared, immutable, wrapped, and
+consensus-address owned, also called party<Cite src="sui-docs-object-ownership" /> — and choosing
+among them is an architecture decision with a latency consequence, made early, in the data model.
+
+**What the user experiences under contention.** It depends on which path the application put them on,
+and that is the point. A wallet transfer touching only owned objects is unaffected by whatever is
+happening to a busy pool elsewhere. A trade against that busy pool is a shared-object transaction and
+is ordered by consensus like everyone else's. The contention is scoped to the object, and your data
+model decided who is exposed to it.
+
+<Misconception
+  belief="Sui and Aptos parallelise the same way because both are Move chains."
+  reality="Aptos executes optimistically and re-executes conflicting transactions. Sui partitions by object ownership and bypasses consensus entirely for owned-object transactions. These are different mechanisms at different layers of the stack."
+  why="The language and the execution engine get conflated. Move is a language; it does not imply an execution strategy, and the two chains chose opposite ones."
+  src="sui-lutris"
+/>
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Solana', note: 'declare and lock', tone: 'accent' },
+    { title: 'Aptos', note: 'execute and retry', tone: 'accent' },
+    { title: 'Sui', note: 'partition by ownership', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'How does the engine learn about a conflict?',
+      cells: [
+        <>From the account list the client submitted, before anything runs<Cite src="solana-sealevel-note" /></>,
+        <>By running, and comparing what each transaction read against what earlier ones wrote<Cite src="aptos-docs-execution" /></>,
+        <>From the transaction’s input objects — and for owned objects there is nothing to learn<Cite src="sui-docs-object-ownership" /></>,
+      ],
+    },
+    {
+      label: 'What happens to conflicted work?',
+      cells: [
+        { v: 'None is started: conflicting transactions are not co-scheduled', tone: 'good' },
+        { v: 'It is thrown away and re-executed until the output matches the preset order', tone: 'warn' },
+        { v: 'Shared-object transactions are ordered by consensus instead', tone: 'warn' },
+      ],
+    },
+    {
+      label: 'What does the contending user see?',
+      cells: [
+        { v: 'A transaction that never landed, and a fee auction on that one account', tone: 'danger' },
+        { v: 'The transaction lands, later than it would have', tone: 'warn' },
+        { v: 'Consensus latency', tone: 'warn' },
+      ],
+    },
+    {
+      label: 'What does an unrelated user see?',
+      cells: [
+        { v: 'Largely nothing — the pressure is local to the hot account', tone: 'good' },
+        { v: 'Degradation: the wasted work comes from a budget everyone shares', tone: 'danger' },
+        { v: 'Nothing, and for a stronger reason — those transactions never reach consensus', tone: 'good' },
+      ],
+    },
+    {
+      label: 'What does contention cost you?',
+      cells: ['Scheduling slots', 'Wasted re-execution', 'Consensus participation'],
+    },
+  ]}
+  caption="None of them makes contention cheap. They differ in which of your users is billed for it."
+  alt="Solana, Aptos and Sui compared on parallel execution: how each engine learns about a conflict, what happens to conflicted work, what the contending user experiences, what an unrelated user experiences, and the currency in which each charges for contention."
+/>
+
+## Programmable Transaction Blocks: the transaction becomes a small program
+
+One more Sui-specific thing belongs here, because it follows from the same objects-as-inputs decision
+and it changes what a "transaction" is.
+
+A Sui transaction is not one call to one entry point. It is a sequence of commands in which "you can
+use the results from one transaction command in any subsequent transaction command within the
+PTB",<Cite src="sui-docs-ptb" /> with a documented ceiling of up to 1,024 unique operations in a
+single execution.<Cite src="sui-docs-ptb" /> The whole thing is atomic: "The effects of each
+transaction command in the block, such as object modifications or transfers, are applied atomically
+at the end of the transaction. If one transaction command fails, the entire block fails and no
+effects from the commands are applied."<Cite src="sui-docs-ptb" />
+
+**Subgoal: compare with what you would do on Ethereum.** To compose several calls atomically, with
+the output of one feeding the input of the next, you deploy a contract that performs the composition,
+or you route through a batching wrapper someone else deployed and trust it. Composition is a
+*deployment* on the EVM. Here it is the default transaction shape, written by the client, with no new
+on-chain code and no new trusted intermediary.
+
+**Subgoal: connect it back to parallelism.** A PTB still names its objects. Chaining a thousand
+operations does not smuggle in undeclared state; the inputs are inputs. So the composability and the
+schedulability come from the same decision, which is a satisfying piece of design and also the reason
+the model is hard to bolt onto a chain that did not start there.
+
+<Misconception
+  belief="Parallel execution means my application will be fast."
+  reality="Parallelism helps a workload whose transactions touch different state. An application whose users all contend for one hot value gets little from any of these designs — it gets a different failure mode from each."
+  why="'Parallel' is marketed as a throughput number, which is measured on workloads chosen to parallelise well. Your workload is the one that decides what you get."
+  src="block-stm-paper"
+/>
+
+## Sharding a hot counter, three times
+
+The abstract comparison is only useful if it changes what you build, so run one concrete mitigation
+through all three engines. The workload: a mint that increments a single `minted` counter, which
+every participant must write.
+
+**Subgoal: name the shared mutable value.** In all three designs the bottleneck is the same object —
+one value, many writers, ordered somehow. Nothing about the engine changes that. This is why the first
+move is always to ask whether the value must be exact and must be global, and surprisingly often the
+answer is no.
+
+**Subgoal: apply the standard fix.** Replace one counter with N counters, assign each writer to one
+of them by a hash of their address, and compute the total by summing when a total is actually needed.
+Contention drops by roughly a factor of N, at the cost of reads that must aggregate and of a supply
+cap that is now approximate near the boundary unless you add a reconciliation step.
+
+**Subgoal: work out what N buys on each engine, because it is not the same thing.**
+
+On Solana, N shards means N write locks instead of one, so up to N contending transactions can be
+co-scheduled instead of one.<Cite src="solana-sealevel-note" /> The user-visible change is that
+transactions stop failing to be *included*, and the local fee pressure on the single hot account
+disperses. The declaration is what makes the sharding legible to the scheduler: because the client
+names the shard in the account list, the runtime can see that two writers do not
+collide.<Cite src="anza-central-scheduler" />
+
+On Aptos, N shards means speculative executions stop invalidating each other, so re-execution falls
+away and the wasted CPU with it.<Cite src="aptos-docs-execution" /> The user-visible change is
+throughput recovering across the whole block, because the cost of contention on Aptos was being paid
+out of everyone's budget rather than out of the contending users'.
+
+On Sui, sharding a shared object into N shared objects reduces conflict on each, but every writer is
+still on the consensus path, because a shared object is a shared object however many of them there
+are.<Cite src="sui-docs-object-ownership" /> The bigger lever here is different in kind: restructure so
+that the per-user record is an *owned* object and the shared state is touched rarely, which moves the
+common case off consensus entirely rather than making the consensus case cheaper. That restructuring
+is a data-model change, not a parameter.
+
+**Subgoal: state the transferable lesson.** The same fix produces three different improvements
+because each engine was charging you in a different currency: scheduling slots on Solana, wasted
+re-execution on Aptos, consensus participation on Sui. When someone tells you a chain "solved
+parallel execution", the question that gets a real answer is which of those three currencies you will
+be paying in.
+
+<Check type="explain" concept="three-parallelism-strategies">
+A popular mint opens. For sixty seconds, tens of thousands of users send transactions that all write
+to the same counter, and a second group of users, meanwhile, is doing ordinary unrelated transfers.
+For each of the three designs, say (a) what the engine does with the contending transactions, (b)
+what the contending user sees, and (c) what the *unrelated* user sees.
+
+<Answer>
+**Solana — declare and lock.** (a) The counter account is write-locked; contending transactions are
+serialised against it and the ones that do not get scheduled do not land.<Cite src="solana-sealevel-note" /><Cite src="anza-central-scheduler" />
+No speculative work is done and none is discarded. (b) The user sees transactions that fail to be
+included, and a priority-fee auction on that specific account. (c) Largely unaffected — that is what
+[account-scoped locking](/c/account-lock-semantics) buys, and it is the reason the fee pressure is
+local rather than global.
+
+**Aptos — execute and retry.** (a) Every contending transaction is executed speculatively, most read
+a counter value that a lower-indexed transaction invalidates, and they are
+re-executed.<Cite src="aptos-docs-execution" /><Cite src="block-stm-paper" /> The CPU cost of the block
+rises sharply; correctness does not change, because the output must match the preset
+order.<Cite src="aptos-docs-execution" /> (b) The transaction lands, later than it would have. (c)
+Degraded, because the wasted work is spent from the same block-level budget everyone shares. The pain
+is distributed rather than local.
+
+**Sui — partition by ownership.** (a) A counter every user writes is a shared object, so those
+transactions go through consensus and are ordered there.<Cite src="sui-docs-object-ownership" /> (b)
+The user gets consensus latency, and the mint is exactly as fast as the consensus path allows. (c)
+Unaffected in a stronger sense than on Solana: those transfers touch only owned objects and therefore
+take the fast path that does not involve consensus at
+all.<Cite src="sui-docs-object-ownership" /><Cite src="sui-lutris" />
+
+**The synthesis worth writing down.** Solana localises the *failure* to the hot account. Aptos
+socialises the *cost* across the block. Sui localises the *latency* to whoever touches shared state,
+and the application decided in advance who that is. None of the three made contention cheap. Each
+chose which of your users pays for it.
+
+**And the design lever this hands you.** On Solana, the lever is splitting the hot account so the
+lock is not global. On Aptos, it is reducing how much state a contended transaction touches so
+re-execution is cheap. On Sui, it is keeping as much of the workload as possible in owned objects —
+which is a data-model decision made long before the mint, and very expensive to change during it.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**In evaluating any "parallel EVM" or high-throughput claim.** You now have the three-question
+checklist: does the engine learn about conflicts before or during execution; what happens to work
+that turns out to be conflicted; and what does the user of a contended piece of state actually
+experience. A benchmark number that does not answer those three is a number about the vendor's chosen
+workload.
+
+**In application design on any of these chains.** Contention is a property of your data model, not of
+the chain. One counter that everyone increments is a bottleneck under all three designs, expressed
+three different ways. Sharding that counter is the fix on all three, and it is a fix you write.
+
+**In reading this ecosystem accurately.** Move is a language. It does not imply an execution
+strategy, a storage model, or an ownership taxonomy — the two chains that share it disagree about all
+three.<Cite src="sui-docs-concepts" /><Cite src="aptos-move-book-global-storage" /> Keeping "language"
+and "engine" separate is the discipline that makes the rest of the comparisons in this track land.
+
+**What this unlocks.** Every module in this track so far has asked what machine runs your code on
+somebody else's chain. The next module asks whether you should be renting block space at all: build
+the application as a state machine, compile it into its own chain, and take the fee token, the
+validator set and the upgrade schedule with it — at the price of having to find the security
+yourself.

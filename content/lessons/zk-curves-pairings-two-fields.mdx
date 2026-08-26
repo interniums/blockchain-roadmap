@@ -1,0 +1,283 @@
+---
+id: zk-curves-pairings-two-fields
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-197, eip-2537, eip-4844, eth2book-bls12-381, execution-spec-tests-eip2537]
+stack: {}
+---
+
+Two numbers, both 254 bits, both prime, both belonging to the same elliptic curve:
+
+```text
+21888242871839275222246405745257275088696311157297823662689037894645226208583
+21888242871839275222246405745257275088548364400416034343698204186575808495617
+```
+
+They agree on their first thirty-eight decimal digits. They differ by about
+1.48 × 10³⁸. The first is BN254's **base field** modulus `p`, the field its point coordinates live
+in. The second is its **scalar field** modulus `r`, the order of the subgroup, and the field its
+scalars, witnesses and circuit values live in. Both appear in EIP-197's specification of the
+alt_bn128 pairing precompile, a few lines apart.<Cite src="eip-197" />
+
+Reducing a value into the wrong one of these is the single most common integration bug when wiring a
+proving system to on-chain code, and it is a bad kind of bug: the arithmetic still works, the types
+still line up, the tests you wrote with small numbers still pass, and the failure appears only for
+inputs above a threshold nothing in your code mentions.
+
+## Which field is which
+
+The [elliptic-curve group](/c/ec-group) supplies two entirely separate arithmetic contexts, and they
+are not interchangeable in either direction.
+
+**The base field, `Fp`.** Point coordinates. When you serialise a curve point you are serialising two
+elements of `Fp` — or, on the twisted curve where `G2` lives, two elements of the quadratic extension
+`Fp2`.<Cite src="eth2book-bls12-381" /> Field arithmetic here is what a pairing implementation spends
+its time on. You almost never touch it directly.
+
+**The scalar field, `Fr`.** Everything you put *into* the cryptography. Private keys. Polynomial
+coefficients. Circuit signals. The public inputs your verifier contract passes in. Its modulus is the
+order of the prime-order subgroup, which is why the group and the scalar field have the same size.
+
+The one-line rule: **`Fp` is where the curve lives, `Fr` is where you live.**
+
+On BLS12-381 the distinction is easier to keep because the two moduli are visibly different sizes —
+the base field is 381 bits and the subgroup order is 255.<Cite src="eip-2537" /><Cite src="eth2book-bls12-381" />
+On BN254 they are both 254 bits and share thirty-eight leading digits, so a value that belongs to one
+looks exactly like a value that belongs to the other. BN254 is the curve most on-chain verifiers use.
+The trap and the default sit on the same curve.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Base field, Fp', note: 'the coordinates', tone: 'muted' },
+    { title: 'Scalar field, Fr', note: 'the values you supply', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What lives in it?',
+      cells: [
+        <>Point coordinates — and on the twisted curve where G2 lives, two elements of the quadratic extension Fp2.<Cite src="eth2book-bls12-381" /></>,
+        'Private keys, polynomial coefficients, circuit signals, and the public inputs a verifier contract passes in.',
+      ],
+    },
+    {
+      label: 'How wide is it on BN254?',
+      cells: [
+        <>{'254 bits'}<Cite src="eip-197" /></>,
+        <>254 bits, sharing thirty-eight leading digits with the base field modulus<Cite src="eip-197" /></>,
+      ],
+    },
+    {
+      label: 'How wide is it on BLS12-381?',
+      cells: [
+        <>{'381 bits'}<Cite src="eip-2537" /></>,
+        <>{'255 bits'}<Cite src="eip-2537" /></>,
+      ],
+    },
+    {
+      label: 'How does EIP-2537 validate it?',
+      cells: [
+        { v: <>Strictly. 64 bytes big-endian, the top 16 bytes checked to be zero, and an invalid encoding must return an error.<Cite src="eip-2537" /></>, tone: 'good' },
+        { v: <>Not at all. 32 bytes, not required to be less than or equal to the subgroup order — the precompile reduces for you.<Cite src="eip-2537" /></>, tone: 'warn' },
+      ],
+    },
+    {
+      label: 'How often do you touch it directly?',
+      cells: [
+        'Almost never. It is what a pairing implementation spends its time on.',
+        'At every boundary between a contract and a circuit.',
+      ],
+    },
+  ]}
+  caption="Nothing in a type system separates these two. Only the modulus does, and on BN254 the two moduli look alike."
+  alt="The base field holds point coordinates and is 254 bits on BN254 and 381 on BLS12-381, validated strictly by EIP-2537. The scalar field holds keys, witnesses and public inputs, is 254 bits on BN254 and 255 on BLS12-381, and is not range-checked by the precompiles at all."
+/>
+
+<Misconception
+  belief="A curve has one modulus, the way a hash function has one output size."
+  reality="Every curve carries at least two: the base field of the coordinates and the scalar field of the group order. Pairing curves add a third context, the extension field the target group lives in."
+  why="Library APIs hand you opaque scalar and point types and reduce for you, so the two moduli never appear next to each other until something rejects your input."
+  src="eip-197"
+/>
+
+## The bug, in the form you will actually meet it
+
+Almost every version of this bug starts the same way: a hash is used as a circuit input.
+
+```solidity
+// The contract computes a public input for the verifier.
+uint256 publicInput = uint256(keccak256(abi.encode(user, amount)));
+verifier.verifyProof(a, b, c, [publicInput]);
+```
+
+That is a 256-bit value being handed to something that expects an element of a 254-bit field. Run the
+arithmetic on what that means.
+
+**Subgoal: measure how often the value is out of range.** BN254's `r` is roughly `2²⁵⁴`, and
+`2²⁵⁶ / r ≈ 5.29`.<Cite src="eip-197" /> A uniformly random 256-bit value therefore lands below `r`
+about **19% of the time**. Four times in five, your "public input" is not a field element at all.
+
+**Subgoal: work out what happens to the other four.** One of two things, and which one is a property
+of the code path rather than of the value:
+
+- If some component reduces modulo `r`, the value silently wraps. No revert, no event, no signal. The
+  proof will verify against the reduced value and your contract believes it verified against the hash.
+- If some component range-checks, the call reverts — for 81% of user inputs, which is the kind of
+  failure rate that gets diagnosed as "the verifier is broken" rather than as a field-domain error.
+
+**Subgoal: notice the reduction is not uniform even when it succeeds.** Because `2²⁵⁶` is about 5.29
+times `r`, values near the bottom of `Fr` have six preimages among 256-bit strings and values near
+the top have five. If anything downstream assumed the field element was uniformly distributed — a
+nullifier, a challenge, a blinding factor — that assumption is now false by about 20% in the tails.
+
+**Subgoal: fix it in the way the ecosystem actually fixes it.** Throw away the top byte:
+
+```solidity
+uint256 publicInput = uint256(keccak256(abi.encode(user, amount))) >> 8;
+```
+
+`2²⁴⁸` is comfortably below `r`,<Cite src="eip-197" /> so every output is in range and no reduction
+occurs. You give up eight bits of hash output, which leaves 248 — far more than any collision bound
+you care about — and you gain a value that means the same thing on both sides of the boundary.
+
+<Aside kind="warn">
+The same arithmetic with different constants applies to BLS12-381, where `r` is 255 bits: a uniformly
+random 256-bit value is out of range about **55%** of the time.<Cite src="eip-2537" /> The failure is
+less frequent, which makes it worse — it is far likelier to survive a test suite and appear in
+production.
+</Aside>
+
+<Figure
+  caption="A 256-bit hash is not a field element on either curve. The curve decides only how often you find that out."
+  alt="Share of uniformly random 256-bit values that are not valid scalar field elements: about 81 percent on BN254 and about 55 percent on BLS12-381."
+>
+  <Bars
+    unit="%"
+    axisLabel="uniform 256-bit values that are not scalar field elements"
+    items={[
+      { label: 'BN254', value: 81, tone: 'danger', note: 'four random hashes in five are out of range' },
+      { label: 'BLS12-381', value: 55, tone: 'warn', note: 'rarer, so likelier to survive a test suite' },
+    ]}
+  />
+</Figure>
+
+## Three more places the two fields diverge
+
+**Circuit arithmetic wraps, and it does not wrap where Solidity wraps.** Inside a circuit, `a + b`
+and `a * b` are operations in `Fr`. There is no overflow, because in a field there is no such thing;
+the result is reduced and the computation continues. Solidity since 0.8 reverts on integer overflow,
+so an engineer arriving from that world has a reflex — "the compiler catches this" — that is exactly
+inverted here. The circuit's default is silent wrapping at `r`, not at `2²⁵⁶`, and not with a revert.
+This is the [default a circuit language gives you](/c/field-arithmetic-default) and the reason
+range checks in circuits are explicit, expensive, and easy to forget.
+
+<Misconception
+  belief="A uint256 in the contract and a field element in the circuit are the same type with different syntax."
+  reality="They have different moduli. Every uint256 above r is a value the circuit cannot represent, and every circuit value is an integer that wraps at r rather than at 2²⁵⁶ — so the two agree on a proper subset of their range and silently disagree outside it."
+  why="Both are 32 bytes on the wire and both are called integers, and the ABI has no way to express 'this one is modulo something else'."
+  src="eip-197"
+/>
+
+**Subtraction produces enormous numbers.** In `Fr`, `3 - 5` is `r - 2`: a 254-bit value. Any check
+written as "the difference is small, so it must be a valid delta" is satisfied by underflow in the
+one direction it was meant to catch. Signed reasoning has to be built out of explicit bit
+decomposition, not inferred from magnitude.
+
+**A value valid in one field is not automatically valid in the other.** There is no coercion that is
+always safe. A coordinate is not a scalar with a different name; feeding one where the other is
+expected produces a well-typed value with no meaning.
+
+## The specifications disagree with each other on purpose
+
+EIP-2537 is the clearest place to see that the two fields have genuinely different validation rules,
+because it states both in the same document a few paragraphs apart.
+
+**Base field elements are checked strictly.** An `Fp` element is encoded as 64 bytes big-endian. The
+modulus is 381 bits, so the top 16 bytes are always zero — and the EIP requires that this be
+*checked*, not assumed, even when only a sub-slice of the input is used for decoding. An encoding
+that is not a valid field element must return an error.<Cite src="eip-2537" />
+
+**Scalars are not checked at all.** A scalar is 32 bytes big-endian, and the EIP states that the
+corresponding integer "is not required to be less than or equal to main subgroup order
+q".<Cite src="eip-2537" /> The test-vector properties make the consequence explicit: multiplication
+by an unnormalised scalar satisfies `(scalar + group_order) * P = scalar * P`.<Cite src="eip-2537" />
+The precompile reduces for you.
+
+So on a single call to `BLS12_G1MSM`, the 128 bytes of point data are validated to the byte and the
+32 bytes of scalar are accepted however you send them. Both rules are correct — an out-of-range
+coordinate is meaningless, while an out-of-range scalar has an unambiguous reduction — but an
+integrator who has internalised "the precompile validates its input" has learned something true about
+half of each call.
+
+<Aside kind="note">
+This is also why the blob machinery you met on the protocol side is so insistent about its modulus.
+The point-evaluation precompile at `0x0a` returns, as part of its successful output, the number of
+field elements per blob and `BLS_MODULUS` itself — the *scalar* field modulus of
+BLS12-381.<Cite src="eip-4844" /> A precompile that hands the caller back the modulus it just worked
+in is a specification telling you, in the only way a return value can, that getting the field wrong
+is the expected mistake.
+</Aside>
+
+<Check type="spot-bug" concept="scalar-field-vs-base-field">
+A team is building a mixer-style contract with a BN254 Groth16 verifier. A reviewer flags this
+helper, which derives a nullifier that the circuit also computes and exposes as a public input:
+
+```solidity
+function nullifierOf(bytes32 secret, uint256 leafIndex) public pure returns (uint256) {
+    return uint256(keccak256(abi.encodePacked(secret, leafIndex)));
+}
+```
+
+The team's response: "the circuit computes the same keccak over the same bytes, so the two agree by
+construction." Say what is wrong, what the observable symptom is, and what the fix costs.
+
+<Answer>
+**The two do not agree by construction, because the circuit cannot hold this value.** The contract
+returns a full 256-bit integer. The circuit's public input is an element of `Fr`, whose modulus is
+254 bits.<Cite src="eip-197" /> The circuit is comparing its own value — already reduced, or
+constructed from at most 254 bits — against something that is out of range about **81%** of the time.
+
+**The symptom depends on where the range check lives, and both symptoms are misleading.** A verifier
+that range-checks public inputs reverts for roughly four out of five secrets, which reads as a broken
+verifier or a bad proof rather than as a domain error. A path that reduces silently produces a
+nullifier that is `keccak mod r` on one side and `keccak` on the other — and the contract's
+duplicate-nullifier set is then keyed on a *different value* from the one the circuit constrained.
+For a mixer, that is not a liveness bug. Two distinct secrets whose hashes differ by exactly `r` map
+to the same reduced nullifier, and the whole point of the nullifier set is that collisions are
+impossible.
+
+**There is a second, quieter defect.** Even for the 19% that are in range, `2²⁵⁶ / r ≈ 5.29`, so the
+reduction is not uniform: some residues have six 256-bit preimages and others have five. Any argument
+that the nullifier is indistinguishable from random has a bias of about 20% in the tails baked into
+it.
+
+**The fix costs eight bits and one shift.** Derive the nullifier as
+`uint256(keccak256(...)) >> 8`, on both sides, and constrain the circuit to the same 248-bit
+form.<Cite src="eip-197" /> 248 bits is far beyond any collision bound this design needs. The
+expensive part is not the code — it is that the contract and the circuit are two implementations of
+one function, and the field domain is part of that function's signature even though neither language
+writes it down.
+
+**The reviewable rule to take away:** every value that crosses the boundary between a contract and a
+circuit needs its field named in a comment, at the definition, on both sides. "uint256" is not a
+type here; it is a container.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The pairing lesson, immediately.** A pairing maps two curve points — objects over `Fp` — into a
+target group living in a twelfth-degree extension of `Fp`, while the scalars it multiplies still live
+in `Fr`. Three arithmetic contexts in one equation. Keeping them apart is what makes the bilinearity
+identity readable rather than mystical.
+
+**The precompile lesson.** The encoding rules there are field rules: 64 bytes for an `Fp` element
+with a mandatory zero check, 32 for a scalar with none, 128 for a `G1` point because it is two `Fp`
+elements.<Cite src="eip-2537" /><Cite src="execution-spec-tests-eip2537" /> Once you see the field
+underneath, the byte counts stop needing memorisation.
+
+**And in any circuit you write later**, the habit that pays is naming the field at every boundary —
+in the ABI comment, in the circuit's input declaration, and in whatever off-chain code produces the
+witness. Three places, one sentence each, and a whole class of bug stops being possible.

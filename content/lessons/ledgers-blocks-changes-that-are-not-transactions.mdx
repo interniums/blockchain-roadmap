@@ -1,0 +1,296 @@
+---
+id: ledgers-blocks-changes-that-are-not-transactions
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-4895, eip-7685, eip-6110, eip-7002, eip-7251, execution-specs-osaka-blocks, execution-specs-osaka-fork, execution-specs-osaka-requests, eip-7708, eip-7773]
+stack: {}
+---
+
+A support ticket that every staking product eventually receives, in some wording or other:
+
+> My ETH arrived. The balance went up. But there is no transaction — the explorer shows nothing on
+> that date, and your export is missing it. Where did the money come from?
+
+The engineer's first instinct is that something is broken. It is not. The engineer's second instinct
+is that the explorer is behind. It is not that either. The money arrived through a mechanism that has
+no sender, consumes no gas, produces no receipt, emits no log and has no transaction hash — and which
+is, by every measure of volume, one of the most common balance changes on the network.
+
+This lesson is about the two header fields that cover state changes originating outside user
+transactions, and about the fact that they point in opposite directions.
+
+## Withdrawals: the consensus layer pushing money down
+
+When a validator's balance is swept or its stake is returned, that ETH has to cross from the
+consensus layer into the execution layer. EIP-4895 defines the mechanism and is explicit about its
+category: a **system-level operation**, deliberately not a transaction
+type.<Cite src="eip-4895" />
+
+A withdrawal carries four values:<Cite src="eip-4895" />
+
+- an `index`, a globally monotonic counter across the entire sequence of withdrawals ever made —
+  not per-validator, not per-block;
+- the `validator_index` on the consensus layer that it corresponds to;
+- an `address` on the execution layer to credit;
+- an `amount` in **Gwei**, as a `uint64`.
+
+They are RLP-encoded as the list `[index, validator_index, address, amount]`, collected into the
+block body as a list, and committed to by an index-keyed trie exactly like transactions — key
+`rlp(i)`, value `rlp(withdrawal)` — whose root is the header's withdrawals
+root.<Cite src="eip-4895" /><Cite src="execution-specs-osaka-fork" />
+
+<Figure
+  caption="There is no sender field, no signature field and no gas field — which is why nothing in a transaction-shaped view can ever see one."
+  alt="The RLP list encoding a withdrawal holds four values: a global index, the consensus-layer validator index, a 20-byte execution-layer address to credit, and an amount denominated in Gwei. No signature, sender, nonce or gas field appears anywhere in the record."
+>
+  <ByteLayout
+    caption="rlp([index, validator_index, address, amount])"
+    fields={[
+      { label: 'index', variable: true, note: 'global counter' },
+      { label: 'validator_index', variable: true, note: 'consensus layer' },
+      { label: 'address', size: 20, note: 'unconditional credit' },
+      { label: 'amount', variable: true, tone: 'accent', note: 'uint64 of Gwei' },
+    ]}
+  />
+</Figure>
+
+Three details in the processing rule matter more than they look:
+
+**They are applied after all transactions.** The withdrawal credits land at the end of block
+processing, once every transaction has run.<Cite src="eip-4895" />
+
+**The credit is unconditional and cannot fail.** There is no execution, no revert path, no failure
+mode. The specification creates the ether at the address, unconditionally.<Cite src="execution-specs-osaka-fork" />
+
+**The amount is in Gwei and the state is in wei.** The conversion is a multiplication by
+`10**9`.<Cite src="execution-specs-osaka-fork" /> If your reconciliation is out by a factor of a
+billion, this is why, and the error is loud rather than subtle only because the magnitude is absurd.
+
+### Why the protocol refused to make it a transaction
+
+The EIP answers this directly, and the answer is a good piece of protocol-design reasoning to carry
+around.
+
+A transaction is a user-authored object: it has a signer, it pays for its own execution, it can fail,
+and it interacts with arbitrary EVM code. Every one of those properties is a liability for a
+system-initiated balance credit. So the design **firewalls the system-level concern off from
+user-level execution**, on the grounds that mixing them creates interaction effects that make testing
+and security review harder.<Cite src="eip-4895" />
+
+The same reasoning explains why withdrawals only ever *increase a balance* and never run code. More
+general processing would introduce failure modes, and a withdrawal that can fail is a withdrawal
+whose accounting on the consensus layer becomes conditional on execution-layer outcomes — which is a
+far worse problem than the one it would solve.<Cite src="eip-4895" />
+
+There is also a cost argument. Withdrawals pay no gas at all, which is only safe because the
+consensus layer bounds how many can reach the execution layer per block; the EIP puts the added
+payload overhead at roughly one percent of average payload size.<Cite src="eip-4895" />
+
+<Misconception
+  belief="Withdrawals are transactions sent from the deposit contract."
+  reality="They are system-level operations with their own list and their own root. No sender, no gas, no receipt, no log, no transaction hash — and they never appear in the transactions trie."
+  why="Every balance change you have previously debugged was a transaction, and the deposit contract is the only staking-shaped address most people have heard of. There is nowhere in a normal RPC workflow that this category becomes visible."
+  src="eip-4895"
+/>
+
+### The quiet data bug this produces
+
+Follow the consequences for anything that reconstructs balances.
+
+`eth_getTransactionByHash` cannot find a withdrawal, because there is no hash. `eth_getLogs` cannot
+find one, because no log is emitted. A tracing API that enumerates internal calls will not show one,
+because no call occurred. An indexer that reconciles an address by walking every transaction to and
+from it will produce a balance that is short by exactly the validator income, and — this is the part
+that makes it dangerous — the deficit will look like a plausible accounting discrepancy rather than
+a category error.
+
+The only ways to see a withdrawal are to read the block's `withdrawals` list directly, or to observe
+a balance delta with no transaction explaining it.
+
+## Requests: the execution layer pushing instructions up
+
+Now the opposite direction, and a different shape of commitment.
+
+Some actions have to travel from the execution layer *to* the consensus layer: a deposit that
+registers a new validator, a request to exit or partially withdraw, a request to consolidate two
+validators. Before Pectra, each such action would have meant its own header field. EIP-7685 replaced
+that pattern with a single field, `requestsHash`, covering an ordered list of typed
+requests.<Cite src="eip-7685" />
+
+A request is a **type byte followed by an opaque payload** — deliberately opaque, so that future
+request types can choose their own encoding without the framing having to
+change.<Cite src="eip-7685" /> Three types exist today:<Cite src="execution-specs-osaka-requests" />
+
+- **`0x00` — deposit**, per EIP-6110.<Cite src="eip-6110" />
+- **`0x01` — withdrawal request**, per EIP-7002.<Cite src="eip-7002" />
+- **`0x02` — consolidation request**, per EIP-7251.<Cite src="eip-7251" />
+
+### The commitment breaks the pattern the rest of the header follows
+
+Every other root-shaped field in the header is a Merkle-Patricia root, keccak-based. This one is
+not.<Cite src="execution-specs-osaka-blocks" />
+
+The construction: build an intermediate list by taking the SHA-256 digest of each request in the
+block that has a non-empty payload — items consisting of only their type byte are skipped entirely —
+ordered by type byte ascending. The commitment is the SHA-256 of those digests
+concatenated.<Cite src="eip-7685" /> The specification's implementation is four
+lines:<Cite src="execution-specs-osaka-requests" />
+
+```python
+def compute_requests_hash(requests):
+    m = sha256()
+    for request in requests:
+        m.update(sha256(request).digest())
+    return m.digest()
+```
+
+Different hash function, different structure, no trie, no proofs of individual membership. If you are
+writing code against this field, read the construction out of EIP-7685 rather than inferring it from
+its neighbours — including the skip-if-empty rule, which is routinely overlooked and changes the digest.
+
+<Misconception
+  belief="`requestsHash` is another Merkle Patricia root."
+  reality="It is a SHA-256 accumulator over typed request byte arrays: hash each non-empty request, concatenate the digests in ascending type order, hash again. Different hash function, different structure, and no per-item inclusion proofs."
+  why="Every other root in the header is an MPT root, and the field name follows the same convention. The pattern is strong enough that people write the trie code before reading the EIP."
+  src="eip-7685"
+/>
+
+### Requests are not in the block body
+
+Here is a structural point that catches people building block parsers. The `Block` object is a
+header, a transaction list, an (always empty) ommers list and a withdrawals list. **Requests are not
+one of its fields.**<Cite src="execution-specs-osaka-blocks" />
+
+They are *derived during execution* and the header's commitment is checked against what the verifier
+re-derives — which puts `requestsHash` in the same epistemic category as the state root from lesson
+two, not the same category as the transactions root. You cannot compute it by reading the block; you
+compute it by running the block.
+
+Where do the requests come from? Two different sources, and the first is a lovely piece of protocol
+reuse:<Cite src="execution-specs-osaka-requests" />
+
+**Deposits come from logs.** After execution, the client walks the block's receipts looking for logs
+emitted by the beacon deposit contract at `0x00000000219ab540356cbb839cbe05303d7705fa` whose first
+topic matches the `DepositEvent` signature hash. Each matching log's payload — a fixed 576-byte
+ABI-encoded structure, whose offsets and field sizes the client verifies exactly and rejects the
+whole block over if they deviate — is stripped of its ABI framing and concatenated into the deposit
+request data.<Cite src="execution-specs-osaka-requests" /><Cite src="eip-6110" />
+
+Sit with that for a second. The log mechanism from the previous lesson is not only an application
+convenience; the protocol itself consumes logs as protocol input. The receipts root is load-bearing
+for validator registration.
+
+**Withdrawal and consolidation requests come from system contracts.** After the transactions, the
+client makes a system call to each predeploy and appends whatever it returns, prefixed with the
+appropriate type byte.<Cite src="execution-specs-osaka-requests" /> Users interact with those
+predeploys through ordinary transactions during the block; the post-block system call drains the
+queue. EIP-7002 rate-limits that queue with a fee rather than a hard cap, so that demand for exits
+cannot be used to spam the consensus layer.<Cite src="eip-7002" />
+
+<Figure
+  caption="A deposit request is manufactured after execution, out of a log — so requestsHash is a thing you run the block to learn, not a thing you read off it."
+  alt="A deposit travels from a log emitted by the beacon deposit contract, into the transaction's receipt under the receipts root, through a post-execution scan that verifies and strips the 576-byte ABI framing, and out as a type-0x00 request folded into the SHA-256 accumulator behind requestsHash."
+>
+  <Flow
+    lanes={['during execution', 'committed', 'after the block', 'the header']}
+    nodes={[
+      { id: 'log', label: 'DepositEvent log', note: 'from the deposit contract', col: 0 },
+      { id: 'rcpt', label: 'receipt', note: 'under receiptsRoot', col: 1 },
+      { id: 'scan', label: 'post-block scan', note: '576 bytes, framing stripped', col: 2 },
+      { id: 'req', label: 'type 0x00 request', note: 'into a sha256 accumulator', col: 3, tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+### Two withdrawal paths, and only one of them is money
+
+Post-Pectra there are two things called "withdrawal" in this module and confusing them is the most
+likely way to get a staking integration wrong.
+
+- **A withdrawal** (EIP-4895) is a credit arriving. It is in the block body, committed to by the
+  withdrawals root, and it moves ETH.<Cite src="eip-4895" />
+- **A withdrawal request** (EIP-7002) is an instruction leaving. It is a type-`0x01` request,
+  committed to by `requestsHash`, and it moves no ETH at all.<Cite src="eip-7002" />
+
+The request asks the consensus layer to begin an exit or a partial withdrawal. The money, if and when
+it comes, arrives later as a withdrawal in some future block. A product that treats the request as
+the payout will report funds that have not moved and cannot be spent.
+
+## The direction is the whole idea
+
+Two fields, two directions, two different commitments:
+
+- **Down (consensus to execution): withdrawals.** Money. An input the verifier is handed, committed
+  to by a Merkle-Patricia root, applied after transactions, unconditional.
+- **Up (execution to consensus): requests.** Instructions. An output the verifier re-derives,
+  committed to by a SHA-256 accumulator, assembled from receipts and system-contract queues.
+
+Everything else about these fields follows from which way the arrow points.
+
+<Aside kind="note">
+A telling piece of evidence for how awkward the withdrawal category is. EIP-7708 — currently in
+Review and listed as scheduled for the Glamsterdam upgrade — makes every non-zero ETH transfer emit
+a log, precisely so that ETH movement becomes traceable the way ERC-20 movement already is. Its
+authors considered covering withdrawals and explicitly declined, on the grounds that withdrawals are
+not attached to a transaction and so have no natural point at which to emit
+anything.<Cite src="eip-7708" /> Even the EIP whose stated purpose is making all ETH movement
+loggable leaves this category out. Read it from the header or do not see it.<Cite src="eip-7773" />
+</Aside>
+
+<Check type="explain" concept="withdrawals-root">
+You maintain a treasury reconciliation service. For each address the company controls, it computes an
+expected balance by summing every incoming and outgoing transfer it can find — transactions, internal
+calls from traces, and ERC-20 `Transfer` logs — and compares that against `eth_getBalance` at the
+same block. Any drift pages an on-call engineer.
+
+The company starts running validators, pointing withdrawal credentials at one of the treasury
+addresses. Within a day the service is paging continuously.
+
+Explain precisely why, say what the drift will look like over time, and describe the smallest correct
+fix. Then answer a harder question: if the company later uses EIP-7002 to trigger an exit, what
+should the service expect to see on the day the request is submitted?
+
+<Answer>
+**Why it pages.** Validator withdrawals are system-level operations, not transactions. They have no
+sender, no receipt, no log, no transaction hash, and no entry in the transactions trie. Every source
+the service consults — the transaction list, the trace API, `Transfer` logs — is blind to them by
+construction. So `eth_getBalance` climbs and the computed expectation does not.
+
+**What the drift looks like.** Monotonically increasing, roughly proportional to validator count and
+elapsed time, and never self-correcting. That shape is the tell: an ordinary indexing bug tends to
+produce drift in both directions or a step change, whereas a missed income category produces a
+one-directional, roughly linear gap.
+
+**The smallest correct fix.** Read the `withdrawals` array from each block and treat each entry whose
+`address` is a treasury address as an incoming credit of `amount * 10**9` wei — remembering that
+`amount` is denominated in Gwei while balances are in wei. No new data source is required beyond the
+block itself; the information was always there, in a field the service never read at all.
+
+**The EIP-7002 question.** On the day the exit request is submitted, the service should expect to see
+**no balance change at all**. Submitting a withdrawal request is a transaction to the withdrawal
+predeploy that pays a fee and enqueues an instruction; the request itself is committed to by
+`requestsHash` and moves no ETH. The staked ETH returns later, as ordinary EIP-4895 withdrawals in
+some future block, subject to the consensus layer's exit and withdrawal queues.
+
+If the service were to treat the request transaction as the payout it would credit the treasury on
+the wrong day, for an amount it had to guess, and then double-count when the real withdrawals landed.
+The correct model is: the request is an event in a workflow, the withdrawal is the money.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Any accounting, tax or treasury tooling** you build or audit. "Sum the transactions" is the default
+mental model and it is incomplete on this chain in a way that produces silent, one-directional error.
+
+**Staking and restaking products** live on both fields at once: withdrawals for income, requests for
+lifecycle. Getting the direction right is most of getting the product right.
+
+**The proof-of-stake module** picks up the other end of both arrows — what a validator is, what the
+sweep actually does, and why exits are queued rather than immediate.
+
+**The next lesson** stays inside the header but changes the question from "what does this field
+commit to" to "why is this field still here at all" — because roughly a fifth of the modern header is
+kept only so that the encoding never had to change.

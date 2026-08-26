@@ -1,0 +1,501 @@
+---
+id: toolchain-invariant-testing-handler
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [foundry-invariant-guide, foundry-invariant-testing, foundry-testing-config, foundry-forge-testing, forge-test-reference, foundry-inline-test-config, foundry-cheatcode-assume, forge-std-repo, measured-forge-1-7-1, rareskills-invariant-testing, cyfrin-fuzz-guide, threesigma-invariant, foundry-ci, foundry-issue-3001, foundry-releases]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Here is a campaign pointed straight at the vault, with a correct solvency invariant, run on forge
+1.7.1 against a vault that can be drained in two calls:<Cite src="measured-forge-1-7-1" />
+
+```console
+[PASS] invariant_assetsCoverShares() (runs: 256, calls: 128000, reverts: 128000)
+
+╭----------+----------+-------+---------+----------╮
+| Contract | Selector | Calls | Reverts | Discards |
++==================================================+
+| VaultBug | deposit  | 64147 | 64147   | 0        |
+|----------+----------+-------+---------+----------|
+| VaultBug | withdraw | 63853 | 63853   | 0        |
+╰----------+----------+-------+---------+----------╯
+
+Suite result: ok. 1 passed; 0 failed; 0 skipped; finished in 4.70s
+```
+
+One hundred and twenty-eight thousand calls. One hundred and twenty-eight thousand reverts. The
+campaign executed the contract's business logic exactly zero times, and reported `PASS`.
+
+This lesson is about the gap between those two numbers, which is where all the engineering in
+invariant testing lives.
+
+<Figure
+  caption="Nothing the campaign generates reaches the vault directly: the handler chooses the caller, the amount, and whether the call happens at all."
+  alt="The fuzzer targets a test-only handler contract rather than the vault. The handler calls the vault as a funded actor and, separately, records what it observed into ghost variables."
+>
+  <Flow
+    nodes={[
+      { id: 'fz', label: 'the fuzzer', note: 'random words, random senders', col: 0 },
+      { id: 'h', label: 'the handler', note: 'a test-only contract', col: 1, tone: 'accent' },
+      { id: 'v', label: 'the vault', note: 'the system under test', col: 2 },
+      { id: 'g', label: 'ghost variables', note: 'an independent tally', col: 2, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'fz', to: 'h', label: 'targets' },
+      { from: 'h', to: 'v', label: 'calls, as a funded actor' },
+      { from: 'h', to: 'g', label: 'records what it observed', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+## Why every call reverted
+
+Forge's default targeting is generous: with `targetContract(address(vault))` it will call any
+external function on the vault, with fuzzed arguments, from fuzzed
+senders.<Cite src="foundry-invariant-guide" /><Cite src="foundry-invariant-testing" />
+Enumerate what each of those two functions needs, and the result is not surprising.
+
+`deposit(uint256 assets)` pulls tokens with `transferFrom`. The sender is a random address that has
+never held the asset and has never approved the vault. Every call fails at the allowance check or the
+balance check.
+
+`withdraw(uint256 s)` requires `shares[msg.sender] >= s`. Nobody has any shares, because no deposit
+ever succeeded. Every call fails at the first `require`.
+
+The two failures are also *coupled*: `withdraw` cannot succeed until `deposit` does, so a state where
+the invariant could even be interesting is unreachable from the outside. This is the normal condition
+for any contract with preconditions, which is to say every contract worth testing. Foundry's guide
+states the remedy in one line — handlers wrap target contracts to constrain inputs and track
+state<Cite src="foundry-invariant-guide" /> — and understates how much of the work that is.
+
+<Misconception
+  belief="You can point the fuzzer at the contract and let it work."
+  reality="Random senders hold no tokens, no approvals and no positions, so nearly every generated call fails a precondition and is silently discarded from the result."
+  why="The setup looks complete once `targetContract` is declared, and the run still reports `PASS` in green."
+  src="foundry-invariant-guide"
+/>
+
+### The one-line diagnostic
+
+Before building anything, there is a fast way to find out whether a campaign is in this state.
+`fail_on_revert` defaults to `false` under `[invariant]` on forge 1.7.1 — the campaign treats a
+reverting call as a no-op and keeps walking.<Cite src="measured-forge-1-7-1" /><Cite src="foundry-testing-config" />
+Flip it on for one run:
+
+```text
+FOUNDRY_INVARIANT_FAIL_ON_REVERT=true forge test --match-contract NoHandlerTest
+
+[FAIL: SHARES]
+	[Sequence] (original: 1, shrunk: 1)
+		calldata=withdraw(uint256) args=[3]
+finished in 44.84ms
+```
+
+Forty-five milliseconds to learn what the four-and-a-half-second green run
+concealed.<Cite src="measured-forge-1-7-1" /> The failure is not a bug in the contract; it is the
+campaign reporting that it cannot make a single legal call. Run this once at the start of every new
+campaign, and again whenever a handler grows a new action.
+
+The default is `false` for a real reason — once you have a working handler, some reverts are
+legitimate and expected, and failing on them makes the suite unusable. But `false` is a decision, not
+a default you inherit. A campaign left at `fail_on_revert = false` with no revert budget in mind is a
+campaign nobody is measuring.<Cite src="foundry-testing-config" />
+
+## Building the handler
+
+A handler is a test-only contract that stands between the fuzzer and the system. The fuzzer targets
+the handler; the handler makes the calls. Its four jobs are to supply callers that own something,
+bound arguments into plausible ranges, skip calls that cannot succeed, and record what the system
+*ought* to hold.<Cite src="foundry-invariant-guide" /><Cite src="cyfrin-fuzz-guide" />
+
+**Subgoal: give the fuzzer callers that own something.** The constructor mints to a fixed set of
+actors and approves the vault on their behalf. Foundry's guide does this with a `useActor(uint256
+actorSeed)` modifier wrapping `vm.startPrank`;<Cite src="foundry-invariant-guide" /> the shape below
+is the same idea inline.
+
+```solidity
+constructor(Token t, IVault v) {
+    token = t; vault = v;
+    actors = [address(0xA11CE), address(0xB0B), address(0xCA401)];
+    for (uint256 i; i < 3; ++i) {
+        token.mint(actors[i], 1_000_000e18);
+        vm.prank(actors[i]);
+        token.approve(address(vault), type(uint256).max);
+    }
+}
+```
+
+**Subgoal: turn a random word into an actor, without letting the fuzzer choose addresses.** A fuzzed
+`address` parameter is nearly always wrong here: the search space is 2^160, essentially none of it
+holds tokens, and the values that *are* interesting — the vault itself, `address(0)`, the cheatcode
+address — are exactly the ones that produce uninteresting reverts. Take a `uint256` seed and index a
+fixed array instead.
+
+```solidity
+function _actor(uint256 seed) internal view returns (address) {
+    return actors[seed % actors.length];
+}
+```
+
+Three actors is a deliberate number, not a lazy one. One actor cannot express "A's action harmed B",
+which is the entire class of fairness bugs. Two can, and three lets a bug appear that needs a
+bystander. Foundry's best-practice list says the same thing more briefly: test with multiple actors,
+not just one.<Cite src="foundry-invariant-guide" />
+
+**Subgoal: turn a random word into a spendable amount — by remapping, not rejecting.** This is where
+[bound remapping](/c/bound-remapping) earns its place. `bound(x, min, max)` maps every generated
+value into the range; `vm.assume(cond)` discards the run and re-rolls when the condition is false, and
+the documentation explicitly recommends `bound` or modulo for range constraints, reserving `assume`
+for narrow exclusions.<Cite src="foundry-cheatcode-assume" /><Cite src="forge-std-repo" /> In a
+campaign the difference compounds: every discarded call is budget spent reaching no new state.
+
+```solidity
+function deposit(uint256 actorSeed, uint256 assets) external {
+    address a = _actor(actorSeed);
+    uint256 wallet = token.balanceOf(a);
+    if (wallet == 0) return;                 // skip, do not revert
+    assets = bound(assets, 1, wallet);
+    uint256 ts = vault.totalShares();
+    if (ts != 0 && assets * ts / vault.totalAssets() == 0) return;
+    vm.prank(a);
+    vault.deposit(assets);
+    ghost_depositedSum += assets;
+    ghost_depositedBy[a] += assets;
+}
+```
+
+**Subgoal: skip impossible calls with an early `return`, not a `require`.** The two lines beginning
+`if` are the load-bearing ones. A `return` consumes one unit of the budget and produces a no-op; a
+revert consumes the same budget and additionally pollutes the metrics you are about to rely on. Both
+"waste" a call, and only one of them lies to you about it.
+
+## The handler's own bugs, and what they cost
+
+The first version of the handler above did not have the `wallet == 0` guard. Against a *correct*
+vault, at default budget, it produced this:<Cite src="measured-forge-1-7-1" />
+
+```text
+[PASS] invariant_assetsCoverShares() (runs: 256, calls: 128000, reverts: 1182)
+| Handler  | deposit  | 63935 | 1182    | 0        |
+| Handler  | withdraw | 64065 | 0       | 0        |
+finished in 6.94s
+```
+
+Under one percent — an unremarkable number that most reviewers would accept. The cause was not the
+vault. It was `bound(assets, 1, wallet)` being called with `wallet == 0`, which asks `bound` for a
+value at least 1 and at most 0. The handler's own input-shaping code was the thing reverting.
+
+Adding the guard produced this:<Cite src="measured-forge-1-7-1" />
+
+```text
+[PASS] invariant_assetsCoverShares() (runs: 256, calls: 128000, reverts: 0)
+finished in 27.01s
+```
+
+Zero reverts — and the run got **four times slower**, from 6.94 seconds to
+27.01.<Cite src="measured-forge-1-7-1" /> That number is the lesson. The 1,182 reverts
+were 1,182 calls that returned early without touching the vault; removing them meant 1,182 more
+deposits actually executing. A faster campaign is very often a campaign doing less work, and
+wall-clock time is not a proxy for thoroughness in either direction.
+
+<Aside kind="warn">
+Handler bugs are systematically under-diagnosed because they present as contract behaviour. A revert
+attributed to `Handler.deposit` in the metrics table might be the vault refusing the call, or the
+handler's own `bound`, or a `vm.prank` that expired, or an actor array index. The metrics table names
+the selector, not the line. When a revert count is nonzero and you cannot say why in one sentence,
+re-run the specific handler function with `fail_on_revert = true` and read the reason
+string.<Cite src="foundry-testing-config" />
+</Aside>
+
+## Reading the metrics table exactly
+
+The table is not decoration and its three columns are not synonyms. Here is a campaign built to
+separate them: one handler function guarded by `vm.assume`, one by a `require` in the target, at
+`runs = 20` and `depth = 500`.<Cite src="measured-forge-1-7-1" />
+
+```text
+[PASS] invariant_neverNegative() (runs: 20, calls: 10000, reverts: 946)
+
+| Contract       | Selector    | Calls | Reverts | Discards |
+| DiscardHandler | bumpAssumed | 7266  | 0       | 4662     |
+| DiscardHandler | bumpRaw     | 7396  | 946     | 0        |
+```
+
+<Figure
+  caption="Only reverted and executed calls come out of a run's depth budget; a discarded one is re-rolled for free."
+  alt="A generated call ends in one of three fates. A discard, caused by a false vm.assume, is re-rolled and costs no depth. A revert and a successful execution each consume one step of the run's depth, and only the successful one moves the state."
+>
+  <Flow
+    nodes={[
+      { id: 'gen', label: 'one generated call', col: 0 },
+      { id: 'disc', label: 'discarded', note: 'vm.assume was false', col: 1, tone: 'muted' },
+      { id: 'rev', label: 'reverted', note: 'a precondition failed', col: 1, tone: 'danger' },
+      { id: 'ok', label: 'executed', note: 'the state moves', col: 1, tone: 'good' },
+      { id: 'free', label: 're-rolled', note: 'costs no depth', col: 2, tone: 'muted' },
+      { id: 'step', label: 'one step of depth', note: 'spent either way', col: 2 },
+    ]}
+    edges={[
+      { from: 'gen', to: 'disc' },
+      { from: 'gen', to: 'rev' },
+      { from: 'gen', to: 'ok' },
+      { from: 'disc', to: 'free', tone: 'muted' },
+      { from: 'rev', to: 'step', tone: 'danger' },
+      { from: 'ok', to: 'step', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+Work the arithmetic, because it tells you what each column counts.
+
+- **Discards come from `vm.assume`.** `bumpAssumed` never reverts; 4,662 of its 7,266 attempts were
+  thrown away because the assumption was false, and re-rolled.<Cite src="foundry-cheatcode-assume" />
+- **Reverts come from the call itself.** `bumpRaw` has no assumption, and 946 of its calls failed the
+  target's `require`.
+- **Discarded attempts do not consume the sequence budget; reverted calls do.** 7,266 + 7,396 =
+  14,662 attempts. Subtract the 4,662 discards and you get 10,000 — exactly `runs × depth`, the
+  number on the result line.
+
+So the top-line `calls:` figure is the budget actually spent walking the state space, and the
+per-selector `Calls` column is attempts including re-rolls. A revert therefore costs you a step of
+depth and buys nothing; a discard costs you only the time to generate another input. Both are waste,
+and the one that is silently expensive is the revert.
+
+Rejections are capped: `max_assume_rejects` is 65,536 under `[invariant]` on forge
+1.7.1,<Cite src="measured-forge-1-7-1" /> and exceeding it fails the test with a rejection error
+rather than a property violation — a failure that reads like a contract bug and is not
+one.<Cite src="foundry-testing-config" />
+
+### The metrics are on by default now, and that is a recent change
+
+Widely-circulated guidance describes campaign metrics as opt-in, something you enable with
+`show_metrics = true` before you can see any of this. On forge 1.7.1, `forge config` reports
+`[invariant] show_metrics = true` in the default profile, and the table above printed without any
+configuration at all.<Cite src="measured-forge-1-7-1" /> Turning it off suppresses the table but not
+the summary line, which still carries `reverts:`.<Cite src="measured-forge-1-7-1" />
+
+Do not take that as settled for your machine. Check `forge config` on the version you actually run —
+the same command settles the question in a second, and the answer has demonstrably changed between
+versions.<Cite src="threesigma-invariant" />
+
+## Ghost variables: giving the invariant an independent model
+
+The previous lesson's warning was that an invariant phrased in the contract's own terms cannot see a
+bug in the contract's own bookkeeping. A ghost variable is the fix: test-only state the handler
+maintains alongside the real contract, recording what it *ought* to hold.<Cite src="foundry-invariant-guide" />
+
+Foundry's guide uses two shapes, and both are worth having.<Cite src="foundry-invariant-guide" />
+
+**Aggregate sums.** `ghost_depositSum` and `ghost_withdrawSum`, incremented by the handler after each
+successful call, checked at the end of a run:
+
+```solidity
+function afterInvariant() public view {
+    assertEq(
+        address(vault).balance,
+        handler.ghost_depositSum() - handler.ghost_withdrawSum()
+    );
+}
+```
+
+`afterInvariant()` runs once against the final state of a run, after the per-call invariant checks
+pass; it must have exactly that signature, a contract may define only one, and state changes it makes
+are not persisted.<Cite src="foundry-invariant-guide" /> Use it for aggregate checks that would be
+wasteful to evaluate after all 500 calls of a run.<Cite src="foundry-invariant-guide" />
+
+**Per-actor tallies.** A `mapping(address => uint256)` of what each actor put in and took out is what
+makes fairness properties expressible — the class the previous lesson showed solvency cannot reach.
+The guide's token example keeps `ghost_mintedSum`, `ghost_burnedSum` and a per-address
+`ghost_balanceDeltas`, and asserts `totalSupply()` against the first two.<Cite src="foundry-invariant-guide" />
+
+The discipline that makes a ghost worth keeping is **independence**. Record what the handler *asked
+for and observed*, never what the contract computed:
+
+```solidity
+uint256 before = token.balanceOf(a);
+vm.prank(a);
+vault.withdraw(shares);
+ghost_withdrawnBy[a] += token.balanceOf(a) - before;   // observed, not returned
+```
+
+Using the return value of `withdraw` would make the ghost a copy of the contract's arithmetic, and
+the invariant an identity again. Measuring the actor's balance before and after is a different
+computation with a different failure mode, which is the entire point.
+
+<Misconception
+  belief="A ghost variable is a convenience for writing shorter assertions."
+  reality="It is a second, independent implementation of the accounting. Its value is precisely that it can disagree with the contract."
+  why="Ghosts look like bookkeeping helpers, and a ghost that mirrors the contract's own formula still compiles, still runs, and still passes."
+  src="foundry-invariant-guide"
+/>
+
+## Spending the budget: runs, depth, and the numbers you should not copy
+
+Two budget dimensions, measured defaults on forge 1.7.1: `runs = 256`, `depth =
+500`.<Cite src="measured-forge-1-7-1" /> The previous lesson showed the asymmetry between them with a
+single measurement — 10,000 runs at depth 1 found nothing in 2.29s, while 10 runs at depth 500 found
+the bug in 1.33s.<Cite src="measured-forge-1-7-1" /> Depth determines which states exist; runs
+determine how many paths you take to them.
+
+**The published numbers for both disagree, and none of them come with evidence.** The default depth
+is given as 15 in one widely-read tutorial,<Cite src="rareskills-invariant-testing" /> shown as 100
+in the Foundry guide's own example `foundry.toml` snippet,<Cite src="foundry-invariant-guide" /> and
+reported as 500 by `forge config` on 1.7.1.<Cite src="measured-forge-1-7-1" /> For CI budgets the
+spread is similar: one source recommends 512 runs at roughly 500 depth, while the official CI profile
+example raises `invariant = { runs = 1000 }` and says nothing about depth at
+all.<Cite src="foundry-ci" /><Cite src="foundry-testing-config" /> These are conventions, not
+findings. There is no published study linking either number to defect discovery in Solidity, and this
+curriculum is not going to invent one.
+
+What you can do instead is measure on your own suite: seed a bug at a known sequence length, and find
+the depth at which it becomes discoverable. That number is a property of your system's state machine,
+and it is the only defensible input to a CI budget.
+
+<Aside kind="note">
+Foundry 1.7.0 added `check_interval`, which trades precision for speed on deep campaigns: `0` checks
+only the last call of each run, `1` checks every call, `N` checks every N calls and always the
+last.<Cite src="foundry-invariant-guide" /><Cite src="foundry-releases" /> The default on 1.7.1 is
+`1`.<Cite src="measured-forge-1-7-1" /> The documentation is unusually direct about the cost: raising
+it can miss bugs that break and then restore the invariant between
+checks.<Cite src="foundry-invariant-guide" /> Reentrancy and flash-loan sequences are exactly that
+shape, so treat `check_interval` as a knob for expensive invariants and not as a general speed-up.
+</Aside>
+
+## Narrowing what gets called
+
+Two more targeting tools are worth knowing before you reach for a second handler.
+`targetSelector(FuzzSelector(...))` restricts the campaign to a named list of selectors on a target,
+and `excludeSelector` removes specific ones — useful for keeping debug helpers and view functions out
+of the budget.<Cite src="foundry-invariant-guide" /> Both are declared in `setUp` alongside
+`targetContract`.<Cite src="foundry-invariant-guide" />
+
+Use them narrowly. Every selector you exclude is a call sequence the campaign can no longer construct,
+which is the same [overconstraining hazard](/c/overconstraining-hazard) that bounds carry: the search
+runs faster and covers less, and nothing in the output says which.
+
+## Getting a campaign into CI
+
+Three practical constraints, all verified on forge 1.7.1.<Cite src="measured-forge-1-7-1" />
+
+**Machine-readable results come from `--junit`.** It emits JUnit XML on stdout, which every CI system
+already parses.<Cite src="forge-test-reference" /> `--json` exists, but the long-open report of
+non-JSON appearing on stdout means anything consuming it has to tolerate
+that.<Cite src="foundry-issue-3001" />
+
+**`--junit` and `--gas-report` cannot be combined.** forge rejects the pair outright:<Cite src="measured-forge-1-7-1" />
+
+```text
+$ forge test --junit --gas-report
+error: the argument '--junit' cannot be used with '--gas-report'
+```
+
+So a single job cannot produce both structured test results and a gas report. Split them into two
+invocations, and accept that the second one re-runs the suite.
+
+**Inline per-test configuration is profile-scoped.** A comment reading
+`/// forge-config: default.invariant.runs = 10000` applies to the `default` profile only and does
+nothing when CI runs with `FOUNDRY_PROFILE=ci`.<Cite src="foundry-inline-test-config" /> This is the
+single easiest way to ship a campaign that silently runs at a hundredth of its intended budget.
+
+The shape that works is tiering: a short bounded campaign gates the pull request, and a long
+scheduled campaign runs nightly and opens an issue on failure. The reason to separate them is not
+only runtime. A randomised search used as a required check produces intermittent red builds unrelated
+to the diff, which trains reviewers to re-run rather than read — and a fixed `seed` removes the
+flakiness by freezing the search, which is a different loss.<Cite src="foundry-testing-config" />
+
+<Aside kind="warn">
+One unresolved point you will meet if you try to reason about gas here. The Foundry testing docs
+state that call isolation is enabled by default, so each top-level external call runs as its own
+transaction in its own EVM context.<Cite src="foundry-forge-testing" /> `forge config` on 1.7.1 prints
+`isolate = false`, and `--no-isolate` is not a recognised flag on that
+version.<Cite src="measured-forge-1-7-1" /> A behavioural probe on this machine — three identical
+top-level calls to the same contract, each costing 28,661 gas, unchanged by passing `--isolate` —
+is consistent with the documentation rather than with the config line.<Cite src="measured-forge-1-7-1" />
+That is one probe at one version; treat the config key as unreliable evidence here and measure
+behaviour if it matters to you. The topic belongs to [isolation mode](/c/isolate-mode).
+</Aside>
+
+<Check type="spot-bug" concept="revert-metrics">
+A team reports their invariant suite green and asks you to review it. The campaign summary reads:
+
+```text
+[PASS] invariant_solvent() (runs: 256, calls: 128000, reverts: 0)
+
+| Contract | Selector      | Calls  | Reverts | Discards |
+| Handler  | deposit       | 42551  | 0       | 0        |
+| Handler  | withdraw      | 42730  | 0       | 0        |
+| Handler  | liquidate     | 42719  | 0       | 42011    |
+```
+
+Zero reverts everywhere. Name the problem and the likely cause.
+
+<Answer>
+**`liquidate` is discarding 98% of its attempts, so the campaign barely tested liquidation at all.**
+
+Read the arithmetic. Discards are re-rolled rather than counted against the sequence budget, so of
+`liquidate`'s 42,719 attempts only 708 actually executed. Across the whole campaign, roughly one call
+in 180 was a liquidation. The zero in the Reverts column is not evidence of health — it is evidence
+that nothing was being rejected by the *contract*, because almost nothing reached it.
+
+**The cause is almost certainly a `vm.assume` in the handler**, of the form "assume this position is
+under water". Positions become liquidatable only after a price move, so the assumption is false for
+nearly every generated state, and the handler is filtering by rejection rather than by
+construction.<Cite src="foundry-cheatcode-assume" />
+
+**The fix is to construct the state rather than wait for it.** Either bound the actor seed to
+positions the handler knows are unhealthy, or give the handler an explicit price-move action so the
+campaign can *create* liquidatable positions instead of hoping to stumble into them. The first is
+cheaper; the second explores more.
+
+**Two things to check afterwards.** That the discard count has collapsed — if it has not, the guard
+is still rejection-shaped. And that `max_assume_rejects` was not being approached: at 65,536 per test
+on 1.7.1, a campaign at this rejection rate is not far from failing with a rejection error that reads
+like a contract bug.<Cite src="measured-forge-1-7-1" /><Cite src="foundry-testing-config" />
+
+**And the meta-point:** every number needed to see this was printed next to a green PASS. The
+campaign was not lying. Nobody read it.
+</Answer>
+</Check>
+
+<Check type="explain" concept="ghost-variable">
+Your handler tracks `ghost_totalDeposited` and the vault tracks `totalAssets()`. A colleague proposes
+replacing the ghost with `vault.totalAssets()` in the invariant, arguing it is the same number and
+one fewer thing to maintain. Give the one-sentence reason they are wrong, and the one case where they
+are right.
+
+<Answer>
+**Wrong because:** the ghost's only value is that it is computed by different code, so an invariant
+that reads `totalAssets()` on both sides is an identity that holds no matter how wrong the vault's
+accounting is.
+
+**Right in one case:** if the property you are asserting is genuinely about the *token's* view of the
+world rather than the vault's — for instance "the vault's token balance is at least its recorded
+liabilities" — then one side should be `asset.balanceOf(address(vault))`, because that is the
+independent authority. The test is not "ghost versus contract" but "are the two sides computed by
+code that can disagree". A ghost is one way to get independence; an external contract's own state is
+another. Note the corollary from the ERC-4626 work: `balanceOf(address(this))` is independent of the
+vault but writable by anyone, so an invariant resting on it must be an inequality, never an
+equality.<Cite src="foundry-invariant-guide" />
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The practice exercises** for this module are the two halves of what you just read: build a handler
+with ghosts and a solvency invariant that catches a seeded bug, and take a campaign with a 90% revert
+rate and repair it until the metrics say it is doing work.
+
+**Track 06's security work** reuses the handler wholesale. The same contract, targeted by a different
+engine, is how property tests get run under Echidna or Medusa alongside Foundry — the write-once
+harness is a real pattern with real tooling behind it.<Cite src="cyfrin-fuzz-guide" /> Corpus-guided
+engines add one thing this lesson has not: a persisted corpus, so successive campaigns get deeper
+instead of restarting. Note that forge 1.7.1's own `[invariant]` config block now carries
+`corpus_gzip`, `corpus_min_mutations`, `corpus_min_size` and `show_edge_coverage`
+keys<Cite src="measured-forge-1-7-1" /> — the presence of those keys is worth knowing about; their
+semantics were not established here and should be read from the release notes before you rely on
+them.<Cite src="foundry-releases" />
+
+**The habit that survives all of it** is the one this lesson opened with. Before believing a green
+invariant result, read the number next to it. A campaign that reverts its way through its budget
+proves nothing, takes four seconds, and looks exactly like a campaign that proves something.

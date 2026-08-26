@@ -1,0 +1,401 @@
+---
+id: toolchain-ci-budgeting-random-search
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [foundry-testing-config, foundry-fuzz-corpus-guide, foundry-ci, echidna-action, create-chimera-app, github-actions-cache, forge-test-reference, foundry-issue-3001, foundry-issue-2210, measured-forge-1-7-1, foundry-invariant-testing]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Every other check in this module returns a fact. The formatter found a space or it did not. The
+compiler resolved the import or it did not. Gas is 28,783 or it is 30,477.
+
+A fuzz or invariant run returns something else entirely:
+
+```text
+[PASS] invariant_totalAssetsCoversShares() (runs: 256, calls: 128000, reverts: 0)
+```
+
+That `PASS` means *no counterexample was found in 256 sequences of 500 calls each*. It is a statement
+about a budget, and the budget is a number you chose. Run it again with different randomness and it
+can say something else, on code nobody touched.
+
+Fitting that honestly into a pipeline is the last thing this module does, and it has three parts:
+deciding how much search to buy and where, making the search compound instead of restarting, and
+getting results out in a form a machine can read — which turns out to be the part with the sharpest
+constraint.
+
+## What a run costs before you change anything
+
+Resolved defaults on forge 1.7.1, read from `forge config` rather than from documentation:<Cite src="measured-forge-1-7-1" />
+
+<Matrix
+  corner="Resolved default"
+  cols={['[fuzz]', '[invariant]']}
+  rows={[
+    { label: 'runs', cells: ['256', '256'] },
+    { label: 'depth', cells: ['—', '500'] },
+    { label: 'fail_on_revert', cells: ['true', 'false'] },
+    { label: 'shrink_run_limit', cells: ['—', '5000'] },
+    { label: 'failure_persist_dir', cells: ['cache/fuzz', 'cache/invariant'] },
+    { label: 'show_metrics', cells: ['false', 'true'] },
+    { label: 'corpus_dir', cells: [{ v: 'unset', tone: 'warn' }, { v: 'unset', tone: 'warn' }] },
+    { label: 'seed', cells: [{ v: 'unset', tone: 'warn' }, { v: 'unset', tone: 'warn' }] },
+  ]}
+  caption="A laptop's defaults: bounded, unseeded, and carrying nothing over from the run before."
+  alt="Resolved fuzz and invariant defaults on forge 1.7.1 — runs 256 for both, invariant depth 500, fail_on_revert true for fuzz and false for invariant, invariant shrink_run_limit 5000, failure directories cache/fuzz and cache/invariant, show_metrics false for fuzz and true for invariant, and corpus_dir and seed unset for both."
+/>
+
+Two rows decide the shape of everything below. `corpus_dir` is unset, so nothing accumulates between
+runs. `seed` is unset, so nothing is reproducible between runs. Both are right for a laptop and both
+are decisions you have to make again for CI.
+
+A default invariant run is 256 × 500 = 128,000 generated calls per invariant. That is not nothing, and
+it is also not a proof: if a bug needs a specific three-call sequence with specific arguments drawn
+from a `uint256` space, 128,000 draws is a lottery ticket with decent odds, not a search.
+
+<Misconception
+  belief="An invariant test either passes or fails, like a unit test."
+  reality="It is a bounded random search. 'Passed' means 'found no counterexample at this runs × depth and this seed'. The same code can pass and then fail with nothing changed."
+  why="The runner prints PASS with no confidence qualifier, in the same colour, in the same list, as the deterministic tests beside it."
+  src="foundry-testing-config"
+/>
+
+## Tiering: two jobs asking different questions
+
+The value of a random search grows with the time you give it — an invariant campaign is generating
+call *sequences*, so the interesting states are the ones several calls
+deep.<Cite src="foundry-invariant-testing" /> A pull request cannot wait hours. Those two sentences
+are incompatible unless you split the search into tiers that answer different questions.
+
+**The pull-request tier answers: did this change break something obvious?** Short, bounded, and
+*seeded* — for the reasons the [fork lesson](/c/fuzz-seed-in-ci) established, plus one more below. It
+can be a required check precisely because it is deterministic.
+
+**The nightly tier answers: is there anything here at all?** Long, unseeded, scheduled, with a
+persisted corpus. On a finding it opens an issue rather than turning a pull request red, because the
+pull request it would turn red is unrelated to what it found.
+
+Only the first question belongs on the critical path. The second is more valuable and less urgent,
+which is exactly the combination that makes people put it in the wrong place.
+
+<Aside kind="stop">
+**The specific run counts are conventions, and the sources disagree.** Foundry's CI page shows a
+profile with `fuzz = { runs = 10000 }` and `invariant = { runs = 1000 }`, stating no
+depth.<Cite src="foundry-ci" /> Other widely-circulated CI guidance uses roughly `runs = 512` with
+`depth ≈ 500`. This curriculum's research found no source connecting any run/depth pair to a
+defect-detection rate for smart contracts, so both are presented as examples and neither as a
+recommendation. Derive yours from two things you can actually measure: the wall-clock budget the tier
+is allowed, and whether raising depth on a known bug in your own code changes whether it is found.
+</Aside>
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'The pull-request tier', note: 'on the critical path' },
+    { title: 'The nightly tier', note: 'scheduled' },
+  ]}
+  rows={[
+    { label: 'What does it answer?', cells: ['Did this change break something obvious?', 'Is there anything here at all?'] },
+    { label: 'Is the search seeded?', cells: ['Yes, so a red result is caused by the diff', 'No, or it searches one trajectory forever'] },
+    { label: 'Does it keep a corpus?', cells: ['No', 'Yes, so each run starts where the last one got to'] },
+    { label: 'Where does a finding go?', cells: ['A red required check on the pull request', 'An issue, opened asynchronously'] },
+    { label: 'Why not swap them?', cells: ['A pull request cannot wait hours', 'The pull request it would turn red is unrelated to what it found'] },
+  ]}
+  caption="The two tiers differ in seed, in memory and in where a finding lands — not in how long they are allowed to run."
+  alt="The pull-request and nightly fuzzing tiers compared on the question each answers, whether the search is seeded, whether a corpus is kept, where a finding is reported, and why the two cannot be swapped."
+/>
+
+A concrete pair of profiles, offered as a starting point to be measured rather than adopted:
+
+```toml
+[profile.ci]                    # the pull-request tier
+verbosity = 3
+fuzz = { runs = 1000, seed = "0x1" }
+invariant = { runs = 256, depth = 500 }
+
+[profile.campaign]              # the nightly tier
+verbosity = 3
+fuzz = { runs = 100000, corpus_dir = "cache/corpus" }
+invariant = { runs = 5000, depth = 1000, corpus_dir = "cache/corpus" }
+```
+
+Because a profile is a section that inherits from `[profile.default]` and overrides only what it
+names, the campaign profile is a diff rather than a duplicate.<Cite src="foundry-testing-config" />
+Select either with `FOUNDRY_PROFILE`.<Cite src="foundry-ci" />
+
+## Making the search compound
+
+A coverage-guided fuzzer does not draw uniformly at random. It keeps the inputs that reached
+interesting states and mutates them, so a long run differs qualitatively from many short runs — its
+later part searches from ground its earlier part found.
+
+Setting `corpus_dir` under `[fuzz]` or `[invariant]` "enables coverage-guided fuzzing", and the guide
+separates it cleanly from the failure directory you already have:<Cite src="foundry-fuzz-corpus-guide" />
+
+| Artifact | Purpose |
+|---|---|
+| Failure (`failure_persist_dir`) | "Reproduce a counterexample that failed a fuzz or invariant test" |
+| Corpus (`corpus_dir`) | "Preserve coverage-increasing inputs and reuse them for mutation" |
+
+They are easy to conflate and they do opposite jobs. The failure directory is a regression record: one
+bad input, replayed forever so a fixed bug stays fixed. The corpus is an asset: thousands of inputs
+that reach places, carried forward so tomorrow's run starts where today's got to.
+
+On forge 1.7.1 the corpus lands under the configured directory, filed by contract and test:<Cite src="measured-forge-1-7-1" />
+
+```console
+$ forge test --match-test testFuzz
+$ find cache/corpus
+cache/corpus
+cache/corpus/CounterTest
+cache/corpus/CounterTest/testFuzz_SetNumber
+```
+
+Two related settings matter: `corpus_gzip` is on by default, "although small entries remain plain
+JSON", and `show_edge_coverage` "collects edge coverage metrics without changing which entries Forge
+persists" — which is how you tell whether last night's run got deeper.<Cite src="foundry-fuzz-corpus-guide" />
+
+<Misconception
+  belief="A nightly fuzz campaign is the pull-request job with a longer timeout."
+  reality="Without a persisted corpus every run restarts from nothing, so a month of nightly runs is thirty independent one-night searches rather than one month-long one."
+  why="The command line is identical. The only difference is accumulated state on disk, which is invisible in the workflow file and invisible in the log."
+  src="echidna-action"
+/>
+
+### Caching it is a GitHub problem, not a Foundry problem
+
+Foundry writes the corpus; nothing persists it across runners. That is `actions/cache`, and three of
+its documented properties decide whether the design works:<Cite src="github-actions-cache" />
+
+- **"The cache is scoped to the key, version, and branch. The default branch cache is available to
+  other branches."** This is what makes the design work at all: a nightly job on `main` writes a
+  corpus that a pull-request job can read.
+- **"A repository can have up to 10GB of caches."** A corpus grows without bound unless something
+  prunes it, and it is competing with your build cache and your RPC cache for the same budget.
+- **"Caches that are not accessed within the last week will also be evicted."** A nightly job keeps
+  its own corpus alive by touching it; a weekly one may find it gone.
+
+```yaml
+  campaign:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      FOUNDRY_PROFILE: campaign
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { submodules: recursive }
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1
+        with: { version: v1.7.1 }
+      - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: cache/corpus
+          key: corpus-${{ github.run_id }}
+          restore-keys: corpus-
+      - run: forge test --match-path 'test/invariant/*'
+```
+
+The key pattern is the same one the toolchain action uses by default and for the same reason: a
+unique write key so runs never clobber each other, and a bare prefix restore key so every run starts
+from the most recent corpus.<Cite src="github-actions-cache" />
+
+If your campaign runs under Echidna or Medusa, the mechanism is identical and the plumbing is still
+yours. `crytic/echidna-action` exposes `corpus-dir` — "Directory to store corpus and coverage data" —
+plus `test-limit` ("Number of sequences of transactions to generate during testing") and
+`test-mode`.<Cite src="echidna-action" /> It documents no caching between runs, so wiring
+`actions/cache` around it is a step you add, not one you inherit.<Cite src="echidna-action" />
+Templates exist that run one set of properties under Foundry, Echidna, Medusa and Halmos, which makes
+a multi-engine campaign a configuration question rather than a rewrite.<Cite src="create-chimera-app" />
+
+## Why the search must not be the gate
+
+Put an unseeded campaign behind a required status check and you get red builds caused by the
+randomness rather than by the diff.
+
+The reviewer's experience is what matters. They open a pull request that renames a variable, one check
+is red, and the failure describes a nine-call sequence against a contract the pull request did not
+touch. No action is available to them: the finding is real, it is not theirs, and it is blocking a
+merge. What they learn, quickly, is to click re-run.
+
+That is a design error with the same shape as the [gas gate](/c/snapshot-check-gate): *a check that
+goes red for reasons unrelated to the change gives a reviewer nothing to act on while still competing
+for attention with the checks that do.*
+
+Two ways out, and they are both acceptable:
+
+- **Seed the gating tier.** `seed = "0x1"` makes the pull-request run deterministic, so a red result
+  is caused by the diff.<Cite src="foundry-testing-config" /> The cost is that this tier searches the
+  same trajectory forever and will never find anything new — which is fine, because finding new things
+  is the other tier's job.
+- **Move the search off the critical path.** Schedule it, and report findings asynchronously by
+  opening an issue.
+
+What you must not do is leave it unseeded *and* required. That combination has the cost of both
+designs and the benefit of neither.
+
+## Getting results out: the constraint that shapes the job
+
+A campaign that reports into a log is a campaign nobody reads. As soon as something else consumes the
+results — an annotation, a dashboard, an issue-opening step, an exercise grader — you need machine
+output, and here forge 1.7.1 is unusually opinionated.
+
+**`--junit` emits JUnit XML on stdout.** A real run, verbatim:<Cite src="measured-forge-1-7-1" />
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="Test run" tests="4" failures="1" errors="0" time="0.002">
+    <testsuite name="test/Pollute.t.sol:PolluteTest" tests="2" failures="1" time="0.000">
+        <testcase name="test_Fails()" time="0.000">
+            <failure message="deliberate failure: 1 != 2"/>
+            <system-out>[FAIL: deliberate failure: 1 != 2] test_Fails() (gas: 3739)</system-out>
+        </testcase>
+        <testcase name="test_Logs()" time="0.000">
+            <system-out>[PASS] test_Logs() (gas: 3552)</system-out>
+        </testcase>
+    </testsuite>
+</testsuites>
+```
+
+Per-suite and per-test-case results, a `<failure>` element carrying the assertion message, timing, and
+the human line preserved in `<system-out>`. Every CI system parses this schema, which is the actual
+argument: a format with an external specification and many independent implementations is unlikely to
+drift under you.<Cite src="forge-test-reference" />
+
+**And it cannot be combined with the other output flags.** On forge 1.7.1:<Cite src="measured-forge-1-7-1" />
+
+```console
+$ forge test --junit --gas-report
+error: the argument '--junit' cannot be used with '--gas-report'
+
+$ forge test --junit --json
+error: the argument '--junit' cannot be used with '--json'
+
+$ forge test --json --show-progress
+error: the argument '--json' cannot be used with '--show-progress'
+```
+
+The reference lists `--json`, `--junit`, `--gas-report` and `--show-progress` side by side under
+display options and does not mark any of them mutually exclusive; the binary rejects the combinations
+anyway.<Cite src="forge-test-reference" /><Cite src="measured-forge-1-7-1" /> Design your jobs around
+it: **one `forge test` invocation produces exactly one machine-readable artifact.** Structured results
+and a gas report are two runs, and if the suite contains unseeded fuzz tests those two runs disagree
+about gas.
+
+**Three outcomes, not two.** The last piece of the design comes from what happens when the project
+does not build. On 1.7.1, a compile failure under `--junit` gives exit 1, **empty stdout**, and the
+compiler error on stderr:<Cite src="measured-forge-1-7-1" />
+
+```console
+$ forge test --junit > results.xml 2> errors.txt ; echo $?
+1
+$ wc -c results.xml
+0
+$ head -2 errors.txt
+Error: Compiler run failed:
+Error (7576): Undeclared identifier.
+```
+
+So any consumer needs three branches, not two: **XML parsed** → report per-test results; **exit
+non-zero with no parseable XML** → "could not run", which is a compile failure and a different message
+to a human; **exit zero** → everything passed. Collapsing the middle case into "you failed" is the bug
+that makes a grader or a dashboard actively misleading.
+
+<Misconception
+  belief="`forge test --json` is the machine-readable output format; --junit is a legacy option for old CI systems."
+  reality="--junit is the reliable path. --json's own help text describes it as 'Format log messages as JSON' — a narrower promise than 'emit a machine-readable result document' — and issue #3001, about non-JSON reaching stdout, has been open for years with the proposed fix (#2210, a separate --json-file) unimplemented."
+  why="JSON is the default assumption for machine-readable CLI output in 2026, and XML reads as something you would only choose under duress."
+  src="foundry-issue-3001"
+/>
+
+<Aside kind="warn">
+**Be precise about what is wrong with `--json`, because a lazy version of this claim will mislead
+you.** Issue #3001 — non-JSON written to stdout alongside the JSON — is open, and issue #2210, which
+asks for a separate `--json-file` so human and machine output can coexist, is
+unimplemented.<Cite src="foundry-issue-3001" /><Cite src="foundry-issue-2210" /> Both are real and
+both are the reason the recommendation exists. But in a minimal project on forge 1.7.1, a `--json` run
+with compiler warnings and a failing test produced a single clean JSON object on stdout, with
+compiler diagnostics on stderr; the symptom did not reproduce
+there.<Cite src="measured-forge-1-7-1" /> Draw the correct conclusion: `--json`'s stream discipline is
+not a contract you can rely on across versions and project shapes while the defect is open, whereas
+`--junit` is a schema with an external specification. Choose `--junit` for that reason — and verify
+the behaviour of whatever you choose on the version you pin, which is a thing this lesson could only
+tell you because someone ran it.
+</Aside>
+
+<Check type="spot-bug" concept="junit-machine-output">
+A team wants their nightly campaign to open an issue on failure and annotate the run. They write:
+
+```yaml
+  campaign:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      FOUNDRY_PROFILE: campaign
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge test --junit --gas-report > results.xml
+      - if: failure()
+        run: gh issue create --title "Nightly campaign failed" --body-file results.xml
+```
+
+They also add this job as a required status check, because "an invariant failure should block
+merges". Name every defect.
+
+<Answer>
+**1. The command does not run at all.** `--junit` cannot be used with `--gas-report`; forge exits
+with a usage error before touching a test.<Cite src="measured-forge-1-7-1" /> `results.xml` is created
+by the shell redirect and is empty, the step fails, and the failure looks like a campaign failure. If
+they want both, that is two invocations — and with unseeded fuzzing, two invocations that disagree
+about gas.
+
+**2. The issue body will be wrong in the case that matters.** `results.xml` holds only stdout. On a
+compile failure stdout is empty and the diagnostics are on stderr, so the issue reads "Nightly
+campaign failed" with an empty body.<Cite src="measured-forge-1-7-1" /> Capture stderr separately and
+branch on the three outcomes: parsed XML, non-zero with no XML, clean pass.
+
+**3. `if: failure()` fires on the wrong things.** It triggers for a checkout failure, a toolchain
+install failure, a rate-limited download — none of which are findings. Gate on the exit status of the
+test step specifically, and label the issue with what actually happened.
+
+**4. No corpus, so the campaign never compounds.** `corpus_dir` is unset by
+default.<Cite src="measured-forge-1-7-1" /> Even with `corpus_dir` in the campaign profile, nothing
+here persists `cache/corpus` between runners, so every night restarts the search from
+nothing.<Cite src="foundry-fuzz-corpus-guide" /> Add `actions/cache` on that path with a unique write
+key and a prefix restore key.<Cite src="github-actions-cache" />
+
+**5. It is a required check, and it is scheduled.** These are contradictory. A `schedule` job does not
+run on a pull request, so the required check can never report on one — pull requests will sit forever
+waiting for a status that will not arrive. And if they "fixed" it by adding `pull_request` to the
+trigger, they would have an unseeded random search blocking merges, which is the
+[flaky-gate](/c/flaky-gate-hazard) failure in full.<Cite src="foundry-testing-config" />
+
+**6. Unpinned action and unpinned toolchain.** `actions/checkout@v4` is a mutable tag and
+`foundry-toolchain` with no `version` installs a channel.<Cite src="github-actions-cache" /> On a job
+holding a `GITHUB_TOKEN` that can create issues, the first is a supply-chain exposure and the second
+means a campaign finding might be a Foundry behaviour change.
+
+**The corrected shape.** Two jobs, not one. A seeded, bounded invariant run in the pull-request
+workflow as a required check, emitting `--junit` to a file with stderr captured separately. A
+scheduled campaign under `FOUNDRY_PROFILE: campaign` with a cached corpus, not required, whose failure
+path opens an issue built from parsed XML and, when there is no XML, says "could not run" instead.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**This closes the module and the loop it opened.** Four feedback loops at four latencies: lint in
+seconds, tests in minutes, a bounded seeded search in tens of minutes, a compounding campaign in
+hours. A pipeline's quality is not the sum of what it checks — it is whether each red result tells a
+reviewer something they can act on, which is why half this module was about what *not* to gate on.
+
+**The security track** takes the campaign tier as its default working mode: invariants derived from a
+threat model, run for hours against a persisted corpus. The difference between a campaign that
+compounds and one that restarts is measured in classes of bug found, not in runtime.
+
+**The transferable rule** is one you can carry to any pipeline: *a check should be classified by what
+a red result licenses a human to do.* Deterministic and actionable — gate on it. Informative and
+noisy — comment it. Valuable and slow — schedule it and route the finding to someone who is not
+currently blocked. Getting that routing right matters more than any individual tool in this module.

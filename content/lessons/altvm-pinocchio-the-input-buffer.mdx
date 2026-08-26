@@ -1,0 +1,364 @@
+---
+id: altvm-pinocchio-the-input-buffer
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solana-docs-account-runtime, solana-docs-account-structure, pinocchio-entrypoint-source, helius-pinocchio, p-token-entrypoint-source, solana-docs-compute-budget, eip-2930]
+stack: {}
+---
+
+A token transfer on Solana moves 165 bytes of account state. The buffer the runtime hands the program
+to do it with is more than twenty thousand bytes long, and almost all of that is padding.
+
+That is not a criticism. It is the fact this entire module is built on, and it is invisible from
+inside Anchor, invisible from inside the `solana-program` crate, and completely absent from how anyone
+coming from the EVM imagines a contract call.
+
+## Two ways of getting state to a program
+
+Recall how a call reaches an EVM contract. The transaction carries calldata — a selector and some
+arguments, usually a few hundred bytes. State is *not* in there. When the contract wants a balance it
+executes `SLOAD`, the client reaches into the state trie, and you pay
+[a cold or warm access price](/c/cold-vs-warm-access) for the privilege. The contract discovers what
+it needs as it goes.
+
+Solana cannot work that way, and the reason is the one you already know:
+[every transaction declares its accounts up front](/c/declared-account-access). A program is not
+allowed to reach for state it did not name, because
+[the scheduler resolved lock conflicts before execution began](/c/sealevel-declared-access). If the
+read/write set is fixed before the first instruction runs, then the runtime can do something the EVM
+cannot: it can gather all of that state *in advance* and hand it to the program in one piece.
+
+So it does. Before a program is invoked, the runtime loads every referenced account, validates the
+fee payer, checks rent-exemption, and serializes the accounts into a contiguous memory buffer which
+it passes to the SBF virtual machine.<Cite src="solana-docs-account-runtime" /> One pointer. One
+region. Program id, account metadata, account *contents*, and instruction data, all in a row.
+
+This is the single most important structural difference between the two machines for the purposes of
+performance work, and it has a consequence that takes a moment to land:
+
+**On Solana, the cost of "reading state" is not paid when you read it. It was paid before your program
+started.**
+
+<Misconception
+  belief="Instruction data is Solana's calldata, so parsing the input is about parsing arguments."
+  reality="Instruction data is usually tiny — a plain SPL token transfer is a one-byte discriminator plus a u64 amount. The input buffer is dominated by the serialized contents of every account the transaction declared, whether the instruction touches them or not."
+  why="'The thing passed to the program' maps onto 'calldata' by analogy, and calldata never contains state."
+  src="solana-docs-account-runtime"
+/>
+
+## The layout, exactly
+
+<Figure
+  caption="The program id and the arguments sit at the far end of the buffer. Everything in front of them is account state."
+  alt="The input buffer in order: an eight-byte account count, one region per declared account, an eight-byte instruction-data length, the instruction data, the 32-byte program id, and a trailing table of eight-byte account pointers."
+>
+  <ByteLayout
+    caption="what the runtime hands the SBF virtual machine"
+    fields={[
+      { label: 'count', size: 8, note: 'u64, little-endian' },
+      { label: 'account 0', variable: true, tone: 'accent', note: 'header, data, realloc space' },
+      { label: 'account n…', variable: true, tone: 'accent', note: 'one region each, in order' },
+      { label: 'ix data len', size: 8, note: 'u64, little-endian' },
+      { label: 'instruction data', variable: true, note: 'the arguments' },
+      { label: 'program id', size: 32 },
+      { label: 'pointer table', variable: true, tone: 'muted', note: '8 bytes per account' },
+    ]}
+  />
+</Figure>
+
+Here is what `serialize_parameters_aligned()` writes, for the standard aligned format used by every
+loader except the deprecated loader-v1.<Cite src="solana-docs-account-runtime" />
+
+The buffer opens with a `u64` — 8 bytes, little-endian — holding the number of
+accounts.<Cite src="solana-docs-account-runtime" /> Then, for each account in the instruction:
+
+<Matrix
+  corner="Offset"
+  cols={['Size', 'Field', 'Type']}
+  rows={[
+    {
+      label: '0',
+      cells: [
+        '1',
+        { v: 'duplicate marker', tone: 'accent' },
+        <><code>u8</code> — <code>0xFF</code> if unique, otherwise the index of the account it duplicates</>,
+      ],
+    },
+    { label: '1', cells: ['1', <code>is_signer</code>, <code>u8</code>] },
+    { label: '2', cells: ['1', <code>is_writable</code>, <code>u8</code>] },
+    { label: '3', cells: ['1', <code>executable</code>, <code>u8</code>] },
+    { label: '4', cells: ['4', <code>original_data_len</code>, 'reserved, always 0'] },
+    { label: '8', cells: ['32', 'key', 'address'] },
+    { label: '40', cells: ['32', 'owner', 'address'] },
+    { label: '72', cells: ['8', 'lamports', <><code>u64</code> little-endian</>] },
+    { label: '80', cells: ['8', <code>data_len</code>, <><code>u64</code> little-endian</>] },
+    { label: '88', cells: [<code>data_len</code>, 'data', 'bytes'] },
+    {
+      label: <>88 + <code>data_len</code></>,
+      cells: [
+        { v: '10,240 + padding', tone: 'warn' },
+        'realloc space',
+        <>zero-filled to <code>MAX_PERMITTED_DATA_INCREASE</code>, then padded to <code>BPF_ALIGN_OF_U128</code></>,
+      ],
+    },
+    { label: '…', cells: ['8', <code>rent_epoch</code>, <><code>u64</code> little-endian</>] },
+  ]}
+  caption="The first 88 bytes are fixed and addressable by constant. Everything after them depends on values you have to read first."
+  alt="The per-account region written by serialize_parameters_aligned: a one-byte duplicate marker at offset 0, is_signer, is_writable and executable flags, four reserved bytes, a 32-byte key at offset 8, a 32-byte owner at 40, lamports at 72, data_len at 80, the account data at 88, then 10,240 bytes of realloc space plus padding, then an eight-byte rent_epoch."
+/>
+
+<Cite src="solana-docs-account-runtime" />
+
+After the last account the buffer appends an 8-byte instruction-data length, the instruction data
+itself, and the 32-byte program id.<Cite src="solana-docs-account-runtime" /> Pinocchio's own
+entrypoint module documents the same structure, and adds two details the runtime page leaves implicit:
+the alignment padding before `rent_epoch`, and a trailing table of account pointers — eight bytes per
+account, each pointing at the start of that account's region in the
+buffer.<Cite src="pinocchio-entrypoint-source" />
+
+Read that table once more with an EVM eye and three things should look wrong.
+
+**There is no type tag.** Nothing in the header says what kind of account this is. There is an owner
+program id and a length, and that is the entire vocabulary the runtime gives you for deciding whether
+the bytes at offset 88 are a token account, a mint, or an attacker's forgery. Every scheme you have
+met for answering that question — Anchor's [eight-byte discriminator](/c/eight-byte-discriminator),
+SPL Token's length check — is a convention layered on top of a header that has no opinion.
+
+**Everything is little-endian.** Not because a designer preferred it, but because SBF is a
+little-endian target and nobody is going to spend compute units byte-swapping. This matters later,
+when you write a struct onto these bytes yourself.
+
+**There are 10,240 bytes of padding after every single account.**
+
+## The padding is the story
+
+`MAX_PERMITTED_DATA_INCREASE` is 10 KiB: the most an account's data may grow in one
+instruction.<Cite src="solana-docs-account-structure" /> Because the runtime serializes accounts into
+one contiguous region *before* execution, and because a program may reallocate an account's data
+during execution, the runtime cannot pack the accounts tightly. It has to leave room for every account
+to grow to its legal maximum, in place, without disturbing its neighbours. So it reserves the full
+10,240 bytes after each one, whether or not the program will use a byte of it.<Cite src="solana-docs-account-runtime" />
+
+Work through what that costs for the most common instruction on the network.
+
+**Subgoal 1 — measure one small account's footprint.** An SPL token account holds 165 bytes of data.
+Its region in the buffer is 88 bytes of header, plus 165 bytes of data, plus 10,240 bytes of realloc
+space, plus alignment padding, plus 8 bytes of `rent_epoch`.<Cite src="solana-docs-account-runtime" />
+Call it 10,504 bytes of overhead around 165 bytes of state — a ratio of about sixty-four to one.
+
+<Figure
+  caption="Drawn to scale, an SPL token account is the thin band on the left. The reservation exists so the account may grow in place without moving its neighbours."
+  alt="One token account's region in the input buffer drawn proportionally: 88 bytes of header and 165 bytes of data are slivers beside the 10,240-byte realloc reservation, followed by 8 bytes of rent_epoch."
+>
+  <ByteLayout
+    proportional
+    caption="one 165-byte token account, to scale"
+    fields={[
+      { label: 'header', size: 88 },
+      { label: 'data', size: 165, tone: 'accent' },
+      { label: 'realloc space', size: 10240, tone: 'muted', note: 'MAX_PERMITTED_DATA_INCREASE, reserved for every account' },
+      { label: 'rent_epoch', size: 8 },
+    ]}
+  />
+</Figure>
+
+**Subgoal 2 — scale it to a real instruction.** A plain `transfer` takes three accounts: source,
+destination, authority.<Cite src="p-token-entrypoint-source" /> Two of them are 165-byte token
+accounts; the authority is usually a wallet with no data at all. Even so, each of the three carries its
+own 10,240-byte reservation.
+
+**Subgoal 3 — add the instruction data.** Nine bytes. A one-byte discriminator and a `u64`
+amount.<Cite src="p-token-entrypoint-source" />
+
+**Subgoal 4 — state the shape of the result.** The transaction's *meaningful* payload is roughly 340
+bytes of state and 9 bytes of arguments. The buffer that carries it is over 21,000 bytes. More than
+ninety-eight per cent of what the program is handed is reserved space that no token transfer will ever
+touch.
+
+Nobody is going to fix that; it is the price of letting accounts grow in place under a pre-serialized
+layout. But it explains something that is otherwise baffling — why the fixed cost of *starting* a
+Solana instruction is large enough to dominate a small instruction entirely, and why so much of the
+optimisation work in this module is about not walking that buffer.
+
+<Aside kind="note">
+The runtime also caps how much account data a transaction may load at all:
+`MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES` is 64 MiB, and the accounting adds a
+`TRANSACTION_ACCOUNT_BASE_SIZE` of 64 bytes per account on top of each account's real
+size.<Cite src="solana-docs-account-runtime" /> Exceeding it fails the transaction with
+`MaxLoadedAccountsDataSizeExceeded`.<Cite src="solana-docs-account-runtime" /> That is a separate
+limit from the 10,240-byte in-buffer reservation, and it is charged on real data size, not on the
+padded footprint.
+</Aside>
+
+## The duplicate marker, and why it exists
+
+One byte in that header does not have an EVM analogue at all.
+
+An instruction's account list is positional. Nothing stops a client from listing the same account in
+two positions — passing the same token account as both source and destination of a transfer, for
+instance. The runtime deduplicates: each entry gets its own instruction-account slot, but entries
+referring to the same underlying account point at the same
+data.<Cite src="solana-docs-account-runtime" /> Rather than serializing that account's bytes twice, the
+runtime writes only the duplicate marker carrying the index of the first occurrence, plus seven bytes
+of padding, and moves on.<Cite src="solana-docs-account-runtime" /><Cite src="pinocchio-entrypoint-source" />
+
+Two consequences follow, and both come back later in this module.
+
+**Modifications through one reference are immediately visible through every other reference**, because
+they share the same underlying data.<Cite src="solana-docs-account-runtime" /> A program that reads a
+balance through slot 0, writes through slot 1, and then re-reads through slot 0 is not looking at a
+stale copy. It is looking at what it just wrote. This is the mechanism behind the duplicate-mutable-account
+vulnerability class you met in [the Solana security material](/c/duplicate-mutable-accounts) — the bug
+is not that the runtime failed to isolate the two slots, it is that the program assumed it would.
+
+**Only one mutable borrow may be held at a time.** Attempting to borrow the same underlying account
+mutably through two different instruction-account indexes returns
+`InstructionError::AccountBorrowFailed`, and the program must drop one borrow before taking
+another.<Cite src="solana-docs-account-runtime" />
+
+And a third consequence, purely mechanical, that turns out to matter enormously: because a duplicate
+occupies 8 bytes instead of 10,000-odd, **the position of every later account in the buffer depends on
+whether earlier accounts were duplicates**. You cannot compute an offset into this buffer without
+knowing the duplicate status and data length of everything before it. Any code that wants to jump
+straight to account three has to check its assumptions first.
+
+## The cost scales with what you declared, not what you used
+
+There is one more property of this buffer worth stating on its own, because it inverts an EVM habit.
+
+In the EVM, an access list is a *hint*. EIP-2930 made access lists optional: naming an address or
+storage key pre-warms it, and omitting it costs the cold surcharge on first
+touch.<Cite src="eip-2930" /> Either way, state you never read is state you never pay for. Optimising
+an EVM function means touching fewer slots.
+
+On Solana the account list is not a hint, it is the contract with the scheduler. Every account named
+in the instruction is loaded, validated, serialized into the buffer with its full 10,240-byte
+reservation, and — if it is writable — held under an exclusive lock for the duration. An account you
+declared and never read still occupied buffer space, still consumed loaded-data-size budget against
+the 64 MiB cap, and if writable still blocked every other transaction that wanted
+it.<Cite src="solana-docs-account-runtime" /> It also still cost the entrypoint the work of parsing
+its header.
+
+The validator's scheduler makes this explicit in its pre-execution cost model, which charges
+`WRITE_LOCK_UNITS` of 300 CU per writable account and a `loaded_accounts_data_size_cost` based on
+total loaded account data, both entirely independent of whether the program reads any of
+it.<Cite src="solana-docs-compute-budget" />
+
+So the optimisation target is different in kind. In the EVM you reduce cost by doing less. Here, a
+large part of the cost is fixed the moment the transaction is built, before the program has a say —
+which is precisely why the interesting savings turn out to live in the machinery between the buffer
+and your code, rather than in your code.
+
+## Deserialize, or borrow
+
+Now the fork in the road that names this module.
+
+Every framework's first act is to turn that buffer into something a Rust program can work with. There
+are exactly two strategies.
+
+**Copy it out.** The standard entrypoint that ships with the Solana SDK walks the buffer and builds
+owned Rust values: a vector of account structures, each holding the account's data behind interior
+mutability, with the bytes copied out of the buffer into heap-allocated
+structures.<Cite src="helius-pinocchio" /> The entrypoint macro also installs a heap allocator and a
+panic handler while it is there.<Cite src="helius-pinocchio" /> Once that has run, the program holds
+comfortable, ordinary Rust values, and reading an account is reading a struct field.
+
+**Point at it.** The alternative is to construct references into the buffer where it already sits, and
+never copy anything. Pinocchio's account type is described by its own documentation as being, in
+effect, a pointer to the underlying input data representing that
+account.<Cite src="helius-pinocchio" /> Reading an account becomes a pointer dereference. Pinocchio's
+entrypoint macro is documented as differing from the standard one in exactly this respect: it performs
+no allocations or copies when reading the input buffer.<Cite src="pinocchio-entrypoint-source" />
+
+Nothing about the program's *behaviour* changes between these two. The same accounts, the same bytes,
+the same results. What changes is whether the act of looking at an account costs a copy plus an
+allocation, or a dereference.
+
+The second thing that changes — and this is the part that will occupy the rest of this module — is who
+is responsible for the bytes being what you think they are. When a deserializer hands you a struct, it
+has already decided the layout, checked the length, and given you a type. When you point at raw bytes,
+those three jobs did not disappear. They moved.
+
+<Misconception
+  belief="'Zero-copy' means the runtime stops copying account data."
+  reality="The runtime copies every declared account into the input buffer before your program starts, exactly as before. Zero-copy means your program declines to copy it a second time."
+  why="The phrase names an absence, and the most conspicuous copy in the system is the runtime's."
+  src="pinocchio-entrypoint-source"
+/>
+
+## What this costs, in the unit that matters
+
+One warning before you carry any intuition forward from Track 05.
+
+Solana meters **compute units**, not gas. The two are not convertible, they are not priced the same
+way, and the constants you measured for the EVM — cold `SLOAD` at 2,100, warm at 100, `SSTORE` at
+20,000 — describe a different machine metering a different resource. Nothing in this module converts.
+
+A few CU facts to anchor the rest of the module, all from the Solana documentation. Each instruction is
+allocated a default of 200,000 CU, and a transaction is capped at 1,400,000
+CU.<Cite src="solana-docs-compute-budget" /> One cross-program invocation costs a flat
+`DEFAULT_INVOCATION_COST` of 1,000 CU before the callee executes a single
+instruction.<Cite src="solana-docs-compute-budget" /> Requesting heap costs 8 CU per 32 KiB
+page.<Cite src="solana-docs-compute-budget" />
+
+Hold that 1,000 CU CPI charge in mind. It is the number that eventually makes the punchline of this
+module land.
+
+<Check type="predict" concept="runtime-input-buffer">
+A transaction invokes a program with three accounts, in this order:
+
+1. A 165-byte SPL token account.
+2. A different 165-byte SPL token account.
+3. A wallet account with zero bytes of data, acting as the authority.
+
+You want to write code that reads the third account's `is_signer` flag without walking the first two
+accounts. Compute the byte offset of the third account's header within the input buffer, and then name
+the two things that must be checked before that offset may be trusted.
+
+<Answer>
+**Subgoal 1 — start after the account count.** The buffer opens with an 8-byte `u64` account
+count.<Cite src="solana-docs-account-runtime" /> Account 1's header therefore begins at offset **8**.
+
+**Subgoal 2 — measure one 165-byte account's region.** Header 88 bytes, then `data_len` bytes of data,
+then 10,240 bytes of realloc space, then padding to an 8-byte boundary, then 8 bytes of
+`rent_epoch`.<Cite src="solana-docs-account-runtime" /><Cite src="pinocchio-entrypoint-source" /> So:
+8 + 88 + 165 + 10,240 = 10,501, rounded up to the next multiple of 8 gives 10,504, plus 8 for
+`rent_epoch` gives **10,512**. That is where account 2's header starts.
+
+**Subgoal 3 — do it once more.** Account 2 is also 165 bytes: 10,512 + 88 + 165 + 10,240 = 21,005,
+aligned to 21,008, plus 8 gives **21,016**. Account 3's header begins at offset 21,016 — that is
+`0x5218` in hex, and its `is_signer` byte is one further along, at 21,017.
+
+**Subgoal 4 — name what makes the offset a guess.** Two things, and both are in the header you skipped
+over.
+
+First, **the duplicate markers**. If account 2 were a duplicate of account 1, its region would be 8
+bytes rather than 10,504, and your offset would be wrong by more than ten
+thousand.<Cite src="solana-docs-account-runtime" /> You have to read account 2's marker byte at offset
+10,512 and confirm it is `0xFF`.
+
+Second, **the data lengths**. The whole calculation assumed 165 bytes twice. If account 1 is a mint
+(82 bytes) rather than a token account, every later offset shifts. You have to read the `data_len`
+field at header offset 80 for each preceding account and confirm it is what you assumed.
+
+**The general form.** An offset into this buffer is not a constant; it is a *conditional* constant,
+valid only under an assumption about the accounts before it. Anything that hard-codes one must verify
+the assumption first. Hold on to the number 21,016 — you will meet it again, hard-coded, in the
+most-invoked program on the network.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now describe, byte for byte, what a Solana program is actually handed, and you can compute
+where anything in it lives. That is the prerequisite for every claim in the rest of this module,
+because every one of them is a claim about how much work happens between the runtime writing that
+buffer and your first line of logic running.
+
+The next lesson takes the second road at the fork. It looks at what Pinocchio is — a replacement for
+the `solana-program` crate rather than a rival to Anchor — how its account type manages to be a pointer
+into the buffer rather than a copy of it, and then does the arithmetic on where the compute savings in
+the most-cited case study actually came from. The answer is not the part of the program anyone was
+looking at.

@@ -1,0 +1,425 @@
+---
+id: zk-noir-circuits-looks-like-rust-isnt
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [noir-docs-quickstart, noir-docs-thinking-in-circuits, noir-docs-control-flow, noir-docs-ops, noir-docs-assert, noir-docs-fields, noir-docs-unconstrained, noir-docs-nargo-commands, noir-docs-profiler, barretenberg-docs]
+stack: {}
+---
+
+Here is a function you have written a hundred times. Find the first index in an array where a
+predicate holds, and stop.
+
+```rust
+// Rust. Costs whatever the data costs.
+fn first_hit(xs: &[u32], target: u32) -> usize {
+    for i in 0..xs.len() {
+        if xs[i] == target {
+            return i;          // done. average case, half the array.
+        }
+    }
+    xs.len()
+}
+```
+
+Now the Noir version. It will not compile, and the reason is not a syntax slip: **Noir has no early
+return from a loop in constrained code.** The documentation's porting checklist puts it in one line —
+no early return in a function; use a constraint via assertion instead.<Cite src="noir-docs-thinking-in-circuits" />
+
+The instinct is to reach for a `found` flag and keep going. That version compiles. It is also the
+moment the language quietly stops being Rust, because the flag does not save you anything: the loop
+was going to run every iteration regardless. There is no "average case, half the array". There is one
+case, and it is the worst one, on every proof, forever.
+
+This lesson is about the gap between a syntax you read fluently and an execution model you do not.
+Three parts: what a circuit does instead of running, what an `if` and a loop actually cost, and why
+the default numeric type is not an integer.
+
+## The syntax is an on-ramp, and the docs are honest about it
+
+Noir is a domain-specific language for writing circuits, developed by Aztec, whose syntax is
+deliberately Rust-shaped so that an engineer can express a relation in readable code while the
+compiler handles the translation into constraints.<Cite src="noir-docs-quickstart" /> The
+documentation is direct that a Rust implementation can be ported "with some key changes", and the
+changes it lists are short enough to memorise:<Cite src="noir-docs-thinking-in-circuits" />
+
+- `println!` is not a macro — use the `println` function, and the same for `assert_eq`.
+- No early return in a function. Constrain via assertion instead.
+- No boolean operators `&&` or `||`. Use the bitwise `&` and `|` with boolean values.
+- No `usize`. Use `u8`, `u32`, `u64` and friends.
+- `main`'s return must be public, `pub`.
+- No `const` — use `global`.
+
+Note what kind of list that is. Every item is a *removal*. Nothing on it is a feature Noir has that
+Rust lacks; each is a construct whose cost inside a constraint system is bad enough that the language
+declines to offer it. The `&&` case says so out loud: Noir has no `||` and `&&` because encoding the
+short-circuiting they require is inefficient for the backend, so you use `|` and `&`, which behave
+identically for booleans, just without the short-circuit.<Cite src="noir-docs-ops" />
+
+Sit with that for a second, because it is the whole lesson in miniature. **Short-circuiting is a
+runtime saving.** It saves work by not doing work, based on a value only known at runtime. A circuit
+has no mechanism for not doing work. So the operator that exists to skip evaluation has nothing to
+offer, and the language removes it rather than pretending.
+
+<Misconception
+  belief="Noir is Rust, so Rust performance intuitions carry over."
+  reality="Every line becomes constraints. A loop bounded at 1000 costs 1000 iterations' worth regardless of the data, and both branches of an `if` are paid for. The intuitions that transfer are the ones about clarity, not the ones about speed."
+  why="The syntax is deliberately Rust-like — that is its stated design goal — and syntax is what a reader pattern-matches on first."
+  src="noir-docs-unconstrained"
+/>
+
+<Compare
+  axis="What the code says"
+  columns={[
+    { title: 'What the syntax suggests', tone: 'muted' },
+    { title: 'What the circuit does', tone: 'accent' },
+  ]}
+  rows={[
+    { label: <>What does an <code>if</code> cost?</>, cells: [
+      'The branch that runs',
+      <>Both. It is flattened into predicated arithmetic, with gates created for each path even though execution takes one<Cite src="noir-docs-thinking-in-circuits" /></>,
+    ] },
+    { label: 'What does a loop cost?', cells: [
+      'Whatever the data makes it run',
+      <>Every iteration. The loop is unrolled, and its gates are duplicated per iteration<Cite src="noir-docs-thinking-in-circuits" /></>,
+    ] },
+    { label: 'Can it stop early?', cells: [
+      <>Yes — <code>return</code>, <code>break</code>, <code>while</code></>,
+      <>Not in constrained code: no early return, and <code>break</code>, <code>continue</code>, <code>loop</code> and <code>while</code> are unconstrained-only, because Noir must know exactly how many iterations a loop may have<Cite src="noir-docs-control-flow" /></>,
+    ] },
+    { label: <>What does <code>&amp;&amp;</code> do?</>, cells: [
+      'Short-circuits, skipping the right-hand side',
+      <>Nothing — it does not exist. Encoding short-circuiting is inefficient for the backend, so <code>&amp;</code> and <code>|</code> are what you use<Cite src="noir-docs-ops" /></>,
+    ] },
+    { label: 'What is a statement?', cells: [
+      'An instruction, executed in order',
+      { v: 'A constraint that must hold, committed to all at once', tone: 'accent' },
+    ] },
+  ]}
+  caption="The gap is not syntax: every row is a place where a value known only at run time decides how much work happens, and a circuit has no such moment."
+  alt="Rust's if, loops, early return, short-circuiting operators and statements set against what each becomes in a Noir circuit."
+/>
+
+## What a circuit does instead of running
+
+The mental model to install: a Noir program compiles into an abstract circuit intermediate
+representation which is conceptually a tree — the leaves are `Field` inputs, the nodes are arithmetic
+operations combining them, and the root is the return value.<Cite src="noir-docs-thinking-in-circuits" />
+Proving does not walk a program counter through that tree taking branches. It commits to a witness
+that satisfies every relation in it, all at once.
+
+That single fact generates every rule below.
+
+### `if` costs both branches
+
+An `if` statement is *flattened*: gates are created for each path even though execution only ever
+takes one, and there are additional operations required per path.<Cite src="noir-docs-thinking-in-circuits" />
+The mechanism is a predicate. When conditional logic compiles to gates it is predicated with a
+boolean, so a branch on `X` becomes arithmetic of the shape `X * V1() + (1-X) * V2()` — returning
+`V1()` when `X` is true and `V2()` when it is false.<Cite src="noir-docs-thinking-in-circuits" />
+Both `V1()` and `V2()` are in the circuit. Both are constrained. The boolean selects which one the
+output equals; it does not decide which one exists.
+
+The compiler's advice follows directly: put only essential computation inside conditional logic, and
+compute anything invariant once, outside.<Cite src="noir-docs-thinking-in-circuits" /> The nesting
+penalty is worse than additive — the docs note this can have a multiplying effect on the operations
+inside the `if` and `else`.<Cite src="noir-docs-thinking-in-circuits" />
+
+<Figure
+  caption="Every path exists; only the selection is data-dependent."
+  alt="A conditional compiles to gates for both arms plus a predicated combination X times V1 plus one minus X times V2, in which the boolean selects the output rather than the work."
+>
+  <Flow
+    nodes={[
+      { id: 'src', label: 'if X { V1 } else { V2 }', col: 0 },
+      { id: 'v1', label: 'gates for V1()', col: 1, row: 0 },
+      { id: 'v2', label: 'gates for V2()', col: 1, row: 1 },
+      { id: 'sel', label: 'X*V1 + (1-X)*V2', note: 'both arms constrained; X picks the output', col: 2, tone: 'accent' },
+    ]}
+    edges={[
+      { from: 'src', to: 'v1' },
+      { from: 'src', to: 'v2' },
+      { from: 'v1', to: 'sel' },
+      { from: 'v2', to: 'sel' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="note">
+**The escape hatch, and its cost.** For a function guaranteed never to fail an assertion whatever
+its inputs — roughly, a pure one — the `#[no_predicates]` attribute tells the compiler not to add
+those predicates, which reduces gate count for something like a hash function that must sit inside
+an `if`.<Cite src="noir-docs-thinking-in-circuits" /> The documentation attaches a hard warning: do
+not mark a function `#[no_predicates]` if it may call other predicated functions, because a
+`#[no_predicates]` function calling a regular one severely breaks the intended representation, proof
+generation and verification of the program.<Cite src="noir-docs-thinking-in-circuits" /> This is an
+optimisation that can silently produce a circuit that does not mean what you wrote. Reach for it last,
+and only with a gate count on both sides.
+</Aside>
+
+### Loops are unrolled, and their bounds are compile-time
+
+A loop duplicates its gates for each iteration — the docs' word is "unrolls".<Cite src="noir-docs-thinking-in-circuits" />
+A `for` over `0..1000` therefore costs a thousand copies of its body, and a `for` over `0..=10` costs
+eleven, because the inclusive form runs one more time.<Cite src="noir-docs-control-flow" />
+
+Which is why the constructs that make loop length data-dependent are restricted to unconstrained
+code. `break` and `continue` are allowed in `for` and `loop` only in unconstrained code; `loop` (a
+loop ending at a `break`) is unconstrained-only; `while` is unconstrained-only. The documentation
+gives the same reason for all three: normal constrained code requires that Noir knows exactly how
+many iterations a loop may have.<Cite src="noir-docs-control-flow" />
+
+That is not a limitation the compiler imposes out of caution. It is a structural requirement. A
+circuit is a fixed system of constraints, and a system whose *size* depends on a witness value is not
+a fixed system.
+
+```rust
+// Reads as if the flag saves work. It does not.
+let mut found_index: u32 = 0;
+let mut found: bool = false;
+for i in 0..N {
+    if (xs[i] == target) & !found {   // no `&&` — bitwise, no short circuit
+        found_index = i as u32;
+        found = true;
+    }
+}
+```
+
+**Subgoal: price the loop rather than the execution.** Every iteration contributes an equality
+comparison, a negation, an AND, and two predicated assignments. `found` being true after iteration
+three changes nothing about iterations four through `N`; their gates are already in the circuit. The
+flag's only job is correctness of the result, not economy of the search.
+
+**Subgoal: recognise which cost the language is actually offering to remove.** It is not the loop. It
+is the *derivation*. The next lesson but three shows the move: let the prover assert the index out of
+band and have the circuit check one equality instead of `N` of them. That is the only lever with real
+leverage here, and it comes with a trust boundary attached.
+
+### `assert` is the primitive, not a debugging aid
+
+`assert` explicitly constrains the predicate that follows it to be true; if the expression is false
+at runtime, the program fails to be proven.<Cite src="noir-docs-assert" /> It works only for
+predicate operations such as `==`, and the docs give the reason ambiguity is rejected: it is unclear
+whether `assert(x + y)` should check `x + y == 0` or simply return true, so it will not
+compile.<Cite src="noir-docs-assert" />
+
+Two details worth carrying. Since `v1.0.0-beta.2`, assertions are expressions and can be used in
+value contexts.<Cite src="noir-docs-assert" /> And there is a separate `static_assert` that behaves
+like `assert` but runs at **compile time** — it will happily check that an array's length is three,
+and will fail outright if handed a value only known at run time.<Cite src="noir-docs-assert" /> The
+distinction is exactly the one that matters in a circuit: a `static_assert` costs nothing because it
+never becomes a constraint, and an `assert` costs gates because it becomes one.
+
+<Check type="predict" concept="everything-is-a-constraint">
+Two implementations of "is this value in the allowlist", for a fixed allowlist of 64 entries. Predict
+which has the lower gate count, and by roughly what factor.
+
+```rust
+// A
+let mut ok = false;
+for i in 0..64 {
+    if candidate == allowlist[i] {
+        ok = true;
+    }
+}
+assert(ok);
+
+// B
+let mut ok = false;
+for i in 0..64 {
+    ok = ok | (candidate == allowlist[i]);
+}
+assert(ok);
+```
+
+<Answer>
+**They are close, and neither is meaningfully cheaper than the other — the factor is roughly one.**
+That is the point of the question.
+
+The instinct is that A "stops caring" once `ok` is set and B does redundant work. Neither is true.
+Both loops are unrolled to 64 copies of their body,<Cite src="noir-docs-thinking-in-circuits" /> and
+both bodies do the same equality comparison. A's `if` is flattened into predicated arithmetic of the
+`X * V1 + (1-X) * V2` shape, which is the assignment to `ok` in one arm and a copy of the old `ok` in
+the other.<Cite src="noir-docs-thinking-in-circuits" /> B writes that selection out by hand as an OR.
+Same 64 comparisons, same accumulation, near-identical cost.
+
+**What would actually move the number**, in rough order of size:
+
+1. Not searching at all. Have the prover supply the matching index unconstrained, and constrain one
+   array read and one equality — turning 64 comparisons into one. That is the next-but-one lesson,
+   and it is where the factor of tens lives.
+2. Replacing the linear scan with a Merkle membership proof against a committed root, which turns
+   `N` comparisons into `log N` hashes and, more importantly, stops the cost growing with the
+   allowlist.
+3. Checking whether `allowlist[i]` is being indexed by something known at compile time. It is here —
+   `i` is a loop constant — which keeps the access in read-only memory rather than promoting it to
+   random-access memory, and the docs put that difference at 2 gates versus about
+   3.25.<Cite src="noir-docs-thinking-in-circuits" />
+
+**The transferable habit:** when two versions of a circuit differ only in control-flow *style*, they
+almost certainly cost the same. Real savings come from changing what is derived inside the circuit,
+never from arranging the derivation more tidily.
+</Answer>
+</Check>
+
+## Field elements are not integers
+
+The default numeric type in Noir is `Field`, and it corresponds to the native field type of the
+proving backend — its size depends on that backend's elliptic-curve finite field, and with the
+default backend it is a 254-bit integer.<Cite src="noir-docs-fields" /> Barretenberg's own primitives
+are built over BN254 and Grumpkin.<Cite src="barretenberg-docs" /> You met the distinction between a
+curve's [scalar field and its base field](/c/scalar-field-vs-base-field) earlier in this track; this
+is where it stops being an abstraction and starts being your `let`.
+
+Three behaviours that will bite an engineer arriving from Solidity or Rust.
+
+**It wraps at the modulus, silently.** Field arithmetic wraps around the field modulus with no
+overflow checks, so operations like addition and multiplication can silently produce unexpected
+results if values exceed the modulus — adding 1 to the maximum field value wraps back to 0 with no
+error.<Cite src="noir-docs-fields" /> Not at 2^256. Not at 2^64. At a 254-bit prime you did not
+choose. The documentation's own guidance is that many use cases require standard integer arithmetic —
+enforcing that a balance does not go negative is its example — and that in those programs explicitly
+sized integer types are necessary to catch overflow when proving.<Cite src="noir-docs-fields" />
+
+**Comparison is not free, and sometimes not available.** The operations table is explicit that `<`,
+`<=`, `>` and `>=` require the upper bound to have a known bit size, and that `%`, `^`, `&`, `|`,
+`<<` and `>>` require integer types.<Cite src="noir-docs-ops" /> The docs' own example says it
+plainly: for `x: Field`, the expression `x & x` would not compile, because `x` is a `Field` and not
+an integer type.<Cite src="noir-docs-ops" /> Ordering and bit-manipulation are not native operations
+on a field element; they are decompositions into bits, and bits cost constraints.
+
+**Parsing from bytes wraps too, unless you ask.** `Field::from_le_bytes` and `from_be_bytes` will
+silently wrap around if the byte array represents a value greater than or equal to the field modulus;
+the `_checked` variants assert that the input is a canonical representation strictly below the
+modulus and trigger a constraint failure otherwise.<Cite src="noir-docs-fields" /> If you are
+deserialising anything an untrusted party produced — and in a circuit, the prover is that party — the
+unchecked version is a place where two distinct byte strings map to one field element.
+
+<Misconception
+  belief="Field elements behave like uint256 — big numbers with the usual overflow semantics."
+  reality="They wrap modulo a roughly 254-bit prime with no overflow check, comparison requires a known bit size, and bitwise operators do not accept them at all."
+  why="Both are described as big numbers and both print as hex, so the type looks like a wider integer rather than a different algebraic object."
+  src="noir-docs-fields"
+/>
+
+### The cost table that inverts everything you know
+
+Here is the sentence that reorganises an engineer's intuition, straight from the docs. Since circuits
+are made of arithmetic gates, the cost of an arithmetic operation tends to be one gate, whereas for
+procedural code it is several clock cycles — and inversely, non-arithmetic operators take multiple
+gates against one clock cycle.<Cite src="noir-docs-thinking-in-circuits" /> The published table:
+
+| cost per op | arithmetic — `*` and `+` | bit-wise — comparison, or, shift |
+|---|---|---|
+| cycles | 10+ | 1 |
+| gates | 1 | 10+ |
+
+<Cite src="noir-docs-thinking-in-circuits" />
+
+Every bit-twiddling trick you learned to make a hot loop fast is, in a circuit, a way to make it
+expensive. The docs say to translate away from bit shifts when writing constrained functions, and add
+that shifts are fine in unconstrained functions and tests because those execute outside the
+circuit.<Cite src="noir-docs-thinking-in-circuits" />
+
+The worked example is a bit-packing one. Packing two `u8` values into a `u16` reads naturally as
+`high as u16 << 8 | low as u16`. The gate-efficient equivalent asserts the bit sizes explicitly and
+then does arithmetic:<Cite src="noir-docs-thinking-in-circuits" />
+
+```rust
+low.assert_max_bit_size::<8>();
+high.assert_max_bit_size::<8>();
+(high * 2.pow_32(8) + low)
+```
+
+**Subgoal: see why that is cheaper.** The shift-and-or version needs the compiler to prove facts
+about binary representations, which means range decomposition. The arithmetic version states the
+range facts once, as two explicit assertions, and then uses a multiplication and an addition — two
+gates' worth of the cheap kind. The docs' summary is blunter than any paraphrase: where possible use
+the `Field` type for values, because writing code with smaller value types and bit-packing strategies
+will result in *more* gates.<Cite src="noir-docs-thinking-in-circuits" />
+
+<Misconception
+  belief="Smaller types are cheaper, so use the narrowest integer that fits — u8 over u32 over Field."
+  reality="The opposite. `Field` is the cheap default; smaller integer types incur extra range constraints, and the docs recommend `Field` when proving efficiency is the priority."
+  why="In every other environment an engineer has worked in, narrower means less memory and fewer cycles. Here the narrowing itself is the thing that must be proved, and proving it costs gates."
+  src="noir-docs-fields"
+/>
+
+The tension between the two misconceptions above is real and you have to hold both: `Field` is the
+efficient default,<Cite src="noir-docs-fields" /> *and* `Field` has no overflow check, so anything
+that must not overflow needs a sized integer type.<Cite src="noir-docs-fields" /> The resolution is
+not a rule of thumb, it is a question: does this value's correctness depend on wrapping behaviour? A
+Merkle path element, a hash output, a commitment — no, and those should be `Field`. A balance, a
+counter, an index bound — yes, and those pay for their range checks because the check is the point.
+
+### What "one gate" actually holds
+
+The table above says an arithmetic operation "tends to be one gate", which invites the reading that a
+gate is an operation. It is not. A gate is a row of a constraint system with a fixed algebraic shape,
+and how much of your expression fits into one row depends on that shape.
+
+Barretenberg — the current default backend for Noir — is described in the docs as a width-4 PLONKish
+constraint system, with the per-row relation written out as:<Cite src="noir-docs-thinking-in-circuits" />
+
+```text
+w1*w2*qm + w1*q1 + w2*q2 + w3*q3 + w4*q4 + qc = 0
+```
+
+Read what that row can absorb. Four witness values, one product of the first two, four constants
+multiplying the witnesses individually, and one additive constant. A whole small linear combination
+with a single multiplication in it collapses into one row. A second multiplication does not fit, so
+it needs another row and an intermediate witness to carry the result forward.
+
+**Subgoal: turn that into a habit rather than a fact.** It means the order in which you write
+arithmetic can change the gate count, because it changes how the compiler packs expressions into
+rows. The documentation says exactly this: inspect the ACIR opcodes with `nargo info --print-acir`,
+and the proving system for gates, and it may present opportunities to amend the order of operations
+and reduce the number of constraints.<Cite src="noir-docs-thinking-in-circuits" /> `--print-acir` is
+a documented flag on `nargo info`, and it displays the ACIR for the compiled circuit including the
+Brillig bytecode.<Cite src="noir-docs-nargo-commands" /> This is the
+circuit equivalent of packing struct fields to fill storage slots — and it earns its keep for the
+same reason, in the same narrow circumstances: a hot path, measured before and after.
+
+The docs also record a manual lever for the cases where the compiler packs badly, `std::as_witness`,
+which tells the compiler to save a variable as a witness rather than an expression. They frame it as
+temporary — a thing that will become unnecessary over time — and warn that used incorrectly it
+creates less efficient circuits with a *higher* gate count.<Cite src="noir-docs-thinking-in-circuits" />
+That is the correct posture toward every lever in this section: reach for it only when a measurement
+has already told you where the gates are.
+
+### Static beats dynamic
+
+One more structural rule, because it explains gate counts that otherwise look inexplicable. Static
+reads cost fewer gates than dynamic ones: reading from read-only memory adds fewer gates than
+random-access memory, 2 versus about 3.25, due to the additional bounds
+checks.<Cite src="noir-docs-thinking-in-circuits" /> And the promotion is automatic — if an index
+used to access an array is not known at compile time, ROM is converted to RAM and the gate count
+expands.<Cite src="noir-docs-thinking-in-circuits" />
+
+There is a compile-time guard for this. Calling `assert_constant(i)` before using `i` as an index
+gives a compile error if `i` is not known at compile time.<Cite src="noir-docs-thinking-in-circuits" />
+Treat it the way you would treat a static assertion about a buffer size: not a runtime check, a
+statement about the shape of your program that the compiler will hold you to.
+
+The profiler documentation shows the effect end to end. Zeroing an array past a dynamic index costs
+387 ACIR opcodes; rewriting it so that the arrays are read at known constant indices removes the
+memory operations entirely — searching the flamegraph for `memory::op` afterwards finds no
+matches — and brings the program to 284 opcodes.<Cite src="noir-docs-profiler" />
+
+## What this unlocks
+
+**Next lesson** opens the box under the compiler: what ACIR actually is, what Barretenberg does with
+it, and why the two tools version independently in a way that produces confusing first-hour failures.
+You now have the reason that layer matters — everything in this lesson was a statement about what
+your source code becomes, and the next one is about who turns it into that.
+
+**Three lessons on** is the payoff for everything here. Once you have internalised that a circuit
+cannot skip work, the only remaining optimisation is to *not do the work in the circuit at all* —
+compute outside, check inside. Every rule in this lesson is a reason that pattern exists, and the
+trust boundary it opens is the module's real subject.
+
+**And immediately**, when you write your first Noir file: the compiler will accept a great deal of
+code that costs ten times what you intended. It compiles clean because it *is* clean; it is just
+expensive. The only instrument that tells you is the gate count, which is why you learn to read it
+before you learn to optimise against it.

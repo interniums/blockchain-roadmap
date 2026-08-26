@@ -1,0 +1,374 @@
+---
+id: infra-running-nodes-disk-decides
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    geth-hardware,
+    geth-dbpruning,
+    geth-archive-mode,
+    geth-history-pruning,
+    ethereum-node-ssd-list,
+    eth-docker-resource-usage,
+    eth-run-a-node,
+    nethermind-sync,
+    erigon-pruning-modes,
+    engine-api-paris,
+    eip-7935,
+  ]
+stack: {}
+---
+
+The node synced. It took the expected number of hours, the logs are clean, `eth_syncing` returns
+`false`, and it has been running for three weeks without an error.
+
+It is also four blocks behind head. Not sometimes. Always. When you check at nine in the morning it is
+four blocks behind, and when you check at eleven at night it is four blocks behind, and the gap never
+closes and never widens. If you stake on it, attestations land late. If you serve reads from it, users
+occasionally see a transaction "not found" that a public endpoint found forty seconds ago.
+
+Every dashboard is green. CPU is at twenty percent, memory has headroom, the network graph is flat and
+boring, and the storage volume reports throughput far above anything the documentation asked for.
+
+This is the characteristic failure of an underpowered node, and it is confusing precisely because it is
+not a failure of any resource anyone thought to provision. This lesson is about the resource that is
+actually binding, why the number your cloud console shows you is the wrong one, and about the recurring
+chore that follows from the same underlying fact.
+
+## The workload is not what the specification sheet measures
+
+Start from what executing a block actually asks of the disk.
+
+You know from the state trie material that [trie paths are hashes of keys](/c/merkle-patricia-trie),
+which means logically adjacent state — two slots in the same mapping, two accounts owned by the same
+user — lands in unrelated places in the structure. That is the property that makes the trie's
+authenticated lookups possible and it is also the property that makes access
+[random rather than sequential](/c/state-growth-problem).
+
+Now execute a block against that. A transaction touches accounts and slots that were not chosen to be
+near each other; the client resolves each one by walking a path of interior nodes; and those walks are
+scattered small reads, not one large one. Multiply by the transactions in a block, and one block is
+thousands of independent small reads at unpredictable offsets. Since EIP-7935 raised the default block
+gas limit to 60M,<Cite src="eip-7935" /> each block can contain materially more of them than the same
+workload produced a year earlier.
+
+Then add the deadline. Blocks arrive on a fixed cadence, and your execution client is not free to take
+as long as it likes: the consensus client hands it a payload over `engine_newPayload` and waits for a
+`VALID` or `INVALID` answer.<Cite src="engine-api-paris" /> If answering takes longer than the gap
+between blocks, the node does not crash. It just never catches up, because the next payload is already
+waiting when it finishes the last one.
+
+<Figure
+  caption="Every box here succeeds. The failure is visible only in the edge that runs backwards."
+  alt="A payload arrives every twelve seconds, the consensus client calls engine_newPayload and waits, the execution client executes the block as thousands of small scattered reads and answers VALID — and by then the next payload is already waiting, so the queue never drains."
+>
+  <Flow
+    lanes={['the cadence', 'the deadline', 'the disk', 'the answer']}
+    nodes={[
+      { id: 'pl', label: 'payload arrives', note: 'every 12 seconds', col: 0 },
+      { id: 'np', label: 'engine_newPayload', note: 'consensus waits', col: 1, tone: 'warn' },
+      { id: 'ex', label: 'execute the block', note: 'thousands of small reads', col: 2 },
+      { id: 'ok', label: 'VALID', note: 'answered, correctly', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'pl', to: 'np' },
+      { from: 'np', to: 'ex' },
+      { from: 'ex', to: 'ok' },
+      { from: 'ok', to: 'np', label: 'next payload already waiting', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+**That is the whole mechanism behind a node that is permanently four blocks behind.** Nothing is
+broken. The service is arriving faster than it can be performed, and the queue depth has found its
+equilibrium.
+
+<Misconception
+  belief="An SSD-class cloud volume is fine if the throughput figure is comfortably above what the docs ask for."
+  reality="This workload is thousands of small scattered reads under a deadline. What decides whether you keep up is how long a single small read takes, and that number is not the one on the console."
+  why="Cloud storage dashboards foreground megabytes per second, because that is the metric that distinguishes their tiers and the one most workloads care about. Sequential throughput and random-read latency are close to independent, and this workload lives entirely on the second axis."
+  src="geth-hardware"
+/>
+
+## Latency, and the two numbers that stand in for it
+
+The practitioner sources are unusually direct about the metric, and worth quoting because the
+distinction they draw is finer than "use an SSD".
+
+The community SSD list that geth's own hardware page points readers to<Cite src="geth-hardware" /> opens
+by stating that syncing a node is largely reliant on the latency of the storage, that budget drives
+will struggle and some will not sync at all, and — crucially — that **IOPS can roughly be used as a
+proxy for latency, while measuring latency directly is arguably better.**<Cite src="ethereum-node-ssd-list" />
+The eth-docker resource page says the same thing in one line: latency is what matters most to Ethereum
+clients.<Cite src="eth-docker-resource-usage" />
+
+So there is a hierarchy of metrics, and most people stop one or two rungs too early:
+
+1. **Throughput (MB/s)** — measures the wrong axis entirely.
+2. **IOPS** — correlated with the right answer, and the number vendors publish.
+3. **Random-read latency under load** — the thing that decides it.
+
+Both sources give a target on the third rung. The SSD list reports that geth is understood to benefit
+from around 300 microseconds of latency, while noting that not all clients are alike — some need
+faster, some tolerate slower.<Cite src="ethereum-node-ssd-list" /> eth-docker states the requirement as
+staying under 300 microseconds *maximum* for an execution client, and adds the consequence that matters
+to a staker: high latency degrades attestation performance, and is particularly noticeable during sync
+committee duties.<Cite src="eth-docker-resource-usage" />
+
+### The measurement that settles the cloud-storage argument
+
+The abstract argument convinces nobody who has just provisioned a volume with a large IOPS number on
+it. The SSD list contains the concrete version, and it is the most useful paragraph in this lesson.
+
+Measured while geth was state-healing, an AWS gp3 volume provisioned at 16,000 IOPS showed roughly
+425 / 615 / 1300 microseconds minimum, average and maximum latency. A data-centre NVMe drive measured
+25 / 75 / 150 microseconds with geth in steady state, and 25 / 80 / 265 microseconds on the same
+hardware under synthetic load.<Cite src="ethereum-node-ssd-list" />
+
+<Matrix
+  numeric
+  corner={<>Random-read latency under load — community SSD list, read 26 August 2026<Cite src="ethereum-node-ssd-list" /></>}
+  cols={['Min µs', 'Avg µs', 'Max µs']}
+  rows={[
+    {
+      label: 'AWS gp3 provisioned at 16,000 IOPS — geth state-healing',
+      cells: [{ v: '425', tone: 'warn' }, { v: '615', tone: 'danger' }, { v: '1300', tone: 'danger' }],
+    },
+    {
+      label: 'Data-centre NVMe — geth in steady state',
+      cells: [{ v: '25', tone: 'good' }, { v: '75', tone: 'good' }, { v: '150', tone: 'good' }],
+    },
+    {
+      label: 'The same NVMe — under synthetic load',
+      cells: [{ v: '25', tone: 'good' }, { v: '80', tone: 'good' }, { v: '265', tone: 'good' }],
+    },
+    {
+      label: <>Target for an execution client<Cite src="eth-docker-resource-usage" /></>,
+      cells: ['—', '—', { v: 'under 300', tone: 'accent' }],
+    },
+  ]}
+  caption="Both drives satisfy a purchase order written in IOPS; only one of them is inside the target the clients actually care about."
+  alt="An AWS gp3 volume provisioned at 16,000 IOPS measured 425, 615 and 1300 microseconds minimum, average and maximum under geth state-healing; a directly attached data-centre NVMe measured 25, 75 and 150 in steady state and 25, 80 and 265 under synthetic load, against a target of staying under 300 microseconds."
+/>
+
+Read the two averages next to each other. The provisioned-IOPS network volume is roughly eight times
+slower per read than the directly attached drive, and its *best case* is worse than the attached
+drive's worst case. Nothing about that gap is visible from the IOPS figure, which is the number the
+volume was purchased on.
+
+The reason is structural rather than a matter of tier: a network-attached volume puts a network hop
+inside every read. Sequential throughput hides the hop by amortising it over large transfers. A
+workload of thousands of small scattered reads pays it every time.
+
+<Aside kind="warn">
+This is the failure mode that most deserves to be recognised on sight, because it does not announce
+itself. A node on high-latency storage syncs — slowly, but it finishes — and then runs indefinitely a
+few blocks behind head while reporting healthy. Compare your head to an independent source and alarm on
+the gap; `eth_syncing` will not tell you, because from the client's point of view it is not syncing, it
+is keeping up as fast as it can.
+</Aside>
+
+## Measuring yours, in two commands
+
+Both sources publish the same diagnostic pair, which is a good sign that it is the one practitioners
+actually use.
+
+**Subgoal: measure latency under realistic load rather than at rest.** Run
+`sudo ioping -D -c 30 /dev/<ssd-device>` while the node is running as an Ethereum node, and read the
+min/avg/max.<Cite src="ethereum-node-ssd-list" /><Cite src="eth-docker-resource-usage" /> At rest, a
+mediocre drive looks fine; the point of the measurement is to catch it while it is being asked for
+scattered reads faster than it likes.
+
+**Subgoal: manufacture that load if you do not have a node yet.** Both pages give the same fio
+invocation — a 4k random read/write mix at queue depth 64 over a 150 GB file — and eth-docker explains
+the size: 150 GB was chosen to break through any caching strategy the SSD uses for bursty writes,
+because execution clients write steadily and an SSD's behaviour under sustained write is what
+matters.<Cite src="eth-docker-resource-usage" /><Cite src="ethereum-node-ssd-list" /> Run the ioping
+while the fio job is still going.<Cite src="ethereum-node-ssd-list" />
+
+**Subgoal: read the answer off the node itself, not just the hardware.** The SSD list names a second
+measurement that is better than either, because it is the actual thing you care about: the
+`newPayload` quantile in your execution client's metrics during normal operation, where you want the
+95th or even 99th percentile below 500 milliseconds.<Cite src="ethereum-node-ssd-list" />
+
+That last one deserves emphasis. It is the Engine API call from the first lesson in this module, timed.
+It measures the disk, the CPU, the client's caches and the state size together, in the units the
+protocol actually imposes — and it degrades before the node falls behind, which makes it a leading
+indicator rather than a post-mortem. If you take one metric from this module into a dashboard, take
+that one.
+
+### Latency problems that are not the drive
+
+A surprising share of "my node is slow" cases are configuration rather than hardware, and the same
+community list enumerates them.<Cite src="ethereum-node-ssd-list" />
+
+- **Heat.** A drive above roughly 60 °C throttles; the list recommends checking with `smartctl -x` and
+  keeping the temperature below that, ideally below 50 °C.<Cite src="ethereum-node-ssd-list" />
+- **TRIM not being allowed**, which happens with some hardware RAID controllers.<Cite src="ethereum-node-ssd-list" />
+- **Copy-on-write filesystems** — ZFS, BTRFS and similar.<Cite src="ethereum-node-ssd-list" />
+- **RAID 5 or 6**, where write amplification is severe.<Cite src="ethereum-node-ssd-list" />
+- **A SATA controller not set to AHCI** in firmware.<Cite src="ethereum-node-ssd-list" />
+- **`atime` left on**, which the list recommends disabling on the database volume; eth-docker notes its
+  own test systems are configured with `noatime` and no swap for the same
+  reason.<Cite src="ethereum-node-ssd-list" /><Cite src="eth-docker-resource-usage" />
+- **QLC and DRAM-less drives**, which are far slower than mainstream ones and have lower endurance —
+  the list's blunt observation being that any saving disappears when the drive fails
+  early.<Cite src="ethereum-node-ssd-list" />
+
+Check that list before buying anything. Two of those items are one-line changes.
+
+## The treadmill, and what it is actually a property of
+
+The second half of this lesson is the cost line that does not appear in a hardware budget, because it
+is measured in your time.
+
+A hash-based state database accumulates trie nodes that are no longer reachable from any recent state
+root — every superseded interior node from the previous lesson's arithmetic. Reclaiming that space
+means taking the node **offline** and running a pruning pass. Geth's documentation describes the loop
+without euphemism: users will rapidly run out of space, an offline snapshot prune brings storage back
+down, and this has to be done periodically to keep total disk within the bounds of the local hardware —
+on the order of every month or so for a small disk.<Cite src="geth-dbpruning" />
+
+Three details turn that from an inconvenience into something you schedule.
+
+**It takes real downtime.** The page gives figures of upwards of twelve hours depending on hardware, and
+four to five hours for the documented command sequence, with a stretch of over an hour during the
+compaction stage that produces **no log output at all** — which is normal, and must not be interrupted;
+the run is finished when a "State pruning successful" message
+appears.<Cite src="geth-dbpruning" />
+
+**It needs headroom you must reserve in advance.** At least 40 GB of free space is recommended, with
+failures reported around 25 GB, which means **pruning cannot rescue a disk that has already
+filled**.<Cite src="geth-dbpruning" /> The rule of thumb is to prune before the node reaches about 80%
+of available disk.<Cite src="geth-dbpruning" /> A monitor on free space is not a nice-to-have here; it
+is the thing that keeps the escape hatch usable.
+
+**It is not available to every node.** Geth's pruning rules begin with: do not try to prune an archive
+node, because archive nodes need to maintain all historic data by definition.<Cite src="geth-dbpruning" />
+Nor is retention adjustable in place — Erigon requires deleting `chaindata` and re-syncing to change
+mode.<Cite src="erigon-pruning-modes" />
+
+Now the part that keeps this lesson from ageing badly. **The treadmill is a property of the storage
+scheme, not of Ethereum.** Geth's own pruning page carries a note at the top saying offline pruning is
+only for the hash-based state scheme, that the path-based scheme enables pruning by default, and that
+once hash-based is no longer supported, offline pruning will be
+deprecated.<Cite src="geth-dbpruning" /> The archive documentation describes the path-based design that
+replaces it — one persistent state plus reverse diffs rather than every historical trie
+node.<Cite src="geth-archive-mode" /> Practitioner tables record the same transition across the
+ecosystem, noting which clients continuously prune state and which need an explicit
+pass.<Cite src="eth-docker-resource-usage" />
+
+So the question to ask about a client is not "how often must I prune" but **"does this client's storage
+engine require a maintenance window at all"** — and the answer is changing, per client, per version.
+
+<Misconception
+  belief="Running a node is a setup task: provision it, sync it, and it runs."
+  reality="On a hash-based state scheme it is a recurring maintenance commitment with a downtime window attached, a free-space threshold you must monitor, and a headroom requirement you must reserve. On a path-based or flat scheme much of that is handled inline. Which one you are on is a client-and-version fact, not an Ethereum fact."
+  why="Every other database you have operated either compacts itself or does it online. Offline pruning is an artefact of a specific historical storage design, and it is being retired — but not everywhere, and not yet."
+  src="geth-dbpruning"
+/>
+
+### The growth rate, and why this lesson will not give you one
+
+You will want a gigabytes-per-week number to plan the schedule against. The sources disagree, and the
+disagreement is not resolved.
+
+Geth's own documentation states, in two places, that a snap-synced full node's database grows about
+14 GB per week at the default cache size.<Cite src="geth-hardware" /><Cite src="geth-dbpruning" />
+Vendor material circulating in 2026 puts the figure closer to a gigabyte a day. Nothing in this
+curriculum's research resolved which is right, and there are good reasons to expect *both* to be stale:
+the geth hardware page prefaces its disk section with "at the time of writing (September 2022)" and
+carries a last-edited date of September 2023,<Cite src="geth-hardware" /> and the default block gas
+limit has since risen to 60M,<Cite src="eip-7935" /> which means more transactions, more receipts and
+more state churn per block than any pre-2026 measurement captured.
+
+The honest procedure is short and gives you a number that is actually about your node:
+
+1. Record the datadir size and `eth_blockNumber` on a schedule for a week.
+2. Divide. That is your growth rate, on your client, your version, your sync mode, your workload.
+3. From that and your free space, compute the date you will hit 80%, and put the pruning window in the
+   calendar before it.
+4. Re-measure after every client upgrade, because storage engines are exactly the thing client teams
+   keep changing.<Cite src="eth-docker-resource-usage" />
+
+<Check type="spot-bug" concept="disk-is-the-bottleneck">
+A deployment plan for a production read node. Name every defect, say what would be observed, and give
+the corrected plan.
+
+```text
+1. Cloud VM, network-attached SSD volume provisioned at 16,000 IOPS.
+   Throughput is 1000 MB/s, well above the docs' requirement.
+2. Filesystem: ZFS, for snapshots before client upgrades. RAID-5 across
+   three volumes for redundancy.
+3. Alerting: page if the node process dies or if eth_syncing returns true.
+4. Disk: alert at 95% full, then run the offline prune.
+```
+
+<Answer>
+**Four defects. The first three combine into one failure, and the fourth removes the way out of it.**
+
+**1 — The storage is chosen on the wrong metric, and the right metric is measured.** Throughput is the
+wrong axis for thousands of small scattered reads; latency is what
+decides.<Cite src="ethereum-node-ssd-list" /><Cite src="eth-docker-resource-usage" /> The published
+measurement is specific: a gp3 volume at 16,000 IOPS showed roughly 425 / 615 / 1300 microseconds
+min/avg/max under geth state-healing, against 25 / 75 / 150 for a directly attached data-centre
+NVMe.<Cite src="ethereum-node-ssd-list" /> Against a target of staying under about 300
+microseconds,<Cite src="ethereum-node-ssd-list" /><Cite src="eth-docker-resource-usage" /> this volume
+misses on its *minimum*. Observed: the node syncs, reports healthy, and sits permanently a few blocks
+behind head.
+
+**2 — ZFS and RAID-5 both add latency to the exact operation that is already the constraint.**
+Copy-on-write filesystems and RAID 5/6 are both named as things that increase
+latency, RAID 5/6 for write amplification.<Cite src="ethereum-node-ssd-list" /> Observed: the gap in
+defect 1, made worse, with the cause split across three layers so that no single dashboard shows it.
+The snapshot requirement is real, but it should be met by a mechanism that is not in the node's hot
+read path.
+
+**3 — The alerting cannot detect the failure this deployment will actually have.** `eth_syncing`
+distinguishes "catching up" from "not catching up"; a node that is keeping pace as fast as it can,
+four blocks behind, reports `false`. Observed: every alert stays green while the product serves stale
+reads. The correct check compares your head against an independent source and alarms on the gap, and
+the leading indicator is the `newPayload` quantile — 95th or 99th percentile under 500
+milliseconds.<Cite src="ethereum-node-ssd-list" /> That degrades *before* the node falls behind.
+
+**4 — Alerting at 95% full means the prune will fail.** Offline pruning needs at least 40 GB free, with
+failures reported around 25 GB, so it cannot rescue a disk that has already filled; the recommended
+trigger is about 80%.<Cite src="geth-dbpruning" /> Observed: the alert fires, the operator runs the
+documented command, it fails for lack of space, and the only remaining option is a resync of a
+production node. Note also that the prune itself is not a quick job — figures of four to five hours and
+upwards of twelve are documented, including an hour or more of complete log silence during compaction
+that must not be interrupted.<Cite src="geth-dbpruning" /> That is a maintenance window, not a
+command.
+
+**The corrected plan.** Directly attached NVMe, verified by `ioping` under load rather than by the
+console's IOPS figure.<Cite src="ethereum-node-ssd-list" /> A plain filesystem with `atime` disabled;
+take upgrade safety from a second node rather than from a copy-on-write layer under the
+database.<Cite src="ethereum-node-ssd-list" /><Cite src="eth-docker-resource-usage" /> Alert on head lag
+against an independent source and on the `newPayload` quantile, not on `eth_syncing`. Alert on free
+space at 80% and schedule the pruning window from your own measured growth rate — and check first
+whether the client and version you run still needs offline pruning at all, since path-based schemes
+prune inline and geth states offline pruning will be deprecated when hash-based support
+ends.<Cite src="geth-dbpruning" />
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now name the binding constraint on a node — random-read latency under a per-block deadline —
+measure it three ways, and recognise its signature failure, which is a healthy-looking node that is
+permanently slightly behind. You can also state the recurring cost of ownership without hand-waving:
+a monitored free-space threshold, a scheduled downtime window, a re-measurement after every upgrade,
+and a client-specific answer to whether any of that is still required.
+
+That completes the module. You chose two clients knowing that the popular choice is the risky one,
+chose a sync mode knowing which questions it makes permanently unanswerable, decomposed a disk into
+history and state and blob data, and put a number on what keeping it alive costs in attention.
+
+The next module spends that knowledge. It prices RPC access — per method, per provider, per compute
+unit — and asks when running your own node is the cheaper answer. You now have the honest side of that
+comparison, which almost no build-versus-buy spreadsheet includes: not the price of the machine, but
+the pruning window, the resync after a corrupted database, the upgrade before a fork, and the fact that
+the retention decision you made on day one cannot be revised without doing all of it
+again.<Cite src="erigon-pruning-modes" />

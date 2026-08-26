@@ -1,0 +1,400 @@
+---
+id: app-transaction-ux-cancel-is-a-race
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    eip-1559,
+    geth-cli-options,
+    viem-wait-for-transaction-receipt,
+    wagmi-use-wait-for-transaction-receipt,
+    ethereum-org-json-rpc,
+    anvil-rpc-methods,
+    chainpath-conflict-register,
+  ]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+Product wants a Cancel button. It is a reasonable request: the user has a pending transaction, they
+have changed their mind, and every other interface in their life lets them take it back.
+
+The button can be built. What it cannot be is a cancel. There is no operation in the protocol that
+removes a broadcast transaction, and there is no party you could ask — the transaction is sitting in an
+unknown number of independent pools belonging to people who have never heard of you.
+
+What exists instead is a race, entered by paying an entry fee, which you can lose. This lesson is about
+building that honestly: the mechanism, the threshold that governs whether anyone will even accept your
+entry, the three genuinely different things a replacement can mean, and the copy that stops the button
+from being a lie.
+
+## Replacement is the only edit
+
+The mechanism is one sentence. **You broadcast a different transaction using the same nonce, offering a
+higher fee, and hope that nodes swap it for the old one in their pools and that it is the one a
+proposer includes.**
+
+Everything about that sentence is worth slowing down on.
+
+*A different transaction* — not an amendment. It is separately constructed, separately signed, and has
+its own hash. The old one is not modified; it is competed with.
+
+*Using the same nonce* — this is the entire enforcement mechanism. Because
+[nonce order is strict](/c/nonce-ordering), exactly one transaction at a given nonce can ever execute
+for an account. Two transactions at nonce N are two candidates for one slot, and the chain will consume
+exactly one of them.
+
+*Offering a higher fee* — because nodes will not otherwise take the swap, for a reason that has nothing
+to do with fairness. A pool that accepted free replacements would accept unlimited free replacements,
+and would spend its bandwidth relaying churn. The fee bump is anti-spam, which is why it is set by node
+operators rather than by the protocol.
+
+*And hope* — because you are not talking to the entity that decides. You are talking to a node. The
+transaction that gets included is the one held by whoever builds the block, and their pool may have
+been updated or may not.
+
+<Figure
+  caption="Two hashes, one slot. The loser is not queued behind the winner — it stops being resolvable at all."
+  alt="The original transaction and its replacement both target nonce N. Exactly one of them consumes that slot: either the replacement is mined, or the original is mined because the builder's pool never took the swap. Whichever loses returns null from a receipt lookup forever."
+>
+  <Flow
+    lanes={['two candidates', 'one slot', 'one block', 'the other hash']}
+    nodes={[
+      { id: 'orig', label: 'original', note: 'nonce N, low fee', col: 0 },
+      { id: 'repl', label: 'replacement', note: 'nonce N, raised fee', col: 0, tone: 'accent' },
+      { id: 'slot', label: 'nonce N', note: 'exactly one executes', col: 1, tone: 'warn' },
+      { id: 'win', label: 'replacement mined', note: 'you won the race', col: 2, tone: 'good' },
+      { id: 'lose', label: 'original mined', note: 'the builder had the old one', col: 2, tone: 'danger' },
+      { id: 'null', label: 'null, forever', note: 'no receipt, no event', col: 3, tone: 'muted', dashed: true },
+    ]}
+    edges={[
+      { from: 'orig', to: 'slot' },
+      { from: 'repl', to: 'slot', tone: 'accent' },
+      { from: 'slot', to: 'win', tone: 'good' },
+      { from: 'slot', to: 'lose', tone: 'danger' },
+      { from: 'win', to: 'null', dashed: true, tone: 'muted' },
+      { from: 'lose', to: 'null', dashed: true, tone: 'muted' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="Replacing a transaction removes the original."
+  reality="It creates a competitor for the same nonce. The original still exists, still propagates, and can still be the one that is included. Exactly one of them will execute — you do not get to choose which."
+  why="'Replace' in every other system means overwriting a record you own. Here you own neither copy, and there are as many copies as there are nodes."
+  src="eip-1559"
+/>
+
+## The bump threshold is client policy, and sources disagree about the number
+
+This is the point in the topic where almost every article states a constant, and where a constant is
+not available.
+
+What is verifiable: go-ethereum exposes `--txpool.pricebump` with a **default of 10**, documented as
+the "Price bump percentage to replace an already existing transaction".<Cite src="geth-cli-options" />
+It sits in the same list as the rest of the pool's tunables, all of which are operator settings.
+
+What is not verifiable as a general rule:
+
+- **It is not in an EIP.** [EIP-1559](/c/eip-1559-fee-fields) defines the fee fields and the validity
+  condition against the base fee; it does not define a replacement threshold.<Cite src="eip-1559" />
+  Nothing about replacement acceptance is consensus.
+- **The commonly quoted figures disagree.** Both 10% and 12.5% circulate widely. The research register
+  for this curriculum records the threshold as client mempool policy rather than a protocol rule, with
+  the current cross-client values not established.<Cite src="chainpath-conflict-register" /> This
+  module does not publish one number as *the* threshold, because there is not one.
+- **It is not even uniform within one client.** `--blobpool.pricebump` defaults to **100** — a
+  hundred per cent, meaning a blob transaction replacement must double the fee, ten times the legacy
+  pool's default.<Cite src="geth-cli-options" /> Same client, same machine, same operator, different
+  pool, different rule.
+- **Operators change it.** It is a flag. Whoever runs the node you are broadcasting to, and whoever
+  runs the node that builds the block, each chose a value independently.
+
+<Aside kind="warn">
+The engineering conclusion is not "use 12.5% to be safe". It is that the threshold is a property of
+infrastructure you do not control, so a replacement must be built to **fail visibly and be retried at a
+higher bump**, not to succeed on the first attempt because you picked the magic number. A rejection at
+broadcast time is the cheap failure here: nothing was signed onto the chain and nothing was charged.
+The expensive failure is a replacement that is accepted by your node, never propagates far enough, and
+loses the race silently.
+</Aside>
+
+There is a second reason a generous bump is the right instinct, and it is not about the threshold at
+all. The replacement has to beat the original **in the block builder's ordering**, not merely be
+accepted into a pool. Being one notch above the minimum accepted bump gets you swapped in; being
+meaningfully more attractive gets you built.
+
+## Cancel is a replacement whose payload does nothing
+
+Now the button.
+
+A cancel is a replacement at the same nonce whose content is deliberately inert: a zero-value transfer
+from the account to itself, with no calldata, at a higher fee. If it wins the race, the nonce is
+consumed by a transaction that does nothing, and the original can never execute — its slot is gone.
+
+Three properties follow, and a UI that omits any of them is misleading its user.
+
+**It costs gas.** A self-transfer is a real transaction that occupies a block and is charged. If the
+cancel wins, the user paid for a transaction that did nothing, on purpose. If it loses, they paid for
+one that did nothing *and* the original went through anyway. There is no outcome in which cancelling is
+free, and the fee involved is higher than the original's by construction.
+
+**It can lose.** If the original is already in a block being assembled, or is held by a builder whose
+pool never saw your replacement, it lands and the cancel does not. The user's action happens. From
+their point of view they pressed Cancel and the thing happened anyway, which is the worst possible
+outcome for trust and the one your copy has to prepare them for *before* they press it.
+
+**It only cancels one nonce.** This is the property teams miss most often. Cancelling nonce N does not
+touch N+1 or N+2. It makes N execute as a no-op, which *unblocks* everything behind it — so a user with
+three queued transactions who cancels the first one will watch the other two execute immediately, at
+speed, which is the exact opposite of what "cancel" led them to expect.
+
+<Misconception
+  belief="Cancelling the stuck transaction cancels everything that was waiting behind it."
+  reality="It consumes that one nonce with an empty transaction, which makes every later nonce executable. The queue does not clear — it fires."
+  why="Cancelling the first item in a blocked queue usually means abandoning the batch. Here the queue was blocked by an ordering rule, not by a dependency, and removing the blockage releases the rest."
+  src="eip-1559"
+/>
+
+## Three replacements, three different things to say
+
+When `waitForTransactionReceipt` finds a transaction from the same sender at the same nonce — it scans
+new blocks for exactly that, because "Transactions are replaced when they are sent from the same
+nonce" — it invokes `onReplaced` with a `reason` of `'repriced'`, `'cancelled'` or `'replaced'`, along
+with the replacing transaction and its receipt.<Cite src="viem-wait-for-transaction-receipt" /> wagmi
+surfaces the same callback on `useWaitForTransactionReceipt`.<Cite src="wagmi-use-wait-for-transaction-receipt" />
+
+These are three distinct events in the user's life and they deserve three distinct sentences.
+
+<Matrix
+  corner="Reason"
+  cols={['What changed', 'What the user did', 'What your UI should say']}
+  rows={[
+    {
+      label: 'repriced',
+      cells: [
+        'Fee only; value and data identical',
+        'Pressed "Speed Up"',
+        { v: '"Still going through, at a higher fee." Keep the record, swap the hash.', tone: 'good' },
+      ],
+    },
+    {
+      label: 'cancelled',
+      cells: [
+        'Value went to zero',
+        'Pressed "Cancel"',
+        '"You cancelled this." Close the record as abandoned.',
+      ],
+    },
+    {
+      label: 'replaced',
+      cells: [
+        'Value or data differ',
+        'Something else used this slot',
+        { v: '"This was superseded by a different transaction." Investigate; do not assume.', tone: 'warn' },
+      ],
+    },
+  ]}
+  caption="One callback, three reasons, and only one of them answers “is this still happening?” with yes."
+  alt="The three replacement reasons viem reports: repriced changes the fee only and follows a Speed Up press; cancelled sends the value to zero and follows a Cancel press; replaced changes value or data and means something else consumed the nonce. Each carries the distinct sentence the interface should show."
+/>
+
+The third row is the interesting one, and the one that most codebases collapse into the second. A
+`replaced` reason means the account signed a *different action* at that nonce. On a user's own wallet
+that is usually them doing something unrelated after a stuck transaction. On a shared operational
+account it can mean two processes are writing to the same key, which is an incident, not a UI state.
+
+Collapsing all three into "your transaction changed" throws away the only information that distinguishes
+"it is still happening" from "it is definitely not happening" — and those two produce opposite
+behaviour in anything downstream that was waiting.
+
+<Aside kind="note">
+The classification is viem's, derived from comparing value and data between the two transactions, and
+it is a heuristic about intent rather than a protocol-level label.<Cite src="viem-wait-for-transaction-receipt" />
+A user who "cancels" by sending a self-transfer of a non-zero amount would be classified `replaced`, not
+`cancelled`. Use the reason to choose your wording, and use the receipt's actual contents to decide
+anything that moves money.
+</Aside>
+
+## The button most products should build first
+
+Cancel is the request that arrives. Speed Up is usually the one that should ship.
+
+They are the same mechanism with a different payload — same nonce, higher fee, and in the speed-up case
+identical `value` and `data` so that the user's action still happens. It resolves the same ambiguity a
+cancel does, because either way exactly one transaction consumes the nonce and the account is
+unblocked. The difference is which outcome the user gets when they win.
+
+Two arguments for reaching for it first. The first is that most users pressing Cancel do not want the
+action undone; they want it *finished*, and they have reached for the only button that seemed to admit
+something was wrong. A flow that says "this is parked because the network got more expensive — pay more
+and it goes through now" answers the actual complaint, and it does not risk the outcome where they paid
+for nothing.
+
+The second is that speeding up is the recovery your own infrastructure needs. A settlement account with
+a parked transaction does not want that work abandoned; it wants it included so the queue moves. Build
+the reprice path, expose the cancel as the narrower case on top of it, and both your users and your
+operators are served by one piece of code — with a `'repriced'` reason arriving through the same
+callback that reports the other two.<Cite src="viem-wait-for-transaction-receipt" />
+
+## Worked example: building the button so it cannot lie
+
+**Subgoal: decide what the button is allowed to promise, before writing any of it.** The promise is
+"we will try to make this not happen, it will cost you gas, and it may not work". Everything else in
+the implementation follows from having written that sentence down, and if product will not accept the
+sentence, the honest response is that the feature does not exist rather than that it is hard.
+
+**Subgoal: construct the replacement so the only difference is the one you intend.** Same `from`, same
+`nonce`, `to` set to the sender's own address, `value: 0n`, no data, and a fee raised well clear of any
+plausible threshold. Reading the nonce is the step people skip: it must be the nonce of *the
+transaction being cancelled*, taken from your own record of it, not a fresh call to
+`eth_getTransactionCount`, because the pending count on a node that has forgotten the original will
+hand you the wrong number.<Cite src="ethereum-org-json-rpc" />
+
+```ts
+const cancelHash = await walletClient.sendTransaction({
+  account,
+  to: account.address,          // the point is that this does nothing
+  value: 0n,
+  nonce: original.nonce,        // from your record, not from the node
+  maxFeePerGas: bumped(original.maxFeePerGas),
+  maxPriorityFeePerGas: bumped(original.maxPriorityFeePerGas),
+})
+```
+
+Both fee fields have to rise. A pool comparing only one of them will still reject the pair, and
+[the effective price](/c/eip-1559-fee-fields) is derived from both:
+`priority_fee_per_gas = min(transaction.max_priority_fee_per_gas, transaction.max_fee_per_gas - block.base_fee_per_gas)`.<Cite src="eip-1559" />
+
+**Subgoal: keep watching both, because you do not know which one wins.** You now have two hashes
+competing for one nonce, and the resolution is a single fact: which transaction ends up at that nonce.
+Watch the original with `onReplaced` — if the cancel wins, that callback fires with
+`'cancelled'`.<Cite src="viem-wait-for-transaction-receipt" /> Watch the cancel too, because if it is
+the one that gets dropped you need to know you are back to watching only the original.
+
+**Subgoal: render the intermediate state, which is the one everyone forgets.** Between broadcasting the
+cancel and learning the outcome there is a window where *both* are live. The user pressed Cancel and
+the correct interface state is not "cancelled" — it is "cancelling", with the original still shown and
+still capable of succeeding. Marking it cancelled optimistically is precisely the
+[optimistic-UI mistake](/c/tx-optimistic-ui-boundary) this module ends on: the display can be undone,
+but if that display drove an off-chain action, that cannot.
+
+**Subgoal: handle the rejection at broadcast separately from the loss at inclusion.** A node refusing
+the replacement outright — bump too small — is recoverable and cheap: raise the bump and try again,
+having spent nothing. Losing the race after acceptance is terminal and paid for. These are different
+error paths and the second one needs the user to be told what actually executed.
+
+## Reproducing the race deterministically
+
+You cannot reason your way to confidence about a race. You can run it.
+
+Turn off automatic mining with `evm_setAutomine`, whose parameter is `enabled` — "true for instant
+mining, false to stop instant mining".<Cite src="anvil-rpc-methods" /> Send the original at a low fee.
+Send a replacement at the same nonce with a higher fee. Then mine with `anvil_mine`, which "Mines a
+series of blocks" with an optional block count and interval.<Cite src="anvil-rpc-methods" />
+
+What to assert, in order of how much each one teaches:
+
+1. **Exactly one receipt exists.** Two hashes, one nonce, one execution.
+2. **The account's transaction count advanced by one, not two.** This is the assertion that makes the
+   "one slot" model concrete, and it is the one that surprises people who expected the loser to be
+   "queued for later".
+3. **Your UI reached the `replaced` state with the right reason** — and, if you built the cancel,
+   `'cancelled'` rather than `'repriced'`.
+4. **The loser's hash resolves to nothing, forever.** Poll it. It stays `null`, exactly as a dropped
+   transaction does,<Cite src="ethereum-org-json-rpc" /> which is why the losing side of a race and a
+   drop are indistinguishable by hash alone and distinguishable instantly by nonce.
+
+Then run it the other way — replacement first, original second — and observe that the pool refuses the
+lower-fee one. That refusal is the anti-spam rule doing its job, and seeing the error text once is
+worth more than any amount of reading about the threshold.
+
+<Check type="spot-bug" concept="tx-cancel-is-a-replacement">
+A team ships this cancel flow. It works in their manual testing.
+
+```ts
+async function cancel(tx: TrackedTx) {
+  const nonce = await publicClient.getTransactionCount({
+    address: account.address,
+    blockTag: 'pending',
+  })
+  const hash = await walletClient.sendTransaction({
+    account,
+    to: account.address,
+    value: 0n,
+    nonce,
+    maxFeePerGas: tx.maxFeePerGas + 1n,
+    maxPriorityFeePerGas: tx.maxPriorityFeePerGas,
+  })
+  markCancelled(tx.id)
+  return hash
+}
+```
+
+Find every defect. For each, say what the user experiences and whether it is a display problem or a
+money problem.
+
+<Answer>
+**1. The nonce is wrong, and this is the money bug.** `getTransactionCount` at `pending` returns the
+count *including* the node's pending transactions, so for an account with one live transaction it
+returns the nonce *after* the one being cancelled.<Cite src="ethereum-org-json-rpc" /> This
+transaction therefore does not compete with `tx` at all — it is a brand-new zero-value self-send at the
+next nonce. The original executes normally. The user pressed Cancel, was told it worked, paid for an
+extra transaction, and their action went through. The nonce must come from the tracked transaction's
+own record.
+
+Worse, this is the version that *passes* manual testing on a fast local chain, because the original is
+usually already mined by the time anyone clicks, at which point the pending count happens to equal the
+right number for a different reason.
+
+**2. `maxPriorityFeePerGas` is not raised.** Only the total cap moves, by one wei. Any pool applying a
+percentage bump to both fee fields rejects this, and a bump of one wei fails every plausible threshold
+anyway — go-ethereum's documented default for `--txpool.pricebump` is a percentage, not an absolute
+value.<Cite src="geth-cli-options" /> The user sees an opaque broadcast error. Display problem, and a
+cheap one: nothing was signed onto the chain.
+
+**3. `markCancelled` fires before anything is resolved.** The cancel has been broadcast, not won. The
+correct state is "cancelling", and the terminal state is only known when one of the two transactions is
+included. If `markCancelled` merely greys out a row, this is a display problem. If it releases a hold,
+un-reserves inventory, or tells another system the user backed out, it is a money problem — the original
+can still land and the two systems now disagree permanently.
+
+**4. There is no watcher on the outcome.** Nothing calls `waitForTransactionReceipt` with `onReplaced`
+on the original, so even when the cancel does win, the app never learns the reason and cannot tell
+`'cancelled'` from `'repriced'` from `'replaced'`.<Cite src="viem-wait-for-transaction-receipt" /> A
+user who instead pressed "Speed Up" in their wallet gets treated identically to one who cancelled.
+
+**5. There is no failure path for losing the race.** The function returns a hash and the flow ends.
+Nothing in the code can ever reach "the cancel lost and the original executed", which is the single
+state the user most needs to be told about, because it is the one where something happened that they
+believe they prevented.
+
+**6. Nothing is said about cost.** No confirmation step, no mention that the cancel is itself a paid
+transaction, no mention that it may not work. The button reads as a free undo. This is a copy problem
+that becomes a trust problem the first time it loses.
+
+**The corrected shape.** Take the nonce from the record; raise both fee fields by a comfortable
+percentage with retry on rejection; set state to `cancelling`; watch the original with `onReplaced` and
+watch the cancel's own receipt; resolve to `cancelled` or to `confirmed`/`reverted` for the original
+depending on which one lands; and put the cost and the uncertainty in the confirmation dialog, in that
+order, before the user commits to paying for it.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Immediately next: the hash you were tracking is now the wrong hash.** Every replacement in this
+lesson — repriced, cancelled or superseded — produces a new transaction hash for the same user action.
+Anything you keyed on the old one has just been orphaned, including database rows and webhook
+subscriptions you may not own. That is the next lesson, and it is short because the fix is one decision.
+
+**In your product, today:** find every "Cancel", "Undo" or "Stop" in a transaction flow and check
+whether its confirmation copy states that it costs gas and may fail. If it does not, you are shipping a
+promise the protocol does not make.
+
+**And in your operational tooling:** the replacement path is the only recovery mechanism for a blocked
+account. If it exists only as a button in a wallet UI that one engineer has open, it does not exist at
+3am. Build it as a script, with the nonce as an argument, and test it against a local chain the way this
+lesson describes — before it is the thing standing between you and a settlement queue that has been
+stopped for an hour.

@@ -1,0 +1,271 @@
+---
+id: evm-state-tries-proving-a-balance-to-a-phone
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-1186, execution-apis-eth-state, consensus-specs-light-client, eip-4788, storage-proofs-arxiv, geth-dbpruning, geth-hardware, eip-7864, ethereum-org-mpt, execution-specs]
+stack: {}
+---
+
+Two wallet apps display the same balance for the same address.
+
+The first asked an RPC provider and rendered the answer. The second asked the same provider for a
+Merkle proof, ran a verifier on the phone, and rendered the answer only after the proof checked out.
+The second team's release notes say "trustless balance verification". Their threat model document says
+the provider can no longer lie to them.
+
+**If the second app also got its block header from that provider, the two apps have exactly the same
+threat model.** The proof checked out against a root the liar supplied.
+
+This lesson is about that gap. The mechanics of walking a proof you already have — you built the
+verifier in Track 01, and [a proof is a node list](/c/mpt-proof-is-node-list), not a tree. What this
+lesson adds is the part that is actually hard in production: where a trustworthy root comes from, what
+it costs to get one, and what verification does and does not remove from your risk register.
+
+## What `eth_getProof` hands you
+
+The method takes an address, an array of storage keys, and a block. It returns the account's four
+fields plus two kinds of proof: `accountProof`, an array of RLP-serialised trie nodes starting with the
+state-root node and following the path of the hashed address; and, per requested key, a `proof` array
+starting with the storage-root node and following the path of the hashed
+key.<Cite src="eip-1186" /> Two walks, chained by the `storageHash` field you extract from the first.
+
+<Figure
+  caption="A proof is the nodes along one path; every other child of those nodes travels as a bare hash inside them."
+  alt="A walk from the state root through two branch nodes to the account leaf. Each node on the path is shipped whole, the fifteen sibling hashes at each level are carried inside those nodes rather than sent separately, and the account leaf is the value being proved."
+>
+  <Tree
+    root={{
+      label: 'stateRoot',
+      note: 'from a header you trust',
+      tone: 'accent',
+      children: [
+        {
+          label: 'branch node',
+          note: 'shipped whole',
+          children: [
+            { label: '15 sibling hashes', note: '32 bytes each', tone: 'muted', dashed: true },
+            {
+              label: 'branch node',
+              note: 'shipped whole',
+              children: [
+                { label: '15 sibling hashes', note: '32 bytes each', tone: 'muted', dashed: true },
+                { label: 'account leaf', note: 'the four fields', tone: 'good' },
+              ],
+            },
+          ],
+        },
+      ],
+    }}
+  />
+</Figure>
+
+Three properties of that response are worth stating precisely, because each one is a design constraint
+rather than a detail.
+
+**The verifier needs the 32-byte state root and nothing else from the provider.** Every node is checked
+against a hash held by its parent, and the first node is checked against the root. EIP-1186 notes that
+even the convenience fields at the top level — `balance`, `nonce`, `storageHash`, `codeHash` — could be
+read out of the last node of the proof instead.<Cite src="eip-1186" /> Treat them as untrusted until
+they match what you decoded. A response that disagrees with its own proof is a bug or an attack, and
+either way you want to notice.
+
+**The block is an argument, not a default.** A proof is a statement about one block. `latest` is a
+moving target, and on a client that has pruned, most blocks cannot be proved at all — a full node
+discards historical state, which is what separates it from an archive node and most of what separates
+650 GB from more than 12 TB in Geth's own published figures.<Cite src="geth-hardware" /><Cite src="geth-dbpruning" />
+"Get me a proof for last month" is an archive-node request, priced accordingly.
+
+**Proofs are not small.** Each level ships a whole node, and a hexary branch node carries all sixteen
+child references whether you need them or not. EIP-7864 puts the expected cost of proving one branch in
+a `2^32`-entry tree at `15 * 32 * log_16(2^32) = 3840` bytes.<Cite src="eip-7864" /> An account plus one
+storage slot is two such walks. On a phone that is a rounding error; inside a contract, where you pay
+calldata per byte and keccak per node, it is the dominant cost of the feature.
+
+<Aside kind="note">
+EIP-1186 is marked Stagnant and dates from 2018.<Cite src="eip-1186" /> That is not deprecation —
+`eth_getProof` is implemented everywhere and its live parameter and return shapes are maintained in the
+execution APIs specification.<Cite src="execution-apis-eth-state" /> Read the EIP for the rationale and
+the exclusion-proof rule; read execution-apis for what a client will actually accept today.
+</Aside>
+
+## The verifier's four obligations
+
+Rather than re-derive the walk, hold the checklist. A verified read is only as strong as its weakest
+binding, and there are four.
+
+1. **Value under root.** Every node hashes to the reference its parent holds, and the first hashes to
+   the root you supplied. This is the part cryptography does for you, and the part everyone gets
+   right.
+2. **Path bound to the subject.** The account walk must follow `keccak256(expectedAddress)` and the
+   storage walk must follow `keccak256(expectedSlot)`.<Cite src="ethereum-org-mpt" /> A proof that is
+   internally perfect but walked along someone else's path proves a fact about someone else.
+3. **Root bound to a block.** The root must come from a header, and the header must hash to a block
+   hash you are willing to name.
+4. **Block bound to the canonical chain.** The block must be one the network actually built on, and —
+   depending on what you are about to do — final.
+
+Obligations one and two are local: a library can discharge them and a test can prove it.
+Obligations three and four cannot be discharged locally at all. **They are the whole problem**, and the
+rest of this lesson is about them.
+
+<Misconception
+  belief="eth_getProof proves the data is true."
+  reality="It proves the data is committed under a root you supplied. Where that root came from is a separate mechanism you still have to build, and it carries all the trust."
+  why="'Merkle proof' sounds self-sufficient, and in the demo it is — the demo hands the verifier a root that happens to be correct. The gap only becomes visible when you ask who chose the root, which nobody asks while the demo is passing."
+  src="eip-1186"
+/>
+
+## Where a root can come from, ranked by what it costs you
+
+Here is the ladder, cheapest and weakest first. Product teams pick a rung; most pick it by accident.
+
+**Rung 0 — ask the provider.** Fetch the header from the same endpoint that served the proof.
+Verification now defends against a corrupted cache, a mangled response, a middlebox, and your own
+decoding bugs. It defends against nothing the provider itself could do. This is the second wallet app
+in the opening, and it is not worthless — it is just not what the release notes said.
+
+**Rung 1 — compare independent providers.** Fetch the header from several endpoints and require
+agreement. You have replaced a trust assumption with a weaker one: that not all of them are colluding
+or compromised at once. That is a real improvement and it is a *quorum* assumption, not a proof.
+Notice the failure mode: providers frequently share upstream infrastructure, so the independence you
+are counting on may not exist.
+
+**Rung 2 — verify consensus yourself, with a light client.** The beacon chain was designed for this.
+The Altair light-client sync protocol exists specifically so that constrained environments can access
+Ethereum with reasonable safety and liveness, and it names its intended clients precisely: phones
+running trust-minimised wallets, and blockchain VMs running cross-chain
+bridges.<Cite src="consensus-specs-light-client" /> The design uses **sync committees** — a subset of
+validators for each period, whose signatures over headers a light client can check, tracking the
+committee forward from one period to the next and applying an explicit safety
+threshold.<Cite src="consensus-specs-light-client" />
+
+This is a genuine change of kind. The assumption stops being "the provider is honest" and becomes "the
+validator set is behaving", which is the assumption the chain itself rests on. The price is real
+engineering: a store to maintain, updates to fetch, forks to follow, and a bootstrap problem — the
+light client must be initialised from a checkpoint it obtained *somehow*, and that somehow is a trust
+decision you make once.
+
+**Rung 3 — read the root from a chain you are already trusting.** For a contract, this is the practical
+answer. EIP-4788 puts the parent beacon block root into every execution header and exposes it through a
+system contract, so EVM code can read a consensus-layer root without an
+oracle.<Cite src="eip-4788" /> For a rollup, the canonical bridge already relays roots in both
+directions as part of its own operation. In both cases you inherit somebody's existing security rather
+than adding a new one.
+
+**Rung 4 — a committee attests.** Many bridges do this: a named set of signers asserts what the other
+chain's root is. Nothing wrong with saying so; the problem is saying "trustless" while doing it. If the
+committee is the thing standing between an attacker and the funds, then the proof verification
+downstream of it is decoration. This is the shape [the bridge honeypot](/c/bridge-is-the-honeypot)
+takes, and it is why [the header verification problem](/c/header-verification-problem) is the part of a
+bridge worth auditing.
+
+<Misconception
+  belief="A storage proof tells you the current value of a slot."
+  reality="It tells you the value at one specific block. Freshness is a separate problem, and for anything cross-chain it is the hard part."
+  why="RPC calls default to the latest block, so the block dimension is invisible in day-to-day use. It becomes very visible the moment the consumer is a contract on another chain, which only knows about headers somebody bothered to relay to it — and relaying costs gas, so the cadence is a business decision."
+  src="storage-proofs-arxiv"
+/>
+
+## Finality is the fourth obligation, and it is a product decision
+
+A root can be perfectly real and still belong to a block that gets reorganised away.
+
+So obligation four is not "is this block valid" but "is this block one I am willing to act on", and the
+answer depends on the action, not on the chain. [Confirmation depth is a dial](/c/finality-is-a-spectrum),
+and the mapping is the one you already know: reads can be aggressive, irreversible actions cannot.
+
+For a wallet showing a balance, `latest` is fine — a reorg means a number on screen was briefly wrong,
+and the next refresh fixes it. For a contract releasing funds against a proof from another chain,
+`latest` is a vulnerability with a name, because the release is not reversible and the proof's block
+may not survive. The proof is equally valid in both cases. What changed is the cost of being wrong.
+
+## What verification actually removes
+
+Be exact about this, because "trustless" is doing a lot of unearned work in most design documents.
+
+**Removed: forgery.** A server cannot construct a proof for a value that was not there without finding
+a keccak collision. If your root is sound, the value is sound.
+
+**Removed: silent corruption.** Truncated responses, cache poisoning, a proxy rewriting JSON, your own
+decoder misreading a node — all of these turn into a failed check rather than a wrong number.
+
+**Not removed: withholding.** A provider can refuse to answer, or answer slowly, or answer about a
+different block than you asked for. Withholding is a liveness failure, and it shows up as a missing
+answer rather than a wrong one — which is why it is survivable and why it needs an explicit timeout
+policy rather than a cryptographic one.
+
+**Not removed: root supply.** Rung 0 leaves you exactly where you started against the provider.
+
+**Not removed: the code.** The account leaf holds `codeHash`, not bytecode.<Cite src="eip-1186" />
+Proving what an account's code hash is tells you nothing about what the code does until you fetch the
+bytes and check they hash to it — a second fetch, and a second decision about who to ask.
+
+**Not removed: meaning.** A proof about slot `0x7f…` proves what is in that slot. That the slot
+*is* `balances[alice]` is a fact about the contract's storage layout, established by reading its source
+or its layout output — not by any proof.<Cite src="execution-specs" />
+
+<Check type="spot-bug" concept="proof-vs-trust">
+A team is building a mobile wallet with verified reads. Their design:
+
+- On launch, fetch the latest block header from the app's RPC endpoint and cache the `stateRoot`.
+- For each balance display, call `eth_getProof` against the same endpoint at `latest`.
+- Verify the account proof against the cached `stateRoot`, checking every node hashes to its parent's
+  reference and that the walk follows `keccak256(address)`.
+- Decode the leaf, compare the four fields to the response's convenience fields, and show the balance
+  only if everything matches.
+
+They ship this as "your balance is cryptographically verified — we cannot show you a fake number".
+Name the defects in order of severity, and say which ones the design can fix without changing rung.
+
+<Answer>
+**Defect 1, fatal: the root and the proof come from the same party.** Every check in the list is a
+consistency check *against a value that party chose*. A dishonest endpoint constructs its own trie
+containing any balance it likes, computes the root honestly, serves that root at launch and serves
+matching proofs forever. All checks pass. The verification adds nothing against the only adversary the
+release notes named.
+
+**Defect 2, serious: the root is cached at launch and the proofs are fetched at `latest`.** These are
+different blocks, and after the first new block they are guaranteed to be. Either the app rejects every
+proof from the moment the chain advances one block — the benign outcome, which surfaces as "verification is flaky" and gets
+turned off — or the verifier is lenient enough not to notice, which means it was never really checking
+obligation three. Pin the proof to the same block as the root: pass an explicit block number rather
+than `latest`.<Cite src="eip-1186" />
+
+**Defect 3: nothing binds the header to the chain.** Even with a fresh header per read, the app has not
+checked that the header hashes to a block hash anyone else recognises, nor that the block is on the
+canonical chain. For a balance display this is a low-severity gap — but it is the gap, so it should be
+written down rather than discovered later by whoever adds transaction signing to the same code path.
+
+**Defect 4, minor and real: the convenience-field comparison is backwards in spirit.** Comparing the
+decoded leaf to the response's top-level fields is the right check, but the decoded leaf is the source
+of truth and the response fields are the untrusted copy.<Cite src="eip-1186" /> Render from the decoded
+values, not from the response.
+
+**What they can fix without changing rung.** Defects 2 and 4 are local bugs — fixable today with no new
+infrastructure and no new dependency. Defect 3 is partly local.
+
+**What they cannot.** Defect 1 is not a bug in this code; it is the rung. Fixing it means fetching
+headers from somewhere other than the party serving proofs — several independent endpoints for a quorum
+assumption, or a beacon light client for a consensus assumption, which is the case the Altair
+light-client spec was written for.<Cite src="consensus-specs-light-client" />
+
+**And the honest release note**, which is worth more than the feature: *"Balance responses are checked
+against the block header we fetch, so a corrupted or truncated response cannot show you a wrong number.
+We still rely on our node provider for the header itself."* That sentence is true, is useful, and tells
+a reader exactly which attack is still open.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Lesson 6** turns the proof size in this lesson into a systems constraint: four kilobytes per branch is
+fine for one balance and is not fine for a witness covering every account a block touches.
+
+Across the curriculum, this checklist is the one that keeps returning. A
+[storage-proof bridge](/c/storage-proof-bridge) is obligations one and two done in Solidity and
+obligations three and four done by whatever supplies its headers — and that is where the money has gone
+when bridges have failed.<Cite src="storage-proofs-arxiv" /> Rollup withdrawal proofs are the same
+shape with the chain's own bridge on rung 3. And the general habit transfers past Ethereum entirely:
+when someone shows you a proof, ask what it is anchored to and who chose the anchor.

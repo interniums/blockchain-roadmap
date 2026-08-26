@@ -1,0 +1,289 @@
+---
+id: toolchain-fork-testing-not-a-download
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    foundry-fork-testing,
+    forge-test-reference,
+    forge-cache-reference,
+    foundry-config-overview,
+    execution-apis-spec,
+    measured-fork-cache-1-7-1,
+    measured-forge-1-7-1,
+    eth-archive-nodes,
+    eip-7702,
+  ]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+A vault integration is under review. It has a mock for the token it holds:
+
+```solidity
+contract MockERC20 {
+    mapping(address => uint256) public balanceOf;
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+```
+
+Nineteen tests pass against it. Deposit, withdraw, share accounting, rounding, the zero-amount edge.
+Coverage is high and the assertions are real.
+
+Every one of those tests is a statement about `MockERC20`, and none of them is a statement about the
+token the vault will actually hold. The mock returns `true`; a deployed token might return nothing at
+all ([the missing-return case](/c/erc20-missing-return)). The mock moves exactly `amount`; a deployed
+token might move less ([fee-on-transfer](/c/fee-on-transfer-tokens)) or change your balance while you
+are not looking ([rebasing](/c/rebasing-tokens)). You know that taxonomy already. The point here is
+narrower and worse: **a mock is a written record of what you believe the dependency does, and
+integration bugs live precisely in the gap between that belief and the deployed bytecode.** A suite
+built on mocks cannot detect a wrong belief, because the same belief wrote both sides.
+
+A fork test closes that gap by deleting one side of it. Your contracts run in a local EVM whose state
+is backed by a real chain at a chosen block, so the call into the token reaches the actual deployed
+code, at the actual storage, with the actual balances.<Cite src="foundry-fork-testing" />
+
+<Figure
+  caption="A fork starts empty and reaches the network only on the first touch of each distinct item — which is why nothing is downloaded and why the bill tracks what your test reads."
+  alt="One opcode needs code or a storage slot. The local EVM, which starts empty, either finds the item locally and touches no network, or misses and issues a single JSON-RPC state read scoped to the pinned block, whose answer is then cached."
+>
+  <Flow
+    nodes={[
+      { id: 'op', label: 'one opcode', note: 'needs code, or a slot', col: 0 },
+      { id: 'evm', label: 'the local EVM', note: 'empty when it starts', col: 1, tone: 'accent' },
+      { id: 'hit', label: 'found locally', note: 'no network at all', col: 2, tone: 'good' },
+      { id: 'miss', label: 'not found', note: 'the first touch only', col: 2, tone: 'warn' },
+      { id: 'rpc', label: 'one RPC read', note: 'at the pinned block, then cached', col: 3, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'op', to: 'evm' },
+      { from: 'evm', to: 'hit', tone: 'good' },
+      { from: 'evm', to: 'miss', tone: 'warn' },
+      { from: 'miss', to: 'rpc', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+## What "forking mainnet" costs, measured
+
+The phrase sounds expensive. Here is what it actually did on the machine this lesson was written on —
+forge 1.7.1, solc 0.8.36.<Cite src="measured-forge-1-7-1" />
+
+One test. It reads one number off one deployed contract:
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20 { function totalSupply() external view returns (uint256); }
+
+contract ForkProbeTest {
+    function test_UsdcTotalSupply() public view {
+        uint256 ts = IERC20(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48).totalSupply();
+        require(ts > 0, "no supply");
+    }
+}
+```
+
+Run against a real chain, pinned to a block — `--fork-url` names the endpoint,
+`--fork-block-number` fixes which block the state reads refer
+to:<Cite src="forge-test-reference" /><Cite src="foundry-fork-testing" />
+
+```bash
+$ forge test --fork-url https://ethereum.reth.rs/rpc --fork-block-number 21000000
+[PASS] test_UsdcTotalSupply() (gas: 12843)
+Suite result: ok. 1 passed; 0 failed; 0 skipped; finished in 689.14ms
+```
+
+Then ask Foundry what it kept:
+
+```bash
+$ forge cache ls
+- mainnet (10.4 kB)
+	- Block Explorer (0.0 B)
+
+	- Block 21000000 (10.4 kB)
+```
+
+**About ten and a half kilobytes** — 10,362 bytes on
+disk.<Cite src="measured-fork-cache-1-7-1" /><Cite src="forge-cache-reference" />
+Not a terabyte, not a gigabyte. The archive of every historical Ethereum state is a multi-terabyte
+artefact that specialist operators maintain deliberately;<Cite src="eth-archive-nodes" /> what landed
+on disk here was one contract's code and the handful of slots that one `totalSupply()` call touched.
+
+That number *is* the mechanism. Nothing was downloaded. Something was fetched, on demand, exactly
+once, because a running EVM asked for it.
+
+<Misconception
+  belief="Forking the chain downloads a copy of it locally, so it is slow and needs a lot of disk."
+  reality="Nothing is downloaded up front. The local EVM starts empty and requests an account, a code blob or a storage slot over RPC the first time execution touches it. Starting a fork is nearly free; the cost tracks how much distinct state your test reads."
+  why="'Fork' is borrowed from version control, where forking a repository does mean cloning it. The word arrived with the wrong mental model attached."
+  src="foundry-fork-testing"
+/>
+
+## Following one call to the wire
+
+Take the same test and name what happens at each step, because the purpose of each step is what
+makes the cost model predictable later.
+
+**Subgoal — establish what the local EVM knows before the first instruction.** Nothing. No snapshot,
+no preloaded account set, no header chain — an empty state database, the block number you pinned, and
+an endpoint it is allowed to ask.
+
+**Subgoal — find out what forces the first network round trip.** Your test executes `CALL` to the
+token address, and the interpreter needs that account's code to have anything to execute. That is the
+trigger: not "connecting to mainnet", but one opcode needing one thing it does not have.
+
+**Subgoal — identify the shape of the request.** An ordinary JSON-RPC state read of the kind every
+wallet issues — the `eth_getCode` / `eth_getStorageAt` / `eth_getBalance` family, each scoped to one
+item at one block.<Cite src="execution-apis-spec" /> No Foundry-specific protocol, no privileged
+access. Anything you can fork, you could have read by hand.
+
+**Subgoal — see why the block number is part of the question, not just the answer.** Every one of
+those reads takes a block parameter.<Cite src="execution-apis-spec" /> "The balance of this account"
+is not a well-formed question on a chain; "the balance as of block 21,000,000" is. That is why the pin
+reaches all the way down into each individual request — and, three lessons from now, why it decides
+what your fork suite costs.
+
+**Subgoal — watch the second access do nothing.** The code comes back, dispatch runs locally, the
+function body's `SLOAD` fetches the total-supply slot, and the result is written to Foundry's
+cache.<Cite src="foundry-fork-testing" /> Re-run and the interpreter asks for the same items, finds
+them locally, and never touches the network. Cold runs of that one-assertion suite took 518.55 ms and
+689.14 ms on two attempts here; warm runs took 1.56 ms, 491 µs and 437 µs. The spread on the cold side
+is the network; the warm side has none to have.<Cite src="measured-fork-cache-1-7-1" />
+
+**Subgoal — state the invariant the whole module rests on.** The cost of a fork test is proportional
+to *how much distinct state it touches*, and to nothing else — not to the size of the chain, not to
+how old the block is, not to how many tests are in the file. A test that reads one slot is cheap
+forever. A test that walks a thousand positions in a lending market is not, because each of those
+positions is a slot somebody has to serve you.
+
+<Aside kind="note">
+Gas and RPC cost point the same way here, for the same physical reason: somebody has to go and find
+cold state. A cold `SLOAD` costs 2100 gas against 100 warm, and cold account access 2600 against
+100.<Cite src="measured-forge-1-7-1" /> Those constants are about a node's own disk; your fork test
+pays a larger version of the same bill over a network. If you already design around
+[cold versus warm access](/c/cold-vs-warm-access), the instinct transfers directly.
+</Aside>
+
+## What you get that a mock cannot give you
+
+Three things, and it is worth being precise because "realism" on its own is not an
+argument.<Cite src="foundry-fork-testing" />
+
+**The deployed bytecode, not your reading of it.** Verified source on an explorer is a claim about the
+bytecode; the bytecode is the contract. Every behaviour that lives in a compiler version, an
+inline-assembly branch, an upgrade nobody re-verified, or a proxy pointing somewhere unexpected is
+present without you having to know about it in advance.
+
+**The real state, including the parts nobody documents.** Whether a market is paused, whether a role
+was rotated, how large the reserves are relative to your position — none of that is in an interface,
+and all of it changes what your integration does.
+
+**The real graph, transitively.** Mock one contract and you mock a node; fork and you get the whole
+reachable subgraph — oracle, registry, factory — in its real configuration, for the same effort.
+
+There is a fourth thing worth naming because it has bitten people recently. A "user" address on
+forked mainnet may not be a plain externally-owned account any more: since EIP-7702 an EOA can carry a
+delegation designator, so it has code.<Cite src="eip-7702" /> A helper that decides "this is an EOA"
+by testing `addr.code.length == 0` behaves one way against a synthetic local address and another way
+against real 2026 state — which is exactly the class of surprise fork testing exists to surface, and
+exactly why [detecting a delegated EOA](/c/detect-delegated-eoa) is a habit rather than a trick.
+
+<Misconception
+  belief="If the mock implements the same interface, testing against it is equivalent to testing against the real thing."
+  reality="An interface constrains the call shape and nothing else. Return-value conventions, revert conditions, state-dependent behaviour, fees, pauses and access control are all outside it, and all of them are where integration bugs live."
+  why="Type-checked interfaces feel like contracts in the design-by-contract sense. In Solidity an interface is a calling convention, and the compiler cannot check anything about the code on the other side of the call."
+  src="foundry-fork-testing"
+/>
+
+## What this does not buy you
+
+Two limits, stated now so that nothing later reads as a betrayal.
+
+**A fork test is still a test you wrote.** It removes the risk that your model of the dependency is
+wrong. It does not remove the risk that your model of the *scenario* is wrong. The vault above can
+pass against real deployed tokens and still hold a wrong belief about who calls it in what order.
+Fork tests cover integration risk. They cover nothing else, and they cover it only for the paths you
+thought to write.
+
+**A fork test depends on a service.** Every property you assert this way is now downstream of a
+third-party endpoint continuing to answer questions about a block you chose. That dependency has a
+cost, a rate limit and an availability story — forge 1.7.1 ships flags for all three, including a
+compute-units-per-second throttle and a retry backoff — and it is the reason the last two lessons in
+this module are about money and CI rather than about
+cheatcodes.<Cite src="forge-test-reference" /><Cite src="measured-forge-1-7-1" />
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'A mock', note: 'a contract in your test file', tone: 'muted' },
+    { title: 'A fork', note: 'real state at a chosen block', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'What does the call actually reach?', cells: ['Code you wrote', 'The deployed bytecode at that address'] },
+    { label: 'Who decided how it behaves?', cells: ['You, in the same sitting as the code under test', 'Whoever deployed it, and whoever has upgraded it since'] },
+    { label: 'What can it be silently wrong about?', cells: ['Anything you believed about the dependency that is not true', 'Nothing about the dependency — everything about the scenario you chose to write'] },
+    { label: 'What does running it depend on?', cells: ['Nothing outside the repository', 'A third-party endpoint that still answers for your block'] },
+  ]}
+  caption="The two failure modes are disjoint, which is the argument for keeping both kinds of test rather than replacing one with the other."
+  alt="A mock and a fork compared on what the call reaches, who decided the behaviour, what each can be silently wrong about, and what running it depends on."
+/>
+
+<Check type="predict" concept="lazy-state-fetch">
+You have two forked tests, both pinned to the same mainnet block, both run for the first time on a
+clean cache.
+
+- **Test A** reads `totalSupply()` from one ERC-20 and asserts it is non-zero.
+- **Test B** loops over 200 different holder addresses and reads `balanceOf` for each one.
+
+Both run against the same chain, the same block, and the same endpoint. Predict how their first-run
+wall-clock times compare, and predict how big each one's cache entry is relative to the other. Then
+say what happens to each on a second run.
+
+<Answer>
+**Test B is dramatically slower on the first run and leaves a dramatically larger cache entry. Both
+are fast on the second run.**
+
+The reasoning is one sentence long: cost tracks distinct state touched. Test A touches one account,
+one code blob and a small number of slots — measured here at 10.4 kB of cache and between half a
+second and seven tenths of a second of suite time on a cold
+cache.<Cite src="measured-fork-cache-1-7-1" /><Cite src="forge-cache-reference" /> Test B touches the
+same account and code blob, and then 200 *different* mapping slots, each of which is a separate item
+the local EVM does not have and must ask for at that block.<Cite src="execution-apis-spec" /> A
+mapping puts each holder at [its own hashed slot](/c/mapping-slot-derivation) — no two holders share
+one — so there is no batching to be had at the state level.
+
+The second-run behaviour is the interesting half. Both tests become local, because the fetched items
+were written to the cache under the chain-and-block key.<Cite src="foundry-fork-testing" /> Test B is
+still doing 200 lookups, but they are disk lookups, not network ones, and the difference is the
+hundreds-of-milliseconds versus hundreds-of-microseconds gap measured above, in
+miniature.<Cite src="measured-fork-cache-1-7-1" />
+
+**The thing to take out of this:** the expensive dimension of a fork suite is not the number of tests
+or the age of the block. It is the breadth of state the suite reaches. That is a property you control
+by how you write assertions — and it is why "just loop over every position in the market" is a
+different kind of decision in a fork test than it is in a local one.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Immediately next:** there are two ways to put a test on a fork — a flag that forks the whole run,
+and cheatcodes that fork inside one test — and they solve different problems. Choosing the flag when
+you needed the cheatcodes is how a repository ends up unable to run `forge test` without a
+network.<Cite src="foundry-fork-testing" />
+
+**Two lessons on:** because a fork is just state behind a pointer, a single test can hold several of
+them, and switching between them replaces the entire world. That is what makes cross-chain tests
+possible and what makes helper contracts vanish.
+
+**Later in this module:** the block number you pinned is not only a determinism decision — it is the
+cache key.<Cite src="foundry-config-overview" /> What a forked suite costs in seconds, in requests, in
+money, and in whether it can run in CI at all follows from that one fact.

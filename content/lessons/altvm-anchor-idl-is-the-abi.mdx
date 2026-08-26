@@ -1,0 +1,353 @@
+---
+id: altvm-anchor-idl-is-the-abi
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [anchor-docs-idl, anchor-docs-cli, anchor-issue-3947, anchor-issue-4057, anchor-repo-changelog, anchor-changelog, anchor-docs, anchor-lang-error-docsrs, anchor-docs-errors, anchor-account-constraints, solana-docs-pda, anchor-docs-program-structure]
+stack: {}
+---
+
+Somebody hands you a program id on mainnet. Nothing else — no repository, no documentation, no
+contact.
+
+On Ethereum you know the drill. Open a block explorer, hope the deployer clicked verify, and if they
+did you get source and an ABI; if they did not you get bytecode and a decompiler. The ABI, when it
+exists, tells you the functions and their argument types. It does not tell you what state the
+contract holds, where any of it lives, or how to compute a storage location — that knowledge lives
+in the source, or in your head.
+
+On Solana with an Anchor program, you fetch a JSON document from an account whose address is derived
+from the program id, and it tells you every instruction, every account type with its fields, every
+custom error with its code and message, every eight-byte discriminator, and — where the build managed
+to work it out — the seeds from which each program-derived address is
+computed.<Cite src="anchor-docs-idl" /><Cite src="anchor-docs-cli" />
+
+That is a genuinely different capability, and it is one of the places where Solana's tooling is ahead
+rather than merely different. This lesson is about what that document contains, what it lets you do,
+and the two specific ways it can be wrong — because a build artifact that can be silently incomplete
+is a different kind of dependency from one that cannot.
+
+## What is in it
+
+`anchor build` generates the IDL at `target/idl/<program-name>.json`.<Cite src="anchor-docs-idl" />
+Four sections matter.
+
+**`instructions`** corresponds directly to the instructions defined in your program, specifying the
+required accounts and the parameters for each.<Cite src="anchor-docs-idl" /> This is the part with an
+ABI counterpart, and it carries strictly more: an ABI lists a function's parameter types, while an
+IDL instruction also lists the *accounts* it needs, in order, with their mutability and signer
+requirements. The `Accounts` struct — the security specification from lesson one — is exported.
+
+**`accounts`** corresponds to the structs annotated with `#[account]`: the data stored on accounts
+this program creates.<Cite src="anchor-docs-idl" /> Stop on this one. **There is no such section in
+an EVM ABI.** An ABI describes the call boundary; the storage layout behind it is not part of the
+interface and never was. Solana externalises state into accounts a client must fetch and decode
+anyway, so the layout has to be published, and publishing it turns "what does this program actually
+store" from a reverse-engineering exercise into a field read.
+
+**`errors`** carries your `#[error_code]` enum out to clients — the numbers and the `#[msg]`
+strings.<Cite src="anchor-docs-errors" /> This is what lets a client turn `0x1771` back into
+"Amount must be less than or equal to 100" without the program's logs, and it is why the positional
+numbering trap from lesson three has consequences beyond your repository: shift a variant and every
+client holding an older IDL now displays the wrong message for the right code.
+
+**`discriminator`** fields appear on instructions and account types, and have since Anchor
+v0.30.<Cite src="anchor-docs-idl" /> Before that a client recomputed them from names; now they are
+data, which matters because a program may override a discriminator with a
+constant.<Cite src="anchor-account-constraints" />
+
+And the section with no analogue anywhere in EVM tooling: **`pda`**, describing the seeds from which
+an account's address is derived.
+
+## Address derivation is the thing an ABI never had
+
+Set the two artifacts side by side and the asymmetry is the whole point.
+
+<Compare
+  axis=""
+  columns={[
+    { title: 'EVM ABI', tone: 'muted' },
+    { title: 'Anchor IDL', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'Produced by',
+      cells: [
+        'The compiler, mechanically from source',
+        <>A macro-driven build<Cite src="anchor-docs-idl" /></>,
+      ],
+    },
+    {
+      label: 'Call surface',
+      cells: [
+        'Functions, args, return types',
+        <>Instructions, args, <strong>and their account lists</strong><Cite src="anchor-docs-idl" /></>,
+      ],
+    },
+    {
+      label: 'State layout',
+      cells: [
+        'Absent',
+        <><code>accounts</code> section with field types<Cite src="anchor-docs-idl" /></>,
+      ],
+    },
+    {
+      label: 'Errors',
+      cells: [
+        'Custom error selectors',
+        <>Codes <strong>and messages</strong><Cite src="anchor-docs-errors" /></>,
+      ],
+    },
+    {
+      label: 'Address derivation',
+      cells: [
+        { v: 'Absent — no concept', tone: 'muted' },
+        { v: <><code>pda</code> seed descriptions<Cite src="anchor-issue-4057" /></>, tone: 'accent' },
+      ],
+    },
+    {
+      label: 'Distribution',
+      cells: [
+        'Off-chain: explorer, repo, registry',
+        <>Off-chain <strong>or on-chain</strong><Cite src="anchor-docs-cli" /></>,
+      ],
+    },
+  ]}
+  caption="Every row where the IDL carries more is a row about state — what the program stores, and how to find where it lives."
+  alt="EVM ABIs and Anchor IDLs compared on how they are produced, what call surface they describe, whether they carry state layout, how errors appear, whether address derivation is described, and how they are distributed."
+/>
+
+The `pda` row is the one to sit with. A generated client that knows an account lives at
+`[b"position", user.key()]` can compute its address for any user with no hand-written derivation
+code. Given that a Solana transaction must declare every account it touches before it is built — the
+[declared access tax](/c/declared-access-is-a-tax) — that capability is not a nicety. It is the
+difference between a generated client that works and a generated client that is a typed wrapper
+around a list of addresses you have to produce yourself.
+
+Which is exactly why the ways it can be missing matter.
+
+## Two ways the build under-describes the program
+
+A Solidity ABI is a mechanical function of the source. If the contract compiles, the ABI is complete,
+because there is nothing in it that requires the compiler to *understand* anything beyond
+declarations.
+
+An Anchor IDL is emitted by procedural macros that must interpret constraint expressions. That is a
+harder job, and it can partially fail while the program itself compiles and runs correctly. Two
+reported cases make the failure mode concrete.
+
+**Seeds that reference account fields have broken IDL generation outright.** Issue #3947, opened in
+September 2025 and since closed, reports that using seeds constraints referencing account fields in a
+`#[derive(Accounts)]` struct causes `anchor build` to fail with `error[E0425]: cannot find value`
+during IDL generation, while the same program compiles successfully under `anchor build
+--no-idl`.<Cite src="anchor-issue-3947" /> It was reported against 0.30 and 0.31.x. This failure mode
+is at least loud — you get a build error — but the workaround that circulates for it, building with
+`--no-idl`, is the quiet part: it ships a program with *no* IDL rather than a wrong one, and every
+downstream client generator then has nothing to work from.
+
+**Seeds can be silently omitted from an otherwise successful build.** Issue #4057, opened in November
+2025 and still open as of 26 August 2026, reports that when an account uses both `init` and `seeds`,
+the generated IDL omits the `pda` field describing the seed derivation — which, in the reporter's
+words, makes it impossible for client developers to correctly derive the PDA using only the IDL,
+defeating the purpose of IDL-based client generation.<Cite src="anchor-issue-4057" />
+
+Read the second one carefully, because its shape is the lesson. The program is correct. The build
+succeeds. The IDL is valid JSON and passes every schema check. A generated client compiles. And the
+client cannot derive an address it needs, so somebody hand-writes the derivation, and now the seed
+scheme is expressed in two places that no build step compares. When the program's seeds change, one
+of those places changes.
+
+And note *which* combination triggers it: `init` together with `seeds` — the exact pattern from the
+previous lesson, which is to say the most common way anyone creates a PDA account in Anchor.
+
+<Misconception
+  belief="The IDL is a complete, trustworthy description of the program, because it is build output."
+  reality="Known issues let a build emit an IDL missing PDA seed information, or fail on seeds that reference account fields. A generated client can therefore be silently wrong in exactly the place — address derivation — where a wrong client is hardest to notice."
+  why="People treat build output as something that cannot be incomplete, because in the compiler they came from it cannot be. An ABI is a mechanical function of declarations; an IDL requires the macro to interpret expressions, which is a job that can partly fail."
+  src="anchor-issue-4057"
+/>
+
+<Aside kind="warn">
+The concrete check, worth doing once per program and again after any Anchor upgrade: run
+`anchor build`, open `target/idl/<program>.json`, and for every account you expect to be a PDA,
+confirm a `pda` field is present and its seeds match the constraint in the
+source.<Cite src="anchor-docs-idl" /><Cite src="anchor-issue-4057" /> This is a five-minute audit
+that catches a class of client bug that otherwise surfaces as "the account does not exist" against a
+production address.
+</Aside>
+
+## The IDL on chain, and what it does not prove
+
+Now the capability that has no Ethereum equivalent at all.
+
+The IDL can be written into a program-owned account at a deterministic address that is a function of
+nothing but the program's id, so a client can generate an interface for a program using nothing but
+that id.<Cite src="anchor-docs-cli" /> There is no registry to query, no repository to find, no
+verified-source step to hope somebody performed. An explorer can decode an unknown program's accounts
+and instructions on sight.
+
+The tooling around this moved substantially at 1.0, and the honest position is that you should check
+your own version rather than trust prose. Two changes are recorded: `anchor deploy` uploads the IDL to
+the cluster by default unless `--no-idl` is passed, and the legacy IDL instructions were removed in
+favour of integrating the Program Metadata program for IDL
+management.<Cite src="anchor-repo-changelog" /> Program-id arguments were also dropped from
+`idl init` and `idl upgrade`.<Cite src="anchor-repo-changelog" /> Anchor's own CLI reference page
+still documents the older forms, including the `[program-id]` argument, so the documentation and the
+changelog currently disagree — resolve it with `anchor idl --help` on your
+installation.<Cite src="anchor-docs-cli" /><Cite src="anchor-changelog" />
+
+There is also `anchor idl fetch-historical`, added in 1.1.1, which recovers historical IDLs — useful
+when you are decoding an account written by a version of the program that no longer
+exists.<Cite src="anchor-repo-changelog" />
+
+**Now the part people get wrong.** An on-chain IDL is published by whoever holds the program's
+upgrade authority. It is an assertion, not a proof.
+
+Compare it against [verification as bytecode matching](/c/verification-is-bytecode-matching), which
+is the guarantee you are used to. Etherscan-style verification recompiles claimed source and checks
+that the output matches deployed bytecode; what it proves is a correspondence between two artifacts.
+It does not publish an interface — the ABI falls out of the source *because* the source was proved to
+correspond.
+
+The Solana arrangement inverts this. Publishing an IDL gives you an interface with no correspondence
+proof. The two properties come apart, and they are supplied by different tools: `anchor verify`
+verifies that the on-chain bytecode matches the locally compiled
+artifact,<Cite src="anchor-docs-cli" /> and since 0.32.0 it does so by using `solana-verify` under
+the hood with automatic installation via AVM.<Cite src="anchor-repo-changelog" /> On the client side,
+1.1.1 re-implemented `verifiedBuild` against the OtterSec registry at `verify.osec.io`, replacing a
+defunct API.<Cite src="anchor-repo-changelog" />
+
+So the reading protocol for an unknown program is two questions, not one, and they have different
+answers:
+
+- *What does this program claim to expose?* The IDL, fetched from the chain. Trustworthy as a
+  description of an interface, because a wrong one mostly produces transactions that fail.
+- *Does the deployed bytecode correspond to any source anybody can read?* A separate verification
+  step against a build registry, which many programs simply have not
+  done.<Cite src="anchor-docs-cli" /><Cite src="anchor-repo-changelog" />
+
+<Misconception
+  belief="If I can fetch a program's IDL from the chain, the program is verified."
+  reality="The IDL is data written by the upgrade authority. It describes an interface; it says nothing about whether the deployed bytecode matches any published source, and nothing about whether the program is honest. Verification is a separate tool with a separate registry."
+  why="On Ethereum the interface and the verification arrive together — you get an ABI *because* somebody verified — so the two feel like one event. Solana decoupled them, and the convenient half is the one that happens by default."
+  src="anchor-docs-cli"
+/>
+
+<Aside kind="note">
+There is a third property neither answers, and it is the one that actually decides your risk: who
+holds the upgrade authority, and can they replace the program under you. An IDL published by that
+authority describes the program as of now. The bytecode can change at the same address afterwards.
+This is closer to a proxy's admin key than to an immutable contract, and it belongs in the same
+mental slot.
+</Aside>
+
+## Using it: what the IDL actually buys you day to day
+
+Three things, in rising order of leverage.
+
+**Decoding accounts without writing a decoder.** `anchor account <program-name>.<AccountTypeName> <pubkey>`
+fetches an account and deserializes it to JSON using the type name you give, taking the types from
+the workspace's IDL files or from a path you supply.<Cite src="anchor-docs-cli" /> This is the "Read
+Contract" tab of a block explorer, available from a terminal, for any program whose IDL you can
+reach.
+
+**Client generation.** The IDL is what TypeScript and Rust client generators consume, and Codama is
+the mainstream generator producing modern Solana clients from it.<Cite src="anchor-docs" /> Anchor
+1.0 also renamed the TypeScript packages away from `@coral-xyz/anchor`; as noted in the first lesson,
+the CHANGELOG names two different replacements in different entries, so take the package name from
+the registry for the version you are installing.<Cite src="anchor-repo-changelog" />
+
+**Cross-program typing from inside Rust.** `declare_program!` builds typed bindings for another
+program from its IDL, which received a great deal of work through 1.0 and 1.1 — instruction parsers,
+error generation, better namespace handling.<Cite src="anchor-repo-changelog" /> The practical effect
+is that a CPI into somebody else's program can be typed rather than hand-encoded, which removes a
+category of "I encoded the arguments wrong" bug.
+
+<Check type="explain" concept="idl-is-the-abi">
+You are integrating with a Solana lending protocol. All you have is a mainnet program id. Your lead
+asks for a written answer to two questions before any code is merged: what can we determine about
+this program, and what are we trusting.
+
+Lay out the steps, and for each artifact you obtain, say what it proves and what it does not.
+
+<Answer>
+**Step 1 — fetch the IDL from the chain.** It lives at an account derived deterministically from the
+program id, so nothing beyond the id is needed.<Cite src="anchor-docs-cli" /> What you get:
+instructions with their account lists and argument types, `#[account]` state layouts, error codes with
+messages, discriminators, and PDA seed descriptions where the build emitted
+them.<Cite src="anchor-docs-idl" /><Cite src="anchor-docs-errors" />
+
+*Proves:* what the program claims its interface is. That is a strong claim in practice, because a
+wrong instruction list mostly produces transactions that fail at the discriminator rather than
+transactions that do the wrong thing.<Cite src="anchor-docs-idl" />
+
+*Does not prove:* that the deployed bytecode corresponds to any readable source; that the IDL is
+current with the deployed version; that the IDL is complete.
+
+**Step 2 — check the IDL for missing `pda` fields, specifically on accounts that also use `init`.**
+This is the known gap: `init` plus `seeds` can produce an IDL with the seed description
+omitted.<Cite src="anchor-issue-4057" /> If a lending position account has no `pda` field, your
+generated client cannot derive position addresses and somebody on your team will hand-write the
+derivation from documentation or from a support conversation.
+
+*Consequence to write down explicitly:* any hand-written derivation is a second copy of the
+protocol's seed scheme that no build step checks against the first. Record where it lives and what
+happens when the protocol upgrades. This is a maintenance liability, not a security hole — but it
+becomes one the day the seeds change.
+
+**Step 3 — attempt verification, separately.** Check whether the program's bytecode has been verified
+against published source through the verified-build path, which is a different tool with a different
+registry from the IDL.<Cite src="anchor-docs-cli" /><Cite src="anchor-repo-changelog" />
+
+*Proves, if it succeeds:* the deployed bytecode corresponds to source you can read, so an audit of
+that source is an audit of what is running.
+
+*Does not prove:* anything about the future, because the bytecode at that address can be replaced by
+the upgrade authority.
+
+**Step 4 — find the upgrade authority, and treat it as the headline risk.** Whether it is a multisig,
+its threshold, and whether it is timelocked. An IDL and a verified build describe the program as of
+today; the upgrade authority decides whether that description survives the week.
+
+**Step 5 — decode live accounts and compare against the IDL's claims.**
+`anchor account <program>.<Type> <pubkey>` deserializes real mainnet accounts using the IDL's
+types.<Cite src="anchor-docs-cli" /> If the fields decode to values that make sense — balances that
+match the front end, authorities that match the published multisig — you have cheap evidence that the
+IDL corresponds to the deployed program. If they do not, stop: you are decoding with the wrong
+schema, and every assumption downstream is unfounded.
+
+**What to write in the document, in one paragraph.** We can determine the full interface and state
+layout from the chain with no cooperation from the protocol team. We are trusting three things
+separately: that the published IDL matches the deployed bytecode (unproven unless the build is
+verified), that any address derivation we hand-wrote because the IDL omitted it stays in sync with
+the protocol's actual seeds (unenforced, and a known Anchor gap for accounts created with
+`init`),<Cite src="anchor-issue-4057" /> and that the upgrade authority does not replace the program
+in a way that breaks our assumptions. The first two are checkable today. The third is a governance
+fact, and it belongs in the risk register in those words rather than in an engineering ticket.
+
+**The contrast worth stating for the lead.** On Ethereum you usually cannot get this far without the
+team's cooperation, because an unverified contract gives you bytecode. On Solana you get the whole
+interface for free and have to remember that free is not the same as
+proved.<Cite src="anchor-docs-cli" /><Cite src="anchor-lang-error-docsrs" />
+</Answer>
+</Check>
+
+## What this unlocks
+
+The IDL is the last piece of the framework's surface. What remains is its price.
+
+- **The final lesson** puts a number on the convenience — compute units per invocation, and the
+  serialization cost that scales with account size — and lays out the three places you can run a
+  test.<Cite src="solana-docs-pda" />
+- **The Pinocchio module** next takes the opposite bargain: no IDL by default, no generated
+  validation, and a fraction of the compute. Having seen what the IDL does for a client, you can now
+  price what giving it up costs a team rather than a
+  program.<Cite src="anchor-docs-program-structure" />
+- **`declare_program!`** is the bridge worth remembering when you get there: even a program you write
+  in a lower-level framework can publish an IDL so that other people's Anchor programs can call it
+  with types.<Cite src="anchor-repo-changelog" />
+
+One habit to take with you. When you next integrate with any Solana program, fetch its IDL before you
+read its documentation. The IDL is generated from the code that is deployed; the documentation is
+written by people, about the code they meant to deploy, at a time that may not be now.

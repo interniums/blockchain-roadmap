@@ -1,0 +1,379 @@
+---
+id: solidity-proxies-upgrades-storage-here-logic-there
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-7, eip-1967, oz-src-proxy, oz-src-erc1967proxy, oz-src-erc1967utils, oz-src-initializable, oz-docs-writing-upgradeable, oz-upgrades-proxy-pattern, oz-changelog, solidity-docs-storage-layout, solidity-docs-global-vars, measured-gas-constants, zealynx-upgrade-patterns]
+stack: { solidity: "0.8.36" }
+---
+
+A token you use every day has two entries on the explorer. The address in your wallet holds every
+balance, every allowance, the whole supply — and its runtime code is a few dozen bytes that contain
+no function called `transfer`. A second address, one no user has ever typed, holds a full ERC-20
+implementation and a completely empty storage trie.
+
+Neither address is the contract. The contract is the pair, joined by one opcode.
+
+This lesson is about what that split actually is, what it costs, and the specific way it goes wrong
+the first time somebody writes it themselves.
+
+<Figure
+  caption="Only the code travels. Storage, balance, logs and address(this) never leave the first account."
+  alt="A call reaches the proxy account, which holds all storage and balance; the proxy delegatecalls the implementation account, which holds only code; the resulting SSTORE writes back into the proxy's own slots."
+>
+  <Flow
+    lanes={['the call', 'the account', 'the code', 'the effect']}
+    nodes={[
+      { id: 'call', label: 'call to the proxy', note: 'raw calldata, not decoded', col: 0 },
+      { id: 'proxy', label: 'proxy account', note: 'balance, logs, the address users hold', col: 1, tone: 'accent' },
+      { id: 'impl', label: 'implementation', note: 'code only, storage empty', col: 2, tone: 'muted' },
+      { id: 'slots', label: "the proxy's storage", note: 'slot 0, slot 1, matched by number', col: 3, tone: 'accent' },
+    ]}
+    edges={[
+      { from: 'call', to: 'proxy', label: 'fallback' },
+      { from: 'proxy', to: 'impl', label: 'DELEGATECALL', tone: 'accent' },
+      { from: 'impl', to: 'slots', label: 'SSTORE' },
+    ]}
+  />
+</Figure>
+
+## The whole proxy is one function
+
+You already know `DELEGATECALL`: the callee's code runs, but `address(this)`, storage, balance,
+`msg.sender` and `msg.value` all stay the caller's, propagated unchanged from the parent
+scope.<Cite src="eip-7" /> A proxy is a contract that does nothing except that, for every call it
+receives.
+
+Here is OpenZeppelin's `Proxy._delegate` in full — this is the entire mechanism, not a
+simplification.<Cite src="oz-src-proxy" />
+
+```solidity
+function _delegate(address implementation) internal virtual {
+    assembly {
+        calldatacopy(0x00, 0x00, calldatasize())
+        let result := delegatecall(gas(), implementation, 0x00, calldatasize(), 0x00, 0x00)
+        returndatacopy(0x00, 0x00, returndatasize())
+        switch result
+        case 0 { revert(0x00, returndatasize()) }
+        default { return(0x00, returndatasize()) }
+    }
+}
+```
+
+Four steps, each with a purpose worth naming.
+
+**Step 1 — preserve the call verbatim.** `calldatacopy(0x00, 0x00, calldatasize())` copies the raw
+calldata, selector included, to memory offset zero. The proxy never decodes it. It has no ABI for
+the implementation and does not want one: forwarding bytes rather than arguments is what lets one
+proxy serve any implementation.
+
+**Step 2 — borrow the code.** `delegatecall(gas(), implementation, ...)` runs the implementation's
+bytecode in this account's context. `out` and `outsize` are both zero because the size of the return
+is not knowable yet.<Cite src="oz-src-proxy" />
+
+**Step 3 — recover the return.** `returndatasize()` is now known, so `returndatacopy` pulls the whole
+buffer back into memory at zero.
+
+**Step 4 — become transparent to the caller.** `return` and `revert` here exit the *external* call
+frame, not the Solidity function. Control never comes back to Solidity, which is exactly why the
+comment on this block says it takes full control of memory and is free to overwrite the scratch
+space at offset zero.<Cite src="oz-src-proxy" /> To the caller, the result is indistinguishable from
+having called the implementation directly — same return bytes, same revert data, same custom error
+selectors.
+
+That last property is what makes proxies invisible. `viem` decoding a revert, a `try`/`catch` three
+frames up, a subgraph handler — none of them see a proxy. They see the ABI they expected.
+
+## What lives where
+
+Say it as a table, because every bug in this module is a violation of one of these rows.
+
+| | Proxy account | Implementation account |
+|---|---|---|
+| Storage | all of it | empty in practice |
+| Ether balance | all of it | none |
+| `address(this)` during execution | this | this — still the proxy |
+| Code | the fallback above | the actual logic |
+| Address users hold | this one | never referenced by users |
+| Logs emitted | from this address | — |
+
+The row that surprises people in production is the last one. Every `Transfer` event your indexer
+sees carries the *proxy's* address, because `LOG` opcodes record the executing account and under
+delegatecall that is the proxy.<Cite src="eip-7" /> That is the desired behaviour — it is why an
+upgrade does not break your indexer — but it means the implementation address appears in no event,
+ever. Finding it requires reading storage, which is the next lesson.
+
+<Aside kind="note">
+"Implementation storage is empty" is a convention, not a rule. Nothing stops someone calling the
+implementation directly, and if it has an unguarded `initialize()` they can own that account.
+OpenZeppelin's answer is `_disableInitializers()` in the implementation's constructor, which burns
+the initializer on the implementation itself while leaving proxies free to
+initialize.<Cite src="oz-src-initializable" />
+</Aside>
+
+## The proxy has no ABI, and tools have to be told
+
+The proxy exposes exactly one entry point — a `fallback() external payable` — and OpenZeppelin's
+`Proxy` deliberately does not declare a `receive()` alongside it; the redundant one was removed in
+Contracts 5.0.<Cite src="oz-src-proxy" /><Cite src="oz-changelog" /> That single detail has
+consequences you will hit within an hour of working with a real deployment.
+
+**A plain value transfer with empty calldata is forwarded too.** With no `receive()` declared,
+empty calldata plus value falls to the payable fallback, which delegatecalls the implementation with
+zero-length calldata — so it lands on the *implementation's* `receive()` or fallback, running in the
+proxy's context. Whether ETH sent to the proxy is accepted, rejected or credited to somebody is a
+property of the implementation, and it can change on upgrade.
+
+**Every selector "exists" on the proxy.** There is no dispatcher in the proxy to reject an unknown
+function. Call `nonsense()` on it and the call is forwarded, arrives at the implementation's
+dispatcher, matches nothing, and hits *its* fallback — or reverts there. The error you get back is
+the implementation's, which is usually what you want and occasionally makes a missing-function bug
+look like a business-logic revert.
+
+**Verification is two contracts, and explorers map one onto the other.** `forge verify-contract`
+verifies the proxy's own bytecode, which is the fallback and nothing else. What lets an explorer show
+you `transfer` on the proxy's address is that it reads the implementation pointer out of storage and
+overlays the implementation's ABI. That overlay is exactly what the next lesson's standard
+exists to make possible.<Cite src="eip-1967" />
+
+**Value during an upgrade is treated as a mistake.** `ERC1967Utils.upgradeToAndCall` accepts
+`msg.value` only when there is a setup call to forward it to; with empty data it reverts
+`ERC1967NonPayable` rather than leaving ether stranded in an account whose new code may have no way
+to move it.<Cite src="oz-src-erc1967utils" />
+
+## The constructor never runs
+
+A constructor runs during deployment, in the deploying account's context, and its state writes land
+in the account being created. Deploy an implementation and its constructor writes the
+*implementation's* storage. The proxy was deployed separately and its constructor was its own.
+
+So three things a normal contract relies on stop working, and the upgrade documentation states all
+three as rules.<Cite src="oz-docs-writing-upgradeable" />
+
+- **Constructors are prohibited** in code that will sit behind a proxy. Their work moves into an
+  `initialize()` function guarded so it runs once.
+- **Initial values in declarations do not work.** `uint256 public fee = 30;` is compiled into the
+  constructor, so behind a proxy the fee is zero. Every initial value has to be assigned inside the
+  initializer.
+- **`immutable` variables are not storage at all.** They are patched into the runtime bytecode at
+  deployment, so they belong to the implementation and are identical for every proxy pointing at
+  it — which is occasionally what you want and usually a trap.
+
+Constant state variables are the exception and remain fine, because the compiler reserves no storage
+slot for them.<Cite src="oz-docs-writing-upgradeable" />
+
+<Aside kind="warn">
+An uninitialized proxy is a proxy anyone can initialize. OpenZeppelin closed the accident-prone
+version of this in Contracts 5.6.0: `ERC1967Proxy` and `TransparentUpgradeableProxy` now revert with
+`ERC1967ProxyUninitialized` if you deploy them without supplying an initializing call, and opting
+out requires deliberately overriding `_unsafeAllowUninitialized` to return
+true.<Cite src="oz-changelog" /><Cite src="oz-src-erc1967proxy" />
+</Aside>
+
+## Now the failure
+
+Two contracts. Both compiled correctly. Both pass their own tests.
+
+```solidity
+contract Proxy {
+    address implementation;                 // slot 0
+    // fallback delegates to `implementation`
+}
+
+contract TokenV1 {
+    uint256 totalSupply;                    // slot 0
+    mapping(address => uint256) balances;   // slot 1
+
+    function mint(uint256 amount) external {
+        totalSupply += amount;
+        balances[msg.sender] += amount;
+    }
+}
+```
+
+Storage slots are assigned per compilation unit, starting at slot 0 and running contiguously through
+the state variables in linearized inheritance order.<Cite src="solidity-docs-storage-layout" /> The
+proxy's compiler assigned slot 0 to `implementation`. The implementation's compiler assigned slot 0
+to `totalSupply`. Neither compiler has ever seen the other file.
+
+Delegatecall matches storage by slot *number*. There is no name in the bytecode to match on.
+
+**Subgoal 1 — establish the starting state.** The proxy is deployed pointing at `TokenV1` at
+`0x5FbDB2315678afecb367f032d93F642f64180aa3`. Slot 0 of the proxy holds that address, left-padded:
+
+```text
+slot 0  0x0000000000000000000000005fbdb2315678afecb367f032d93f642f64180aa3
+```
+
+**Subgoal 2 — make one ordinary call.** A user calls `mint(1000)` on the proxy. The fallback
+delegatecalls into `TokenV1`. `TokenV1`'s code executes `SSTORE` to slot 0 with the value 1000.
+
+**Subgoal 3 — read the damage.** Slot 0 of the proxy now holds:
+
+```text
+slot 0  0x00000000000000000000000000000000000000000000000000000000000003e8
+```
+
+The proxy's implementation pointer is now the address `0x00000000000000000000000000000000000003e8`.
+Nothing reverted. No event said anything was wrong. `mint` returned successfully, and as far as
+`TokenV1`'s own logic is concerned it did exactly what it was asked.
+
+**Subgoal 4 — watch the second call.** The user calls `balanceOf(...)`. The fallback loads slot 0,
+gets `0x...03e8`, and delegatecalls it. That address has no code — and the EVM treats a call to an
+account with no code as a **success returning empty data**. Low-level `delegatecall` performs none
+of the `EXTCODESIZE` existence checking that Solidity inserts around typed external
+calls.<Cite src="solidity-docs-global-vars" />
+
+So `result` is 1, `returndatasize()` is 0, and the proxy returns zero bytes to the caller. Whether
+that reads as `0`, as a decode failure, or as a silent no-op depends entirely on who is asking. The
+contract is now a very convincing shell that agrees with everything and does nothing.
+
+<Matrix
+  corner="Storage slot"
+  cols={['Proxy declares', 'TokenV1 declares', 'After one mint(1000)']}
+  rows={[
+    { label: 'slot 0', cells: ['implementation', 'totalSupply', { v: '0x…03e8 — an address with no code', tone: 'danger' }] },
+    { label: 'slot 1', cells: ['unused', 'balances', 'unchanged — a mapping writes derived slots'] },
+  ]}
+  caption="One number, two meanings: slot 0 is the pointer to one compiler and the supply to the other, and neither bytecode records which."
+  alt="Storage slot 0 is the proxy's implementation pointer and TokenV1's totalSupply; after mint(1000) it holds 0x...03e8, an address with no code. Slot 1 is unused in the proxy and holds TokenV1's balances mapping, which writes only its derived slots."
+/>
+
+<Misconception
+  belief="A storage collision like this would be caught at compile time, or at least at deploy time."
+  reality="The proxy and the implementation are separate compilations. Nothing in either bytecode records a variable name, and nothing in the deployment links the two layouts. The first signal is corrupted state."
+  why="Within a single contract the compiler does guarantee that two variables never share a slot, so slot assignment feels like a checked property rather than a per-compilation convention."
+  src="oz-upgrades-proxy-pattern"
+/>
+
+### The variant that is harder to see
+
+Reverse the roles and the same bug becomes a takeover rather than a brick.
+
+```solidity
+contract Proxy {
+    address implementation;   // slot 0, bytes 0..19
+    bool    paused;           // slot 0, byte 20   — packed
+}
+
+contract TokenV2 {
+    address owner;            // slot 0, bytes 0..19
+}
+```
+
+Contiguous items smaller than 32 bytes share a slot, the first one lower-order
+aligned.<Cite src="solidity-docs-storage-layout" /> So `implementation` occupies the low 20 bytes of
+slot 0 and `paused` sits in byte 20 directly above it. `TokenV2`'s `owner` occupies exactly the same
+low 20 bytes.
+
+Now `transferOwnership(attacker)` — a function with a perfectly ordinary name, on an implementation
+that looks like every other access-control contract you have read — writes the attacker's address
+into the proxy's implementation pointer. The attacker deploys a contract at that address containing
+a function that transfers the proxy's entire balance, and calls it through the proxy.
+
+The pause flag also gets zeroed as a side effect of the packed write, which is the detail that makes
+this hard to diagnose from a monitoring dashboard: the alert that fires is "contract unpaused",
+which reads as an admin action rather than a compromise.
+
+<Check type="spot-bug" concept="storage-collision">
+Here is a proxy that a team wrote after reading about this problem and deciding to be careful. They
+moved the implementation pointer out of slot 0.
+
+```solidity
+contract CarefulProxy {
+    uint256 private constant VERSION = 2;   // no slot
+    address private admin;                  // ?
+    address private implementation;         // ?
+    // fallback delegates to `implementation`
+}
+
+contract VaultV1 {
+    mapping(address => uint256) public shares;   // ?
+    uint256 public totalShares;                  // ?
+    address public feeRecipient;                 // ?
+}
+```
+
+Fill in the slot numbers for every variable in both contracts, then say which implementation
+function corrupts which proxy variable, and whether moving the pointer helped at all.
+
+<Answer>
+**Slot assignment.** `VERSION` is `constant`, so no slot is reserved for it — the value is inlined
+in the bytecode.<Cite src="solidity-docs-storage-layout" /> That leaves:
+
+```text
+CarefulProxy          VaultV1
+  slot 0  admin         slot 0  shares          (declared slot; data lives at keccak256(0))
+  slot 1  implementation slot 1  totalShares
+                        slot 2  feeRecipient
+```
+
+Two collisions, and one of them is worse than before.
+
+**`totalShares` overwrites `implementation`.** Every deposit and every withdrawal writes
+`totalShares`, so the pointer is destroyed by the first ordinary user action rather than by an admin
+function. The failure is faster and cheaper to trigger than in the slot-0 version.
+
+**`shares` does not overwrite `admin` — and that is the more interesting half.** A mapping's
+declared slot stays empty; it exists only to seed the derivation, and the values live at
+`keccak256(h(k) . p)`.<Cite src="solidity-docs-storage-layout" /> So slot 0 is never written by
+`shares` itself. `admin` survives. But that is luck about which variable was declared first, not
+protection — the mapping's *derived* slots are spread across the whole 2^256 space and one of them
+could in principle land on slot 1, on a hash nobody can predict or audit for.
+
+**Did moving the pointer help?** No. Moving a variable from slot 0 to slot 1 changes *which*
+implementation variable destroys it. The problem is not the number; it is that both contracts are
+numbering from the same origin with the same increment. Any hand-chosen small slot is reachable by
+a sufficiently long implementation.
+
+The fix has to make the proxy's slots unreachable by sequential assignment entirely — which is the
+next lesson.
+</Answer>
+</Check>
+
+## What you are buying, and what you are paying
+
+Upgradeability is usually presented as a pure win: bugs become fixable. It is a trade, and both
+sides deserve to be named.
+
+**What the split buys.** One address that never changes, so integrations, allowances, LP positions
+and off-chain configuration all survive a logic change. And it buys the ability to fix a bug in a
+contract holding real money without asking every user to migrate.
+
+**What the split costs.**
+
+- **An admin key.** Somebody can change the code your users' funds live under. That is a trust
+  assumption an immutable contract does not carry, and it is a standing attack
+  surface.<Cite src="zealynx-upgrade-patterns" />
+- **Gas on every single call, forever.** Each call through the proxy reads the implementation
+  pointer from storage — 2,100 gas when that slot is cold, 100 when warm — and then touches the
+  implementation account, which is a cold account access at 2,600 or a warm one at
+  100.<Cite src="measured-gas-constants" /> On top of that sit the `DELEGATECALL` itself and the
+  calldata copy, whose current cost under the `osaka` and later EVM revisions this curriculum has
+  not measured and therefore does not quote.
+- **A permanent constraint on your storage layout.** From the first deployment onward, every future
+  version of the code inherits the slot assignment of the version before it. That constraint is
+  what the last lesson in this module is about, and it is where the module's case study died.
+
+<Misconception
+  belief="An upgradeable contract is safer, because bugs can be fixed."
+  reality="It swaps one risk for another. You gain the ability to fix bugs and you add an admin key, a layout constraint that compounds with every release, and a delegatecall on every call. Whether that is safer depends on who holds the key and how disciplined your release process is."
+  why="Fixability is a visible, easily imagined benefit. The added key is invisible on the happy path — it costs nothing and does nothing until the day it is used, by you or by somebody else."
+  src="zealynx-upgrade-patterns"
+/>
+
+## Where this pays off
+
+**The next lesson** removes the collision entirely, by putting the proxy's own state at slots
+derived as `keccak256` of a namespaced string minus one — positions the compiler's sequential
+assignment provably cannot reach.<Cite src="eip-1967" /> Those three constants are also how every
+block explorer knows to show you a "Read as Proxy" tab.<Cite src="oz-src-erc1967utils" />
+
+**Two lessons on** the question stops being *where does the pointer live* and becomes *where does
+the upgrade function live, and who may call it*. There are three mainstream answers with three
+different cost shapes.
+
+And the mental model to carry forward is the one this lesson opened with: the proxy is not a wrapper
+around the implementation. The proxy **is** the contract. The implementation is a library of code it
+borrows, and the only thing tying them together is a number in a slot.

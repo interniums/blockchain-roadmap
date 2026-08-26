@@ -1,0 +1,296 @@
+---
+id: defi-hooks-settle-once-at-the-end
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [uniswap-v4-flash-accounting-docs, uniswap-v4-core-poolmanager-source, uniswap-v4-poolmanager, uniswap-v4-vs-v3-docs, uniswap-v4-vision, zealynx-v4-security, eip-1153, eip-6909, measured-gas-constants]
+stack: {}
+---
+
+Route one ETH to DAI through USDC on v3 and count the token transfers. ETH moves to the ETH/USDC
+pool; USDC moves out of it and into the USDC/DAI pool; DAI moves out of that and to the user. Three
+transfers, each an external call into a token contract, each with its own gas and its own failure
+modes — and the middle one exists only because the two pools are different accounts that cannot see
+each other's books.<Cite src="uniswap-v4-flash-accounting-docs" />
+
+Do the same route on v4 and there are two transfers: ETH in at the start, DAI out at the end. The
+USDC never moves. It was never *supposed* to move; it was an intermediate number in a calculation
+that a contract boundary had forced into becoming a token transfer.
+
+This lesson is about the mechanism that removes it, the assertion that keeps it safe, and the thing
+that assertion emphatically does not prove.
+
+## The shape: unlock, do everything, settle
+
+v4 does not let you call `swap` directly. Balance-changing work happens inside a callback. A
+periphery contract calls `unlock` on the `PoolManager`, implements `unlockCallback`, and performs its
+operations there.<Cite src="uniswap-v4-flash-accounting-docs" />
+
+The core of `unlock` is short enough to read whole:<Cite src="uniswap-v4-core-poolmanager-source" />
+
+```solidity
+function unlock(bytes calldata data) external override returns (bytes memory result) {
+    if (Lock.isUnlocked()) AlreadyUnlocked.selector.revertWith();
+
+    Lock.unlock();
+
+    // the caller does everything in this callback, including paying what they owe via calls to settle
+    result = IUnlockCallback(msg.sender).unlockCallback(data);
+
+    if (NonzeroDeltaCount.read() != 0) CurrencyNotSettled.selector.revertWith();
+    Lock.lock();
+}
+```
+
+Four lines of logic. Open the session, hand control to the caller, refuse to close if anything is
+still owed, close. The comparison page states the guarantee in one sentence: a caller that unlocks
+the `PoolManager` may cause balance-changing operations — multiple swaps, multiple liquidity
+modifications — and only needs to perform token transfers at the very end of the
+sequence.<Cite src="uniswap-v4-vs-v3-docs" />
+
+Inside the callback the caller may perform `swap`, `modifyLiquidity`, `donate`, `take`, `settle`,
+`mint`, `burn` and `sync`.<Cite src="uniswap-v4-flash-accounting-docs" /> Pool initialisation is
+deliberately *not* on that list and can happen outside the lock, because creating a pool changes no
+balances.<Cite src="uniswap-v4-flash-accounting-docs" />
+
+<Figure
+  caption="The manager hands control to the caller and takes it back once. The only thing it verifies on the way out is its own solvency."
+  alt="A session on the v4 PoolManager: unlock sets a transient lock, the caller's unlockCallback runs its own code, swaps and liquidity changes move signed deltas rather than tokens, and the session closes only if the count of non-zero deltas reads zero."
+>
+  <Flow
+    lanes={['the manager', 'the caller', 'inside the lock', 'the close']}
+    nodes={[
+      { id: 'unlock', label: 'unlock()', note: 'lock set in transient storage', col: 0 },
+      { id: 'cb', label: 'unlockCallback', note: "the caller's own code runs here", col: 1, tone: 'warn' },
+      { id: 'ops', label: 'swaps and liquidity', note: 'deltas move; tokens do not', col: 2, tone: 'accent' },
+      { id: 'check', label: 'delta count is zero', note: 'or revert CurrencyNotSettled', col: 3, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+**The docs' own worked example makes the point better than a swap does.** You hold 20 USDC and 20
+USDT and want a position made of 15 USDC and 25 USDT. Inside one unlocked session you swap 5 USDC for
+5 USDT and then call `modifyLiquidity`, and in between those two operations *no tokens move at
+all*.<Cite src="uniswap-v4-flash-accounting-docs" /> Only the net change against your starting
+balances is transferred.
+
+## What a delta actually is
+
+Each balance-changing operation updates a signed **delta** per currency, and only the final balance
+changes require token transfers.<Cite src="uniswap-v4-flash-accounting-docs" /> Trail of Bits gives
+the definition compactly: a delta is a signed currency-balance change owed to or from the
+`PoolManager`.<Cite src="zealynx-v4-security" />
+
+So a delta is a ledger entry, not a balance:
+
+- **Negative delta** — you owe the manager this currency. You clear it with `settle`, which is
+  paired with `sync` so the manager can measure what actually arrived.
+- **Positive delta** — the manager owes you. You clear it with `take` (send me the tokens) or `mint`
+  (credit me an ERC-6909 claim I can spend later without an ERC-20
+  transfer).<Cite src="uniswap-v4-flash-accounting-docs" /><Cite src="eip-6909" />
+
+Note the asymmetry, because it is what makes the design safe: **credits are optional to realise;
+debts are mandatory to clear.** You may leave value inside the manager as a claim. You may not leave
+a debt.
+
+<Matrix
+  corner="ETH to USDC to DAI, inside one unlocked session"
+  cols={['after swap 1', 'after swap 2', 'after settle and take']}
+  rows={[
+    { label: 'ETH', cells: [{ v: 'you owe the manager', tone: 'warn' }, { v: 'you owe the manager', tone: 'warn' }, { v: 'zero', tone: 'good' }] },
+    { label: 'USDC', cells: ['the manager owes you', { v: 'zero — hop two consumed it', tone: 'accent' }, { v: 'zero', tone: 'good' }] },
+    { label: 'DAI', cells: ['zero', 'the manager owes you', { v: 'zero', tone: 'good' }] },
+    { label: 'currencies with a non-zero delta', cells: ['2', '2', { v: '0 — the session may close', tone: 'good' }] },
+    { label: 'ERC-20 transfers', cells: ['none', 'none', 'two: ETH in, DAI out'] },
+  ]}
+  caption="Two of the three currencies never leave the manager, and the middle one never existed as a transfer at all."
+  alt="Currency deltas across a two-hop route in one v4 session: ETH is owed to the manager until settlement, USDC becomes positive after the first swap and returns to zero when the second consumes it, DAI is owed to the caller until taken, and the non-zero delta count goes from two to two to zero."
+/>
+
+### The counter, and why it is a counter
+
+The end-of-session check is `NonzeroDeltaCount.read() != 0`.<Cite src="uniswap-v4-core-poolmanager-source" />
+A count, not a scan. That choice is worth a moment because it is a pattern you will re-use.
+
+**Subgoal 1 — see why the obvious implementation is impossible.** Deltas live in a mapping keyed by
+caller and currency. Solidity mappings are not enumerable — there is no way to iterate the keys that
+were touched — so "check every delta is zero" has no direct implementation.
+
+**Subgoal 2 — maintain the count as an invariant instead.** Every write to a delta compares before
+and after: a delta going from zero to non-zero increments the counter, non-zero back to zero
+decrements it. The counter is therefore always the number of currencies with outstanding balances.
+
+**Subgoal 3 — reduce the assertion to one read.** Zero outstanding entries means every delta is zero.
+The final solvency check is a single load and a comparison, whatever happened inside the session:
+one swap or two hundred, across one pool or fifty.
+
+**Subgoal 4 — notice what it does and does not assert.** It asserts *the manager is whole*. It says
+nothing about whether the value inside the session went to the right party. Hold that thought; the
+last section is about it.
+
+<Misconception
+  belief="Flash accounting is a kind of flash loan."
+  reality="It is deferred settlement inside one lock. Nothing is borrowed and nothing is lent — the caller simply may not leave a non-zero delta behind when control returns."
+  why="Both names borrow 'flash' from atomicity, and the unlock/callback shape looks like ERC-3156's lend/callback/repay shape. The difference is that a flash loan hands you assets you did not have; flash accounting declines to move assets you were always going to end up with."
+  src="uniswap-v4-poolmanager"
+/>
+
+The distinction matters practically. A flash loan's danger is that you temporarily control capital
+you do not own. Flash accounting gives you no capital you would not otherwise have had — the risk it
+introduces is different, and it lives in what runs *during* the session.
+
+## Why transient storage made this practical
+
+Deltas exist for one transaction. Persisting them would mean writing storage and then writing it back
+to zero, which is expensive and pointless.
+
+The docs say the design became practical with the gas efficiencies of transient
+storage,<Cite src="uniswap-v4-flash-accounting-docs" /> and the `PoolManager` page states it directly:
+the manager uses transient storage (EIP-1153) for temporary data during complex operations, avoiding
+regular storage operations for data needed only within a single
+transaction.<Cite src="uniswap-v4-poolmanager" /><Cite src="eip-1153" />
+
+You know [transient storage](/c/transient-storage) already. What is worth putting next to it is the
+size of the difference, measured rather than recalled. On the configuration this curriculum measures
+against — forge 1.7.1, solc 0.8.36, optimizer off — `TSTORE` and `TLOAD` are each 100 gas, while an
+`SSTORE` from zero to non-zero is 20,000 plus 2,100 when the slot is cold, and a non-zero to non-zero
+write is 2,900 plus the same cold surcharge.<Cite src="measured-gas-constants" />
+
+Apply that to a delta's life cycle. A delta typically goes zero to non-zero, changes several times,
+and returns to zero. In persistent storage that is a 20,000-plus-cold first write and a 2,900 write
+per change. In transient storage it is 100 per write, and the slot clears itself at the end of the
+transaction with no write at all.
+
+<Aside kind="note">
+The same measurement run produced a warning worth repeating: the reentrancy-guard overhead figures
+that circulate — roughly 7,100 for a storage guard, roughly 200 for a transient one — do not both
+hold. Measured here, a warm storage guard costs about 3,104 and a transient guard about 284, and the
+storage figure is **cold/warm dependent, ranging from about 3,100 to about
+7,100**.<Cite src="measured-gas-constants" /> Teach the range, not a point. The honest ratio for a
+guard is about eleven times, not thirty-five.
+</Aside>
+
+`Lock` itself is the same idea applied to reentrancy: an unlocked flag in transient storage, checked
+at entry and cleared at exit.<Cite src="uniswap-v4-core-poolmanager-source" />
+
+## The pattern, generalised
+
+Strip v4 out of it and the shape is reusable:
+
+1. **Open a session** and mark it open in transient storage.
+2. **Record intent as signed deltas** rather than performing effects.
+3. **Let the caller compose freely** — any order, any number of operations, across any sub-accounts.
+4. **Assert a single global invariant** at close, maintained in O(1) as a counter.
+5. **Let the transient state evaporate**; there is nothing to clean up and nothing to leak into the
+   next transaction.
+
+You have met this before as [flash accounting](/c/flash-accounting) in the Solidity track; v4 is the
+largest production instance of it. The reason to name the pattern rather than the protocol is that it
+transfers: any contract that would otherwise perform N transfers to reach a state it could have
+reached with one can use it, and the correctness argument is always the same — **the effects are
+deferred, so the assertion at the end is the only thing standing between composition and
+insolvency.**
+
+Which is why the next section exists.
+
+## What the settlement check does not prove
+
+This is the most important paragraph in the lesson, and it is the hinge into the rest of the module.
+
+`CurrencyNotSettled` fires when the manager would end the session out of pocket. That is a
+*conservation* check on the manager. It is not a check that the accounting inside the session was
+correct.
+
+Trail of Bits states the gap precisely: settlement only checks that the session's currency deltas
+resolve, and it does not validate a hook's internal accounting, so a hook's accounting can be wrong
+even when settlement succeeds.<Cite src="zealynx-v4-security" />
+
+The demonstration is the Bunni exploit — reported as $8.4M in September 2025 — a rounding bug in
+`BunniHook`'s idle-balance accounting. The attacker pushed a pool's price tick with a flash loan,
+then made 44 small withdrawals that each shrank the active balance disproportionately to the shares
+burned, extracting profit. **Every one of those transactions satisfied the `PoolManager`'s settlement
+invariant**, because the defect was in the hook's own books rather than in the manager's.<Cite src="zealynx-v4-security" />
+
+Read that against the security track's [rounding-direction invariant](/c/rounding-direction-invariant)
+and the shape is familiar: a per-operation error too small to notice, repeated by an attacker who
+chooses the repetition count. What v4 adds is a check that *looks* like it should have caught it and
+structurally cannot.
+
+<Misconception
+  belief="If the PoolManager accepted the transaction, the accounting was right."
+  reality="The manager verifies only that no currency delta is left outstanding. Value can move to the wrong party, in the wrong proportion, or on the wrong terms, and still net to zero."
+  why="The check is global, atomic and unforgiving, which makes it feel like a proof of correctness. It proves conservation, not fairness — the same distinction as a balanced double-entry ledger that posts every amount to the wrong account."
+  src="zealynx-v4-security"
+/>
+
+<Check type="predict" concept="v4-flash-accounting">
+A router contract implements `unlockCallback` for a two-hop route, ETH to USDC to DAI. Its callback:
+
+```text
+1. swap ETH -> USDC on pool A
+2. swap USDC -> DAI on pool B
+3. take(DAI, recipient, amountOut)
+4. return
+```
+
+The transaction reverts with `CurrencyNotSettled`. The developer adds `sync(ETH)` and
+`settle{value: amountIn}()` before step 1 and it works.
+
+Answer three things:
+
+1. Which delta was outstanding, and why did the USDC leg not cause one?
+2. Why does `settle` need `sync` before it?
+3. The router is later changed to route through six pools instead of two. How many ERC-20 transfers
+   does the transaction perform, and how does the end-of-session check change?
+
+<Answer>
+**1 — the ETH debt.** Step 1 gives the manager a claim on the router for the ETH being sold: a
+negative delta in ETH. Steps 2 and 3 never touch it. The USDC leg produced no outstanding delta
+because the credit from hop one and the debt from hop two are in the *same currency for the same
+caller*, so they cancel — the counter increments when the USDC delta becomes non-zero and decrements
+when hop two brings it back to zero. **That cancellation is the whole optimisation**: the
+intermediate token is a number that was created and destroyed inside one session.
+
+**2 — because the manager cannot trust a self-reported amount.** `settle` credits the caller for what
+actually arrived. To know what arrived, the manager needs a reference point taken *before* the
+transfer, which is what `sync` records.<Cite src="uniswap-v4-flash-accounting-docs" /> Without it,
+the amount would have to be supplied by the caller, and a caller that can name its own payment can
+name zero. The pattern also handles tokens whose transferred amount differs from the requested
+amount — fee-on-transfer being the obvious case, which Trail of Bits lists among the token behaviours
+a hook's accounting must state support for explicitly.<Cite src="zealynx-v4-security" />
+
+**3 — still two transfers, and the check is identical.** Six hops means six swaps and five
+intermediate currencies, each of which nets to zero within the session. Only the input and the output
+ever move as ERC-20 transfers — the documentation states the optimisation scales, with any number of
+arbitrary hops requiring only two token transfers.<Cite src="uniswap-v4-flash-accounting-docs" /> The
+end-of-session check does not grow either: it is one read of a counter regardless of how many
+currencies were touched.<Cite src="uniswap-v4-core-poolmanager-source" />
+
+**What does grow** is the number of hooks that ran inside your session. Six pools can mean up to six
+different hook contracts, each executing code around your swap, each able to read the state your
+earlier hops created. The gas is flat, the transfers are flat, and the trust surface is linear in the
+number of pools you routed through. That is the trade this module's last two lessons are about.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You now have the two structural facts about v4: **every pool lives in one contract, and a whole
+sequence of operations settles once at the end under a single global assertion.** Both are
+prerequisites for what follows.
+
+- **Hooks need the lock.** A hook that returns a delta — taking a fee, supplying the trade itself —
+  is only expressible because deltas exist as first-class, deferred quantities. Without flash
+  accounting, "the hook charges the swapper" would have to be a token transfer inside a swap.
+- **Custom accounting is the sharp edge.** Once a hook can move deltas, it can move them wrongly, and
+  the settlement check will not notice.<Cite src="zealynx-v4-security" /> Every value-handling hook
+  therefore needs its own invariants: that no user receives output the accounting did not charge for,
+  that a same-transaction round trip cannot create value, and that internal accounting matches actual
+  balances.<Cite src="zealynx-v4-security" />
+- **The composability argument is real.** Netting across pools is what makes routing, rebalancing and
+  hook-supplied liquidity cheap enough to be ordinary.<Cite src="uniswap-v4-vision" />
+
+The next lesson introduces the hook itself — where the `PoolManager` calls it, what it can return,
+and the design decision that makes hook permissions readable from an address rather than from
+storage.

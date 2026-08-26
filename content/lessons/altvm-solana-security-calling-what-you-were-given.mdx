@@ -1,0 +1,361 @@
+---
+id: altvm-solana-security-calling-what-you-were-given
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [sealevel-attacks, cantina-securing-solana, wormhole-postmortem, helius-solana-hacks, helius-solana-security-guide, solana-docs-cpi, solana-docs-cpi-execution, solana-docs-accounts, solana-docs-account-modification-rules, anchor-account-constraints, solana-docs-token-extensions, neodyme-token-2022]
+stack: {}
+---
+
+An accounts struct with the token program in it looks like infrastructure.
+
+```rust
+#[derive(Accounts)]
+pub struct Deposit<'info> {
+    #[account(mut)] pub user_token: AccountInfo<'info>,
+    #[account(mut)] pub vault_token: AccountInfo<'info>,
+    pub user: Signer<'info>,
+    /// CHECK: the SPL token program
+    pub token_program: AccountInfo<'info>,
+}
+```
+
+It reads like a plumbing declaration — of course the token program is the token program, the same way
+`address(this)` is this contract. It is not a declaration. It is a 32-byte address supplied by
+whoever built the transaction, sitting in a field that asserts nothing, about to be invoked.
+
+This lesson asks the three questions about accounts that hold **code** rather than data. The answers
+are the same three answers, but one of them changes character entirely: for a program, "is this the
+right instance" is not a relationship to another account. It is equality against a constant you
+already know.
+
+## Arbitrary CPI: the callee that agrees with you
+
+**Subgoal: describe the call the program intends.** Take the user's token account, take the vault's,
+invoke the token program's `transfer`, credit the user's internal balance by the amount transferred.
+A cross-program invocation is the mechanism: `invoke` for an ordinary call, `invoke_signed` when the
+caller must sign for a PDA, and `invoke` is a thin wrapper that calls `invoke_signed` with an empty
+signer-seeds array.<Cite src="solana-docs-cpi" />
+
+**Subgoal: describe what an attacker substitutes.** A program they deployed, whose `transfer`
+instruction does nothing at all and returns success. The CPI executes, the runtime is content — a
+program's instructions can be invoked by any other program on the
+network<Cite src="solana-docs-cpi" /> — and control returns to your handler with `Ok`.
+
+**Subgoal: state the outcome.** Your handler credits the deposit. No tokens moved. Repeat until the
+vault is empty of everything real, then withdraw against the fabricated balance. The canonical
+taxonomy files this as class 5, `arbitrary-cpi`, and the audit-firm checklist covers it under the same
+name at high severity.<Cite src="sealevel-attacks" /><Cite src="cantina-securing-solana" />
+
+<Figure
+  caption="A cross-program invocation that returns Ok is not evidence that anything happened."
+  alt="A deposit handler invokes a token transfer through a program supplied by the caller; the attacker's program returns success without moving tokens, the handler credits the internal balance, and the sequence loops back to the invocation for as many times as the attacker cares to repeat it."
+>
+  <Flow
+    nodes={[
+      { id: 'dep', label: 'deposit()', note: 'your handler', col: 0 },
+      { id: 'cpi', label: 'CPI transfer', note: 'callee chosen by whoever built the transaction', col: 1, tone: 'warn' },
+      { id: 'evil', label: "the attacker's program", note: 'returns Ok, moves nothing', col: 2, tone: 'danger' },
+      { id: 'credit', label: 'credit the balance', note: 'internal accounting rises', col: 3, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'dep', to: 'cpi' },
+      { from: 'cpi', to: 'evil' },
+      { from: 'evil', to: 'credit' },
+      { from: 'credit', to: 'cpi', label: 'repeat', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+The thing to sit with is that nothing in the sequence is malformed. The attacker's program is a real,
+deployed, executable program. The CPI is a legitimate CPI. Every runtime rule holds — privileges
+extended to the callee only narrow, never widen, and the account modification rules are enforced after
+each instruction exactly as always.<Cite src="solana-docs-cpi-execution" /><Cite src="solana-docs-account-modification-rules" />
+The defect is entirely in your program's assumption about which program it was talking to.
+
+### The fix, and why the typed version is better
+
+The check is equality against a known constant:
+
+```rust
+require_keys_eq!(
+    ctx.accounts.token_program.key(),
+    spl_token::ID,
+    ErrorCode::WrongTokenProgram
+);
+```
+
+The framework's version carries the same assertion in the field's type. `Program<'info, Token>`
+asserts both the key and the executable flag, which is one more assertion than the manual comparison
+above makes.<Cite src="helius-solana-security-guide" /> The generic constraint that does the same job
+for anything without a wrapper is `address = expr`, which checks that the account key matches the
+pubkey.<Cite src="anchor-account-constraints" />
+
+Prefer the typed form for a reason beyond brevity: the manual comparison is a line of code that can be
+deleted during a refactor without anything else breaking, and the typed form is a type that other code
+depends on. Deleting an assertion should cost you a compile error.
+
+<Misconception
+  belief="This is just the EVM's 'don't call an address supplied by the caller' rule, which I already follow, so it does not need separate attention."
+  reality="On the EVM, external addresses are usually immutables or storage values set at deployment, and passing one as a parameter is an unusual pattern that stands out in review. On Solana every program you invoke arrives as an account in the instruction, so the unusual pattern is the default and there is no version of the code where it does not appear."
+  why="The habit transfers but the base rate does not. A reviewer trained to flag the exception will scan a Solana accounts struct and see nothing but exceptions, which is the same as seeing none."
+  src="sealevel-attacks"
+/>
+
+The EVM analogue is genuinely close, and the closest single construct is
+[delegatecall](/c/delegatecall-is-the-proxy-primitive) to a caller-supplied target: the caller chooses
+whose code runs. There is a second EVM detail worth holding beside it, because it is the same failure
+of silence — a `call` to an address with **no code at all** succeeds and returns
+true.<Cite src="sealevel-attacks" /> Solana differs here in a way that is small but real: invoking an
+account that is not executable fails, and invoking the native loader, the BPF loaders or a precompile
+is rejected with `ProgramNotSupported`.<Cite src="solana-docs-cpi-execution" /> So the empty-address
+case is caught. The wrong-program case is not, because the wrong program is a perfectly good program.
+
+### Two complications specific to tokens
+
+**There are now two token programs, so a hardcoded constant can also be wrong.** Token Extensions —
+Token-2022 — is a separate program with its own id, and mints created under it are not accounts of the
+legacy program.<Cite src="solana-docs-token-extensions" /> A program that pins `spl_token::ID` and
+nothing else is correct against the arbitrary-CPI attack and quietly incompatible with a growing share
+of real mints. A program that accepts either id is compatible and has accepted a much larger surface,
+since taking the Token-2022 program as such means taking every extension any mint under it carries,
+including transfer hooks that run arbitrary code and transfer fees that make the amount received
+differ from the amount sent.<Cite src="neodyme-token-2022" /> The posture that survives both problems
+is to [allowlist specific mints](/c/allowlist-mints-not-programs) with the specific extensions you
+have handled, rather than allowlisting a program.
+
+**The return value of a CPI is data, not truth.** A CPI may return up to 1,024 bytes of return
+data.<Cite src="solana-docs-cpi" /> If the callee is attacker-chosen, that buffer is attacker-written,
+and any decision your program makes from it inherits the substitution. The transferable rule is the
+one the security track already gave you in another costume: after a token transfer, read the balance
+you care about rather than trusting what the transfer reported, because the amount received is not
+necessarily the amount sent.<Cite src="neodyme-token-2022" />
+
+<Aside kind="note">
+Worth knowing the shape of the budget you are spending, since these checks are not free and the module
+after this one cares about compute. A CPI's own limits: maximum 16 PDA signers per CPI, maximum 10 KiB
+of CPI instruction data, maximum 1,024 bytes of return data, and 128 CPI account infos rising to 255
+under SIMD-0339, with serialisation charged at 1 compute unit per 250
+bytes.<Cite src="solana-docs-cpi" /> Note the unit: Solana meters **compute units**, not gas, and no
+EVM gas figure in the corpus transfers to any of these numbers.
+</Aside>
+
+### The privilege you hand down the stack
+
+There is an inverse failure worth naming, because programs that check their callee carefully still
+walk into it: **what you pass into a CPI, you authorise for the duration of that CPI.**
+
+The runtime's rule is that a CPI extends the caller's account privileges to the callee, narrowing
+only.<Cite src="solana-docs-cpi-execution" /> Read that from the callee's side. If your program signs
+for a PDA with `invoke_signed` and passes that PDA into another program, the callee sees a signer. It
+can do whatever that program lets a signer do — and if the callee is chosen by your caller, the
+signature you produced is now working on their behalf.
+
+So the arbitrary-CPI check protects two different things at once, and the second is the one people
+miss. It stops the callee lying to you about what it did. It also stops the callee *using* the
+authority you extended to it. A program that CPIs into an unchecked program while passing a
+PDA it signs for has not merely accepted a false return value; it has lent out its signature.
+
+The mitigation is the same equality check, and one extra habit: before an `invoke_signed`, be able to
+say out loud which accounts you are extending privileges over and what the callee is entitled to do
+with them. Sixteen PDA signers per CPI is the ceiling,<Cite src="solana-docs-cpi" /> and every one of
+them is a delegation.
+
+### The program id you checked can be upgraded
+
+One more property of program accounts, and it is the one an EVM engineer is best equipped to
+understand and most likely to forget here.
+
+A program account is an account like any other, carrying the same five fields, with `executable` set
+and its code stored under a loader.<Cite src="solana-docs-accounts" /> Programs deployed as upgradeable
+have an upgrade authority that can replace the code at the same address. So `require_keys_eq!` against
+a known program id proves the address, and the address is not the code — exactly the relationship you
+already know from [proxies](/c/delegatecall-is-the-proxy-primitive), where the address is stable and
+the implementation behind it is not.
+
+This does not weaken the check in this lesson; without it you have nothing at all. It relocates part of
+the question. Having pinned the program id, the remaining question is who holds that program's upgrade
+authority, whether it is a multisig, and whether there is a timelock — which is
+[upgrade key risk](/c/upgrade-key-risk) in a Solana spelling, and which the last lesson of this module
+will show mattering far more in 2026 than any missing comparison did.
+
+## Sysvars: the constants that arrive as accounts
+
+A sysvar is cluster state — the clock, the rent parameters, the list of instructions in the current
+transaction — and the Solana model has no special channel for it. Sysvars are accounts, in the same
+key-value store as everything else, read the same way as everything
+else.<Cite src="solana-docs-accounts" />
+
+Which means a sysvar can be substituted, and one of them is the most dangerous account in the system
+to substitute: the **instructions sysvar**, used for introspection. Programs read it to answer
+questions like "was the signature-verification precompile invoked earlier in this transaction". A
+program that reads it without checking the account's address is asking that question of an account the
+attacker wrote.
+
+### Wormhole, 2 February 2022
+
+The Solana-side verifier used a deprecated command, `load_instruction_at`, to establish that
+`Secp256k1` had been called — and that command does not check the value of the system address, the
+Instructions sysvar.<Cite src="wormhole-postmortem" /> The attacker created a counterfeit Instructions
+sysvar as a previously-created account referencing `Secp256k1`, and passed that fake account instead of
+the legitimate one; the verification then validated a fraudulent
+context.<Cite src="wormhole-postmortem" /> With that, they created a validator action approval through
+`post_vaa`, used it in a `complete_wrapped` call to mint 120,000 wrapped ether, and extracted
+it.<Cite src="wormhole-postmortem" />
+
+The recorded loss is approximately $326 million; the vulnerability was patched within hours on 2
+February 2022, and Wormhole's parent company reimbursed 120,000 ETH the following day, restoring the
+1:1 backing.<Cite src="helius-solana-hacks" /> Prefer the token quantity to the dollar figure when you
+retell this — 120,000 wETH is invariant, and the dollar amount is a snapshot.
+
+**Subgoal: name the missing check in one sentence.** The verifier's trusted reference — the account it
+was measuring the signature claim against — was supplied by the caller and never compared to the known
+sysvar address.<Cite src="wormhole-postmortem" />
+
+**Subgoal: name the fix.** The checked variant of the same call. That is worth pausing on, because it
+is the most quietly instructive detail in the whole incident: the safe and unsafe versions of these
+APIs differ by one word in the function name, they have the same arguments, and the unsafe one
+compiles. The canonical taxonomy has a whole class for it, class 10,
+`sysvar-address-checking`.<Cite src="sealevel-attacks" />
+
+**Subgoal: generalise past sysvars.** This is the same failure as arbitrary CPI with the roles
+inverted. In arbitrary CPI, the attacker supplies the code that produces the answer. Here, the attacker
+supplies the data the answer is read from. In both cases the program has outsourced a trusted input to
+its caller, and in both cases the verification runs to completion and returns success.
+
+<Misconception
+  belief="Sysvars are runtime-provided values, like block.timestamp, so they are inherently trustworthy."
+  reality="They are ordinary accounts at well-known addresses. The runtime maintains their contents but nothing forces the account you were handed to be the one at that address, so a sysvar read without an address check reads whatever the caller passed."
+  why="The EVM exposes chain context as opcodes — TIMESTAMP, NUMBER, CHAINID — that no caller can influence. Every intuition about block context comes from a world where these values are not addressable, and here they are."
+  src="wormhole-postmortem"
+/>
+
+In the framework, the address check is carried in the type: `Sysvar<'info, Clock>` and its siblings
+assert the account's address, and for anything without a wrapper the generic constraint `address =
+expr` does the same job.<Cite src="anchor-account-constraints" /> The audit-firm checklist adds a
+neighbouring entry worth noting — "missing system account check" — for the same reason: the system
+program is also just an address.<Cite src="cantina-securing-solana" />
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Arbitrary CPI', note: 'class 5', tone: 'accent' },
+    { title: 'Unchecked sysvar', note: 'class 10', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What does the attacker supply?',
+      cells: [
+        'A program they deployed — real, executable, doing exactly what they wrote',
+        'An account they created, filled with bytes describing whatever needs to be true',
+      ],
+    },
+    {
+      label: 'What does your program do with it?',
+      cells: ['Invokes it and believes the result', 'Reads it as chain context and believes the result'],
+    },
+    {
+      label: 'Does the runtime object?',
+      cells: [
+        { v: <>No — a program’s instructions may be invoked by any other program<Cite src="solana-docs-cpi" /></>, tone: 'danger' },
+        { v: <>No — a sysvar is an ordinary account in the same key-value store as everything else<Cite src="solana-docs-accounts" /></>, tone: 'danger' },
+      ],
+    },
+    {
+      label: 'What is the missing comparison?',
+      cells: [
+        <>The account key against the token program’s id</>,
+        <>The account key against the known sysvar address<Cite src="wormhole-postmortem" /></>,
+      ],
+    },
+    {
+      label: 'What carries it in the framework?',
+      cells: [
+        { v: <><code>Program&lt;'info, Token&gt;</code>, or <code>address = expr</code><Cite src="anchor-account-constraints" /></>, tone: 'good' },
+        { v: <><code>Sysvar&lt;'info, Clock&gt;</code> and its siblings, or <code>address = expr</code><Cite src="anchor-account-constraints" /></>, tone: 'good' },
+      ],
+    },
+  ]}
+  caption="One equality check against a constant closes both, and the constant is known before the transaction exists."
+  alt="Arbitrary CPI and unchecked sysvar reads compared: what the attacker supplies, what the program does with it, why the runtime raises no objection, the missing key comparison, and the Anchor construct that carries it."
+/>
+
+<Check type="spot-bug" concept="arbitrary-cpi">
+An escrow program's settle instruction. The typed wrappers on the data accounts are all correct.
+Find every account whose *identity* is unasserted and rank them by what an attacker gets.
+
+```rust
+#[derive(Accounts)]
+pub struct Settle<'info> {
+    #[account(mut, has_one = maker, has_one = escrow_vault)]
+    pub escrow: Account<'info, Escrow>,
+    pub maker: Signer<'info>,
+
+    #[account(mut)] pub escrow_vault: Account<'info, TokenAccount>,
+    #[account(mut)] pub taker_token: AccountInfo<'info>,
+
+    /// CHECK: token program
+    pub token_program: AccountInfo<'info>,
+    /// CHECK: instructions sysvar, for verifying the taker's signature earlier in the tx
+    pub instructions: AccountInfo<'info>,
+}
+```
+
+<Answer>
+**Three unasserted identities, in descending order of damage.**
+
+**1 — `instructions` is unchecked, and it is total.** The comment says the program introspects the
+transaction to confirm the taker signed something. An attacker passes an account they created and
+filled with bytes describing a transaction in which the taker did exactly that. The introspection
+succeeds, the settle proceeds, and the taker never consented to anything. This is Wormhole's missing
+check verbatim — a trusted reference supplied by the caller and never compared to the known
+address.<Cite src="wormhole-postmortem" /> Fix: `address = sysvar::instructions::ID`, or the typed
+sysvar wrapper.<Cite src="anchor-account-constraints" /> Rank it first because it defeats
+authorisation rather than moving value, and everything downstream of a defeated authorisation is
+reachable.
+
+**2 — `token_program` is unchecked.** `AccountInfo` asserts nothing.<Cite src="helius-solana-security-guide" />
+The attacker deploys a program whose `transfer` returns `Ok` without moving anything, passes it here,
+and the escrow is marked settled while the tokens stay where they were. Class 5,
+`arbitrary-cpi`.<Cite src="sealevel-attacks" /> Fix: `Program<'info, Token>`, which asserts both the
+key and the executable flag.<Cite src="helius-solana-security-guide" />
+
+**3 — `taker_token` is unchecked and unbound.** It is `AccountInfo`, so it is not even asserted to be
+a token account, let alone the taker's. Any account of the attacker's choosing receives the payout.
+Fix: type it as `Account<'info, TokenAccount>` so the owner and layout are checked, and bind it —
+`has_one = taker_token` on the escrow, or derive it from seeds that include the taker.
+
+**What the struct gets right, and why that matters to the finding.** `escrow` is bound to both `maker`
+and `escrow_vault` by `has_one`, and `maker` is a real `Signer`.<Cite src="anchor-account-constraints" />
+The data-account half of the accounts struct is exemplary. That is exactly the pattern this module
+keeps producing: the accounts that look like *state* get validated because they look like state, and
+the accounts that look like *infrastructure* — a program, a sysvar, a destination — do not, because
+nobody feels they are inputs.
+
+**The general form of the finding.** Every `AccountInfo` and `UncheckedAccount` in a struct is the
+framework recording, in the author's own words, a place where it stopped answering the three
+questions.<Cite src="helius-solana-security-guide" /> Read every `/// CHECK:` comment as a claim, and
+ask what would make it false.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**A grep that finds a whole class.** In any program: list every account that is invoked, and every
+account that is read as chain context. For each, find the constant it is compared against. Any that
+lack one is a finding, and the fix is a one-line `address` constraint or a typed
+wrapper.<Cite src="anchor-account-constraints" />
+
+**A general rule that has now appeared twice.** *Any verifier one of whose trusted inputs can be
+influenced by the caller is not a verifier.* You met it in the bridge lesson, where a signer set or a
+root came in as a parameter. Here it arrives as a program to invoke and as a sysvar to read from. The
+shape is identical and so is the fix — bind trusted inputs to constants, and treat every update path
+for a trusted value as part of the same review as the verification itself.
+
+**And a turn toward addresses you compute instead of receive.** Every check in this lesson compared an
+account key to a constant that was known in advance. The next lesson is about the case where the
+correct address is not a constant — it is derived, per user and per object, from seeds — and where the
+derivation itself has two failure modes that make the comparison pass for the wrong
+account.<Cite src="cantina-securing-solana" /> That is where the fix from this lesson stops being
+sufficient, and where the third question gets genuinely hard.

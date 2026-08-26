@@ -1,0 +1,401 @@
+---
+id: scaling-blobs-peerdas-two-gas-markets-one-word
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [eip-4844, eip-7892, eip-7918, eip-8134, eip-8135, eip-7840, fusaka-mainnet-announcement, measured-forge-1-7-1, op-docs-configure-batcher, arbitrum-batch-poster-fee-tuning, blocknative-blob-gas, ieee-4844-impact]
+stack: {}
+---
+
+A finance lead asks a reasonable question: "L1 gas is at 45 gwei today, three times last week. What
+did that do to our posting bill?"
+
+Nothing. It did nothing. The bill is set by a different number, on a different curve, driven by
+different demand, and this week that number is 1 wei.
+
+Six weeks later the same question gets asked on a day when L1 gas is at 8 gwei and the answer is that
+posting costs have gone up sixty-fold since Tuesday.
+
+Both answers are correct and neither is intuitive, because English gave two unrelated prices the same
+name. This lesson makes the second price derivable — not "the blob base fee follows an EIP-1559-like
+curve", which you already know, but the specific arithmetic that tells you how fast it can rise, how
+fast it falls, why it spends so much time pinned at its floor, and what a mechanism designed to unpin
+it actually does.
+
+## Two accumulators in one header
+
+The execution fee market and the blob fee market share a block header and nothing else.
+
+Each blob consumes `GAS_PER_BLOB` = 2<sup>17</sup> = 131,072 blob gas, so a transaction's blob gas is
+that constant times the number of versioned hashes it carries.<Cite src="eip-4844" /> The header
+carries `blob_gas_used` for the block and `excess_blob_gas`, a running total of blob gas consumed above
+target, and the price per unit of blob gas is a function of that accumulator
+alone.<Cite src="eip-4844" />
+
+Since EIP-7892 the update reads its parameters from the blob schedule rather than from constants
+compiled into clients, and `TARGET_BLOB_GAS_PER_BLOCK` was removed entirely in favour of
+`GAS_PER_BLOB * blob_schedule.target`:<Cite src="eip-7892" /><Cite src="eip-7840" />
+
+```python
+def calc_excess_blob_gas(parent: Header, blob_schedule: BlobSchedule) -> int:
+    target_blob_gas = GAS_PER_BLOB * blob_schedule.target
+    if parent.excess_blob_gas + parent.blob_gas_used < target_blob_gas:
+        return 0
+    return parent.excess_blob_gas + parent.blob_gas_used - target_blob_gas
+
+def get_base_fee_per_blob_gas(header: Header, blob_schedule: BlobSchedule) -> int:
+    return fake_exponential(
+        MIN_BASE_FEE_PER_BLOB_GAS,
+        header.excess_blob_gas,
+        blob_schedule.base_fee_update_fraction,
+    )
+```
+
+Three things are worth naming before the arithmetic, because each one is a place people assume the
+execution market's behaviour transfers and it does not.
+
+**The accumulator is cumulative, not per-block.** `excess_blob_gas` carries forward. A block that is
+exactly at target changes nothing; a block above target adds the overshoot to a total that persists;
+a block below target subtracts from it, floored at zero. The price is a function of history, not of
+the last block.
+
+**`fake_exponential` is a Taylor series in integers**, approximating
+`factor * e ** (numerator / denominator)` by accumulating terms until they round to
+zero.<Cite src="eip-4844" /> No floating point, no lookup table, and a strictly increasing function
+of the accumulator.
+
+**Nothing in either function mentions execution gas.** Blob demand does not enter the execution base
+fee update and execution demand does not enter this one. That independence is the design, and it is
+why the two markets routinely move in opposite directions.<Cite src="blocknative-blob-gas" />
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Execution gas', note: 'the market you already know' },
+    { title: 'Blob gas', note: 'the one on the same header', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What is metered?',
+      cells: [
+        'Execution work and calldata bytes',
+        <>GAS_PER_BLOB = 131,072 blob gas per blob, times the number of versioned hashes<Cite src="eip-4844" /></>,
+      ],
+    },
+    {
+      label: 'What sets the price?',
+      cells: [
+        "The block's own base fee",
+        <>excess_blob_gas — a running total carried forward across blocks<Cite src="eip-4844" /></>,
+      ],
+    },
+    {
+      label: 'Does the other market enter the formula?',
+      cells: [
+        'No',
+        <>No, except the EIP-7918 reserve clause at the very bottom of the range<Cite src="eip-7918" /></>,
+      ],
+    },
+    {
+      label: 'Is there a priority component?',
+      cells: [
+        'Yes — a tip guessed against a competitive mempool',
+        <>None. There is no tip to pay on blob gas<Cite src="eip-4844" /></>,
+      ],
+    },
+    {
+      label: "Can you know the next block's price before you sign?",
+      cells: [
+        'The base fee, yes; the tip, no',
+        { v: <>Exactly, the moment the current block lands<Cite src="eip-4844" /><Cite src="eip-7892" /></>, tone: 'good' },
+      ],
+    },
+  ]}
+  caption="Only one of these two prices can be computed exactly before you sign the transaction."
+  alt="Execution gas and blob gas compared on five questions: what is metered, what sets the price, whether the other market enters the formula, whether there is a priority component, and whether the next block's price is knowable before signing."
+/>
+
+## Deriving how fast the price can move
+
+The useful quantities are not in any specification as numbers. They fall out in five steps, and once
+you have done it once you can redo it for whatever the schedule says next year.
+
+**Subgoal 1 — express one block's contribution to the accumulator.** A block carrying `n` blobs adds
+`n * GAS_PER_BLOB` and subtracts `target * GAS_PER_BLOB`. So the net change is
+`(n − target) * GAS_PER_BLOB`, positive above target and negative below.<Cite src="eip-7892" />
+
+**Subgoal 2 — convert an accumulator change into a price change.** The fee is
+`exp(excess / fraction)` in shape, so multiplying rather than adding: a change of Δ in the accumulator
+multiplies the fee by `e^(Δ / fraction)`.<Cite src="eip-4844" /> This is the step that turns an
+additive counter into a multiplicative price, and it is why blob fees move in ratios.
+
+**Subgoal 3 — name the two extremes.** The largest single-block increase comes from a maximally full
+block: `Δ = (max − target) * GAS_PER_BLOB`. The largest decrease comes from an empty block:
+`Δ = −target * GAS_PER_BLOB`. These are not symmetric unless `max = 2 × target`.
+
+**Subgoal 4 — substitute the verified schedule.** EIP-8135 records the full history in one table:
+Cancun target 3, max 6, update fraction 3,338,477; Prague 6 / 9 / 5,007,716; BPO1 10 / 15 / 8,346,193;
+BPO2 14 / 21 / 11,684,671.<Cite src="eip-8135" /> Take BPO2's row and compute.
+
+Downward, an empty block: `14 × 131,072 / 11,684,671 = 0.15704`, so the fee multiplies by
+`e^(−0.15704) = 0.8547` — **down 14.5% per block**, a halving every 4.4 blocks.
+
+Upward, a maximally full block: `(21 − 14) × 131,072 / 11,684,671 = 0.07852`, so the fee multiplies by
+`e^(0.07852) = 1.0817` — **up 8.2% per block**, a doubling every 8.8 blocks.
+
+**Subgoal 5 — check the derivation against the one number the specification does state.** EIP-4844
+says its `BLOB_BASE_FEE_UPDATE_FRACTION` of 3,338,477 was chosen to target a maximum change rate of
+`e^(TARGET_BLOB_GAS_PER_BLOCK / BLOB_BASE_FEE_UPDATE_FRACTION) ≈ 1.125` per
+block.<Cite src="eip-4844" /> Run the same arithmetic on Cancun's row: `3 × 131,072 / 3,338,477 =
+0.11778`, and `e^0.11778 = 1.1250`. The derivation reproduces the published constant exactly, which is
+how you know it is sound before applying it to rows the specification never commented on.
+
+### Two properties that fall straight out
+
+**The responsiveness has been held constant since Pectra, deliberately.** Divide each fraction by its
+target: Cancun gives 1,112,826 while Prague, BPO1 and BPO2 all give 834,619. The ratio
+`target × GAS_PER_BLOB / fraction` is therefore identical — 0.15704 — for all three post-Cancun
+rows.<Cite src="eip-8135" /> Every capacity increase scaled the update fraction in exact proportion,
+so raising capacity has never changed how quickly the price reacts. That is a design decision hiding
+in a table of large numbers, and it means the dynamics you learn now survive the next fork even though
+the constants will not.
+
+**The market is asymmetric, and by a documented rule.** Since Pectra the max has been 1.5 times the
+target — 9/6, 15/10, 21/14 — so the up-exponent is exactly half the down-exponent.<Cite src="eip-8135" />
+The blob base fee **falls at twice the exponential rate at which it can climb.** A spike decays faster
+than it built. Under Cancun's 3/6 the two were equal; the asymmetry is a post-Pectra property that
+most material predates.
+
+<Misconception
+  belief="Blob fees follow the same 12.5%-per-block rule as EIP-1559 base fees."
+  reality="The 1.125 figure belongs to Cancun's parameters. On BPO2's schedule the derived maxima are about +8.2% per block upward and −14.5% per block downward — different in magnitude and no longer symmetric."
+  why="The 1.125 was published in EIP-4844 as an explicit design target and got memorised as a property of blobs rather than of one row in a schedule that has since changed three times."
+  src="eip-8135"
+/>
+
+### The next block's price is already known
+
+One more property falls out of the same functions, and it is the most useful one to a batcher.
+
+`get_base_fee_per_blob_gas` takes only the header's `excess_blob_gas` and the schedule's update
+fraction, and `calc_excess_blob_gas` derives the next block's accumulator from the parent's
+`excess_blob_gas` and `blob_gas_used`.<Cite src="eip-4844" /><Cite src="eip-7892" /> Both inputs are
+in a block you can already see. So **the blob base fee that will apply to the next block is exactly
+computable the moment the current block lands** — not estimated, not sampled from a fee history
+endpoint, computed.
+
+That is a stronger guarantee than the execution market gives you in practice, where a tip has to be
+guessed against a competitive mempool. On the blob side there is no tip to guess, so a batcher that
+implements these two functions locally knows its next submission's data cost to the wei before it
+signs anything. Anything that presents blob pricing as a forecast is doing arithmetic you could have
+done exactly.
+
+## Capacity is the max; price is the target
+
+Two parameters, two jobs, and swapping them produces confident wrong predictions.
+
+**The max caps how many blobs a block may carry.** It is a supply ceiling. Raising it alone lets more
+data through per block and, holding demand fixed, lowers the price by making it easier to stay under
+target.
+
+**The target is what the fee mechanism steers towards.** It appears in `calc_excess_blob_gas` and
+nowhere else.<Cite src="eip-7892" /> Raising the target alone lowers the equilibrium price without
+adding a byte of capacity, because more usage now counts as "not enough".
+
+The BPO forks moved both together: BPO1 raised 6/9 to 10/15 at epoch 412,672 on 9 December 2025, and
+BPO2 raised it again to 14/21 at epoch 419,072 on 7 January 2026.<Cite src="fusaka-mainnet-announcement" /><Cite src="eip-8134" /><Cite src="eip-8135" />
+Which is why "blob capacity went up" and "blob prices went down" are two consequences of one change
+rather than one causing the other.
+
+## The floor, and what one wei actually buys
+
+`MIN_BASE_FEE_PER_BLOB_GAS` is **1 wei**.<Cite src="eip-4844" /> Whenever sustained demand sits below
+target, the accumulator floors at zero, `fake_exponential` returns its factor, and the price sits
+there.
+
+Give that a magnitude, because "effectively free" is doing a lot of work in most descriptions.
+
+One blob at the floor is 131,072 blob gas × 1 wei = 131,072 wei, or 1.31 × 10<sup>−13</sup>
+ETH.<Cite src="eip-4844" /> A maximally packed six-blob batcher transaction is 786,432 wei — under a
+picoether. At any exchange rate anyone has ever quoted, the data component of that transaction rounds
+to zero against its 21,000-gas execution floor. The batcher's cost in this regime is entirely the
+execution side of a transaction that executes nothing.
+
+This has a corollary that will save you from a whole genre of headline. **Any ratio computed against a
+1 wei baseline is meaningless.** A rise from 1 wei to 15 million wei is a fifteen-million-fold
+increase and also a rise to 0.015 gwei, which for six blobs is about 1.2 × 10<sup>−5</sup> ETH. This
+curriculum's research sweep found exactly such a multiple in circulation, unverified, and it is not
+repeated here for two reasons: it was not confirmable, and even if it were, the ratio would be
+arithmetically unremarkable and rhetorically misleading.
+
+<Aside kind="stop">
+Neither "blobs are scarce and rollups fight over them" nor "blob space is free" describes the system.
+Each describes a **regime**, and the mechanism moves between them: EIP-7918's motivation is written
+around a fee that repeatedly settles at 1 wei and then has to climb again when demand picks
+up.<Cite src="eip-7918" /> People generalise from whichever regime was current when they learned.
+Build the batcher for both, and treat any claim about current utilisation as needing live data rather
+than a citation. Peer-reviewed measurement of the post-4844 blob fee market
+exists;<Cite src="ieee-4844-impact" /> its specific findings were not read for this curriculum and are
+therefore not summarised here.
+</Aside>
+
+## Why the floor is a problem for the mechanism, not just a discount
+
+A price pinned at its minimum is not merely cheap. It is a broken control loop, and EIP-7918 exists
+because of it.
+
+The argument in the EIP is worth following because it is a clean piece of mechanism design. A dynamic
+pricing auction works when the price it sets is the price the consumer feels. But a rollup's real cost
+of using blob space includes execution costs for the blob-carrying transaction, proof verification and
+priority fees. When those dominate, the blob base fee stops being a meaningful component, and the EIP
+puts a number on how badly: under such circumstances "a change in the blob base fee of 10% may shift
+the total cost of utilizing blobspace by just 0.0000001%."<Cite src="eip-7918" /> Demand becomes
+inelastic to the very quantity the mechanism controls, so the loop keeps lowering the price until it
+hits 1 wei and stays there.<Cite src="eip-7918" />
+
+The recovery is then slow and ugly. The EIP states that when demand picks up, "over an hour of
+near-full blocks is required to restore a market-clearing equilibrium fee, with the mechanism
+intermittently resorting to a first-price auction, considered a worse UX by blob
+consumers."<Cite src="eip-7918" />
+
+**You can derive that hour.** From 1 wei to 1 gwei is a factor of 10<sup>9</sup>, so
+`ln(10⁹) = 20.72` in exponent terms. At BPO2's maximum upward exponent of 0.07852 per block, that is
+20.72 / 0.07852 ≈ **264 blocks**, and at twelve seconds a slot, **about 53 minutes of maximally full
+blocks**.<Cite src="eip-8135" /><Cite src="eip-4844" /> Real blocks are not all maximally full, so the
+observed figure is longer — which is exactly the "over an hour" the EIP asserts. The same arithmetic
+run downward gives 20.72 / 0.15704 ≈ 132 blocks, **about 26 minutes**, so the descent back to the floor
+takes half as long as the climb.
+
+That asymmetry is the operational headline of this lesson. **You get roughly an hour of warning while
+the price climbs, and half an hour of relief once it stops.** A batcher that reacts to blob-fee spikes
+on a five-minute polling loop is reacting inside the ramp, not after it.
+
+<Figure
+  caption="The ascent is exactly twice the descent, because since Pectra the max has been one and a half times the target."
+  alt="A timeline in minutes on BPO2's schedule. From minute 0 to minute 53 the blob base fee climbs from 1 wei to 1 gwei over 264 maximally full blocks at 8.2 percent each. A mark at minute 53 shows demand falling back to target. From minute 53 to minute 79 the fee decays back to the floor over 132 blocks at 14.5 percent each."
+>
+  <Timeline
+    from={0}
+    to={79}
+    unit="minutes"
+    caption="1 wei → 1 gwei → 1 wei, on BPO2's schedule (target 14, max 21)"
+    ticks={[0, 26, 53, 79]}
+    marks={[{ at: 53, label: 'demand falls back to target', tone: 'accent' }]}
+    spans={[
+      { label: 'climb to 1 gwei', start: 0, end: 53, tone: 'warn', note: '264 maximally full blocks, +8.2% each' },
+      { label: 'decay to the floor', start: 53, end: 79, tone: 'good', note: '132 blocks, −14.5% each' },
+    ]}
+  />
+</Figure>
+
+### The mechanism itself
+
+EIP-7918 assigns blobs a reserve price denominated in execution gas, with a single constant
+`BLOB_BASE_COST` = 2<sup>13</sup> = 8,192, and an `if`-clause added to
+`calc_excess_blob_gas`.<Cite src="eip-7918" /> When
+`BLOB_BASE_COST * base_fee_per_gas > GAS_PER_BLOB * base_fee_per_blob_gas`, the function does not
+subtract `target_blob_gas`; instead the accumulator grows by
+`blob_gas_used * (max − target) // max`.<Cite src="eip-7918" />
+
+Read the ratio it fixes: the reserve blob base fee is `BLOB_BASE_COST * base_fee_per_gas /
+GAS_PER_BLOB`, so the ratio of reserve blob base fee to execution base fee is
+`BLOB_BASE_COST / GAS_PER_BLOB` — **exactly 1/16** with the proposed constant.<Cite src="eip-7918" />
+
+The cleanest way to hold it: **at the reserve, one blob costs the same as 8,192 units of execution
+gas.** At an execution base fee of 10 gwei that is 0.00008192 ETH per blob, and the reserve blob base
+fee is 0.625 gwei per blob gas. For calibration against something you measured yourself in the gas
+track, 8,192 gas is a little under four cold `SLOAD`s at 2,100 gas each.<Cite src="measured-forge-1-7-1" />
+A blob at the reserve price costs about what four cold storage reads cost. That is a floor with a
+meaningful shape, rather than a floor at the smallest representable number.
+
+The EIP's second justification is worth carrying because it is about your infrastructure, not about
+auctions: nodes must batch-verify cell KZG proofs for every blob entering a mempool, and the EIP
+estimates that verification at roughly fifteen times the compute of the single point evaluation a
+contract pays 50,000 gas for.<Cite src="eip-7918" /> A price of 1 wei charges nothing for real work
+somebody's hardware is doing.
+
+<Aside kind="note">
+**On EIP-7918's status.** This curriculum's research sweep recorded its status as unresolved, and this
+lesson does not assert one. What can be reported is what two first-party pages showed when they were
+fetched for this lesson on 2026-08-26: the EIP index page for EIP-7918 carries the header "Final,
+Standards Track: Core",<Cite src="eip-7918" /> and the Ethereum Foundation's Fusaka mainnet
+announcement lists "EIP-7918: Blob base fee bounded by execution cost" among Fusaka's core
+EIPs.<Cite src="fusaka-mainnet-announcement" /> Check both yourself before relying on the mechanism
+being active on the network you are pricing against — the status line on an EIP and the activation
+state of a network are different facts, and the second one is the one your batcher feels.
+</Aside>
+
+<Misconception
+  belief="A reserve price on blobs means execution congestion now makes data posting expensive."
+  reality="The clause binds only when the blob base fee is below one-sixteenth of the execution base fee — at the very bottom of the range. Above that it does nothing, and the influence runs one way only: execution constrains blob at the floor, never the reverse."
+  why="'Blob base fee bounded by execution cost' sounds like a coupling between the two markets, and it is — but it is a floor, not a link, and it is invisible in every regime except the cheapest one."
+  src="eip-7918"
+/>
+
+<Check type="predict" concept="blob-base-fee-floor">
+Your chain's batcher posts five blobs every twenty minutes. The blob base fee has been at 1 wei for
+three weeks. This morning a large chain begins a migration and blob demand jumps to maximally full
+blocks; assume the network is on BPO2's schedule of target 14, max 21, update fraction 11,684,671.
+
+Your batcher's cost cap is set to a fixed number of gwei, chosen a year ago.
+
+Answer three things: how long you have before the blob base fee reaches 0.1 gwei, what happens at your
+cap, and how long the pain lasts once demand normalises.
+
+<Answer>
+**How long you have: about 44 minutes of maximally full blocks.**
+
+Work it the same way as the lesson. The rise from 1 wei to 0.1 gwei = 10<sup>8</sup> wei is a factor of
+10<sup>8</sup>, so `ln(10⁸) = 18.42`. The maximum upward exponent per block is
+`(21 − 14) × 131,072 / 11,684,671 = 0.07852`.<Cite src="eip-8135" /><Cite src="eip-4844" /> So
+18.42 / 0.07852 ≈ 235 blocks, and 235 × 12 s ≈ **47 minutes** — call it three quarters of an hour, and
+longer in practice because not every block will be at the maximum. This is the number that matters
+operationally: the ramp is slow enough to react to and fast enough that a daily review will miss it
+entirely.
+
+**What happens at your cap: your transactions stop being includable, and you start burning the
+sequencing window.** `max_fee_per_blob_gas` is a cap on the blob base fee you will accept, and a blob
+transaction whose cap is below the current base fee simply is not included.<Cite src="eip-4844" />
+Two aggravating details. There is no priority component on the blob side, so you cannot outbid anyone
+with a tip on blob gas — you compete on the execution tip or you wait.<Cite src="eip-4844" /> And
+replacing a pending blob transaction is expensive: operator documentation notes that current
+transaction pool implementations require a **doubling** of fees for blob transaction replacements,
+which is why the recommended multi-blob configuration also raises the resubmission timeout to give
+inclusion more time before bumping.<Cite src="op-docs-configure-batcher" /> Arbitrum's batch poster
+exposes the same problem as a tip-cap range with RBF escalation between a minimum and a
+maximum.<Cite src="arbitrum-batch-poster-fee-tuning" />
+
+So the failure is not "we paid more". It is "we paid nothing and posted nothing", which is the
+[batcher stall](/c/batcher) from the first lesson, arriving through the fee market instead of through
+an empty account — and the twelve-hour clock is running the whole time.
+
+**How long the pain lasts: about half as long as it took to arrive.** Once demand falls back below
+target, empty-relative-to-target blocks decay the accumulator at exponent 0.15704 per block, so the
+same 18.42 unwinds in 18.42 / 0.15704 ≈ 117 blocks ≈ **23 minutes**.<Cite src="eip-8135" /> The
+asymmetry is structural: since Pectra the max has been 1.5 times the target, so the fee can only climb
+at half the rate at which it falls.<Cite src="eip-8135" />
+
+**What to change.** Replace the fixed gwei cap with one expressed relative to the current blob base
+fee, and cap total spend per interval rather than price per unit — a fixed price cap converts a cost
+problem into a liveness problem, which is a strictly worse trade for a batcher. Then alert on the
+*derivative*: two consecutive blocks of blob base fee rising is a signal that arrives forty minutes
+before the number itself becomes alarming, and forty minutes is enough to decide deliberately whether
+to keep posting, post less often, or switch posting path entirely — the subject of the next lesson.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next**, the decision this arithmetic feeds. With two independent prices, neither posting path is
+always cheaper, and the crossover point turns out to depend as much on how full your blobs are as on
+either market.
+
+**Two lessons out**, the parameters themselves. Target, max and the update fraction all live on a
+schedule that now moves on its own cadence, which is why this lesson derived the dynamics rather than
+printing a table of outcomes.
+
+**And carry the method, not the multipliers.** Take the target, the max and the update fraction from
+whatever schedule is live; multiply by `GAS_PER_BLOB`; divide by the fraction; exponentiate. Two lines
+of arithmetic reproduce every rate in this lesson and will keep reproducing them after every constant
+here is stale.

@@ -1,0 +1,367 @@
+---
+id: altvm-anchor-init-if-needed
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [anchor-account-constraints, anchor-lang-error-docsrs, anchor-repo-changelog, anchor-docs-account-types, anchor-docs-errors, sealevel-attacks, anchor-docs-security-exploits, cantina-securing-solana, solana-docs-pda]
+stack: {}
+---
+
+Every constraint you have met so far fails by rejecting a transaction. This one fails by accepting
+one.
+
+Here is the shape of it, as it arrives in an incident channel. A user reports that their vault
+balance is zero. The transaction that did it succeeded, signed by them, calling an instruction named
+`initialize_vault` that they had called once before, months earlier, when they opened the vault.
+Nothing reverted, and the program did exactly what its source says it does.
+
+That is `init_if_needed` without a guard, and this lesson is about the fifteen characters of
+difference between it and `init`.
+
+## What `init` actually does
+
+`init` creates the account via a CPI to the System Program and initializes it — which specifically
+means setting its account discriminator.<Cite src="anchor-account-constraints" /> It takes a `payer`
+and a `space`:
+
+```rust
+#[account(init, payer = user, space = 8 + Vault::INIT_SPACE)]
+pub vault: Account<'info, Vault>,
+```
+
+The manual version is several steps, and it is worth seeing them because each one is a decision the
+constraint is making on your behalf:
+
+```rust
+// manual: allocate, fund to rent exemption, assign ownership, tag the type
+let space = 8 + Vault::INIT_SPACE;
+let lamports = Rent::get()?.minimum_balance(space);
+invoke(
+    &system_instruction::create_account(
+        payer.key, vault_info.key, lamports, space as u64, program_id,
+    ),
+    &[payer.clone(), vault_info.clone(), system_program.clone()],
+)?;
+let mut data = vault_info.try_borrow_mut_data()?;
+data[..8].copy_from_slice(&Vault::DISCRIMINATOR);
+```
+
+Three things in there are worth naming.
+
+**Space is fixed at creation.** A Solana account is allocated with a length. It does not grow because
+you wrote a longer string into it — resizing is the separate `realloc`
+constraint, with its own payer.<Cite src="anchor-account-constraints" /> The `8 +` is the
+discriminator, which is why every Anchor space calculation starts that way.
+
+**Somebody pays, in lamports, for the account to exist.** The account must hold enough to be
+[rent exempt](/c/rent-exemption), and `payer` names the account
+debited.<Cite src="anchor-account-constraints" /> This has no EVM counterpart: writing a new mapping
+entry costs the caller gas once and then the state persists at no ongoing cost to anyone. On Solana
+storage is collateralised, the collateral is refundable, and "who funds this account" is a product
+decision — a program that makes users fund their own accounts and one that funds them from a treasury
+behave differently for a new user.
+
+**Creation fails if the account already exists**, which is the property this whole lesson turns on.
+Attempting to `init` a live account is an error, and that error is the guard.
+
+## `init_if_needed` removes the guard, deliberately
+
+`init_if_needed` is the same as `init` but only runs if the account does not exist yet, and it
+requires the `init-if-needed` cargo feature.<Cite src="anchor-account-constraints" />
+
+That feature gate is the framework telling you something, and it is worth reading it as a message
+rather than as an obstacle. Anchor cannot make this constraint safe, because the danger is not in the
+constraint — it is in the code *after* it. So the framework declines to offer it silently and makes
+you write an opt-in into your `Cargo.toml`, where a reviewer will see it.
+
+Run the second call through, line by line, and the failure assembles itself:
+
+```rust
+#[derive(Accounts)]
+pub struct InitializeVault<'info> {
+    #[account(
+        init_if_needed,
+        payer = user,
+        space = 8 + Vault::INIT_SPACE,
+        seeds = [b"vault", user.key().as_ref()],
+        bump
+    )]
+    pub vault: Account<'info, Vault>,
+    #[account(mut)]
+    pub user: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+pub fn initialize_vault(ctx: Context<InitializeVault>) -> Result<()> {
+    ctx.accounts.vault.authority = ctx.accounts.user.key();
+    ctx.accounts.vault.balance = 0;
+    ctx.accounts.vault.bump = ctx.bumps.vault;
+    Ok(())
+}
+```
+
+**Call one.** Account does not exist. It is created, funded, tagged, and the handler writes the
+initial state. Correct.
+
+**Call two, by the same user, months later.** The account exists, so the creation is
+skipped — that is the entire semantic of the constraint.<Cite src="anchor-account-constraints" /> The
+seeds still match. The discriminator still matches.<Cite src="anchor-docs-account-types" /> The owner
+is still this program. Every validation in this module passes, correctly, because the account
+genuinely is this user's genuine vault.
+
+Then the handler runs. `balance = 0`.
+
+**Nothing was bypassed.** The three container checks did their job. The seed constraint did its job.
+There was no type confusion, no forged account, no missing signer. The account was exactly what it
+claimed to be, and the program overwrote it, because the handler's body was written for the case
+where the account had just been created and there was no way for it to tell that it hadn't.
+
+<Compare
+  columns={[
+    { title: 'Call one', note: 'the account does not exist' },
+    { title: 'Call two', note: 'same user, months later', tone: 'danger' },
+  ]}
+  rows={[
+    {
+      label: <>What does <code>init_if_needed</code> do?</>,
+      cells: [
+        'Creates the account, funds it, sets the discriminator',
+        <>Skips creation — that is the entire semantic<Cite src="anchor-account-constraints" /></>,
+      ],
+    },
+    {
+      label: 'What do the seeds and the bump say?',
+      cells: ['Derived and stored', 'They still match — the address is unchanged'],
+    },
+    {
+      label: 'What do owner and discriminator say?',
+      cells: [
+        'Just written by the framework',
+        <>Both correct: it genuinely is this user's vault<Cite src="anchor-docs-account-types" /></>,
+      ],
+    },
+    {
+      label: 'What does the handler write?',
+      cells: [
+        <><code>balance = 0</code></>,
+        { v: <><code>balance = 0</code></>, tone: 'danger' },
+      ],
+    },
+    {
+      label: 'What does that mean?',
+      cells: [
+        'The opening state of a new vault',
+        { v: 'A funded balance, erased, in a transaction that succeeds', tone: 'danger' },
+      ],
+    },
+  ]}
+  caption="The two calls differ in exactly one fact — whether the account already existed — and it is the one fact no check in this module reports."
+  alt="First and second calls to the same initializer compared: creation happens then is skipped, seeds and discriminator match in both cases, and the handler writes balance equals zero in both — which is opening state the first time and an erased balance the second."
+/>
+
+<Misconception
+  belief="The discriminator and owner checks protect me here — a live vault can't be passed to an initializer."
+  reality="It can, because it is a legitimate account of exactly the right type owned by exactly the right program. Every validation passes. That is what makes re-initialization a different category from the account-substitution bugs: nothing is being spoofed."
+  why="Every other constraint in Anchor answers 'is this account what it claims to be', so the reflex is to look for the check that was skipped. Here no check was skipped."
+  src="anchor-account-constraints"
+/>
+
+## The guard has to be yours
+
+The framework cannot supply it. Only you know which of your fields must never be reset — a balance
+must not, a cached price probably may, an authority absolutely must not.
+
+The mechanism is a field you can read to distinguish the two branches:
+
+```rust
+pub fn initialize_vault(ctx: Context<InitializeVault>) -> Result<()> {
+    let vault = &mut ctx.accounts.vault;
+    require!(!vault.is_initialized, VaultError::AlreadyInitialized);
+    vault.is_initialized = true;
+    vault.authority = ctx.accounts.user.key();
+    vault.balance = 0;
+    vault.bump = ctx.bumps.vault;
+    Ok(())
+}
+```
+
+`is_initialized` works because a newly created account is zero-filled, so the flag reads `false`
+exactly once in the account's life. A sentinel field — an authority compared against
+`Pubkey::default()` — works for the same reason. What does *not* work is inferring the branch from
+anything Anchor gives you, because the constraint's whole purpose is to make both branches look the
+same to the code that follows.
+
+<Aside kind="warn">
+Note the interaction with the previous lesson's footgun. Relying on "the account is zero-filled" is
+sound for a *field*, and unsound for the *discriminator*, because an all-zero discriminator is
+indistinguishable from a fresh account — which is why Anchor rejects zeroed account discriminators
+outright.<Cite src="anchor-account-constraints" /> Put your initialization flag in your own data, not
+in the type tag.
+</Aside>
+
+### When `init_if_needed` is the right answer
+
+It is not a banned construct, and treating it as one produces worse programs — usually a hand-rolled
+"create if missing" that reimplements the same hazard with more surface.
+
+The honest case is **an account with no state worth resetting, created idempotently as a side effect
+of something else.** Associated token accounts are the canonical example: a transfer instruction that
+needs the recipient's token account to exist can create it in passing, and the "initial state" of a
+token account is not something a second call can damage in a way the first call did not already
+define.
+
+The test to apply is one sentence. *If this instruction runs twice on a live account, which fields
+change, and does any of them represent value or authority?* If the answer is "none", `init_if_needed`
+is fine. If the answer names a balance, an authority, a nonce, a paused flag, or a timestamp anything
+depends on, you need the guard — and you needed it whether or not you were using this constraint,
+because you have written an instruction whose second execution is meaningful.
+
+<Misconception
+  belief="Using Anchor means I cannot write an insecure program."
+  reality="Anchor removes the default-unsafe cases. `UncheckedAccount`, `init_if_needed`, a missing `has_one`, and unvalidated CPI targets are all still yours to get right — and this constraint is the clearest example, since the framework gates it behind a cargo feature precisely because it cannot make it safe."
+  why="'Safe by default' gets read as 'safe'. The defaults are good, which makes the remaining surface feel smaller than it is rather than merely quieter."
+  src="anchor-account-constraints"
+/>
+
+### The mirror image: closing
+
+The same hazard runs in the other direction and belongs in the same mental slot.
+
+`close = target` closes an account by sending its lamports to the target and resetting its
+data.<Cite src="anchor-account-constraints" /> The manual version — draining lamports and stopping
+there — leaves an account whose data still deserializes and whose discriminator still matches. Anyone
+can top it back up to rent exemption before the runtime reclaims it, and the "closed" position, loan
+or receipt is live again. That is the [account revival attack](/c/account-revival-attack), and the
+reason `close` resets the data rather than only moving the money.<Cite src="anchor-account-constraints" /><Cite src="sealevel-attacks" />
+
+<Figure
+  caption="The loop closes because a drained account differs from a funded one only in its balance, and a balance is something anybody is allowed to top up."
+  alt="A manual close drains an account's lamports but leaves its data and discriminator intact; anybody can send lamports back to rent exemption before the runtime reclaims it, and the account is live again — a cycle back to the state it started in."
+>
+  <Flow
+    nodes={[
+      { id: 'live', label: 'live account', note: 'a position, loan or receipt', col: 0 },
+      { id: 'drain', label: 'lamports drained', note: 'the manual close stops here', col: 1, tone: 'warn' },
+      { id: 'data', label: 'data intact', note: 'discriminator still matches', col: 2, tone: 'danger' },
+      { id: 'top', label: 'topped back up', note: 'by anyone, before reclamation', col: 3 },
+    ]}
+    edges={[
+      { from: 'live', to: 'drain' },
+      { from: 'drain', to: 'data' },
+      { from: 'data', to: 'top' },
+      { from: 'top', to: 'live', label: 'live again', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+Initialization and closing are the two moments when an account's *existence* changes, and both of
+Solana's characteristic state bugs live there. If you are auditing an unfamiliar program with limited
+time, read those two instructions first.<Cite src="anchor-docs-security-exploits" /><Cite src="cantina-securing-solana" />
+
+<Check type="spot-bug" concept="init-vs-init-if-needed">
+A team ships this after a user complained that opening a position failed when their token account did
+not exist yet. The fix "just makes it work both times".
+
+```rust
+#[derive(Accounts)]
+pub struct OpenPosition<'info> {
+    #[account(
+        init_if_needed,
+        payer = trader,
+        space = 8 + Position::INIT_SPACE,
+        seeds = [b"position", trader.key().as_ref(), market.key().as_ref()],
+        bump
+    )]
+    pub position: Account<'info, Position>,
+    pub market: Account<'info, Market>,
+    #[account(mut)]
+    pub trader: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+pub fn open_position(ctx: Context<OpenPosition>, size: u64) -> Result<()> {
+    let p = &mut ctx.accounts.position;
+    p.owner = ctx.accounts.trader.key();
+    p.market = ctx.accounts.market.key();
+    p.size = size;
+    p.collateral_locked = 0;
+    p.bump = ctx.bumps.position;
+    Ok(())
+}
+```
+
+Say what an attacker does, who the attacker is, and give the smallest correct fix.
+
+<Answer>
+**The attacker is the trader, and the victim is the protocol.** This is worth stating first because
+the reflex is to look for an outsider. Every constraint here is correct: the seeds bind the position
+to this trader and this market, the signer proves consent, the container checks confirm the type and
+owner.<Cite src="anchor-account-constraints" /><Cite src="anchor-docs-account-types" /> There is no
+third party to keep out. The hole is that a legitimate owner may call this instruction again on their
+own live position.
+
+**What they get: `collateral_locked = 0` on a position that has collateral locked.** Open a position,
+lock collateral, then call `open_position` a second time. The account exists, so creation is skipped;
+the handler runs and zeroes the field the protocol uses to remember what it is holding. Depending on
+how the rest of the program reads that field, the trader now withdraws collateral the position still
+needs, or reopens the same collateral into a second position, or escapes liquidation because a health
+check divides by a number that is now zero. `size` is also freely rewritable, so an existing position
+can be resized without going through whatever risk checks a proper `modify_position` performs. This
+is [re-initialization](/c/reinitialization-attack) with the owner as the attacker, which is the
+variant people miss because they model attackers as strangers.
+
+**The second defect: it is free to attack.** `payer = trader` only debits on the creation branch, so
+the second call allocates nothing and costs a signature.<Cite src="anchor-account-constraints" />
+There is no economic friction to slow down probing.
+
+**The smallest correct fix is not a guard — it is splitting the instruction.** Add
+`require!(!p.is_initialized, ...)` and you have a correct program with a broken product: the trader
+who complained still cannot open a second position, they just get a different error. What the ticket
+actually described is two operations wearing one name. Make `open_position` use plain `init`, so a
+second call fails with the framework's own error, and add a separate `increase_position` that takes
+an existing position and applies the risk checks that changing a live position
+requires.<Cite src="anchor-account-constraints" />
+
+If the account really must be created opportunistically — because it is created as a side effect of
+some larger flow — then keep `init_if_needed` and guard it, with the guard reading a field of your
+own rather than anything the framework provides:
+
+```rust
+require!(!p.is_initialized, PositionError::AlreadyOpen);
+p.is_initialized = true;
+```
+
+**Two follow-ups a reviewer should raise.** First, is `init-if-needed` in `Cargo.toml` for this one
+instruction? If so, it is now enabled for the whole crate, and every other `init` in the program is
+one keystroke away from the same bug — a good reason to treat enabling the feature as a decision that
+needs a note, not a build fix.<Cite src="anchor-account-constraints" /> Second, does any instruction
+close a `Position`? If it drains lamports without resetting the data, the revival path is open and the
+same account comes back after being closed.<Cite src="anchor-account-constraints" /><Cite src="sealevel-attacks" />
+
+**The one-line version.** `init` fails on the second call, and that failure is a security control.
+`init_if_needed` converts that control into a code path you now have to write, and the framework asks
+you to opt in because it cannot write it for you.
+</Answer>
+</Check>
+
+## What this unlocks
+
+The module now has all four validation mechanisms — container checks, constraints, relational binding,
+and creation — and the failure mode of each.
+
+- **The IDL** comes next: how all of this is described to clients, and how a description can be
+  incomplete enough to produce a client that derives the wrong address. Note that `init` together
+  with `seeds` is exactly the combination with a known IDL-emission problem, so this lesson's
+  constraint is the next lesson's example.<Cite src="anchor-repo-changelog" />
+- **Cost and testing** close the module, and re-initialization is the canonical thing to write a
+  negative test for — an assertion that a second call fails with your named error rather than
+  succeeding.<Cite src="anchor-docs-errors" /><Cite src="anchor-lang-error-docsrs" />
+- **The Solana security module** treats this as one of its named vulnerability classes, alongside
+  bump canonicalization and account revival.<Cite src="cantina-securing-solana" /><Cite src="solana-docs-pda" />
+  Arriving there having already seen where each class comes from in the framework is the point of
+  taking this module first.
+
+Before moving on, grep any Solana codebase you have access to for `init_if_needed` and read the
+handler under every hit. The question is always the same one sentence: if this runs twice, what
+changes.

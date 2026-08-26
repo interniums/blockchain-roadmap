@@ -1,0 +1,439 @@
+---
+id: defi-hooks-code-inside-your-swap
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [uniswap-hooks-docs, uniswap-v4-hooks-concept-docs, uniswap-v4-core-hooks-library, uniswap-v4-hook-deployment-docs, uniswap-v4-poolmanager, uniswap-v4-core-poolkey, uniswap-v4-dynamic-fees-docs, zealynx-v4-security, eip-1014, measured-gas-constants]
+stack: {}
+---
+
+A deployment script for a Uniswap v4 hook starts by burning CPU. Not compiling — it has already
+compiled. It is searching: hashing candidate salts, deriving the address each one would produce, and
+throwing away every result whose last few bits are wrong. Thousands of attempts, and only then does
+it broadcast.
+
+Nothing else in Ethereum deployment looks like this. The reason is a single design decision with
+consequences that run from gas costs to audit checklists: **which callbacks a hook receives is
+encoded in the hook's own address.** Not in storage, not in a registry, not in a call to the hook
+asking what it supports. In the bits of the address.
+
+This lesson builds the hook interface, then derives why the address carries the permissions, then
+works through the failure modes that follow — including the one where nothing reverts and the hook
+is simply never called.
+
+## What a hook is
+
+A hook is an ordinary contract whose address is recorded in a pool's `PoolKey`.<Cite src="uniswap-v4-core-poolkey" />
+At defined points in the pool's lifecycle the `PoolManager` calls it. The documentation frames hooks
+as external smart contracts attached to individual pools that intercept and modify the execution flow
+at specific points during pool-related actions, with callbacks running around pool initialisation,
+liquidity changes, swaps and donations.<Cite src="uniswap-hooks-docs" />
+
+Three structural facts, all load-bearing:
+
+**Every pool can have one hook; one hook can serve any number of pools.**<Cite src="uniswap-v4-hooks-concept-docs" />
+The relationship is many-to-one, which is why hook state has to be keyed by `PoolId` and why a hook's
+storage is shared across pools it does not control.
+
+**Hooks are optional and set at pool creation.**<Cite src="uniswap-hooks-docs" /> Because the hook
+address is a field of the `PoolKey`, the same pair at the same fee with a different hook is a
+*different pool*, and a pool's hook cannot be changed for the pool's lifetime.
+
+**Pool creation is permissionless.** Trail of Bits states the consequence: unless a hook restricts
+initialisation in `beforeInitialize`, anyone can create a pool with that hook address
+attached.<Cite src="zealynx-v4-security" /> Attaching a hook is not something the hook's author
+approves.
+
+<Misconception
+  belief="A hook can be upgraded or swapped out on a live pool."
+  reality="The hook address is part of the PoolKey, so it is fixed for that pool's lifetime. A hook can, however, be an upgradeable proxy behind that fixed address, which is a separate thing to check."
+  why="Everything else in DeFi is upgradeable, so 'the hook' reads as a configurable pointer. It is not — but the immutability is of the address, not of the code at it."
+  src="uniswap-hooks-docs"
+/>
+
+## The ten lifecycle callbacks
+
+The documentation lists them in four groups.<Cite src="uniswap-v4-hooks-concept-docs" />
+
+<Matrix
+  corner="Group"
+  cols={['Callbacks', 'Note']}
+  rows={[
+    { label: 'Initialize', cells: [<><code>beforeInitialize</code>, <code>afterInitialize</code></>, 'can only ever be invoked once for a pool'] },
+    { label: 'Liquidity', cells: [<><code>beforeAddLiquidity</code>, <code>afterAddLiquidity</code>, <code>beforeRemoveLiquidity</code>, <code>afterRemoveLiquidity</code></>, <>split add from remove <strong>for security purposes</strong></>] },
+    { label: 'Swap', cells: [<><code>beforeSwap</code>, <code>afterSwap</code></>, ''] },
+    { label: 'Donate', cells: [<><code>beforeDonate</code>, <code>afterDonate</code></>, 'customises donations to LPs'] },
+  ]}
+  caption="Every callback comes as a before and after pair, so a hook can act on the pool's state on either side of the operation it is attached to."
+  alt="The ten Uniswap v4 hook callbacks in four groups: initialize, liquidity split into add and remove, swap, and donate."
+/>
+
+Developers implement whichever subset they want; the docs are explicit that you do not have to
+implement every hook and can mix and match.<Cite src="uniswap-v4-hooks-concept-docs" />
+
+The granularity of the liquidity group is worth pausing on, because the docs attribute it to security
+rather than convenience.<Cite src="uniswap-v4-hooks-concept-docs" /> A hook that penalises
+just-in-time liquidity needs to act on *removal* without also gating *addition*; a hook that must
+never block exits needs to be able to put logic on add and nothing on remove. Merging the four into
+two would make "cannot block withdrawal" unexpressible.
+
+### Where they sit in a swap
+
+The `PoolManager` documentation gives the sequence for a swap: check the pool is valid and
+initialised, execute `beforeSwap` if applicable, perform the swap and charge fees, execute
+`afterSwap` if applicable, then compute the net amounts owed as a
+`BalanceDelta`.<Cite src="uniswap-v4-poolmanager" /> Liquidity modification has the same shape around
+`modifyLiquidity`.<Cite src="uniswap-v4-poolmanager" />
+
+The timing distinction is not cosmetic. Trail of Bits identifies "right logic, wrong hook" as a
+recurring audit finding: `beforeSwap` executes with pre-swap state and `afterSwap` sees post-swap
+state, so code that is correct in one is unsafe in the other — and the pattern they repeatedly
+observe is logic that needs the final swap result placed in `beforeSwap`, where it operates on stale
+data.<Cite src="zealynx-v4-security" />
+
+There is one more guard worth knowing about: `Hooks.sol` carries a `noSelfCall` modifier that
+suppresses the callback when the hook itself initiated the action.<Cite src="uniswap-v4-core-hooks-library" />
+Without it, a hook that swaps inside `afterSwap` would call itself, recursively.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'beforeSwap', note: 'runs first', tone: 'accent' },
+    { title: 'afterSwap', note: 'runs last' },
+  ]}
+  rows={[
+    { label: 'What state does it see?', cells: [<>The pool before the swap<Cite src="zealynx-v4-security" /></>, <>The pool after the swap and its fees<Cite src="zealynx-v4-security" /></>] },
+    { label: 'What does the manager do around it?', cells: [<>Validates the pool, calls it, then swaps and charges fees<Cite src="uniswap-v4-poolmanager" /></>, <>Calls it after the swap, then computes the BalanceDelta owed<Cite src="uniswap-v4-poolmanager" /></>] },
+    { label: 'Which flag honours a returned delta?', cells: [<><code>BEFORE_SWAP_RETURNS_DELTA</code>, bit 3<Cite src="uniswap-v4-core-hooks-library" /></>, <><code>AFTER_SWAP_RETURNS_DELTA</code>, bit 2<Cite src="uniswap-v4-core-hooks-library" /></>] },
+    { label: 'What happens without that flag?', cells: [<>The manager may still call it and treats the returned delta as zero<Cite src="zealynx-v4-security" /></>, 'The same: the callback runs and its delta is discarded'] },
+    { label: 'What can the delta do?', cells: [<>Consume the whole specified amount, so the hook supplies the trade instead of the curve<Cite src="zealynx-v4-security" /></>, 'Charge against a swap the pool has already priced'] },
+  ]}
+  caption="Where a callback sits decides what it can see, which is why the same logic can be correct in one of these columns and unsafe in the other."
+  alt="beforeSwap and afterSwap compared on the pool state each observes, what the PoolManager does around each, which permission bit honours a returned delta, what happens without that bit, and what each can do with a delta."
+/>
+
+## The four flags that let a hook move value
+
+Ten callbacks, but fourteen flags. The extra four are return-delta permissions, and they are the
+line between a hook that observes and a hook that
+takes.<Cite src="uniswap-v4-core-hooks-library" />
+
+```text
+BEFORE_SWAP_RETURNS_DELTA_FLAG              1 << 3
+AFTER_SWAP_RETURNS_DELTA_FLAG               1 << 2
+AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG      1 << 1
+AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG   1 << 0
+```
+
+With one of these set, the callback's returned delta is honoured by the manager; without it, the
+manager may still call the callback but treats the returned delta as
+zero.<Cite src="zealynx-v4-security" />
+
+The most consequential case is `beforeSwapReturnDelta`. Trail of Bits describes it: if a
+`BeforeSwapDelta` consumes the user's entire specified amount, the `PoolManager` has no amount left
+for its concentrated-liquidity swap and the hook supplies the trade instead — often called a NoOp
+swap, and to be treated as a custom AMM, with conservation, price bounds, rounding and returned
+deltas all tested against real balances.<Cite src="zealynx-v4-security" />
+
+**Read that carefully.** A pool can look like a Uniswap pool, be created through the Uniswap
+`PoolManager`, appear in a router's pool list — and route your trade through pricing logic that
+Uniswap never wrote and no constant-product curve constrains.
+
+The adjacent capability is the dynamic fee. A dynamic-fee pool accepts a per-swap fee override
+returned from `beforeSwap`, and its hook can also update the stored LP fee through
+`updateDynamicLPFee`.<Cite src="uniswap-v4-dynamic-fees-docs" /> Trail of Bits' guidance is to bound
+every fee, limit how quickly privileged changes can move it, and never derive it directly from inputs
+an attacker can cheaply manipulate.<Cite src="zealynx-v4-security" /> Note that the dynamic-fee
+capability itself is fixed at creation and encoded in the key: the `fee` field's high bit set, the
+field exactly `0x800000`.<Cite src="uniswap-v4-core-poolkey" /><Cite src="uniswap-v4-dynamic-fees-docs" />
+
+## The address is the permission set
+
+Now the design decision. `Hooks.sol` opens by stating it: v4 decides whether to invoke specific hooks
+by inspecting the least significant bits of the address the hook contract is deployed
+to.<Cite src="uniswap-v4-core-hooks-library" />
+
+The whole check is one pure function:<Cite src="uniswap-v4-core-hooks-library" /><Cite src="zealynx-v4-security" />
+
+```solidity
+function hasPermission(IHooks self, uint160 flag) internal pure returns (bool) {
+    return uint160(address(self)) & flag != 0;
+}
+```
+
+Fourteen flags occupy the low fourteen bits, with `ALL_HOOK_MASK` defined as
+`uint160((1 << 14) - 1)`:<Cite src="uniswap-v4-core-hooks-library" />
+
+<Matrix
+  numeric
+  corner="Bit"
+  cols={['Flag', 'Group']}
+  rows={[
+    { label: '13', cells: ['BEFORE_INITIALIZE', 'Initialize'] },
+    { label: '12', cells: ['AFTER_INITIALIZE', 'Initialize'] },
+    { label: '11', cells: ['BEFORE_ADD_LIQUIDITY', 'Liquidity'] },
+    { label: '10', cells: ['AFTER_ADD_LIQUIDITY', 'Liquidity'] },
+    { label: '9', cells: ['BEFORE_REMOVE_LIQUIDITY', 'Liquidity'] },
+    { label: '8', cells: ['AFTER_REMOVE_LIQUIDITY', 'Liquidity'] },
+    { label: '7', cells: ['BEFORE_SWAP', 'Swap'] },
+    { label: '6', cells: ['AFTER_SWAP', 'Swap'] },
+    { label: '5', cells: ['BEFORE_DONATE', 'Donate'] },
+    { label: '4', cells: ['AFTER_DONATE', 'Donate'] },
+    { label: '3', cells: [{ v: 'BEFORE_SWAP_RETURNS_DELTA', tone: 'warn' }, { v: 'Return delta', tone: 'warn' }] },
+    { label: '2', cells: [{ v: 'AFTER_SWAP_RETURNS_DELTA', tone: 'warn' }, { v: 'Return delta', tone: 'warn' }] },
+    { label: '1', cells: [{ v: 'AFTER_ADD_LIQUIDITY_RETURNS_DELTA', tone: 'warn' }, { v: 'Return delta', tone: 'warn' }] },
+    { label: '0', cells: [{ v: 'AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA', tone: 'warn' }, { v: 'Return delta', tone: 'warn' }] },
+  ]}
+  caption="Ten of the fourteen bits decide whether a hook is called. The bottom four decide whether what it returns is allowed to move money."
+  alt="The fourteen hook permission bits from 13 down to 0, each named and grouped: initialize, liquidity, swap, donate, and the four return-delta flags occupying bits 3 to 0."
+/>
+
+### Reading an address
+
+Two worked examples, both from first-party sources, both checkable by hand.
+
+**The docs' example.** A hook at `0x00000000000000000000000000000000000000C0` has trailing bits
+`1100 0000`. Counting from the right starting at one, the seventh and eighth bits are set. The docs
+identify these as `AFTER_SWAP` and `BEFORE_SWAP`, so during a swap the manager will call
+both.<Cite src="uniswap-v4-hook-deployment-docs" /> In zero-indexed terms that is bits 6 and 7, which
+matches the table above — `0xC0` is `0x80 + 0x40`, and `1 << 7` plus `1 << 6`.
+
+**The library's own example.** The header of `Hooks.sol` says a hook deployed to
+`0x0000000000000000000000000000000000002400` has lowest bits `10 0100 0000 0000`, causing the
+before-initialize and after-add-liquidity hooks to be used.<Cite src="uniswap-v4-core-hooks-library" />
+Check it: `0x2400 = 0x2000 + 0x400 = (1 << 13) + (1 << 10)`, which is `BEFORE_INITIALIZE_FLAG` plus
+`AFTER_ADD_LIQUIDITY_FLAG`. Exactly as claimed.
+
+<Figure
+  caption="The permission set is not stored anywhere. It is the tail of an address the PoolManager was already holding."
+  alt="The example hook address 0x0000000000000000000000000000000000002400 with its last four hex digits marked as the region carrying the fourteen permission bits, and everything before them marked as bits the manager never reads."
+>
+  <Anatomy
+    value="0x0000000000000000000000000000000000002400"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 38, label: 'never read by the manager', note: 'whatever the salt search produced', tone: 'muted' },
+      { from: 38, to: 42, label: 'the flag bits live here', note: 'low 14 masked: (1 << 13) + (1 << 10)', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+**You can therefore read a hook's callback set off its address with no RPC call at all.** That is a
+genuinely useful property and the first thing to do when a router offers you an unfamiliar pool.
+
+### Why encode permissions in the address at all
+
+Work out the alternatives and the choice stops looking eccentric.
+
+**Alternative 1 — store permissions in the `PoolManager`.** Then every callback site must read
+storage before deciding whether to call. On the configuration this curriculum measures against, the
+first read of a slot in a transaction costs 2,100 gas and a warm read
+100.<Cite src="measured-gas-constants" /> The manager performs up to ten of these checks across a
+single swap-and-liquidity flow, on the hot path of every operation on every pool.
+
+**Alternative 2 — ask the hook.** An external call to a contract you do not trust, before you have
+decided whether to trust it, purely to find out what it claims to support. That inverts the
+trust relationship and adds a call frame per query.
+
+**The address costs nothing.** `hasPermission` is a mask and a comparison on a value the manager
+already holds. No `SLOAD`, no `CALL`, no allocation. Two more properties fall out for free:
+
+- **Immutability.** The permission set cannot drift, because changing it would mean changing the
+  address, which means being a different contract at a different pool.
+- **Public auditability.** Anyone can determine which callbacks a hook receives from the address
+  alone — from a block explorer, from a router's response, from a log entry.
+
+<Aside kind="note">
+The generalisable idea is worth extracting: **the cheapest place to put metadata is inside an
+identifier you were already going to load.** It works when the metadata is small, immutable and
+needed on a hot path — all three hold here. It fails badly when any of them stops holding, which is
+why you should not reach for this pattern to encode anything that might need to change.
+</Aside>
+
+## Mining the address
+
+If the address must carry the bits, you cannot choose the contract and then choose the address. You
+choose the bits and then search for a deployment that lands on them.
+
+`CREATE2` is what makes the search possible: the deployed address is
+`keccak256(0xff ++ deployer ++ salt ++ keccak256(init_code))` truncated to twenty
+bytes.<Cite src="eip-1014" /> Everything but the salt is fixed once the contract compiles, so the salt
+is a free parameter and the address is a hash of it. You have used this before for
+[deterministic addresses](/c/create2-address); here it is being used as a search space.
+
+The docs describe the practice: because of encoded addresses, hook developers must mine an address to
+their particular pattern, and the `HookMiner` helper finds a salt producing a hook address with the
+desired flags.<Cite src="uniswap-v4-hook-deployment-docs" /> The Foundry script pattern is:
+
+```solidity
+uint160 flags = uint160(Hooks.AFTER_ADD_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG);
+
+bytes memory constructorArgs = abi.encode(POOLMANAGER);
+(address hookAddress, bytes32 salt) =
+    HookMiner.find(CREATE2_DEPLOYER, flags, type(PointsHook).creationCode, constructorArgs);
+
+vm.broadcast();
+PointsHook pointsHook = new PointsHook{salt: salt}(IPoolManager(POOLMANAGER));
+require(address(pointsHook) == hookAddress, "PointsHookScript: hook address mismatch");
+```
+
+Two operational details the docs call out. In a `forge script`, `CREATE2_DEPLOYER` should be
+`0x4e59b44847b379578588920cA78FbF26c0B4956C`, the CREATE2 deployer proxy; in `forge test` it is the
+test contract or the pranking address.<Cite src="uniswap-v4-hook-deployment-docs" /> And for local
+testing you can skip mining entirely with Foundry's `deployCodeTo` cheatcode, which places the
+contract at any address you name.<Cite src="uniswap-v4-hook-deployment-docs" />
+
+### How much work is the search?
+
+This is derivable, and the answer surprises people in the reassuring direction.
+
+**Subgoal 1 — establish that the match must be exact, not a superset.**
+`validateHookPermissions` compares each declared permission against `hasPermission` for its flag and
+reverts with `HookAddressNotValid` if any of the fourteen disagree.<Cite src="uniswap-v4-core-hooks-library" />
+So you are not looking for an address with *at least* your bits — you need those fourteen bits to
+equal your mask exactly, extra bits included as zeros.
+
+**Subgoal 2 — model the address as uniform.** A `keccak256` output is not predictable from its input,
+so each salt gives an effectively uniform draw over the low fourteen bits.
+
+**Subgoal 3 — compute expected trials.** One draw in `2^14` matches, so the expected number of salts
+tried is 16,384, and each trial is one `keccak256` over a fixed-length preimage.
+
+**Subgoal 4 — sanity-check the result.** Sixteen thousand hashes is milliseconds of work. Address
+mining sounds like proof-of-work and is not: it is a fourteen-bit search, deliberately sized so that
+it costs a developer nothing and buys the protocol a free permission read forever. Compare it with
+vanity-address mining for a memorable prefix, which targets far more bits and takes far longer.
+
+## The four ways to get the bits wrong
+
+Trail of Bits enumerates three permission mismatches, and a fourth comes from the library's
+validation rules. All four are worth carrying as a checklist because their symptoms are completely
+different.<Cite src="zealynx-v4-security" />
+
+**Bit set, callback missing.** The manager calls a function that is not there. The transaction
+reverts. Loud, immediate, found in the first test.
+
+**Callback implemented, bit missing.** The manager never calls it. **Nothing reverts.** Your fee is
+never charged, your oracle never records, your limit orders never fill — and every transaction
+succeeds. This is the silent one, and it is the reason the constructor validation exists at all.
+
+**Return-delta bit missing.** The manager may call the callback and then treat the returned delta as
+zero.<Cite src="zealynx-v4-security" /> The hook believes it charged a fee; the accounting says it did
+not. Trail of Bits gives the real instance: in the Sorella Angstrom finding, the hook returned a
+non-zero delta for a dynamic protocol fee but the configuration did not encode
+`afterSwapReturnDelta`, so the manager was not authorised to settle the delta and every swap reverted
+with `CurrencyNotSettled()` once the fee was enabled.<Cite src="zealynx-v4-security" />
+
+**Structurally invalid combinations.** `isValidHookAddress` rejects a return-delta flag without its
+corresponding action flag — `beforeSwapReturnDelta` without `beforeSwap`, and the three
+analogues.<Cite src="uniswap-v4-core-hooks-library" /> It also requires that a non-zero hook address
+have at least one flag set or the pool use a dynamic fee, and that the zero hook address is paired
+with a non-dynamic fee.<Cite src="uniswap-v4-core-hooks-library" /> A hook with no flags and no
+dynamic fee is not a permissive hook; it is a rejected pool.
+
+The prescribed defence is to inherit from `BaseHook` and keep `getHookPermissions()` in sync with the
+callbacks and return deltas the hook actually uses, since `BaseHook` validates that the deployed
+address bits match the declared permissions.<Cite src="zealynx-v4-security" /> That turns the silent
+failure into a constructor revert, which is the only acceptable place for it.
+
+<Misconception
+  belief="An address with a permission bit set means that callback is implemented and does something sensible."
+  reality="The bit means only that the PoolManager will call it. Whether the hook implements it, and whether what it does is safe, are separate questions the address cannot answer."
+  why="The bits are called permissions, which sounds like a capability the hook exercises rather than an instruction to the caller. Reading the address tells you the attack surface, not the behaviour — those need the code."
+  src="zealynx-v4-security"
+/>
+
+## The immutability that is not one
+
+One correction before the next lesson, because it is the single most common misreading of this
+design.
+
+Address bits do not make a hook's behaviour immutable. Trail of Bits states it plainly: if a pool's
+hook address points to a proxy, the permission bits stay fixed while an upgrade can change the code
+reached through that address, so the upgrade admin, delay, storage layout and implementation checks
+are part of the hook's security boundary — and immutable, versioned deployments are
+preferable.<Cite src="zealynx-v4-security" />
+
+So the address pins **which callbacks run**, permanently. It says nothing about **what they do**. If
+you know [the proxy pattern](/c/delegatecall-proxy) — and you do — the shape is familiar: a fixed
+entry point with mutable behaviour behind it. What is new is that here the fixed entry point is also
+the permission system, which makes it very easy to conflate the two.
+
+<Check type="spot-bug" concept="hook-permission-bits">
+A team ships a hook that takes a 5 basis-point surcharge on every swap and forwards it to a treasury.
+Their contract implements `afterSwap`, computes the surcharge, and returns it as a delta. They mine a
+salt for the flag set:
+
+```text
+flags = AFTER_SWAP_FLAG            // 1 << 6
+```
+
+They deploy, create the pool, and integration tests pass: swaps succeed, the pool prices correctly,
+and the hook's internal `treasuryOwed` counter increments on every trade. Two weeks later the
+treasury is empty and the counter reads several million.
+
+Diagnose it, say which of the four mismatch classes this is, and name the check that would have
+caught it before deployment.
+
+<Answer>
+**The diagnosis.** `AFTER_SWAP_FLAG` authorises the callback but not its return value. Charging value
+through `afterSwap` requires `AFTER_SWAP_RETURNS_DELTA_FLAG` — `1 << 2` — as well. Without it, the
+manager calls `afterSwap`, receives the delta, and treats it as
+zero.<Cite src="zealynx-v4-security" /> The surcharge was never levied against anyone.
+
+**Why nothing failed.** Every layer behaved exactly as designed:
+
+- The swap succeeded, because no delta was created and therefore nothing was left unsettled.
+- `treasuryOwed` incremented, because that is the hook's own storage and the hook ran.
+- Prices were right, because the pool's concentrated-liquidity maths was untouched.
+
+The hook was keeping a careful ledger of money nobody ever paid. **This is the "return-delta bit
+missing" class**, and its signature is exactly this: internal accounting that grows while real
+balances do not.
+
+**Note the near miss.** Had the flag been set on the *manager* side but the delta computed wrongly,
+the transaction would have reverted with `CurrencyNotSettled` — which is what happened in the Sorella
+Angstrom finding, where a hook returned a non-zero delta for a dynamic protocol fee while the
+configuration omitted `afterSwapReturnDelta`.<Cite src="zealynx-v4-security" /> Same missing bit, and
+whether you get a loud revert or two weeks of silence depends on nothing more than whether the
+returned delta is non-zero on the paths your tests exercise.
+
+**The check that would have caught it.** Inheriting from `BaseHook` and declaring the intended
+permissions in `getHookPermissions()`, which validates that the deployed address bits match the
+declaration and reverts in the constructor if they do
+not.<Cite src="zealynx-v4-security" /><Cite src="uniswap-v4-core-hooks-library" /> The declaration
+would have listed `afterSwapReturnDelta: true`, the mined address would not have had the bit, and the
+deployment would have failed instead of the treasury.
+
+**The generalisable rule.** When a permission system is *read by the counterparty* rather than
+enforced against you, a missing permission does not produce an authorisation error — it produces
+silence. Every such system needs a self-check at construction time, because there will be no runtime
+signal at all.
+
+**And a monitoring rule that falls out of it.** Assert that the hook's internal accounting matches
+observed asset balances, continuously — one of the three accounting invariants Trail of Bits says
+every value-moving hook should test.<Cite src="zealynx-v4-security" /> That single invariant catches
+this bug on the first swap.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now look at a v4 pool and say what code will run inside your transaction, before running it,
+from the key alone.
+
+- **Read the hook address.** Mask the low fourteen bits and you have the exact callback set the
+  `PoolManager` will invoke.<Cite src="uniswap-v4-core-hooks-library" /> Bits 3 through 0 are the ones
+  that let the hook move value, and their presence changes what kind of review the pool needs.
+- **Know what the bits cannot tell you.** Not whether the callback is implemented, not what it does,
+  and not whether the code behind the address can change tomorrow.<Cite src="zealynx-v4-security" />
+- **Know that liquidity does not follow from deployment.** The docs are blunt: making a hook does not
+  mean the Uniswap front end will route liquidity to it.<Cite src="uniswap-v4-hooks-concept-docs" />
+  Pools reach users through routers and aggregators, which is precisely the path by which an
+  unfamiliar hook reaches your trade.
+
+The last lesson takes the swapper's side of this. If a pool's hook can retax, reorder, degrade or
+block a trade, then choosing a pool is choosing whose code to trust — and the defences available to
+you as a user are narrower, and more mundane, than the sophistication of the attack surface would
+suggest.

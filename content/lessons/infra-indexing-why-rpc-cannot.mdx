@@ -1,0 +1,325 @@
+---
+id: infra-indexing-why-rpc-cannot
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [ponder-docs, ponder-indexing-overview, thegraph-subgraph-overview, alchemy-eth-getlogs, execution-apis-filter-schema, execution-apis-log-object, execution-apis-spec, execution-specs-osaka-log, eth-archive-nodes, yellow-paper, envio-contract-state, sentio-obib]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The ticket says: *positions page — show every open position for the connected user, newest first, with
+the fee accrued since it was opened, and let them sort by size.*
+
+You have shipped this page a hundred times against Postgres. It is one query. You have a chain, a
+contract you wrote, an archive node, and a provider plan with no range caps. You know the log format
+by heart. And there is no sequence of JSON-RPC calls that returns that page.
+
+This lesson is about why — not as a complaint about tooling, but as a structural fact with a precise
+shape. Once you can state the shape, the entire indexing field stops being a catalogue of products
+and becomes one definition with consequences.
+
+<Compare
+  axis="The query"
+  columns={[
+    { title: 'What the page asks for', note: 'the ticket at the top', tone: 'accent' },
+    { title: "What the node indexes", note: "the protocol's own indexes", tone: 'muted' },
+  ]}
+  rows={[
+    { label: 'What can it filter on?', cells: [
+      'owner, status, size, time-open',
+      <>an address or list of addresses, a positional topic array, and a block range<Cite src="execution-apis-filter-schema" /></>,
+    ] },
+    { label: 'What can it order by?', cells: [
+      'any column — size descending, across every user',
+      <>chain order only: block number, then transaction index, then log index<Cite src="execution-apis-log-object" /></>,
+    ] },
+    { label: 'Which indexes exist?', cells: [
+      'the ones your queries name: by user, by status, by size',
+      <><code>(address, slot)</code> for state, <code>(block, transactionIndex)</code> for history, plus a per-block bloom over topics<Cite src="yellow-paper" /></>,
+    ] },
+    { label: 'Where do the join and the aggregate happen?', cells: [
+      'in the database, before the first row is returned',
+      { v: 'in your process, after every matching record has arrived', tone: 'warn' },
+    ] },
+    { label: 'What bounds one request?', cells: [
+      'a LIMIT and an OFFSET',
+      <>provider caps on range and response size — Alchemy publishes a hard 150MB ceiling<Cite src="alchemy-eth-getlogs" /></>,
+    ] },
+  ]}
+  caption="No filter, sort or join in the node's read surface corresponds to the one the page needs — which is why a faster endpoint changes nothing."
+  alt="The product's query and the node's read surface held against five questions: what can be filtered, what can be ordered, which indexes exist, where joins and aggregates happen, and what bounds a request."
+/>
+
+## Four attempts, and why each one dies
+
+Take the requirement literally and try to satisfy it from the node.
+
+**Attempt one: read the contract.** The positions live in a mapping — `mapping(address => Position[])`
+or something close to it. So call a view function and read them out.
+
+This works for a user you already know. It does not produce the page, because a Solidity mapping is
+not enumerable: there is no `keys()`, no length, no iteration. The contract can tell you what is
+stored at a key you supply. It cannot tell you which keys exist. Unless the author wrote and
+maintained an explicit on-chain array of every user — paying for that array on every open — the set
+of users is not on-chain data you can read. It is only implied by the history of who called what.
+
+**Attempt two: pull the logs.** The contract emits `PositionOpened` and `PositionClosed`, and
+[events are the API contract](/c/events-are-an-api-contract) precisely for this. So query them.
+
+The filter you can express is fixed by the standard: an address or list of addresses, a positional
+topic array, and a block range.<Cite src="execution-apis-filter-schema" /> That is the entire query
+language, and none of its terms is "open", "sorted by size" or "belonging to this user's positions".
+
+Now you have a stream of records. To answer the ticket you must: keep the ones with no matching close,
+join each to its user, compute an accrued fee that depends on how long it has been open, sort the
+result by size, and paginate. All of that happens in your process, in memory, after the response
+arrives. For one contract over a short range that is a script. For the page, on every load, across all
+users, it is a full history scan per request.
+
+And the request itself is the only standard read whose cost to serve is unbounded in its arguments,
+which is why providers cap it on both the range and the response size — Alchemy publishes a hard
+ceiling of 150MB on any response and warns that wide ranges are "less likely to succeed", advising you
+split them.<Cite src="alchemy-eth-getlogs" /> You already know this axis from
+[the cost driver lesson](/c/getlogs-is-the-cost-driver). The point here is different: even with
+unlimited budget and no caps, this still does not produce the page, because you cannot sort across
+users without first fetching every user.
+
+**Attempt three: the bloom filter will save the scan.** It will not. The bloom in each block header
+answers *"is this topic definitely absent"* — a negative filter, with false positives and no false
+negatives.<Cite src="yellow-paper" /> [What a bloom buys you](/c/logs-bloom) is the
+ability to skip blocks quickly. It never returns a record, never orders anything, and never joins.
+
+**Attempt four: loop.** Call `balanceOf` or `getPosition` once per user. Two problems, and the second
+is fatal. You do not have the user list — see attempt one. And a loop of point reads cannot produce a
+global sort, because sorting requires having all the rows before you emit the first one.
+
+### The shape underneath all four
+
+Every attempt fails the same way. A node is a key-value store with a state-transition function
+attached. Its indexes are the ones the protocol needs: by `(address, slot)` for state, by
+`(block, transactionIndex)` for history, plus a per-block bloom over topics.<Cite src="yellow-paper" />
+That is the complete list, and the standard read methods are a thin surface over
+it.<Cite src="execution-apis-spec" />
+
+Your product's queries want different indexes: by user, by status, by size, by time-open. Those
+indexes do not exist, and no read method creates them. A node will not build an index for a question
+the protocol never asks.
+
+<Aside kind="note">
+Notice what is *not* the problem. The data is all there — every position that was ever opened is
+derivable from the chain's history, and an archive node holds every intermediate state to prove
+it.<Cite src="eth-archive-nodes" /> There is no missing information. There is a missing *arrangement* of it. That distinction is why
+"just use a better RPC provider" is never the fix and why the answer is a database you own.
+</Aside>
+
+## What an indexer actually is
+
+Strip the products away and the definition is one line.
+
+**An indexer applies a deterministic function to an ordered sequence of on-chain events,
+accumulating a database as it goes.**
+
+That is a fold — `reduce` — where the accumulator is a set of tables and the sequence is the chain's
+history in execution order. "Execution order" is not a figure of speech: for each chain, indexing
+functions are called by block number, then transaction index, then log
+index.<Cite src="ponder-indexing-overview" /> Ponder's documentation states the same idea from the other end: you write
+code that transforms on-chain data into your application's schema, the framework fetches the data,
+runs your logic, and writes the result to Postgres.<Cite src="ponder-docs" />
+
+<Figure
+  caption="The arrangement is built once on the way in, rather than recomputed on every request."
+  alt="An indexer folds an ordered sequence of events through a transition function into accumulated tables, which the product then queries directly."
+>
+  <Flow
+    lanes={['the chain', 'your code', 'your database', 'your product']}
+    nodes={[
+      { id: 'seq', label: 'ordered events', note: 'block, txIndex, logIndex', col: 0 },
+      { id: 'fn', label: 'the transition', note: 'pure fn of (event, row)', col: 1, tone: 'accent' },
+      { id: 'acc', label: 'the accumulator', note: 'tables shaped by queries', col: 2, tone: 'accent' },
+      { id: 'q', label: 'the page', note: 'filter, sort, paginate', col: 3, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+Two properties of that definition generate every hard problem in the field. It is worth being slow
+about both, because the rest of this module and the next one are consequences of them.
+
+### Property one: the function must be deterministic
+
+The same input range must always produce the same output tables. This is what makes retries safe,
+restarts safe, and parallel backfill possible at all. It is also the property that a handler can
+quietly violate, and the violation does not throw — it produces a table that cannot be reproduced,
+which you discover months later when a reindex disagrees with production.
+
+The usual sources, in rough order of how often they appear in real code:
+
+**Reading chain state without pinning the block.** A handler that fetches a token's `decimals` or a
+pool's current reserve with an unpinned read resolves it against whatever the node considers latest at
+the moment the handler runs. During backfill that is the chain head, not the block the event came
+from. Re-run the backfill next month and the same event produces different numbers. Frameworks expose
+this deliberately — Envio documents contract-state access in handlers as its own topic, with caching
+and multicall as the efficiency story.<Cite src="envio-contract-state" /> Efficiency is the second
+question. The first is: *as of which block*.
+
+**Wall-clock time.** `Date.now()` in a handler makes the row depend on when you indexed, not on what
+happened. Every event carries a block timestamp; use it.<Cite src="ponder-indexing-overview" />
+
+**Unordered concurrency.** Firing handler writes inside `Promise.all` and letting them land in
+whatever order they resolve turns any accumulation that is not commutative — a running index, a
+sequence number, a "first seen" field — into a race.
+
+**Randomness and identity generation.** A UUID as a primary key means the same replay produces
+different keys. On-chain data already has a natural key — block number, transaction index, log
+index<Cite src="execution-apis-log-object" /> — and the event-pipelines module builds on it.
+
+<Misconception
+  belief="Non-determinism in an indexing handler shows up as an error."
+  reality="It shows up as a table you cannot reproduce. The pipeline reports success, the dashboard renders, and the discrepancy only appears when someone re-runs the same range and gets different rows."
+  why="Every other class of bug an engineer meets in a data pipeline throws, times out, or fails a constraint. This one satisfies every constraint you wrote, because the constraints describe the shape of the row and not its provenance."
+  src="ponder-indexing-overview"
+/>
+
+### Property two: the input sequence is rewritable
+
+This is the property that has no analogue in any pipeline you have built before. Kafka topics,
+webhook streams, database change logs, S3 event notifications — all append-only. Once an entry
+exists, it exists.
+
+A chain's recent history is not append-only. The last few blocks can be replaced with different
+blocks, and events you already folded into your tables can cease to have happened, or reappear at a
+different block number and log index. [The reorg mechanism itself](/c/reorg) you already know from the
+ledgers track. What is new here is what it does to a fold: the accumulator now has to run
+*backwards*.
+
+Ponder's engine records every insert, update and delete against a trigger-based transaction log, and
+on detecting a reorg it evicts non-canonical cached data, rolls the database back to the common
+ancestor block height using that log, fetches the new canonical data, and re-runs the indexing
+functions over it.<Cite src="ponder-indexing-overview" /> That four-step sequence exists because of
+property two, and nothing else. Cursor design, idempotent writes, the finality boundary and the entire
+notion of a "safe" block are the same consequence wearing different clothes.
+
+Lesson four of this module is that consequence in full. For now, hold the shape: **determinism makes
+the fold replayable; rewritability makes it un-playable, and the indexer has to be both.**
+
+## Worked example: turning a product question into a fold
+
+Take the ticket at the top and do the translation explicitly. The subgoal labels name the *purpose* of
+each step, because the steps are mechanical and the purposes are where the judgement lives.
+
+**Subgoal — establish what the product actually asks, in query form.** Not "show positions". Write
+the query you would run if the table existed:
+
+```sql
+SELECT position_id, size, opened_at, accrued_fee
+FROM   positions
+WHERE  owner = $1 AND status = 'open'
+ORDER  BY size DESC
+LIMIT  20 OFFSET $2;
+```
+
+This artifact does more work than it looks like. It names the columns, the filters and the sort keys —
+and those are exactly the things that must be *materialised*, not computed at read time, because a
+sort you compute per request is a scan.
+
+**Subgoal — identify the events that are inputs to those columns.** `PositionOpened(owner, id, size)`
+feeds `owner`, `size`, `opened_at`. `PositionClosed(id)` feeds `status`. A `FeeAccrued(id, amount)` or
+a rate change event feeds `accrued_fee`. Which of a contract's state changes are visible to you at all
+is fixed by which ones it chose to emit.<Cite src="execution-specs-osaka-log" /> Anything the product needs that no event carries is a gap you
+must close now — by reading state in the handler at the event's block, or by asking for a new event
+before the contract ships. Contracts are frozen; your read model is not. [Deciding what to
+emit](/c/events-are-an-api-contract) is a schema decision for consumers you have not met.
+
+**Subgoal — choose the accumulator's shape, driven by the query and not by the contract's storage.**
+The contract stores an array per user because that is cheap to write on-chain. Your table stores one
+row per position with `owner` and `status` indexed, because that is cheap to *read*. These schemas
+should not match, and matching them is the most common mistake in a first indexer. You are not
+mirroring storage. You are building the arrangement the chain does not have.
+
+**Subgoal — write the transition, one event at a time.** `PositionOpened` inserts a row with
+`status = 'open'`. `PositionClosed` updates that row to `'closed'`. `FeeAccrued` adds to the row's
+`accrued_fee`. Each handler is a pure function of `(event, current row)`.
+
+**Subgoal — audit the transition for determinism.** Does any branch read `Date.now()`? Does any read
+of contract state name a block? Does any write depend on the order two handlers happen to resolve in?
+Three questions, asked before the first backfill, that save the reindex that disagrees.
+
+**Subgoal — ask the unwind question, and answer it out loud.** If the block containing a
+`PositionOpened` is replaced by a different block, what happens to the row? `INSERT` inverts to
+`DELETE`. `status = 'closed'` inverts to the previous value, *which you must have kept*. And
+`accrued_fee += amount` inverts to a subtraction only if you can identify which additions came from the
+abandoned blocks. If your answer to this subgoal is "nothing happens", you have just described the
+silent corruption that lesson four is about.
+
+That last subgoal is the one every tutorial omits, and skipping it is free right up until it is not.
+
+## The two claims people make that are wrong
+
+<Misconception
+  belief="An indexer is a cache in front of the RPC node."
+  reality="A cache returns things the node could have returned, faster. An indexer materialises derived state — open positions, running balances, per-user aggregates, sorted rankings — that no RPC method returns at all, at any speed."
+  why="Both sit between the chain and the application in the architecture drawing, and both make the app faster. The drawing hides the difference, which is not latency but expressiveness."
+  src="ponder-docs"
+/>
+
+<Misconception
+  belief="You could query product data straight from a node if the RPC surface were richer."
+  reality="A richer read surface would still be a read surface over the protocol's own indexes. The queries a product asks are joins and aggregates over history, which require a schema someone chose in advance — and only your product knows what that schema is."
+  why="The node genuinely holds every byte you need, so the gap feels like a missing endpoint rather than a missing arrangement. It is the same reason nobody expects their database to answer questions from the write-ahead log."
+/>
+
+<Check type="explain" concept="indexer-is-a-deterministic-fold">
+A team ships an indexer that populates a `token_holders` table. Each `Transfer` handler adjusts the
+sender's and receiver's balances. Six months later they add one field — `first_seen_block`, the block
+at which each address first held a non-zero balance — and want it populated for all history.
+
+Two questions. Can they compute the new field incrementally, by scanning forward from today? And what
+does the answer imply about how the choice of indexer is made?
+
+<Answer>
+**No, they cannot.** `first_seen_block` is a function of the whole history, not of the current state.
+The table records what the balances *are*; it does not record when each address first crossed zero,
+because nothing ever stored that. Scanning forward from today can only tell them about addresses that
+appear from today onward. The field has to be produced by re-running the fold from the beginning with
+the new transition logic — a full re-backfill.
+
+That is the general case, not an unlucky one. A fold is incremental over *new input*, not over
+*changed logic*.<Cite src="ponder-docs" /> Add a derived field, change how a fee is amortised, fix a rounding rule, correct a
+handler that mis-attributed a transfer — each of those changes the function, and the only way to get
+tables consistent with the new function is to replay the sequence through it.
+
+**The implication for selection is the honest reason backfill speed matters at all.** It is not that
+users wait for the initial sync once. It is that backfill duration is the *deploy latency of every
+change to your data model*. A four-hour backfill means a one-line schema change is a four-hour
+release. A four-day backfill means your data model is effectively frozen, and the team starts working
+around it — computing the field in application code, writing a second pipeline, patching rows by hand —
+which is how a clean fold turns into three inconsistent ones.
+
+So when the selection module ranks the axes, this is the one that converts a benchmark number into a
+product constraint you can feel. Not "is it fast", but "how often will I need to change the fold, and
+what does each change cost me in wall-clock hours".
+</Answer>
+</Check>
+
+## Where this goes
+
+The definition you now have — a deterministic fold over a rewritable ordered stream — is the whole
+frame for what follows.
+
+**The subgraph** is one concrete encoding of that fold: a manifest naming the inputs, a schema naming
+the accumulator, and mapping handlers holding the transition.<Cite src="thegraph-subgraph-overview" />
+The next lesson takes it apart, and then delivers the fact that invalidates the deploy step of nearly
+every indexing tutorial published before 2026.
+
+**Backfill and live tail** are the same fold run under two different sets of constraints — the
+frameworks implement them as distinct internal modes<Cite src="ponder-indexing-overview" /> — which is
+why a single "speed" number describes only one of them — and why the published benchmarks that compare
+platforms all pick fixed historical block ranges with known expected record counts.<Cite
+src="sentio-obib" />
+
+**Reorg safety** is property two taken seriously: what it means to run the fold backwards, what the
+frameworks now do for you, and precisely which part of your system they still do not cover.
+
+**And choosing a platform** turns out to be mostly a question about which folds it can express — over
+logs, over blocks, over transactions, over internal traces — long before it is a question about
+minutes.

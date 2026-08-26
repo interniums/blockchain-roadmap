@@ -1,0 +1,302 @@
+moduleId: infra-event-pipelines
+concepts:
+  - id: pipeline-two-regimes
+    title: Two regimes, two sets of failure modes
+    oneLine: Bounded historical backfill is throughput-bound, deterministic and restartable; unbounded live tail is latency-bound and non-deterministic because the tip can be rewritten.
+    statement: >
+      Every event pipeline runs in two regimes that share code and share almost nothing else. Backfill has a
+      known end, a deterministic input, and no correctness constraint from ordering across workers - so it
+      parallelises, and its failures are about throughput and provider limits. Live tail has no end, is
+      bounded by latency rather than throughput, must preserve order, and reads from a tip that can be
+      replaced after you have consumed it - so its failures are about correctness. Designing them as one
+      system with one set of assumptions is why pipelines that pass every test during development produce
+      wrong data in week three of production.
+    volatility: stable
+    edges:
+      - { to: indexer-is-a-deterministic-fold, type: requires }
+      - { to: backfill-vs-live, type: requires }
+    sources: [ponder-indexing-overview, bilinear-indexing-events]
+  - id: backfill-chunking
+    title: Chunking against the provider's caps
+    oneLine: Backfill is chunked by block range against the provider's log-range and result-size caps, and every chunk must be independently retryable and idempotent.
+    statement: >
+      A historical range is fetched in chunks because providers cap both the block span and the result size
+      of a log query, and the two caps bind under different conditions - a quiet range hits the span cap and a
+      busy one hits the size cap. Chunks must therefore be independently retryable, which in turn requires
+      them to be idempotent, because a retry after a partial write is the normal case rather than the
+      exception. Chunk size is a tuning parameter with a cost consequence: smaller chunks mean more requests
+      and a larger bill, larger chunks mean more failures. Constants inherited from pre-2026 material now hit
+      result-size caps more often, because blocks carry more logs than they used to.
+    volatility: evolving
+    edges:
+      - { to: getlogs-is-the-cost-driver, type: requires }
+      - { to: idempotency-via-upsert, type: requires }
+    sources: [execution-apis-spec, bilinear-indexing-events]
+  - id: log-natural-key
+    title: The key that identifies an event
+    oneLine: The natural key is the chain id plus block number, transaction index and log index - never the transaction hash, which identifies many logs and is not stable across branches.
+    statement: >
+      An on-chain event is identified by where it sits in the ordered stream: chain id, block number,
+      transaction index within the block, log index within the block. The equivalent form using the block
+      hash instead of the number is also correct and additionally records which branch the row came from,
+      which is useful during reorg handling. What is not a key is the transaction hash. One transaction emits
+      many logs, so the hash is not unique; and the same transaction can appear in two competing branches at
+      different positions, so it is not stable either. Keying on it silently collapses distinct events into
+      one row, and the loss is invisible until someone counts.
+    volatility: stable
+    edges:
+      - { to: pipeline-two-regimes, type: requires }
+      - { to: log-record-shape, type: requires }
+    sources: [ponder-indexing-overview]
+    misconceptions:
+      - belief: The transaction hash is a unique key for an event.
+        reality: One transaction emits many logs, and the same transaction can exist on two branches; the key is chain id plus block number, transaction index and log index.
+        why: Explorers present events grouped under a transaction, so the hash looks like the identifier.
+        source: ponder-indexing-overview
+  - id: idempotency-via-upsert
+    title: Idempotent writes on the natural key
+    oneLine: Writing with an on-conflict clause keyed on the natural key means replaying any block range produces the same table, which is what makes retries and restarts safe.
+    statement: >
+      Idempotent ingestion means an insert that does nothing, or updates to the same value, when the row
+      already exists - an on-conflict clause keyed on the event's natural key. With it, replaying a range is
+      a no-op and a crash mid-chunk costs nothing but time. Without it, every retry and every restart
+      double-counts, and because the duplicates are legitimate-looking rows rather than errors, the corruption
+      is discovered downstream in an aggregate that is quietly too large. This is the single cheapest
+      correctness property in the whole pipeline and it is one clause.
+    volatility: stable
+    edges:
+      - { to: log-natural-key, type: requires }
+    sources: [ponder-indexing-overview]
+  - id: at-least-once-is-the-default
+    title: Every transport delivers at least once
+    oneLine: Webhooks, queues, resubscribes and cursor resumes all redeliver; exactly-once is something you achieve downstream with an idempotent write, never something a transport gives you.
+    statement: >
+      Any delivery mechanism that can crash between handing you a message and recording that it did so must
+      redeliver, and every real transport can. Webhooks retry, queues redeliver on unacknowledged messages,
+      a WebSocket resubscribe replays from a point, and a cursor resume reprocesses the last incomplete
+      range. This is not a defect to be engineered away; it is the honest guarantee. Exactly-once processing
+      is therefore always achieved at the write, by making the write idempotent on the natural key. A vendor
+      claiming exactly-once delivery has either built that idempotency for you or is describing something
+      narrower than it sounds - and either way your own writes should still be idempotent, because the cost
+      of that is one clause and the cost of being wrong is silent double-counting.
+    volatility: stable
+    edges:
+      - { to: idempotency-via-upsert, type: requires }
+    sources: [envio-reorgs, bilinear-indexing-events]
+    misconceptions:
+      - belief: Exactly-once delivery from a streaming API removes the need for idempotent writes.
+        reality: Exactly-once is achieved by your idempotent write on a natural key; any transport can redeliver after a crash.
+        why: The phrase exactly-once is a strong-sounding claim and it appears on the marketing page rather than in the failure-mode documentation.
+        source: envio-reorgs
+  - id: cursor-checkpointing
+    title: The cursor belongs in the same transaction
+    oneLine: Persist the last fully-processed block in the same database transaction as the rows it accounts for, or a crash between the two writes leaves a gap or a duplicate.
+    statement: >
+      A cursor records how far the pipeline has processed. If it is written in a separate transaction from
+      the rows, there are two crash windows: crash after the rows and before the cursor and you reprocess -
+      harmless only if your writes are idempotent - or crash after the cursor and before the rows and you
+      have a permanent gap that nothing will ever revisit. Committing both in one transaction closes both
+      windows, and it costs nothing, because they are already writes to the same database. The permanent-gap
+      version of this bug is the more dangerous one: it produces no duplicates, no errors and no symptoms
+      except missing data nobody is looking for.
+    volatility: stable
+    edges:
+      - { to: idempotency-via-upsert, type: requires }
+    sources: [bilinear-indexing-events, ponder-indexing-overview]
+  - id: ordering-guarantee
+    title: Order matters downstream, even when backfill is parallel
+    oneLine: Consumers need events in block, transaction-index, log-index order for their state machines to be correct, so parallel workers may write rows out of order but must not emit derived events until the range is contiguous.
+    statement: >
+      Any consumer that maintains a state machine - a position, a balance, an auction - needs events in
+      canonical order, because applying them out of order produces a different and wrong result. Parallel
+      backfill workers necessarily complete out of order. The reconciliation is to let raw rows land in any
+      order, because they carry their position in the key, while holding back every derived computation and
+      every downstream emission until the ingested range below that point is contiguous. Contiguity, not
+      completion, is the gate.
+    volatility: stable
+    edges:
+      - { to: backfill-chunking, type: requires }
+      - { to: log-natural-key, type: requires }
+    sources: [bilinear-indexing-events, ponder-indexing-overview]
+  - id: reorg-definition
+    title: What a reorg does to rows you already wrote
+    oneLine: A reorg replaces recently canonical blocks with a different branch, so events you already ingested can cease to exist or reappear at a different position.
+    statement: >
+      From a pipeline's point of view a reorg is not an abstract consensus event, it is a mutation of your
+      input history. Blocks you already consumed are replaced by different blocks. An event you wrote a row
+      for may not exist on the new branch at all; a transaction may exist but at a different index, giving
+      its logs different natural keys; and events that never reached you may appear in the replacement. Every
+      derived value computed from the old branch is therefore suspect until the affected range is reapplied.
+      The correct mental model is that the tail of your input is mutable, not that a special error condition
+      occurred.
+    volatility: stable
+    edges:
+      - { to: reorg, type: requires }
+      - { to: reorg-safe-indexing, type: requires }
+      - { to: pipeline-two-regimes, type: requires }
+    sources: [quicknode-reorg, envio-reorgs]
+  - id: reorg-depth-reality
+    title: Design for shallow, not for spectacular
+    oneLine: Post-Merge rewrites at the tip are shallow, so the practical requirement is handling one- and two-block rewrites correctly every time rather than surviving a fifty-block reorg once.
+    statement: >
+      Deep reorgs are rare on a post-Merge chain, and shallow ones at the tip are the ordinary case. The
+      engineering consequence is a reordering of priorities: correctness on a one- or two-block rewrite, every
+      time, matters more than a heroic mechanism for a depth that will probably never occur. Published
+      frequency and depth statistics for 2026 were not verified for this material, so treat any specific
+      number as something to measure against a beacon-chain analytics source rather than a fact to
+      internalise. The design rule survives without the number: handle the shallow case perfectly and bound
+      what you do about anything deeper, rather than the reverse.
+    volatility: evolving
+    edges:
+      - { to: reorg-definition, type: requires }
+      - { to: reorg-depth-in-practice, type: requires }
+    sources: [quicknode-reorg]
+  - id: finality-vs-confirmations
+    title: Finality is the boundary, not a confirmation count
+    oneLine: On post-Merge Ethereum the safety boundary is the consensus layer's finalized checkpoint, not a fixed number of confirmations - and on an L2 neither number is the right one.
+    statement: >
+      Counting confirmations is a proof-of-work heuristic: with no explicit finality, depth was a proxy for
+      cost-to-revert. Post-Merge Ethereum has explicit finality - the consensus layer justifies and then
+      finalizes checkpoints, and a finalized block cannot be reverted without an economic catastrophe rather
+      than merely bad luck. The correct boundary for anything irreversible is therefore the finalized block,
+      which the consensus layer will tell you directly. On an L2 the picture has one more layer: the
+      sequencer's confirmation is a promise from an operator, and the equivalent hard boundary is the
+      finality on L1 of the batch containing your transaction, which arrives minutes to hours later and is
+      deliberately hidden by the L2's user experience.
+    volatility: stable
+    edges:
+      - { to: reorg-definition, type: requires }
+      - { to: finality-is-a-spectrum, type: requires }
+      - { to: epoch-and-finality-timing, type: requires }
+      - { to: sequencer, type: deepens }
+    sources: [eth-pos-finality]
+    misconceptions:
+      - belief: Twelve confirmations means finalized.
+        reality: Post-Merge Ethereum has an explicit finalized checkpoint; confirmation counting is a proof-of-work heuristic that no longer describes the guarantee.
+        why: Exchange deposit interfaces still display confirmation counts, so the habit is reinforced daily.
+        source: eth-pos-finality
+      - belief: An L2 transaction is final when the L2 explorer shows it confirmed.
+        reality: The sequencer's confirmation is an operator's promise; the hard boundary is when the batch containing it is finalized on L1.
+        why: L2 user experience deliberately hides the gap, because showing it would make the chain feel slow.
+        source: quicknode-reorg
+  - id: indexer-handles-reorgs-your-db-does-not
+    title: The rollback stops at the indexer's tables
+    oneLine: Frameworks roll their own store back automatically, and that guarantee ends at their database - anything you copied downstream is yours to fix.
+    statement: >
+      Both major TypeScript indexing frameworks now handle reorgs by default: one keeps entity state history
+      for unfinalized blocks and reverts on detection, the other keeps a trigger-based transaction log and
+      rolls back to the common ancestor. Hand-written reorg logic inside handlers has become an anti-pattern
+      as a result. What changed is where the risk lives, not whether it exists. The rollback covers rows in
+      the indexer's own database. It does not cover a replica you stream into, a warehouse table you export
+      to, a cache you populate, or a downstream service you called. Everything past the indexer's boundary is
+      a copy that no framework knows about. The exact retention window for unfinalized state, and the
+      behaviour when a reorg exceeds it, are implementation details worth checking for the version you run
+      rather than assuming.
+    volatility: hot
+    edges:
+      - { to: reorg-definition, type: requires }
+      - { to: idempotency-via-upsert, type: requires }
+    sources: [envio-reorgs, ponder-indexing-overview, envio-indexing-and-reorgs]
+    misconceptions:
+      - belief: Once my indexer handles reorgs, my pipeline handles reorgs.
+        reality: The rollback covers the indexer's own tables; replicas, exports, caches and already-fired side effects are not rolled back.
+        why: The documentation says "automatic" and there is no obvious reason to keep reading.
+        source: envio-reorgs
+  - id: side-effects-are-unrollbackable
+    title: You cannot unsend an email
+    oneLine: Notifications, payouts, exports and third-party calls cannot be undone by a rollback, so every irreversible side effect must be gated on finality even when the read model updates optimistically.
+    statement: >
+      A database rollback restores rows. It does not recall an email, retract a push notification, reverse a
+      fiat payout, un-post a Slack message, or undo a call to someone else's API. These are the actions that
+      turn a two-block reorg from a data-consistency event into a user-visible failure and, when money is
+      involved, a loss. The rule is therefore asymmetric: reads may be optimistic, because a revised number
+      is recoverable; irreversible actions must wait for finality, because a revised action is not. Applying
+      the same latency to both is the mistake in either direction - it makes the interface needlessly slow or
+      the payouts needlessly wrong.
+    volatility: stable
+    edges:
+      - { to: indexer-handles-reorgs-your-db-does-not, type: requires }
+      - { to: finality-vs-confirmations, type: requires }
+    sources: [eth-pos-finality, envio-reorgs]
+  - id: two-tier-read-model
+    title: A pending view and a finalized table
+    oneLine: A workable pattern is a fast optimistic view from the tip, labelled as pending in the interface, plus a finalized table that only advances on finality and is what accounting and payouts read.
+    statement: >
+      The way to have both low latency and correctness is to stop pretending they are the same requirement.
+      Maintain two read paths over the same ingested data: an optimistic view computed from the tip, which
+      the interface renders and explicitly labels as not yet settled, and a finalized table whose rows only
+      appear once the block containing them is finalized - a boundary you do not have to guess at, because
+      the JSON-RPC block tags expose it directly. Every consumer then declares which one it reads.
+      Interfaces read the optimistic view. Notification jobs, exports, accounting and payouts read the
+      finalized table, and by construction can never act on something that was reorged out. The labelling is
+      not a detail - a pending value shown as though it were settled is how the correct architecture still
+      produces a support ticket.
+    volatility: stable
+    edges:
+      - { to: side-effects-are-unrollbackable, type: requires }
+    sources: [eth-pos-finality, execution-apis-spec]
+  - id: schema-change-means-rebackfill
+    title: Adding one field re-runs the whole fold
+    oneLine: Because the fold is not incremental over changes to its own logic, changing derived logic or adding a derived field usually requires re-running the entire backfill.
+    statement: >
+      Ordinary application migrations are incremental: add a column, default it, move on. An indexer's
+      derived state is the output of a function applied to the whole history, so changing that function
+      invalidates the whole output. Adding a field that must be correct for historical rows means running the
+      fold again from the start. This is why backfill duration is a product constraint rather than a
+      one-time setup cost - it sets how fast you can change what your product knows. It is also the most
+      honest reason indexer speed matters at all, and a much better argument than any benchmark: the number
+      you care about is how long a schema change takes to ship.
+    volatility: stable
+    edges:
+      - { to: pipeline-two-regimes, type: requires }
+      - { to: indexer-is-a-deterministic-fold, type: requires }
+      - { to: benchmark-is-workload-shaped, type: contrasts }
+    sources: [ponder-indexing-overview]
+    misconceptions:
+      - belief: Adding one field to my schema is a small change.
+        reality: Derived-state changes usually require a full re-backfill, because the fold is not incremental over changes to its own logic.
+        why: Every other database migration in the developer's experience is incremental.
+        source: ponder-indexing-overview
+  - id: gap-detection-monitoring
+    title: Liveness is not the health check
+    oneLine: A pipeline must continuously assert two invariants - no missing block numbers within the ingested range, and cursor lag under a threshold - because both failures are otherwise silent.
+    statement: >
+      A running process is not evidence that data is arriving. A stalled cursor, a dropped block range, or a
+      subscription that reconnected past a gap all present as a healthy process with no errors. Two checks
+      catch the common cases. The first asserts contiguity: no missing block numbers between the first and
+      last block in the ingested range. The second asserts freshness: the cursor's distance behind chain head
+      is under a threshold you chose deliberately. Frameworks give you the raw material for the second one -
+      Ponder exposes a status endpoint reporting indexing progress per chain, and metrics for the latest
+      block number and timestamp it has seen - but you still have to decide the threshold and act on it.
+      Both checks should be silent on a healthy pipeline and both should page when they are not. Run them on
+      a schedule from outside the pipeline process, because a check that dies with the thing it is checking
+      is not a check.
+    volatility: stable
+    edges:
+      - { to: cursor-checkpointing, type: requires }
+    sources: [ponder-observability, bilinear-indexing-events]
+    misconceptions:
+      - belief: If the indexer process is running, data is arriving.
+        reality: A stalled cursor, a silently dropped range and a reconnect past a gap all look exactly like healthy, so contiguity and lag must be asserted explicitly.
+        why: Process liveness is the default health check every deployment platform hands you.
+        source: bilinear-indexing-events
+  - id: multichain-clock-skew
+    title: There is no global ordering across chains
+    oneLine: Each chain has its own head, its own finality rule and its own reorg behaviour, so a cross-chain read model must either key everything by chain or define an explicit merge rule.
+    statement: >
+      Two chains have no shared clock and no shared ordering. Their heads advance independently, their
+      finality boundaries arrive at different rates, and one can reorg while the other does not. A read model
+      that merges events from several chains into one timeline therefore has to make a choice, explicitly:
+      either every row and every aggregate is keyed by chain and never silently combined, or you define a
+      merge rule - by wall-clock timestamp, by finality, by something else - and write down its failure
+      modes. Indexing frameworks now surface that choice as configuration rather than leaving it implicit:
+      Ponder makes cross-chain event ordering a setting, with one mode that folds every chain into a single
+      unified stream and another, isolated mode that keeps chains independent and requires every table to
+      carry a chain identifier in its composite primary key. The failure of not choosing is a table that
+      looks unified, orders rows by a timestamp nobody guarantees, and is subtly wrong in a way that only
+      shows up when two chains disagree.
+    volatility: stable
+    edges:
+      - { to: ordering-guarantee, type: requires }
+      - { to: finality-vs-confirmations, type: requires }
+    sources: [ponder-isolated-indexing, eth-pos-finality]

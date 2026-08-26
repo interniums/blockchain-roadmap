@@ -1,0 +1,263 @@
+---
+id: evm-accounts-inside-vs-outside-view
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-7702, eip-1052, eip-3541, eip-6780, eip-2929, measured-gas-constants, solidity-external-calls]
+stack: {}
+---
+
+Two engineers are debugging the same failing transaction, on the same block, against the same
+archive node.
+
+One is reading a trace of an external contract's view of the caller: `EXTCODESIZE` on the caller's
+address returned **23**. The other is reading the trace inside the caller's own frame: `CODESIZE`
+returned **4,812**.
+
+Neither tool is wrong, neither node is out of sync, and there is no race. The EVM answers the
+question "how much code does this account have" differently depending on who is asking, and it does
+so by design.
+
+## The rule
+
+For an account holding a delegation designator:<Cite src="eip-7702" />
+
+- **The external inspection opcodes** — `EXTCODESIZE`, `EXTCODECOPY`, `EXTCODEHASH` — observe the
+  designator itself. Size is 23. The bytes copied are `0xef0100` followed by the delegate's
+  address. The hash is the hash of those 23 bytes.
+- **The self-inspection opcodes** — `CODESIZE`, `CODECOPY`, evaluated while the delegated code is
+  running — observe the delegate's code.
+
+The spec states the case directly: when executing a delegated account, `EXTCODESIZE` returns 23,
+the size of `0xef0100` followed by the address, whereas `CODESIZE` returns the size of the code
+residing at that address.<Cite src="eip-7702" />
+
+So there is no single answer to "how much code does this account have". There are two, both
+correct, and which one you get is a property of your vantage point.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'The outside view', note: 'EXTCODESIZE · COPY · HASH' },
+    { title: 'The inside view', note: 'CODESIZE · CODECOPY', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What bytes does it see?',
+      cells: ['The 23-byte designator', "The delegate's runtime code"],
+    },
+    {
+      label: 'What size does it report?',
+      cells: ['23, alike for every delegated account', "Whatever the delegate's code measures"],
+    },
+    {
+      label: 'Who can ask it?',
+      cells: ['Any contract, about any address', 'Only code already running in the account'],
+    },
+    {
+      label: 'Does it say what will run?',
+      cells: ['No — only which address will', 'Yes — it is already what is running'],
+    },
+  ]}
+  caption="Only one of these two views answers what will run, and it is not the one a contract can reach."
+  alt="The external code-inspection opcodes and the self-inspection opcodes compared on which bytes they see, what size they report, who can ask them, and whether they reveal what will execute."
+/>
+
+<Aside kind="note">
+The verb the spec uses for the executing operations is *follow*: `CALL`, `CALLCODE`,
+`DELEGATECALL`, `STATICCALL` and a transaction whose destination is delegated all follow the
+pointer.<Cite src="eip-7702" /> The code-*reading* operations do not. Execution follows; inspection
+does not. That one sentence is the whole asymmetry.
+</Aside>
+
+## Why the spec chose the confusing option
+
+It would have been simpler to make `EXTCODEHASH` follow the delegation too. The rationale explains
+why that was rejected, and the argument is worth having in your head because it constrains what you
+can build.
+
+If `EXTCODE*` followed delegations, an account could **temporarily masquerade as having a
+particular code hash**, which would break contracts that rely on code hashes as a definition of
+possible account behaviour.<Cite src="eip-7702" />
+
+Read the invariant that protects. Before EIP-7702, a contract's behaviour could change only if its
+own code explicitly permitted it — that is, if the author wrote a `DELEGATECALL` — and its code
+hash could change only through `SELFDESTRUCT`, which since Cancun has an effect only in the same
+transaction that created the account.<Cite src="eip-7702" /><Cite src="eip-6780" /> Following
+delegations in the inspection opcodes would have created an account type that breaks both, so the
+spec kept the inspection opcodes honest about the bytes and let execution be the thing that moves.
+
+`EXTCODEHASH` was introduced by EIP-1052 as a cheap way to ask what code lives at an
+address.<Cite src="eip-1052" /> It still answers exactly that question. What it no longer answers
+is "what will happen when I call this account", and those two questions were the same question for
+seven years.
+
+<Misconception
+  belief="EXTCODEHASH of an account identifies the code that will run when I call it."
+  reality="For a delegated account it hashes the 23-byte designator. Identifying the code that runs means reading those bytes, extracting the address inside, and inspecting the code there."
+  why="For an ordinary contract the two coincide perfectly, and they coincided for every account on the network until 2025."
+  src="eip-7702"
+/>
+
+## Resolving a designator by hand
+
+The decoding is short enough to do without tooling, and doing it once fixes the shape in memory.
+
+**Subgoal: get the bytes the outside sees.** `eth_getCode` on the account. A delegated account
+returns 23 bytes.
+
+**Subgoal: confirm it is a designator rather than a very small contract.** The length must be
+exactly 23 and the first three bytes must be `0xef0100`. Nothing else can be confused with it:
+`0xEF` is an undefined instruction that aborts on execution, and the analysis EIP-3541 cited found
+zero contracts in state starting with that byte before deployment of such code was
+banned.<Cite src="eip-3541" />
+
+**Subgoal: extract the target.** The last 20 bytes are the delegate's address.
+
+<Figure
+  caption="Resolving a designator by hand is a length check, a prefix check, and the last twenty bytes."
+  alt="The 23 bytes that eth_getCode returns for a delegated account, split into the three-byte 0xef0100 tag and the 20-byte address of the delegate to inspect next."
+>
+  <Anatomy
+    value="0xef01001111111111111111111111111111111111111111"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 8, label: 'tag', note: 'exactly these 3 bytes', tone: 'accent' },
+      { from: 8, to: 48, label: 'delegate address', note: 'eth_getCode here next', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+**Subgoal: inspect the delegate.** `eth_getCode` on that address. *That* is what runs as your
+account.
+
+A worth-knowing detail for anyone building an allowlist: the code hash of the account above is the
+keccak of those 23 bytes, which for this example is
+`0xdfe7c7677e3d245aaff2e3e94db902f5fb37475eb611959c71ee641508dcf49a` — reproducible with any keccak
+implementation. It is a hash of a pointer. Two accounts delegated to the same wallet share it, and
+it tells you nothing about the wallet's code except its address.
+
+If you want to allowlist behaviour, you have to hash the *delegate's* code, having resolved the
+pointer yourself. There is no opcode that does this for you.
+
+## What it costs to follow
+
+Resolution is not free. When a code-executing instruction accesses a **cold** account while
+resolving delegated code, an extra `COLD_ACCOUNT_READ_COST` of 2,600 gas is charged and the
+delegate is added to the accessed-addresses set; otherwise the warm cost of 100
+applies.<Cite src="eip-7702" /><Cite src="eip-2929" /> Those two figures were confirmed by direct
+measurement on this machine — cold account access 2,600, warm 100.<Cite
+src="measured-gas-constants" />
+
+There is a small courtesy in the spec worth noticing: if a transaction's destination has a
+delegation designator, the delegation target is added to the accessed set as part of transaction
+setup.<Cite src="eip-7702" /> The top-level call into a delegated account therefore does not eat a
+cold read for the resolution; a call made to it from inside another contract's frame can.
+
+## Chains are not followed
+
+Delegate to an account that is itself delegated, and nothing forwards.
+
+The spec is unambiguous: where a designator points to another delegation, creating a potential
+chain or loop, clients must retrieve only the first code and then stop following the
+chain.<Cite src="eip-7702" />
+
+So the bytes retrieved are the *second* designator, and those bytes are handed to the interpreter
+as code. They begin with `0xEF`, which is an undefined instruction — it pops nothing, pushes
+nothing, and causes an exceptional abort when executed.<Cite src="eip-3541" /> The call frame does
+not forward and does not silently no-op. It aborts.
+
+This is a deliberate choice against a whole category of structure. Proxy chains forward, because
+each proxy contains a `DELEGATECALL` that the next hop honours. Delegation does not, because
+resolution is one lookup performed by the protocol rather than a program that can call onward.
+
+<Misconception
+  belief="Delegating to another delegated account forwards through the chain, like nested proxies."
+  reality="Exactly one hop is resolved. The second designator is retrieved as code rather than resolved as a pointer, and the frame aborts on the undefined 0xEF instruction."
+  why="Proxy chains do forward, and a delegation looks like a proxy, so the composition rule transfers by analogy."
+  src="eip-7702"
+/>
+
+## The other one-hop surprise: precompiles
+
+Delegating to a precompile address is legal and does nothing.
+
+When a precompile is the target of a delegation, the retrieved code is considered empty, and
+`CALL`, `CALLCODE`, `STATICCALL` and `DELEGATECALL` targeting that account execute empty code —
+succeeding, with no execution, given enough gas to initiate the call.<Cite src="eip-7702" /> The
+authors' reasoning was that precompiles technically have no code associated with their accounts, so
+not executing the precompile logic was marginally simpler to implement; they describe the outcome
+as somewhat unintuitive themselves.<Cite src="eip-7702" />
+
+The product consequence is the part to keep. A call to such an account **returns success**. If your
+code branches on the boolean a low-level call returns, a delegation to a precompile is
+indistinguishable from a call that did what you asked. Success has never meant "something happened"
+on the EVM — a call to an account with no code has always succeeded — but delegation gives that old
+sharp edge a new way to appear on an address that visibly has code.
+
+## One place the asymmetry changes Solidity's behaviour
+
+There is a compiler-level consequence that goes unnoticed, because it happens without any of your
+code mentioning `EXTCODESIZE` at all.
+
+A high-level external call in Solidity — calling through an interface rather than through
+`address.call` — inserts an `extcodesize` check, because the EVM treats a call to an account with
+no code as succeeding and the compiler would rather throw than let you believe a call landed. That
+check is skipped when return data is expected, since the ABI decoder catches the empty case
+anyway.<Cite src="solidity-external-calls" />
+
+Now put a delegated account on the other end. Its `EXTCODESIZE` is 23, not zero, so the existence
+check passes — and the call proceeds to execute the delegate's code as that account. The same
+interface call aimed at a plain EOA would have thrown.
+
+So a contract that has never heard of delegation can find itself making a successful interface call
+to what its author was certain was a user's wallet. Nothing in the calling contract changed. The
+callee acquired 23 bytes.
+
+<Check type="predict" concept="extcode-vs-code-asymmetry">
+Account `A` is delegated to `B`. `B` is itself an ordinary contract with 4,812 bytes of runtime
+code. Contract `C` runs the following against `A`, in a single transaction, having never touched
+`A` or `B` before:
+
+1. `EXTCODESIZE(A)`
+2. `EXTCODEHASH(A)`
+3. a `CALL` to `A`, which succeeds and, inside its frame, executes `CODESIZE`
+
+Give the three results, and say which of the calls paid a cold account read for resolving the
+delegation.
+
+<Answer>
+**1 — `EXTCODESIZE(A)` returns 23.** The external view sees the designator, never the delegate. The
+value is 23 for every delegated account on the network, regardless of what it delegates to, which
+is what makes the number a useful detector and a useless identifier.
+
+**2 — `EXTCODEHASH(A)` returns the keccak of those 23 bytes.** Not the hash of `B`'s code. Two
+accounts delegated to `B` return the same value here; an account delegated to a different contract
+returns a different one. It identifies the pointer, not the behaviour.
+
+**3 — `CODESIZE` inside the frame returns 4,812.** Execution followed the pointer, so the running
+code is `B`'s and self-inspection reports `B`'s size. Note that the same physical account produced
+both 23 and 4,812 in one transaction.
+
+**The cold read.** The `CALL` in step 3 is the one that resolves the delegation, so it pays the
+extra cold account read of 2,600 for touching `B`, and adds `B` to the accessed
+set.<Cite src="eip-7702" /> The earlier
+`EXTCODESIZE` and `EXTCODEHASH` warmed `A`, not `B`, because they never followed the pointer —
+another way of seeing that inspection and execution take genuinely different paths through the
+state.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Every "is this a contract" check** is the next lesson, and the asymmetry here is why the checks
+cannot be repaired by looking harder. The observable quantity and the behavioural question came
+apart; no amount of careful inspection puts them back together.
+
+**Code-hash allowlists** — a pattern that shows up in factory registries, integration guards and
+some bridge designs — need re-derivation. Hashing what `EXTCODEHASH` returns for a delegated
+account allowlists a pointer.
+
+**Proxy debugging** on the Solidity track uses the same discipline: when behaviour and bytes
+disagree, resolve the indirection explicitly before reasoning about either.

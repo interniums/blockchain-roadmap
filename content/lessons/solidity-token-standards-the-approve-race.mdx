@@ -1,0 +1,363 @@
+---
+id: solidity-token-standards-the-approve-race
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-20, oz-changelog, oz-erc20-source, oz-safe-erc20-source, weird-erc20, eip-2612, measured-gas-constants]
+stack: { solidity: "0.8.36" }
+---
+
+There is a warning inside ERC-20 itself. It sits under `approve`, in capitals, and it has been
+there since 2015:
+
+> NOTE: To prevent attack vectors like the one described here and discussed here, clients SHOULD
+> make sure to create user interfaces in such a way that they set the allowance first to 0 before
+> setting it to another value for the same spender. THOUGH The contract itself shouldn't enforce
+> it, to allow backwards compatibility with contracts deployed before<Cite src="eip-20" />
+
+A specification that names an attack against its own function, prescribes a mitigation, and then
+declines to enforce the mitigation, is telling you something. This lesson works out what the attack
+actually is, what each mitigation costs, and — the part that gets skipped — why auditors keep
+rating it low while users keep losing money to something else entirely.
+
+## The mechanism
+
+Two clauses from the previous lesson do all the work. `approve` lets the spender withdraw
+**multiple times** up to the value, and calling it again **overwrites** the current allowance
+rather than adding to it.<Cite src="eip-20" />
+
+Overwriting is the natural design. It is also what makes the window exist, because between the
+holder deciding "100 is too much, make it 50" and the chain agreeing, the old 100 is still live and
+the transaction expressing the new intent is sitting in public.
+
+You already know that the mempool is a broadcast, not a queue, and that ordering within a block is
+a builder's choice driven by fees rather than by submission time. That is the whole prerequisite.
+
+### Worked example: the allowance word, block by block
+
+Alice approved the router for 100 tokens last month. Today she wants to reduce that to 50 and
+submits `approve(router, 50)`. The router's operator is watching.
+
+**Subgoal: read the standing authorisation before touching it.** The attacker does not need the
+mempool for this part. `allowance(alice, router)` is a public view function; the value 100 has been
+readable by anyone since the day it was written.
+
+**Subgoal: observe the intent to change it.** Alice's `approve(router, 50)` appears in the public
+mempool. Its calldata is not encrypted and its selector is one of the most-watched four bytes on
+the chain.
+
+**Subgoal: spend the old authorisation at a higher priority fee.** The attacker submits
+`transferFrom(alice, attacker, 100)` and pays more, so a rational builder orders it first.
+
+**Subgoal: let the victim's transaction land, and spend again.** Alice's approve executes, setting
+the word to 50 — not to "50 remaining out of 100", because it is an overwrite. The attacker then
+calls `transferFrom(alice, attacker, 50)`.
+
+<Figure
+  caption="The overwrite does not subtract what was already spent — it refills the word, and the attacker spends it twice."
+  alt="Four steps in the order the chain executes them. The allowance starts at 100. The attacker's transferFrom for 100 is ordered first and takes 100. Alice's approve for 50 then overwrites the word to 50. The attacker's second transferFrom takes that 50, for 150 in total."
+>
+  <Flow
+    lanes={['before', 'ordered first', "alice's tx", 'and again']}
+    nodes={[
+      { id: 'a', label: 'allowance = 100', note: 'granted last month', col: 0, tone: 'muted' },
+      { id: 'b', label: 'transferFrom 100', note: 'attacker, taken: 100', col: 1, tone: 'danger' },
+      { id: 'c', label: 'approve(router, 50)', note: 'overwrite → 50', col: 2, tone: 'accent' },
+      { id: 'd', label: 'transferFrom 50', note: 'attacker, taken: 150', col: 3, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+Alice intended to authorise 50. She authorised 150.
+
+Two details make this less dramatic than it first reads, and both matter for how you rate it.
+
+**The attacker had to be the spender.** Not a bystander — `transferFrom` succeeds only for the
+address Alice already approved. This is not a bug an arbitrary front-runner can exploit; it is a
+bug your *counterparty* can exploit.
+
+**The marginal loss is the new value, not the total.** Alice had already granted 100 to a spender
+who was willing to steal it. That 100 was gone the moment she stopped watching, race or no race.
+What the race adds is the extra 50.
+
+Hold that second point. It is the whole argument for the severity rating later in the lesson, and
+it is the part that gets dropped when the attack is retold.
+
+## The mitigations, and what each one actually costs
+
+### Set to zero, then set the new value
+
+The specification's own advice.<Cite src="eip-20" /> It works because after the zero lands there is
+nothing to spend, so the attacker's only move is to front-run the *zeroing* transaction — which
+spends the old allowance, which they could have done anyway.
+
+The honest description is therefore not "it prevents the attack". It is: **it caps the loss at the
+old allowance instead of old plus new.** That is a real improvement and a smaller claim than the one
+usually made for it.
+
+Costs: two transactions instead of one, and a window between them in which the allowance is zero
+and the application does not work. It also breaks against tokens that revert on zero-value
+approvals — BNB is the catalogued example.<Cite src="weird-erc20" />
+
+### Tokens that enforce it
+
+Some tokens refuse to move from a non-zero allowance to a different non-zero value at all. USDT and
+KNC are the catalogued cases, and the reason given is precisely this attack.<Cite src="weird-erc20" />
+
+This turns a client-side convention into a hard integration requirement, and it is one of the more
+common ways a working integration fails against one specific asset. Code that calls
+`approve(spender, amount)` unconditionally works everywhere except against those tokens, where it
+reverts whenever a previous approval is still outstanding.
+
+### `forceApprove`
+
+OpenZeppelin's answer, added in 4.9.0 (23 May 2023) and still present in the 5.x
+line.<Cite src="oz-changelog" /><Cite src="oz-safe-erc20-source" /> The logic is three lines and
+worth reading, because the shape tells you what it is defending against:
+
+```solidity
+function forceApprove(IERC20 token, address spender, uint256 value) internal {
+    if (!_safeApprove(token, spender, value, false)) {
+        if (!_safeApprove(token, spender, 0, true)) revert SafeERC20FailedOperation(address(token));
+        if (!_safeApprove(token, spender, value, true)) revert SafeERC20FailedOperation(address(token));
+    }
+}
+```
+
+**Subgoal: try the direct approval, without reverting on failure.** The `false` argument suppresses
+bubbling, so a token that refuses the non-zero-to-non-zero write returns `false` here instead of
+killing the transaction.
+
+**Subgoal: only if that failed, zero and retry, this time bubbling.** Two more calls, and any
+failure now surfaces as a revert.
+
+The compatibility win is that one code path handles both token families. The cost is up to three
+external calls where one would do, and the `SSTORE` pattern behind them: writing an allowance from
+non-zero to zero and back to non-zero is two writes, and a non-zero-to-non-zero `SSTORE` is 2,900
+gas while zero-to-non-zero is 20,000.<Cite src="measured-gas-constants" /> Compatibility here is
+paid for in gas, in a shape that depends on the slot's prior value.
+
+### `safeIncreaseAllowance` and `safeDecreaseAllowance`
+
+These read the current allowance and call `forceApprove` with the adjusted total. Here is
+`safeIncreaseAllowance` in full:<Cite src="oz-safe-erc20-source" />
+
+```solidity
+function safeIncreaseAllowance(IERC20 token, address spender, uint256 value) internal {
+    uint256 oldAllowance = token.allowance(address(this), spender);
+    forceApprove(token, spender, oldAllowance + value);
+}
+```
+
+Read what that is and is not. It is a read, then an absolute write. It is **not** an atomic
+increment at the token, because ERC-20 has no such operation. If the allowance changes between the
+read and the write — inside the same transaction it cannot, but across transactions it certainly
+can — the write lands on a stale basis.
+
+There is also a live incompatibility recorded in the source itself: if the token implements
+ERC-7674 temporary allowances and the client uses them, performing a `safeIncreaseAllowance` or
+`safeDecreaseAllowance` against a non-zero temporary allowance produces unexpected behaviour, and
+OpenZeppelin's own guidance is to avoid these functions in that case.<Cite src="oz-safe-erc20-source" />
+
+### The correction almost every tutorial needs
+
+OpenZeppelin **removed** `increaseAllowance` and `decreaseAllowance` from the `ERC20` contract
+itself in 5.0.0, released 5 October 2023.<Cite src="oz-changelog" /> They are gone from the current
+source; the token you deploy from `@openzeppelin/contracts` today does not have
+them.<Cite src="oz-erc20-source" />
+
+Three things follow, and they are the reason this is worth stating flatly:
+
+- **They were never in ERC-20.** The standard defines `approve` and `allowance` and nothing
+  else in that family.<Cite src="eip-20" />
+- **Most deployed tokens do not implement them.** Calling `token.increaseAllowance(...)` against an
+  arbitrary ERC-20 is calling a function that probably is not there.
+- **The surviving equivalents are library helpers, not token functions.** `safeIncreaseAllowance`
+  and `safeDecreaseAllowance` live in `SafeERC20` and work by reading and re-approving, exactly as
+  shown above.<Cite src="oz-safe-erc20-source" />
+
+<Misconception
+  belief="Use increaseAllowance to avoid the approve race — it is the OpenZeppelin way."
+  reality="OpenZeppelin deleted it from ERC20 in 5.0.0. It was never part of the standard, most tokens on chain do not have it, and the SafeERC20 helpers that replaced it are a read followed by an absolute approve, not an atomic increment."
+  why="It was the OpenZeppelin 4.x recommendation for years and it is still the top answer in a great deal of published material."
+  src="oz-changelog"
+/>
+
+### Not leaving a standing value at all
+
+The mitigation that removes the window rather than narrowing it: authorise with a signature that
+carries a deadline, so nothing sits in the allowance word between uses. EIP-2612's `permit` does
+this at the token; Permit2 does it for tokens that lack `permit`.<Cite src="eip-2612" /> That is the
+next lesson, and it is the direction the ecosystem actually moved.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'approve(0) first', note: "the spec's own advice" },
+    { title: 'forceApprove', note: 'SafeERC20' },
+    { title: 'permit / Permit2', note: 'sign, do not store', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'Does it stop the theft?',
+      cells: [
+        'No. It caps the loss at the old allowance instead of old plus new.',
+        'No. Same cap, reached from one call site instead of two.',
+        'The window closes: nothing stands in the word between uses.',
+      ],
+    },
+    {
+      label: 'What does it cost?',
+      cells: [
+        'Two transactions, and a gap in between where the integration does not work.',
+        'Up to three external calls, and a zero-then-set pays 20,000 gas rather than 2,900.',
+        'A signature — which is cheaper to extract from a user than a transaction.',
+      ],
+    },
+    {
+      label: 'Which tokens break it?',
+      cells: [
+        'Tokens that revert on a zero-value approval; BNB is the catalogued case.',
+        'None of that family — handling both is the entire point of the fallback.',
+        'Tokens with no permit at all, which is why Permit2 exists.',
+      ],
+    },
+    {
+      label: 'Who has to implement it?',
+      cells: [
+        'The client. The standard declined to enforce it.',
+        'The integrator, via a library.',
+        'The token, or a separate contract standing in for it.',
+      ],
+    },
+  ]}
+  caption="Only the last column removes the standing value; the first two make the loss smaller and the integration more fragile."
+  alt="Three approval mitigations compared on whether they stop the theft, what they cost, which tokens break them, and who implements them."
+/>
+
+### The allowance changes without an event
+
+One more thing about that word, because it breaks the tool most people reach for when they want to
+audit their own exposure.
+
+`Approval` MUST trigger on any successful call to `approve`.<Cite src="eip-20" /> It is not required
+to trigger when an allowance is *spent*, and OpenZeppelin's implementation says so in a comment on
+`_spendAllowance`: it updates the allowance and does not emit an `Approval`
+event.<Cite src="oz-erc20-source" />
+
+So an approvals dashboard built by replaying `Approval` logs shows what was granted, never what
+remains. For a finite approval that has been partly spent, the log-derived figure is an
+over-estimate; for an infinite one it is right by accident, because the value never
+moves.<Cite src="oz-erc20-source" /> The only correct source for "how much can this spender still
+take" is a live `allowance(owner, spender)` call — the same lesson as the previous one, arriving
+from a different direction: the mapping is the ledger, and the events are a partial description of
+it.
+
+This matters here because "review your approvals" is the standard advice given after every approval
+incident, and the tooling that implements that advice is reading logs.
+
+## Why auditors rate this low, and why they are right
+
+Assemble the preconditions for the classic race:
+
+1. The victim holds a **non-zero** allowance to some spender.
+2. That spender is **willing to steal** from them.
+3. The victim submits a change to **another non-zero** value.
+4. The attacker wins the ordering.
+
+Condition 2 is doing almost all of the work. A spender willing to steal, holding a non-zero
+allowance, does not need conditions 3 and 4 — they can call `transferFrom` for the full standing
+amount at any moment of their choosing. The race lets them additionally take the *new* value. It
+converts a loss you had already accepted into a slightly larger one.
+
+Now put that next to how funds are actually lost at the approval layer.
+
+**Unlimited approvals that never decay.** Because implementations short-circuit at
+`type(uint256).max` and skip the decrement, an unlimited approval is not consumed by
+use.<Cite src="oz-erc20-source" /> It is a permanent capability held by a contract address, and the
+question is not whether that contract is honest today but whether it is upgradeable, whether its
+admin key is safe, and whether it has an unguarded path that reaches `transferFrom`. USDC and USDT
+are themselves upgradeable, which is the same class of trust one layer down.<Cite src="weird-erc20" />
+
+**Signatures obtained by deception.** A signature is cheaper to extract from a user than a
+transaction: it costs them no gas, produces no pending-transaction feedback, and is presented by
+wallets as a smaller act than sending. When the thing being signed *is* an approval — which is
+exactly what lesson three is about — the phishing surface moves from "trick them into sending" to
+"trick them into signing".
+
+Neither of those requires an ordering race, a competitive fee bid, or the victim to be
+mid-adjustment. Both are available to an attacker on their own schedule.
+
+This is why "reorder the mitigations by expected loss" gives a different answer from "reorder by
+how memorable the attack is". Be careful about turning that into a number, though: published loss
+attributions for the approval layer come from vendor aggregations with incompatible scopes, and
+this repository's own conflict register keeps several of them explicitly unresolved. The ordering
+is defensible; a percentage is not.
+
+<Misconception
+  belief="Approve-to-zero-first is a free, universally correct habit."
+  reality="It costs an extra transaction, it leaves a window in which the integration is broken, it fails against tokens that revert on zero-value approvals, and it caps the loss at the old allowance rather than preventing anything."
+  why="It is the specification's own advice, which reads as a complete fix rather than as damage limitation for a case the spec declined to enforce."
+  src="eip-20"
+/>
+
+<Check type="spot-bug" concept="erc20-approve-race-mitigations">
+A payments integration ships this helper. It is called before every pull, for whatever ERC-20 the
+merchant configured.
+
+```solidity
+function ensureAllowance(IERC20 token, address spender, uint256 amount) internal {
+    if (token.allowance(address(this), spender) < amount) {
+        token.approve(spender, type(uint256).max);
+    }
+}
+```
+
+It passes every test against the team's own mock token. Name every distinct way it fails in
+production, and say which one is a security problem rather than a compatibility problem.
+
+<Answer>
+**It reverts against USDT-shaped tokens.** Those refuse a non-zero-to-non-zero approval, and this
+function is only ever called when an allowance already exists and is too small — that is, exactly
+in the case they refuse.<Cite src="weird-erc20" /> The fix is `forceApprove`, which tries the write
+and falls back to zero-then-set.<Cite src="oz-safe-erc20-source" />
+
+**It reverts against tokens that return no data.** `token.approve(...)` typed to return `bool`
+decodes 32 bytes of returndata; several major tokens return none. That is lesson four's subject and
+the same fix applies: go through `SafeERC20`.
+
+**It silently does nothing against tokens that return `false` instead of reverting.** The return
+value is discarded here. The standard is explicit that callers MUST handle `false` and MUST NOT
+assume it is never returned.<Cite src="eip-20" /> The allowance is then unchanged and the
+subsequent pull fails with a confusing error somewhere else.
+
+**It reverts against tokens that cap approvals below `type(uint256).max`.** UNI and COMP revert on
+values that do not fit in `uint96`, and have special-case logic that stores `type(uint96).max`
+when handed `uint256` max — so the allowances mapping does not contain the value you
+passed.<Cite src="weird-erc20" />
+
+**And the security problem, which is none of the above:** it escalates a bounded approval to an
+unlimited one, permanently, on a threshold that has nothing to do with the merchant's needs. A
+request to pull 10 tokens installs a capability over the entire balance, and because
+implementations do not decrement an infinite allowance, it never shrinks
+back.<Cite src="oz-erc20-source" /> Every other failure here is a support ticket. This one is the
+loss.
+
+The corrected shape approves exactly `amount` through `forceApprove` before the pull, or — better —
+carries a signed, expiring authorisation instead of writing a standing one.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Next lesson** replaces the standing allowance with a signature: EIP-2612 `permit` where the token
+supports it, Permit2 where it does not, and the new failure modes that come with moving
+authorisation off-chain.
+
+**Lesson four** explains why `token.approve(...)` reverts against USDT at all, which is a different
+bug from the one in this lesson and is caught by the same library.
+
+**The security track** returns to this as a severity-calibration exercise: the approve race is the
+canonical example of a finding that is real, correctly reported, and almost never the thing that
+costs a protocol its users' money.

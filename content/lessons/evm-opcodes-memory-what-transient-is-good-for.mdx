@@ -1,0 +1,367 @@
+---
+id: evm-opcodes-memory-what-transient-is-good-for
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    eip-1153,
+    eip-2200,
+    eip-2929,
+    eip-3529,
+    measured-gas-constants,
+    solidity-transient-storage-blog,
+    uniswap-v4-flash-accounting,
+    uniswap-v4-poolmanager,
+    chainsecurity-tstore,
+  ]
+stack:
+  solc: "0.8.36"
+  forge: "1.7.1"
+---
+
+A protocol with forty external functions guards eight of them. The other thirty-two were judged safe:
+they do not send ETH, or they follow checks-effects-interactions, or somebody reasoned about them
+once in 2023 and wrote a comment.
+
+Ask why only eight and the honest answer is never "we proved the other thirty-two safe". It is
+"guards cost thousands of gas each and we did not want to pay it forty times".
+
+That is a budget decision masquerading as a security decision, and the tier introduced in the previous
+lesson changes the budget by roughly an order of magnitude. This lesson is about what the new tier is
+actually good for: the guard, the many-lock generalisation of the guard, and flash accounting — the
+pattern that could not have existed at all before this lifetime did.
+
+## The guard, mechanically
+
+A reentrancy guard writes a lock before the protected body and clears it afterwards, refusing to run
+if the lock is already set. In transient storage it is four instructions:
+
+```solidity
+modifier nonReentrant() {
+    assembly {
+        if tload(0) { revert(0, 0) }
+        tstore(0, 1)
+    }
+    _;
+    assembly {
+        tstore(0, 0)
+    }
+}
+```
+
+The storage version most codebases use looks slightly odd until you know why:
+
+```solidity
+uint256 private _lock = 1;   // never zero
+
+modifier nonReentrant() {
+    require(_lock == 1, "reentrant");
+    _lock = 2;
+    _;
+    _lock = 1;
+}
+```
+
+The `1` and `2` are not arbitrary and they are not style. A slot holding zero is
+[absent from the trie](/c/zero-slot-is-absent), so writing a non-zero value into it is a
+zero-to-non-zero transition at 20,000 gas.<Cite src="measured-gas-constants" /> Keeping the slot
+permanently non-zero means every lock and unlock is a cheaper non-zero-to-non-zero update instead.
+The pattern is a workaround for the storage pricing tiers, and it disappears entirely in the transient
+version because transient storage has no such tiers.
+
+## What it costs, stated honestly
+
+Measured on this machine — forge 1.7.1, solc 0.8.36, optimizer off — comparing a guarded call against
+the identical call unguarded:<Cite src="measured-gas-constants" />
+
+| guard | guarded call | unguarded call | overhead |
+|---|---|---|---|
+| storage lock, warm slot | 4,312 | 1,208 | **3,104** |
+| transient lock | 1,490 | 1,206 | **284** |
+
+The warm storage figure reconstructs cleanly from the measured constants: a warm read at 100, a
+non-zero-to-non-zero write at 2,900, and a closing write that restores the slot's original value
+within the same transaction, which EIP-2200's net metering prices near the bottom
+tier.<Cite src="eip-2200" /><Cite src="eip-2929" /><Cite src="measured-gas-constants" /> The transient figure is two
+operations at 100 gas each plus the branch.<Cite src="eip-1153" />
+
+Three figures circulate in the ecosystem for these: roughly 7,100 and roughly 5,000 for the storage
+guard, and roughly 200 for the transient one. **None of them matched this
+configuration.**<Cite src="measured-gas-constants" />
+
+The 7,100 is not fabricated. It assumes a **cold** lock slot, which is true on the first guarded call
+in a transaction and false on every one after it, because the cold surcharge is charged once per slot
+per transaction.<Cite src="eip-2929" /> So the honest statement is a range, and the range is the
+teaching point:
+
+> The storage guard costs somewhere between roughly 3,100 and 7,100 gas depending on whether the lock
+> slot is already warm. The transient guard is flat at about 284, because transient storage has no
+> cold tier.<Cite src="measured-gas-constants" /><Cite src="eip-1153" />
+
+That makes transient roughly eleven times cheaper in the warm case — not the thirty-five times the
+7,100-against-200 pairing implies. This corpus measured the warm end and did not measure the cold end,
+which is itself worth saying rather than hiding.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Storage lock', note: 'slot held non-zero', tone: 'warn' },
+    { title: 'Transient lock', note: 'TSTORE / TLOAD', tone: 'good' },
+  ]}
+  rows={[
+    {
+      label: 'What does the overhead depend on?',
+      cells: ['Whether the lock slot is already warm in this transaction', 'Nothing — it is flat'],
+    },
+    {
+      label: 'So what is the overhead?',
+      cells: ['A range: roughly 3,100 warm to roughly 7,100 cold', 'About 284, every call'],
+    },
+    {
+      label: 'Why initialise the lock to 1 rather than 0?',
+      cells: [
+        'A zero slot is absent from the trie, so setting it would be a 20,000-gas transition',
+        'No reason to — transient storage has no zero versus non-zero tiers',
+      ],
+    },
+    {
+      label: 'What clears the lock at the end of the transaction?',
+      cells: ['A second write you pay for', 'The protocol, with no clearing write required'],
+    },
+  ]}
+  caption="The two guards are not one price against another: the storage guard has a range because it is charged for having touched a slot before, and the transient guard has no such history to be charged for."
+  alt="A persistent-storage reentrancy lock compared with a transient one. The storage lock's overhead depends on whether its slot is already warm and spans roughly 3,100 gas warm to roughly 7,100 cold; the transient lock is flat at about 284. The storage lock is held at 1 rather than 0 to avoid a 20,000-gas zero-to-non-zero transition, and must be cleared by a second paid write; transient storage has no such tiers and is discarded automatically."
+/>
+
+<Misconception
+  belief="A storage reentrancy guard costs about 7,100 gas."
+  reality="That figure assumes a cold lock slot, which holds only for the first guarded call in a transaction. Measured warm overhead on a current toolchain was 3,104. The truthful answer is a range, not a number."
+  why="One number is easier to quote than a range, and the cold case is the one people benchmark, because a fresh test environment makes everything cold. The figure then travels without the assumption that produced it, and gets compared against a transient figure measured under different conditions — which is how a factor of eleven becomes a factor of thirty-five in a migration proposal."
+  src="measured-gas-constants"
+/>
+
+<Misconception
+  belief="Transient storage removes the reentrancy vulnerability class."
+  reality="It makes the guard cheap. An unguarded function is exactly as vulnerable as it was before, and transient storage introduces reentrancy hazards of its own."
+  why="Cheap defences get described as if they were automatic, and the EIP's flagship use case being a reentrancy lock makes it sound like the feature is about reentrancy rather than about inter-frame communication. The second half of that reality — the new hazards — is the ninth lesson in this module and is the part most migration write-ups omit."
+  src="chainsecurity-tstore"
+/>
+
+### What the price change actually buys
+
+Not "our guards got cheaper". The real payoff is that the argument at the top of this lesson stops
+working.
+
+At 3,100 to 7,100 gas, guarding all forty functions is a visible line item and somebody will push
+back. At 284, it is noise, and "we only guarded the risky ones" stops being defensible — because the
+cost of being wrong about which ones were risky is now enormously larger than the cost of guarding
+them all.
+
+That is the correct security framing, and it is narrower than the usual one: transient storage did not
+make reentrancy harder. It removed the *excuse* for leaving a function unguarded.
+
+## Many locks for the price of one
+
+Because transient storage is a key-value store rather than a linear region, independent locks are just
+independent keys, and each costs the same 100 gas.<Cite src="eip-1153" />
+
+The Solidity team's announcement works through the case: a contract with two shared data structures,
+where accesses to each are independent, gets two separate locks keyed by distinct constants. Functions
+touching buffer A share one lock, functions touching buffer B share another, and a reentrant call
+triggered inside a buffer-A function may safely enter a buffer-B function — but not another buffer-A
+one.<Cite src="solidity-transient-storage-blog" />
+
+```solidity
+modifier nonreentrant(bytes32 key) {
+    assembly {
+        if tload(key) { revert(0, 0) }
+        tstore(key, 1)
+    }
+    _;
+    assembly { tstore(key, 0) }
+}
+```
+
+This is worth pausing on because it is genuinely new capability rather than a cheaper version of an
+old one. Under storage pricing, a second lock meant a second slot and a second few thousand gas per
+call, so protocols used one coarse lock and accepted that it blocked legitimate composition. Fine-grained
+locking was possible and nobody could afford it. Now the granularity is a design choice again.
+
+The same key-value shape is what makes the next pattern work.
+
+## Flash accounting
+
+Here is the pattern that justifies the whole region.
+
+A multi-step operation touching several assets normally moves tokens at every step. A three-hop swap
+transfers into the first pool, out of it and into the second, out of that and into the third, and out
+to the user: six transfers, each an external call to a token contract, each with its own storage
+writes.
+
+Flash accounting replaces the intermediate transfers with arithmetic. Each operation adjusts a running
+**delta** for the asset it touched. Nothing moves. At the end, a single settlement moves the net
+amounts, and the transaction reverts if any delta is still non-zero.
+
+Uniswap v4 is the canonical implementation, and its documentation states both the mechanism and the
+dependency plainly: the design became practical with the gas efficiency of transient storage, each
+balance-changing operation updates an internal net balance known as a delta, and only the final
+balance changes require token transfers.<Cite src="uniswap-v4-flash-accounting" /> The delta itself is
+described as a field held in transient state, representing debts and credits owed to or from the
+pool manager.<Cite src="uniswap-v4-flash-accounting" />
+
+The control flow is a lock and a callback. A periphery contract must unlock the singleton pool
+manager, then implement an `unlockCallback` in which it performs swaps, liquidity modifications and
+settlements; when execution returns to the pool manager, the core contract checks that balances are
+resolved and that nothing is owed in either direction.<Cite src="uniswap-v4-flash-accounting" /><Cite src="uniswap-v4-poolmanager" />
+
+<Figure
+  caption="The solvency check is the whole architecture: the pool manager will not return while any delta is still owed in either direction."
+  alt="Uniswap v4's flash-accounting flow. A periphery contract calls unlock on the pool manager, which calls back into unlockCallback. Swaps and liquidity changes inside the callback only adjust transient deltas. Settlement moves the net amounts, and on return the pool manager either finds every delta at zero and succeeds, or finds one outstanding and reverts."
+>
+  <Flow
+    nodes={[
+      { id: 'u', label: 'unlock()', note: 'opens the till', col: 0 },
+      { id: 'cb', label: 'unlockCallback', note: 'deltas move, tokens do not', col: 1, tone: 'accent' },
+      { id: 's', label: 'settle / take', note: 'net amounts move', col: 2 },
+      { id: 'ok', label: 'all deltas zero', note: 'returns', col: 3, tone: 'good' },
+      { id: 'bad', label: 'a delta remains', note: 'reverts', col: 3, tone: 'danger', dashed: true },
+    ]}
+    edges={[
+      { from: 'u', to: 'cb' },
+      { from: 'cb', to: 's' },
+      { from: 's', to: 'ok', tone: 'good' },
+      { from: 's', to: 'bad', tone: 'danger', dashed: true },
+    ]}
+  />
+</Figure>
+
+### Why it needs *this* region and not another
+
+Run the three properties from the previous lesson against the pattern's requirements. This is the
+argument that makes flash accounting a consequence rather than a coincidence.
+
+**It must span frames.** The deltas are written inside `unlockCallback`, which is a different frame
+from the one that will check them on return. Memory cannot do this: a callee's memory is fresh and
+zeroed and its caller cannot see it.<Cite src="eip-1153" />
+
+**It must clear itself.** A storage implementation would pay to create a trie entry for every
+intermediate delta and pay again to clear it, against a clearing refund of 4,800 capped at a fifth of
+gas used.<Cite src="eip-3529" /> For a pattern whose entire purpose is to make intermediate steps
+nearly free, that is fatal. Transient storage discards everything at the transaction
+boundary.<Cite src="eip-1153" />
+
+**It must roll back with a revert.** If any step in the callback fails, the deltas it wrote must
+vanish along with it, or the solvency check at the end is checking corrupted arithmetic. Transient
+writes are reverted with the frame, including those made in inner calls.<Cite src="eip-1153" />
+
+Remove any one of those three and the pattern does not work. That is what "the middle tier" means
+concretely: not a cheaper storage, but the only region satisfying a conjunction that nothing satisfied
+before.
+
+<Misconception
+  belief="Flash accounting is a Uniswap feature."
+  reality="It is a general pattern — accumulate net deltas transiently, settle once, revert if anything is unresolved — that any multi-step protocol can use. Uniswap v4 is the best-known implementation, not the mechanism."
+  why="Most engineers met the idea through one product, and that product's documentation is the clearest write-up of it, so the name and the implementation arrived together. EIP-1153 listed the shape years earlier as the 'till' pattern: let users perform all actions in a callback, then check the till is balanced at the end."
+  src="eip-1153"
+/>
+
+### The other patterns the EIP anticipated
+
+EIP-1153's motivation lists the use cases its authors expected, and the list has aged well enough to
+be worth reading as a menu:<Cite src="eip-1153" />
+
+- **Reentrancy locks** — the flagship, covered above.
+- **On-chain computable `CREATE2` addresses**, where constructor arguments are read from the factory
+  during construction instead of being baked into the initcode hash. This is a real trick:
+  [a `CREATE2` address depends on the initcode](/c/create2-address), so moving the arguments out of the
+  initcode makes the address independent of them.
+- **Single-transaction ERC-20 approvals** — a `temporaryApprove(spender, amount)` that cannot outlive
+  the transaction, removing the standing-allowance risk.
+- **Fee-on-transfer contracts**, where a fee paid once unlocks transfers for the rest of the
+  transaction.
+- **The "till" pattern** — flash accounting, named before it was built.
+- **Proxy call metadata**, passing extra context to an implementation without occupying calldata.
+
+Two of those come with warnings that arrive in the next lesson. Note them now: the temporary-approval
+idea is the exact example an audit firm used to demonstrate a new reentrancy vector, and anything that
+leaves a transient value set after your call returns is a composability hazard rather than a saving.
+
+## The discipline that comes with it
+
+The Solidity team's guidance is short and it is the operational rule to adopt: always clear transient
+storage completely at the end of a call into your contract, to avoid these classes of issue and to
+keep the contract's behaviour analysable inside complex transactions.<Cite src="solidity-transient-storage-blog" />
+
+And explicitly do not skip the clearing write to save its 100 gas. The announcement spells out the
+consequence: failing to reset a lock restricts your contract to a single call per transaction, which
+prevents its use in the composed transactions that complex on-chain applications are built
+from.<Cite src="solidity-transient-storage-blog" /> A hundred gas is not worth becoming
+un-composable.
+
+<Check type="explain" concept="flash-accounting">
+A lending protocol wants to let a user, in one transaction, withdraw collateral, sell it, repay a
+debt, and re-deposit the remainder — with the health check deferred to the end so that intermediate
+states may be temporarily unhealthy.
+
+The team proposes: set a `deferredCheck` flag, run the user's callback, then check health and clear
+the flag. They ask which location the flag and the intermediate balances should use.
+
+Answer for each, and then name the two failure modes this design must handle regardless of location.
+
+<Answer>
+**The flag must be transient.** It is set in the protocol's frame, must be visible to the protocol's
+*other* frames when the callback re-enters, and must not survive the transaction. Memory cannot cross
+the frame boundary.<Cite src="eip-1153" /> Persistent storage would work and would cost a
+zero-to-non-zero write plus a clearing write for a value whose life is one
+transaction.<Cite src="measured-gas-constants" /> This is exactly the inter-frame communication case
+the EIP was written for.
+
+**The intermediate balances must be transient as well, and this is the flash-accounting shape.** Each
+step adjusts a delta rather than moving tokens; the final settlement moves net amounts; the
+transaction reverts if any delta is unresolved.<Cite src="uniswap-v4-flash-accounting" /> Holding them
+in persistent storage would pay trie costs for every intermediate value, which defeats the purpose;
+holding them in memory is impossible across the callback boundary.
+
+**Failure mode one — a reverting callback must not leave the flag set.** If it did, the protocol would
+be jammed in deferred-check mode for the rest of the transaction. Transient storage rolls back with
+the reverting frame, including writes made in inner calls, so this is handled by the
+protocol.<Cite src="eip-1153" /> Note that this is a *reason* the design is safe, not an accident:
+were the rollback semantics absent, the pattern would need explicit cleanup on every failure path.
+
+**Failure mode two — the deferred window is a reentrancy window, and this is the dangerous one.**
+While `deferredCheck` is set, ordinary invariants are suspended by construction. If any function
+reachable from the callback reads balances without knowing which set is authoritative, or if the
+protocol's own `transfer` operates on transient balances for one party and persistent balances for
+another, an attacker can re-enter during the window and act on a state that is inconsistent by design.
+An audit firm demonstrated exactly this against a vault built on the same deferred-check idea: nesting
+one batch inside another made it possible to re-enter a transfer while both parties' operations were
+being performed against transient balances.<Cite src="chainsecurity-tstore" />
+
+**The design rule that follows.** The flag must not merely be set and cleared; every function
+reachable during the window must be audited under the assumption that the window is open. A guard on
+the outer entry point does not help, because the callback is *supposed* to call back in. The next
+lesson is about why this general shape — transient state changing what a later call sees — is a
+composability hazard rather than a bug you can patch.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Cheaper guards are not safer guards**, next lesson, is the other half of this one. It covers the
+composability trap the Solidity team warned about, and the specific reentrancy vector transient storage
+created by not carrying `SSTORE`'s gas stipend rule.<Cite src="chainsecurity-tstore" />
+
+**Reentrancy and checks-effects-interactions** in the security track use the guard as one control among
+several. The measured overhead here is what makes "guard everything" affordable, and affordability is
+what turns a pattern into a policy.
+
+**Uniswap v4 hooks** in the DeFi track are built on the unlock-and-settle flow described above. The
+solvency check on return is the invariant the whole architecture rests on, and understanding it as
+transient-delta arithmetic rather than as protocol-specific machinery is what makes hook development
+tractable.<Cite src="uniswap-v4-poolmanager" />
+
+**Invariant testing** in the toolchain track has a natural target here: "no path exits the callback
+with a non-zero delta" is precisely the kind of property a [solvency invariant](/c/solvency-invariant)
+suite exists to attack.

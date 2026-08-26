@@ -1,0 +1,412 @@
+---
+id: infra-running-nodes-sync-modes
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    nethermind-sync,
+    eth-archive-nodes,
+    eth-run-a-node,
+    geth-hardware,
+    eip-8252,
+    erigon-readme,
+    erigon-pruning-modes,
+    lighthouse-checkpoint-sync,
+    prysm-checkpoint-sync,
+    eth-clients-checkpoint-sync-endpoints,
+    quicknode-full-vs-archive,
+  ]
+stack: {}
+---
+
+Three weeks after your node reached head, a product requirement arrives. The monthly statement should
+show each user their balance at the first block of the previous month, not just today's.
+
+You try it. `eth_getBalance` with a block tag from four weeks ago comes back as a failure about a
+missing piece of the state database rather than as anything resembling "we do not keep that". You check
+the flags. You did not do anything wrong. You chose the default sync mode, which is the right default,
+and the default made this question permanently unanswerable on this node.
+
+Not slow. Not expensive. **Unanswerable**, and not fixable in place: Erigon's documentation says that
+to change what a node retains "you must first delete the `/chaindata` folder in the chosen `--datadir`
+directory and re-sync from scratch",<Cite src="erigon-pruning-modes" /> and Nethermind warns "Do not
+enable snap sync on a previously synced node. Only do so when syncing to the network for the first
+time."<Cite src="nethermind-sync" />
+
+Sync mode is the most consequential single decision in this module because it is made once, made
+early, and made before anyone has told you what the product will need.
+
+## Four questions, not one axis
+
+Sync modes are usually drawn as a line from cheap to expensive. That framing loses the thing you
+actually need. Ask four separate questions instead, because the modes score differently on each and
+the differences are not correlated in the way "cheap to expensive" implies.
+
+1. **What did this node verify for itself**, as opposed to accepting from somebody else?
+2. **What does it retain** once it is at head?
+3. **How long until it is useful?**
+4. **Which questions can it answer** — and which can it never answer?
+
+Question 4 is the one that reaches your product requirements, and question 1 is the one that
+determines what your node's answers are worth. Question 3 is the one everybody optimises for.
+
+## Snap sync: the default, and what it actually assumes
+
+Snap sync fetches the header chain and a **state snapshot** at a recent pivot block, then executes
+only the blocks after that pivot to reach head. Nethermind describes it as allowing "a node to perform
+the initial synchronization and download of network state up to 10 times faster than using fast sync",
+with the node downloading leaf nodes of the trie and generating the remaining nodes
+locally.<Cite src="nethermind-sync" /> Hours instead of days, which is why it is the default and why it
+should usually stay the default.
+
+Now the part that is worth getting exactly right, because the popular summary of it is wrong in both
+directions.
+
+**What snap sync does not do:** it does not re-execute the blocks before the pivot. So it has not
+personally checked that the state at the pivot is the correct *result* of applying every transaction
+since genesis. If every client on the network shared a transition bug, a snap-synced node would inherit
+its output without noticing.
+
+**What snap sync does do, and gets no credit for:** it checks that the state it downloaded hashes to
+the [state root](/c/state-root) committed in the pivot block's header. That is not a weak check. A peer
+handing you fabricated account data cannot produce a set of trie nodes that hashes to a root some other
+header already commits to, for the same reason nobody can produce a second preimage on demand. Snap
+sync is not "trust a stranger's database". It is "trust that this header is on the canonical chain,
+then verify the state against it cryptographically."
+
+Which raises the obvious question, and it has a satisfying answer: where does the header's authority
+come from? Not from the execution client, which has no opinion about canonicality. From the consensus
+client — which got its own starting point from checkpoint sync, four sections down. **The whole trust
+story of a freshly synced node terminates in one place, and it is not on the execution side.**
+
+<Figure
+  caption="Every link in this chain is checked by a hash except the first one, which is checked by you."
+  alt="A freshly synced node's trust chain: a checkpoint state fetched over HTTP gives the consensus client its starting point, the consensus client establishes which pivot header is canonical, and the execution client verifies its downloaded state against that header's state root."
+>
+  <Flow
+    lanes={['what you assume', 'consensus client', 'execution client']}
+    nodes={[
+      { id: 'ckpt', label: 'checkpoint state', note: 'fetched over HTTP', col: 0, tone: 'warn' },
+      { id: 'hdr', label: 'pivot block header', note: 'carries a stateRoot', col: 1, tone: 'accent' },
+      { id: 'state', label: 'downloaded state', note: 'must hash to it', col: 2, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'ckpt', to: 'hdr', label: 'fork choice' },
+      { from: 'hdr', to: 'state', label: 'keccak' },
+    ]}
+  />
+</Figure>
+
+### Sync is several phases, and only one of them is a download
+
+The word "sync" hides a pipeline, and knowing its shape is what lets you tell "slow" from "stuck".
+Nethermind documents its own stages plainly: before fetching state at all, the node syncs headers in two
+directions — backward from the pivot to block zero, and forward to the head of the chain for headers,
+bodies and receipts — and only then begins downloading the latest state trie
+nodes.<Cite src="nethermind-sync" /> That forward pass "might be very slow (5 to 50 blocks per second)",
+which is why the documentation says a fresh pivot block is crucial.<Cite src="nethermind-sync" />
+
+Two operational facts fall out of that pipeline, and both surprise people.
+
+**Progress can exceed 100%, and it means what you fear.** If the network or file system pushes state sync
+below roughly 1.5 Mbps on average, Nethermind "will start downloading some parts of the tree repeatedly",
+and you may see something like `58000MB / 53000MB (100%)` — meaning it downloaded around 5 GB of data no
+longer needed.<Cite src="nethermind-sync" /> The reason is worth stating because it is the single most
+useful mental model in this module: **the chain does not wait for you.** State you fetched at the start of
+the pass has already been overwritten by the time you finish it, so you fetch it again. A slow node is
+not late by a fixed amount. It is fighting a moving target, and past a threshold it stops converging at
+all — which is why the documentation says a sync extended beyond two days will likely never catch
+up.<Cite src="nethermind-sync" />
+
+**Restarting costs more than the time you were running.** A single restart during fast sync may extend
+total sync time by up to two hours, because the client has to rebuild caches by reading millions of values
+back out of the database.<Cite src="nethermind-sync" /> "Just restart it" is the reflex from every other
+service you have operated, and here it is often the most expensive thing you can do.
+
+Both facts point at the same underlying resource, and the last lesson in this module is about it.
+
+<Misconception
+  belief="Snap sync is a trust-minimised way to obtain the chain's history — it just gets there faster."
+  reality="It obtains recent state, verified against a header's state root, and no history of state at all. The blocks before the pivot were never executed by your node, and the states they produced are not on your disk."
+  why="'Sync' implies converging on a complete copy, which is what it means for every other replicated system. Here it means reaching agreement about the present."
+  src="nethermind-sync"
+/>
+
+## Full sync, and the word that misleads everyone
+
+A full node in the strict sense executes **every block from genesis**. That is the difference, and it
+is entirely a difference in question 1: the node verified every state transition itself rather than
+accepting a snapshot. It takes days to weeks and the payoff is epistemic, not functional.
+
+Here is what it does not buy, and this is the single most reliably misunderstood term in node
+operation. Once synced, a full node retains all blocks and receipts but only a **short window of
+recent state**. Ethereum.org puts the classic figure in an example: an execution client configured as a
+full node "only caches the past few states, e.g., the state associated with the last 128 blocks, so it
+can handle chain reorgs and provide fast access to recent data."<Cite src="eth-archive-nodes" />
+
+So "full" describes the verification, not the retention. A full node holds every transaction that ever
+produced the balance you are asking about and cannot tell you the balance.
+
+<Misconception
+  belief="A full node keeps the whole history of the chain, so it can answer questions about any past block."
+  reality="It keeps all blocks and receipts and only a recent window of state. A historical eth_call or eth_getBalance needs an archive node — the transactions are there, the states they produced are not."
+  why="'Full' means complete in ordinary English, and the node genuinely does hold every transaction. The distinction that matters is between the inputs and the derived state, and nothing in the name signals it."
+  src="eth-archive-nodes"
+/>
+
+### The retention window is being specified, and the number is not 128
+
+The 128 figure is folklore that ethereum.org offers as an example, and in 2026 it is being replaced by
+something both larger and more precisely defined.
+
+EIP-8252 defines `REORG_RETENTION_WINDOW = 262_144` blocks — 8192 epochs times 32 slots, roughly 36.4
+days — and requires execution clients to keep recent state **reconstructible** (via snapshots, reverse
+state diffs, or any equivalent representation) for every canonical block in that window, so that any
+reorg up to the inactivity-leak-bounded non-finality window can be processed
+locally.<Cite src="eip-8252" /> The reasoning connects straight to material you already have: the
+[inactivity leak](/c/inactivity-leak) bounds how long finality can stall, so it also bounds how deep a
+reorg can be, so it sets how much state a node must be able to get back to without asking anyone.
+
+Two cautions before you write it down. **EIP-8252 is Draft and Informational**<Cite src="eip-8252" /> —
+it is not in a named fork, and it documents a requirement rather than changing consensus. And
+"reconstructible" is doing real work in that sentence: a client that can rebuild a 30-day-old state by
+walking reverse diffs satisfies it, while being nothing like an archive node for query latency.
+
+The direction of travel is nonetheless visible in shipped software. Erigon's default `full` mode retains
+state within that same window, and its four modes — `archive`, `full`, `blocks`, `minimal` — differ
+precisely in this dimension: `archive` keeps all historical state and all blocks, `blocks` keeps all
+block history plus state in the window, and `minimal` keeps state and blocks for roughly the last
+100,000 blocks.<Cite src="erigon-pruning-modes" />
+
+The lesson to carry is not the constant. It is that **"recent state" is a client-and-version-specific
+window with a lower bound now being written down**, and that the correct way to find yours is to read
+your client's current documentation rather than to repeat a number from a tutorial.
+
+## Archive: one difference, and it is not the one people name
+
+An archive node retains historical state — the intermediate values and trie nodes for every past block —
+so that `eth_call`, `eth_getBalance` and `eth_getStorageAt` work at an arbitrary historical block tag
+rather than only near head.<Cite src="eth-archive-nodes" /><Cite src="quicknode-full-vs-archive" />
+
+That retention is the entire difference. Everything else — the blocks, the receipts, the peers, the
+JSON-RPC surface — is the same as a full node. Ethereum.org is explicit that the network does not depend
+on archive nodes for historical *data*, because "all historical interim states can be derived on a full
+node" and the transactions themselves are stored by any full node and can be replayed to build the whole
+archive.<Cite src="eth-archive-nodes" /> An archive node is a node that has done that derivation in
+advance and kept the results.
+
+Nethermind describes archive sync as "the heaviest and slowest sync mode" but the one that "can answer
+questions like 'What was my account balance 2 years ago?'", with the largest database of any
+mode.<Cite src="nethermind-sync" /> Sync takes several days depending on hardware and
+connection.<Cite src="nethermind-sync" />
+
+One widely repeated claim about archive nodes deserves to be retired here, because it is now
+client-specific. "Archive means re-executing from genesis" was true and is no longer universally true:
+Erigon 3's own release notes lead with "Initial sync doesn't re-exec from 0: downloading 99% LatestState
+and History."<Cite src="erigon-readme" /> Whether an archive node must replay the chain, and how long
+that takes, is a property of the client you picked in the previous lesson — not of the mode.
+
+<Aside kind="note">
+Archive is also not a binary. Geth's hardware page notes that "partial archive nodes can also be created
+by turning off the garbage collector after some initial sync — the storage requirement depends how much
+state is saved."<Cite src="geth-hardware" /> If your requirement is "the last eighteen months", a full
+archive from genesis is buying you fifteen years you will never query.
+</Aside>
+
+### The four questions, side by side
+
+<Matrix
+  corner="Mode"
+  cols={['Verified for itself', 'Retains', 'Time to head', 'Historical state query']}
+  rows={[
+    {
+      label: <strong>Snap</strong>,
+      cells: [
+        "post-pivot blocks; state checked against a header's root",
+        'blocks, receipts, recent state',
+        <>hours<Cite src="nethermind-sync" /></>,
+        'no',
+      ],
+    },
+    {
+      label: <strong>Full (from genesis)</strong>,
+      cells: [
+        'every transition since genesis',
+        'blocks, receipts, recent state',
+        'days to weeks',
+        'no',
+      ],
+    },
+    {
+      label: <strong>Archive</strong>,
+      cells: [
+        <>client-dependent — not always a genesis replay<Cite src="erigon-readme" /></>,
+        <>blocks, receipts, <strong>all historical state</strong></>,
+        <>several days<Cite src="nethermind-sync" /></>,
+        { v: 'yes', tone: 'good' },
+      ],
+    },
+  ]}
+  caption="Four questions scored separately, because the modes do not line up on a single cheap-to-expensive axis — and every duration here is client-specific, read 26 August 2026."
+  alt="Snap, full-from-genesis and archive sync compared on what each verified itself, what it retains, how long it takes to reach head, and whether it can answer a historical state query. Only archive answers the last one."
+/>
+
+Read the third and fourth columns together. Full sync costs an order of magnitude more time than snap and
+changes nothing in the last column. Archive costs more again and is the only row that changes it. If your
+reason for choosing full over snap is "so we have the history", you have picked the one upgrade that does
+not deliver it.
+
+One more dial that does not appear in any of those rows: **how far back bodies and receipts are fetched at
+all** is separately configurable. Nethermind exposes `Sync.AncientBodiesBarrier` and
+`Sync.AncientReceiptsBarrier` alongside the pivot settings,<Cite src="nethermind-sync" /> and those
+knobs — not the sync mode — are what decide whether an old `eth_getLogs` range has anything to read. The
+next lesson is about why they exist.
+
+## Checkpoint sync: the one on the other side of the seam
+
+Everything above is an execution-client decision. The consensus client has its own, and it is the one
+that turns a multi-day bring-up into a coffee break.
+
+Rather than replaying the beacon chain from genesis, a consensus client normally starts from a recent
+finalised checkpoint state fetched over HTTP — from a public endpoint or from a node you already
+trust.<Cite src="eth-run-a-node" /> Prysm describes it as a feature that "significantly speeds up the
+initial sync between your beacon node and the Beacon Chain",<Cite src="prysm-checkpoint-sync" /> and
+Lighthouse puts the checkpoint-loading phase at "usually less than a
+minute".<Cite src="lighthouse-checkpoint-sync" />
+
+The instinct is that this is a security shortcut. It is worth correcting sharply, because both major
+client teams say the opposite.
+
+Lighthouse's documentation answers the "is this less secure" question with: "No, in fact it is more
+secure! Checkpoint sync guards against long-range attacks that genesis sync does
+not."<Cite src="lighthouse-checkpoint-sync" /> Prysm says the same thing in different words: "It's
+actually considered more secure thanks to the protections against long-range attacks afforded by Weak
+Subjectivity."<Cite src="prysm-checkpoint-sync" />
+
+<Misconception
+  belief="Checkpoint sync trades security for speed, so a serious operator syncs from genesis."
+  reality="Syncing from genesis is the configuration with the long-range attack surface. Starting from a recent finalised state removes it, at the cost of one bounded, one-time, verifiable assumption about which state you were handed."
+  why="Every other 'sync from a snapshot instead of replaying' choice you have made really was a trust-for-speed trade. Weak subjectivity inverts it: in proof of stake, the distant past is the part you cannot verify from first principles."
+  src="lighthouse-checkpoint-sync"
+/>
+
+The assumption you *do* take is precise and small: that the state you were handed is on the canonical
+chain. And both clients tell you how to discharge it in about a minute.
+
+- Lighthouse: "You should cross-reference the `block_root` and `slot` of the loaded checkpoint against a
+  trusted source like a friend's node, a block explorer or some public
+  endpoints."<Cite src="lighthouse-checkpoint-sync" />
+- Prysm: query your own node at `/eth/v1/beacon/headers/finalized`, take the slot and state root, and
+  confirm they match on independent explorers.<Cite src="prysm-checkpoint-sync" />
+
+The community-maintained list of public endpoints carries its own warning, and it is the right one to
+internalise: "This list should not be treated as a single source of truth for these endpoints, or the
+data they provide."<Cite src="eth-clients-checkpoint-sync-endpoints" /> Fetch from one, verify against
+two others, and note that the assumption expires the moment you are following head yourself.
+
+## Working the actual decision
+
+Take the requirement from the opening and drive it to a choice.
+
+**Subgoal: split the requirement into "now" questions and "then" questions.** Current balances are a
+"now" question and every sync mode answers them. The monthly figure is a "then" question. Only "then"
+questions have any bearing on this decision, and most product specs bury exactly one of them in a
+sentence about reporting.
+
+**Subgoal: bound the "then" horizon.** One month back, once a month. That is a horizon of roughly 216,000
+blocks — inside the reorg-retention window EIP-8252 describes<Cite src="eip-8252" /> and inside Erigon's
+default `full` retention,<Cite src="erigon-pruning-modes" /> and outside the 128-block cache the older
+documentation describes.<Cite src="eth-archive-nodes" /> So the answer is genuinely
+client-and-configuration-dependent rather than obvious, which is the honest finding: **check your
+client's actual retention before concluding you need an archive node.**
+
+**Subgoal: ask whether the question can be pre-answered.** This is the move most teams miss. You know a
+month in advance which block will be the first block of next month. A "then" question whose subject is
+predictable is not a historical-state problem — it is a *recording* problem. Read the balances when they
+are current, write them to your own database, and the archive requirement evaporates. An archive node is
+frequently the price of not having decided in advance what you would want to know.
+
+**Subgoal: price the fallback for the questions you cannot pre-answer.** For genuinely unpredictable
+historical queries — a support ticket about a balance on an arbitrary past date — the answer is not to
+run an archive node for one query a week. It is to send that one query to a provider that runs one, and
+to accept the latency and the per-call cost. Your node stays cheap and the rare question stays possible.
+
+**Subgoal: re-run the whole thing at five years.** Now pre-answering does not help, because you did not
+record anything five years ago and cannot go back. But notice that "run an archive node" still does not
+follow. Five years of monthly balances for every user is a **dataset**, not a query pattern: you would
+build it once by replaying, store it, and serve it from your own database forever. The node was the wrong
+tool the moment the answer stopped being a single lookup. That is the reflection prompt for this module,
+and it is worth writing your version down before you read anyone else's.
+
+<Check type="spot-bug" concept="sync-mode-full-exec">
+A team writes this in a design document. Find every wrong or unsafe statement, and say what the observable
+consequence of each would be.
+
+```text
+Plan for the analytics node:
+
+1. Sync a full node from genesis so we have the complete history verified locally.
+   Full sync means we keep everything, so historical eth_call will work.
+2. Skip checkpoint sync on the consensus client — starting from genesis is the
+   paranoid-but-correct option and we can afford the extra days.
+3. If we later need archive data, switch the flag and let it backfill.
+4. Sanity check: eth_syncing returns false, so we are done.
+```
+
+<Answer>
+**Four defects, and only the last one is cosmetic.**
+
+**1 — "Full sync means we keep everything, so historical `eth_call` will work" is false.** A full node
+retains all blocks and receipts and only a recent window of state — ethereum.org's example is the state
+associated with the last 128 blocks.<Cite src="eth-archive-nodes" /> Consequence: the node syncs
+successfully over days or weeks, reports healthy, and the first historical query fails. The team has paid
+the full-sync cost and received none of the thing they were paying for, because full sync buys
+*verification*, not *retention*. Note the two halves of the sentence are separately wrong: "full sync"
+and "keeps everything" are unrelated claims that happen to share a word.
+
+**2 — Skipping checkpoint sync is not the paranoid-but-correct option; it is the one with the extra attack
+surface.** Lighthouse states that checkpoint sync "guards against long-range attacks that genesis sync does
+not",<Cite src="lighthouse-checkpoint-sync" /> and Prysm attributes the same protection to weak
+subjectivity.<Cite src="prysm-checkpoint-sync" /> Consequence: days of avoidable sync time spent buying a
+*worse* security property, plus a longer window during which the node is not usable at all. The correct
+paranoid move is to checkpoint sync and then verify — cross-reference the `block_root` and `slot` against
+a friend's node, an explorer and other public endpoints.<Cite src="lighthouse-checkpoint-sync" />
+
+**3 — "Switch the flag and let it backfill" does not exist.** Erigon requires deleting `/chaindata` and
+re-syncing from scratch to change node type,<Cite src="erigon-pruning-modes" /> and Nethermind warns
+against enabling snap sync on an already-synced node.<Cite src="nethermind-sync" /> Consequence: the day the
+archive requirement is confirmed, the plan is a multi-day resync of a machine that is currently serving
+production traffic — a resource and downtime problem discovered at the worst possible moment, which is
+exactly the problem the design document was supposed to prevent. Retention is chosen at sync time.
+
+**4 — `eth_syncing` returning `false` proves less than they think.** It distinguishes "still catching up"
+from "not catching up", and the previous lessons established that it reports `false` for a node that has
+finished syncing *and* for a node that has quietly stopped being driven over the Engine API. Consequence:
+this check passes for a node that has been frozen for an hour. The real check compares your head to an
+independent one and alarms on the gap.
+
+**The correction that makes the plan coherent.** Ask question 4 first — which historical questions must this
+node answer, and how far back — then pick the mode. Here, "analytics" almost certainly means an archive node
+or, better, an indexed dataset that was built once and is served from a database. Full sync from genesis is
+the mode you choose when you want to verify the chain yourself, which is a legitimate goal and is not the
+goal stated anywhere in this document.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now name what a node retains, why, and which of your product's questions that makes impossible.
+Two threads run straight out of here.
+
+**The archive number is next, and it is stranger than it looks.** If a full node holds every transaction in
+under 400 GB and an archive node holds the same transactions in terabytes, the difference is not the
+history — it is the state, and the size of that premium depends almost entirely on how your client lays
+state out on disk. The next lesson makes that arithmetic concrete and then explains why the published
+figures disagree by a factor of six.
+
+**And "the node is allowed to forget" is now a live rule rather than a proposal.** Since 2025 execution
+clients may drop pre-Merge block bodies and receipts entirely while still serving every header. That
+changes what you may assume about fetching old data from an arbitrary peer, and it does nothing whatsoever
+to the archive premium — a distinction the next lesson exists to make sharp.

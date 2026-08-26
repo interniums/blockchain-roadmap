@@ -1,0 +1,293 @@
+---
+id: defi-hooks-choosing-a-pool-is-choosing-a-hook
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [zealynx-v4-security, uniswap-hooks-docs, uniswap-v4-hooks-concept-docs, uniswap-v4-core-hooks-library, uniswap-v4-core-poolkey, uniswap-v4-dynamic-fees-docs, uniswap-v4-poolmanager, uniswap-v4-core-poolmanager-source]
+stack: {}
+---
+
+An aggregator returns two routes for the same trade. One goes through a pool you recognise. The other
+is eleven basis points better and goes through a pool whose `PoolKey` has a hook address you have
+never seen.
+
+In v3 that choice was about liquidity and fee tier. Both pools ran the same bytecode; the only
+question was which had better depth at your size. In v4 the second route means **an unaudited
+contract, written by whoever created that pool, executes inside your transaction, with the ability to
+change what your trade does.**
+
+This lesson is about what that contract can do, why none of it is a bug, why simulation does not
+settle the question, and what actually protects you — which turns out to be a short and rather
+unglamorous list.
+
+## What a hook can do to your swap
+
+The `PoolManager` calls the hook before and after the core logic on that pool's operations:
+initialise, add and remove liquidity, swap, donate.<Cite src="uniswap-hooks-docs" /><Cite src="uniswap-v4-hooks-concept-docs" />
+That placement — inside the operation, in the same transaction, with control returned to it — is the
+whole capability. Five concrete consequences.
+
+**It can charge you an arbitrary additional amount.** A dynamic-fee pool accepts a per-swap fee
+returned from `beforeSwap`, and the hook can also update the stored LP fee.<Cite src="uniswap-v4-dynamic-fees-docs" />
+Trail of Bits' guidance to hook authors — bound every fee, limit how fast privileged changes can move
+it, do not derive it from cheaply manipulable inputs<Cite src="zealynx-v4-security" /> — is guidance
+precisely because none of that is enforced by the protocol.
+
+**It can supply the trade itself.** With `beforeSwapReturnDelta` set, a `BeforeSwapDelta` that
+consumes the user's entire specified amount leaves the `PoolManager` with nothing to swap; the hook
+provides the trade instead. Trail of Bits calls this a NoOp swap and says to treat such a hook as a
+custom AMM.<Cite src="zealynx-v4-security" /> The pool's concentrated-liquidity curve — the thing you
+spent a whole module learning to reason about — is simply not consulted.
+
+**It can revert.** Hook callbacks execute in the same transaction as the pool action, and the
+`PoolManager` preserves atomicity by reverting the parent action when the hook
+reverts.<Cite src="zealynx-v4-security" /> A hook can therefore refuse a swap, and can refuse it
+selectively.
+
+**It can condition on who you are.** `msg.sender`, `tx.origin`, the calldata, the block number and
+its own storage are all readable inside the callback. The visibility that makes a hook attackable
+when it forgets caller checks<Cite src="zealynx-v4-security" /> also makes it able to
+discriminate.
+
+**It can take value through paths that are not the swap.** `donate` has its own before and after
+callbacks<Cite src="uniswap-v4-hooks-concept-docs" />, and the return-delta flags on
+`afterAddLiquidity` and `afterRemoveLiquidity` let a hook move value on liquidity operations
+too.<Cite src="uniswap-v4-core-hooks-library" />
+
+**None of this is a vulnerability.** It is the extension point working as designed — the same
+capability that lets a hook implement limit orders, a volatility-aware fee, an oracle or a
+time-weighted market maker.<Cite src="uniswap-v4-hooks-concept-docs" /> There is no version of
+"powerful hooks" that excludes "hostile hooks", any more than there is a version of "arbitrary
+contract calls" that excludes malicious contracts.
+
+<Misconception
+  belief="Trading on a v4 pool is as safe as trading on v3, because it is the same protocol."
+  reality="A v3 pool has no third-party code path inside a swap. A v4 pool may, and the hook was chosen by whoever created that pool — which is anyone, since pool creation is permissionless."
+  why="The brand, the router and the PoolManager are the same across every v4 pool, so the trust boundary looks unchanged. It moved: it is now per-pool, and it is named in a field of the PoolKey."
+  src="zealynx-v4-security"
+/>
+
+## The trust boundary you already know
+
+When you approve a token to a router, you trust the router's code with your balance, and everyone
+learned to check what they approve and to whom. **Routing through a pool is the same transfer of
+trust, applied to the execution of the trade rather than to the allowance** — arriving without an
+approval prompt, without an explorer warning, and often without the user learning the hook's address
+at all.
+
+Trail of Bits' split is the useful model. The `PoolManager` enforces protocol mechanics: pool
+initialisation rules, swap and liquidity maths, hook-callback sequencing, end-of-session settlement.
+Hook developers validate the application-specific assumptions their hooks
+add.<Cite src="zealynx-v4-security" /> Read that as a statement about *whose bugs you are exposed
+to*: the protocol half has had concentrated scrutiny, and the application half is per-pool, written
+by strangers.
+
+### The two incidents, and what they have in common
+
+Trail of Bits names Cork and Bunni as the app-level incidents that show what can go wrong, together
+accounting for more than $20M in losses: Cork at roughly $12M in May 2025, Bunni at $8.4M in
+September 2025.<Cite src="zealynx-v4-security" />
+
+**Cork** was an access-control gap: data from an untrusted path reached hook logic affecting
+redemptions, which combined with a pricing issue elsewhere gave the attacker a way to drain
+funds.<Cite src="zealynx-v4-security" />
+
+**Bunni** was a rounding bug in the hook's idle-balance accounting. The attacker pushed the pool's
+price tick with a flash loan, then made 44 tiny withdrawals that each shrank the active balance
+disproportionately to the shares burned.<Cite src="zealynx-v4-security" />
+
+The common factor is the one that matters here: **neither stemmed from a flaw in the Uniswap v4 core
+protocol or the `PoolManager`; both arose from application-specific authorisation and accounting
+logic built around hooks.**<Cite src="zealynx-v4-security" /> And in Bunni's case every transaction
+satisfied the manager's settlement invariant, because the defect was in the hook's internal
+accounting rather than in the manager's.<Cite src="zealynx-v4-security" />
+
+That is the previous lesson's warning arriving with a number attached. `CurrencyNotSettled` proves
+conservation for the manager, not correctness for you.<Cite src="uniswap-v4-core-poolmanager-source" />
+
+## Why simulating first is not enough
+
+You already simulate before sending. It is the right habit and it does not resolve this.
+
+**Subgoal 1 — list what a callback can read.** The hook runs as ordinary EVM code. It can read
+`msg.sender`, `tx.origin`, `block.number`, `block.timestamp`, its own storage, and any external
+contract's state.
+
+**Subgoal 2 — list what differs between a simulation and the real send.** An `eth_call` is issued
+from whatever sender the caller chooses, against a chosen block, with no other transactions ordered
+around it. The real transaction has a fixed sender, lands in a later block, and sits somewhere in an
+ordering it does not control.
+
+**Subgoal 3 — conclude.** Every input in step one that differs in step two is a branch a hook can
+take. A hook that behaves for `eth_call` from a zero-address sender at the current block and
+misbehaves for your address two blocks later is not doing anything exotic; it is reading values the
+EVM hands it.
+
+**Subgoal 4 — take the honest position.** Simulation still catches accidental breakage, reverts and
+gross mispricing, and forces a hostile author to write more code and leave more evidence. It does not
+establish safety. Treat it the way you treat a passing test suite: evidence about the paths you
+exercised.
+
+<Misconception
+  belief="A malicious hook can be detected by simulating the swap before sending it."
+  reality="A contract can branch on caller, block number, and its own state, all of which differ between a simulation and the real transaction. Simulation raises the bar; it does not establish safety."
+  why="Simulation is treated as equivalent to execution because for most contracts it nearly is — they have no reason to distinguish the two. A hook designed to extract value has exactly that reason, and the EVM gives it everything it needs."
+  src="zealynx-v4-security"
+/>
+
+## What actually protects you
+
+The defences are ordinary. That is not a disappointment; it is the point. Nothing about hooks
+requires a new class of protection, and reaching for a clever one instead of the boring one is how
+people get hurt.
+
+**A real minimum-output bound.** You know [slippage tolerance](/c/slippage-tolerance) as protection
+against price movement. Here it is protection against the counterparty, and it binds *whatever* the
+hook does: extra fee, custom delta, hostile pricing — all of them show up as less output, and a
+minimum-output check on the final amount rejects all of them identically.
+
+There is one subtlety that turns this defence off, and it is easy to walk into. **If your minimum is
+computed as a percentage of a quote obtained by simulating against the same pool, the hook set both
+numbers.** A hook that quotes generously and executes poorly defeats a relative bound completely. The
+bound has to come from a source the hook does not control — an independent price, a different venue,
+or your own valuation.
+
+**A deadline.** Bounds the window in which a stale, favourably-quoted transaction can be executed
+under different conditions. Cheap, and it costs nothing when unused.
+
+**Knowing which pool you are routed through.** In v3, "which pool" meant a pair and a fee tier. In v4
+it means all five `PoolKey` fields, and the fifth is the one that matters.<Cite src="uniswap-v4-core-poolkey" />
+An integration that logs a pool as "USDC/WETH 0.05%" is now logging an ambiguous identifier.
+
+**Reading the hook address before you trade.** Mask the low fourteen bits and you know exactly which
+callbacks the manager will invoke.<Cite src="uniswap-v4-core-hooks-library" /> It is free, needs no
+RPC call, and separates the pools that merely observe from the pools whose hook can move value —
+bits 3 through 0, the return-delta flags. It does not tell you the hook is safe. It tells you how
+much review the pool needs before you send size through it.
+
+**Checking whether the hook is a proxy.** The address pins the callback set permanently; it does not
+pin the code. If the address is a proxy, the upgrade admin, delay, storage layout and implementation
+checks are part of the hook's security boundary, and immutable versioned deployments are
+preferable.<Cite src="zealynx-v4-security" /> A hook you reviewed last month is not necessarily the
+hook running today.
+
+**Preferring the hookless pool for size.** A zero hook address means v3-style concentrated liquidity
+under v4's accounting. When the price improvement on an unknown pool is small and the notional is
+large, the trade is bad on expectation regardless of how the hook turns out.
+
+## The LP side is worse, and the difference is time
+
+Everything above is about a swapper, whose exposure is one transaction bounded by one minimum-output
+check. A liquidity provider's exposure is different in kind, and this is the asymmetry to carry away.
+
+An LP's capital sits inside the pool across blocks, and exiting is itself a hook-mediated operation.
+Trail of Bits is direct about the failure mode: if reward distribution, dust cleanup or other
+non-essential code reverts inside an `afterRemoveLiquidity` callback, **users cannot exit their
+positions** — and required external reads can do the same, so a stale price feed, a paused lending
+protocol or any reverting dependency can block a withdrawal.<Cite src="zealynx-v4-security" />
+
+This does not require malice. A merely fragile hook — a reward token that gets paused, an oracle that
+starts rejecting stale data, a decimal mismatch on a zero balance — produces the same outcome as one
+designed to trap capital.<Cite src="zealynx-v4-security" /> The guidance to authors is to keep
+non-essential code out of the main user flow, wrap optional external calls in try/catch, and provide
+an exit-safe fallback<Cite src="zealynx-v4-security" /> — none of which an LP can impose after the
+fact.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Swapper', note: 'one transaction' },
+    { title: 'Liquidity provider', note: 'many blocks', tone: 'warn' },
+  ]}
+  rows={[
+    { label: 'How long is the exposure?', cells: ['The length of one transaction', 'Every block the capital sits in the pool'] },
+    { label: 'Which callbacks touch it?', cells: [<><code>beforeSwap</code> and <code>afterSwap</code><Cite src="uniswap-v4-hooks-concept-docs" /></>, <>The liquidity callbacks, including the one that runs on the way out<Cite src="zealynx-v4-security" /></>] },
+    { label: 'What is the worst case?', cells: [{ v: 'A bad fill', tone: 'warn' }, { v: 'A position that cannot be closed', tone: 'danger' }] },
+    { label: 'What bounds it?', cells: ['A minimum output from an independent price, and a deadline', <>Nothing the depositor can impose after the fact<Cite src="zealynx-v4-security" /></>] },
+    { label: 'What does a hook revert do?', cells: ['Rejects the trade, leaving the position untouched', <>Blocks the withdrawal, and a fragile hook does this as readily as a hostile one<Cite src="zealynx-v4-security" /></>] },
+  ]}
+  caption="Both of a swapper's defences expire with the transaction that carries them. That is exactly why they work, and exactly why an LP has no equivalent."
+  alt="A swapper and a liquidity provider compared on how long each is exposed to a pool's hook, which callbacks touch them, the worst case, what bounds the loss, and what a hook revert does to each."
+/>
+
+**So: a swapper's worst case is a bad fill. An LP's worst case is a position that cannot be closed.**
+Size the review accordingly.
+
+<Check type="explain" concept="hook-is-trusted-code">
+A treasury needs to sell 4M USDC for ETH. An aggregator offers a v4 pool with a hook, 11 basis points
+better than the hookless alternative. The team runs a simulation from a fork at the current block; it
+succeeds and the output matches the quote.
+
+Write the checks you would run, ordered by how much of the position each missing check puts at risk,
+and say what each one does and does not establish.
+
+<Answer>
+**1 — Set a minimum output from an independent price.** Highest value by a wide margin, because it
+bounds *every* extraction mechanism at once: dynamic fee override, custom delta, NoOp pricing. The
+essential detail is the word independent — a bound computed as "quote minus 30 bps" where the quote
+came from this pool is set by the counterparty on both sides. Use an external reference, and size the
+tolerance to real market movement rather than to what the pool offered. **Establishes:** an upper
+bound on loss. **Does not establish:** that the trade will execute at all.
+
+**2 — Read the hook's address bits.** Free, instant, and it partitions the risk. Bits 3 through 0 are
+the return-delta flags — the ones that let a hook move value.<Cite src="uniswap-v4-core-hooks-library" />
+A hook with only `afterSwap` set and no return-delta bit cannot alter your amounts through the delta
+path at all; one with `beforeSwapReturnDelta` can supply the entire trade
+itself.<Cite src="zealynx-v4-security" /> **Establishes:** the shape of the attack surface.
+**Does not establish:** anything about behaviour.
+
+**3 — Determine whether the hook is a proxy, and who can upgrade it.** If it is, everything you learn
+from reading the code has a shelf life set by the upgrade admin and any timelock.<Cite src="zealynx-v4-security" />
+For 4M this is not optional. **Establishes:** whether a code review is durable.
+**Does not establish:** that the current implementation is honest.
+
+**4 — Read the hook's code, specifically `beforeSwap` and `afterSwap`.** Look for branches on
+`msg.sender`, `tx.origin` or `block.number`; for a fee that is unbounded or derived from manipulable
+inputs; for a `beforeSwap` that consumes the specified amount.<Cite src="zealynx-v4-security" />
+**Establishes:** whether the code you are looking at is hostile.
+**Does not establish:** that it is the code that will run, unless check 3 came back clean.
+
+**5 — Split the order.** Send a small fraction first and observe what actually happened on-chain
+rather than in a fork. A hook that discriminates by size or by cumulative volume will not reveal
+itself in a simulation, and 4M is exactly the notional worth discriminating on.
+**Establishes:** behaviour for one real transaction from your address.
+**Does not establish:** behaviour for the next one — a hook can count.
+
+**6 — Re-run the comparison honestly.** Eleven basis points on 4M is $4,400, against the cost of
+checks 3 and 4 plus the tail. If the analysis takes an engineer a day the trade is break-even before
+any risk is priced. **The most common correct answer is to take the hookless pool** — and noticing
+that is the real skill, because a sophisticated attack surface tempts people into sophisticated
+defences when the available move is to decline.
+
+**What the simulation bought.** It established that the pool is functional and not obviously broken
+at the current block from the fork's sender. It did not establish that the hook will behave the same
+way for the treasury's address, two blocks later, at full size — because a contract can read all
+three of those.
+</Answer>
+</Check>
+
+## What this unlocks
+
+The module's claim is complete. **v4 moved the trust boundary from the protocol to the pool**, and a
+pool's hook address is where that boundary is written down.<Cite src="uniswap-v4-core-poolkey" />
+
+Three things to carry:
+
+- **The architecture and the risk are the same fact.** The singleton makes pools cheap to create;
+  cheap creation plus a hook field in the key means the same pair has many pools with different code
+  inside them. You cannot keep the composability and discard the trust
+  question.<Cite src="uniswap-v4-poolmanager" />
+- **Hook review is application security, not protocol security.** The checklists that apply are the
+  ones from the security track — caller checks, allowlists, labelled balances, bounded fees, exit
+  paths that cannot revert, fuzzing of nested callbacks and hostile
+  tokens.<Cite src="zealynx-v4-security" /> Nothing in it is v4-specific except the vocabulary.
+- **The user-side defence has not changed and does not need to.** A real minimum-output bound, a
+  deadline, and knowing which pool you are routed through. The same three that protected you from
+  sandwiching protect you from a hostile hook, because all of them terminate in "you received less
+  than you demanded".
+
+If you go on to write a hook rather than trade against one, the seven failure patterns Trail of Bits
+enumerates are the place to start, and the shortest version of them is this: the `PoolManager`
+guarantees its own mechanics, and every assumption your hook adds on top of those is yours to
+enforce.<Cite src="zealynx-v4-security" />

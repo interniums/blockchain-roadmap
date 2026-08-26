@@ -1,0 +1,330 @@
+---
+id: protocol-statelessness-freeze-do-not-convert
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [eip-6800, eip-7612, eip-7748, eip-7864, eip-8297, eip-8347, eip-7928, eip-8159, eip7864-magicians, stateless-fyi-state-conversion, stateless-fyi-eip-7748, stateless-fyi-preimages, stateless-fyi-active-projects]
+stack: {}
+---
+
+Roughly 300 GiB of state, committed under one tree, needs to end up committed under another. The
+chain does not stop. Every client must agree, block by block, on exactly what the state root is
+throughout.
+
+The Stateless Book states the problem in one sentence: "it is easy to spin up a new blockchain with
+a new shiny tree, life is more complicated when you need to do it with an existing tree storing a
+state of ~300GiB."<Cite src="stateless-fyi-state-conversion" />
+
+Nobody has ever proposed converting it all in one fork. What has been proposed is two quite
+different ways of avoiding that, and the second was published a month before this lesson was
+written. This is the module's own subject arriving one level down: a migration plan, taught for
+years, replaced.
+
+## The overlay: freeze, then sweep
+
+The design that held from 2024 has two stages, and the Stateless Book walks them in
+order.<Cite src="stateless-fyi-state-conversion" />
+
+**Stage one** activates EIP-7612. At a fork timestamp, the existing trie becomes read-only and a new,
+**empty** tree is introduced. Every write produced by executing a block goes to the new tree. Every
+read tries the new tree first and falls through to the frozen one if the key is not
+there.<Cite src="eip-7612" /> The block's state root becomes the new tree's root; the frozen trie's
+root is not carried in the header, because it cannot change.<Cite src="stateless-fyi-state-conversion" />
+
+Read what stage one does and does not do. It stops state growth in the old structure instantly and
+moves nothing. EIP-7612's own motivation is explicit about why that ordering matters: the bigger the
+state, the longer any conversion takes, and a conversion longer than a month would collide with
+client teams' release cadence and with the full-syncs core devs use to test
+performance.<Cite src="eip-7612" /> Freezing first buys time to do the moving carefully.
+
+**Then a waiting period**, whose purpose is finality. The frozen trie must be *finalized* before
+stage two begins, so no reorg can mutate it. The book calls this critical: it lets clients treat the
+old trie as not merely read-only but completely immutable, which simplifies both the implementation
+and the preimage work.<Cite src="stateless-fyi-state-conversion" />
+
+**Stage two** activates EIP-7748. From a start timestamp, every block moves a bounded number of
+entries across, before executing that block's transactions.<Cite src="eip-7748" />
+
+```text
+if block_time >= CONVERSION_START_TIMESTAMP and not state._conversion_finished:
+    state_convert(state, CONVERSION_STRIDE)
+for i, tx in enumerate(map(decode_transaction, transactions)):
+    ...
+```
+
+The walk is depth-first: reach an account, walk its storage trie copying every slot, then copy the
+account's own data and chunkified code, then move to the next account.<Cite src="stateless-fyi-eip-7748" />
+A **conversion unit** is either one storage slot or one account's data-plus-code, and because the
+old trie is read-only the walk is guaranteed to terminate.<Cite src="eip-7748" /><Cite src="stateless-fyi-eip-7748" />
+
+<Figure
+  caption="Two stages, a deliberate wait between them, and a read path that spans both."
+  alt="The overlay migration in four steps: at a fork timestamp the old trie is frozen read-only; a new tree starts empty and takes every write, with reads that miss it falling back to the frozen trie; a waiting period runs until the frozen trie is finalized and can be treated as immutable; then a bounded stride of entries is swept across before each block executes."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'freeze', label: 'freeze the old trie', note: 'read-only from a fork timestamp', col: 0, tone: 'accent' },
+      { id: 'empty', label: 'new tree, empty', note: 'writes here, misses fall back', col: 1 },
+      { id: 'final', label: 'wait for finality', note: 'immutable, not merely read-only', col: 2, tone: 'warn' },
+      { id: 'sweep', label: 'sweep a stride', note: 'per block, before its transactions', col: 3, tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="note">
+**Both `CONVERSION_START_TIMESTAMP` and `CONVERSION_STRIDE` are TBD in the
+spec.**<Cite src="eip-7748" /> So is the duration: the EIP's rationale section on expected time to
+finish says, in full, that there is an estimate but it might be worth recalculating closer to the
+fork with a more up-to-date state size.<Cite src="eip-7748" /> This module prints no figure for how
+long the conversion takes, because the specification does not contain one.
+</Aside>
+
+### The details that make it hard
+
+Three of them are worth carrying, because they explain why the design was later reconsidered.
+
+**Stale data.** By the time stage two runs, the new tree already holds writes from every block since
+stage one. So a key being copied may already have a fresher value on the other side. Copying it
+blindly overwrites current state with a stale one — and the failure surfaces only as a wrong state
+root.<Cite src="stateless-fyi-eip-7748" /> The specification handles this with an `only_if_empty`
+write path, and the walk still *counts* a skipped slot against the stride because it had to be
+checked.<Cite src="eip-7748" /><Cite src="stateless-fyi-eip-7748" />
+
+**The stride is not a clean bound.** An account with code has that code chunked and inserted in one
+go rather than one chunk per unit, to keep the algorithm simple — which the EIP notes could overflow
+the stride in a worst-case block by about `24k/31 ≈ 793` units.<Cite src="eip-7748" />
+
+**Preimages, which are the real problem.** The old trie is keyed by `keccak` of the address or slot
+number. The new tree derives keys differently and needs the *inputs*: an address for an account, an
+address plus slot number for a slot, an address plus its code for a code chunk. Walking the old trie
+gives you only the hashes, and `keccak` does not
+invert.<Cite src="stateless-fyi-preimages" /><Cite src="stateless-fyi-eip-7748" />
+
+The proposed answer is a **preimages file** distributed out of band. EIP-7748 expects clients to
+satisfy at least one of: a flat database design that needs no preimage resolution, a full preimage
+database, or a downloaded preimage image distributed before conversion
+starts.<Cite src="eip-7748" /> The Stateless Book records the consensus that CDN distribution is
+probably acceptable, with in-protocol p2p distribution and per-block packing as discussed
+alternatives, and calls the topic "highly contentious".<Cite src="stateless-fyi-preimages" />
+
+Sit with the trust surface. A file, from a CDN, that every full node needs in order to keep
+following the chain. The book is direct about it: nodes "will receive this file from somewhere that
+can be a potentially untrusted party or a hacked supply chain", and a corrupt file blocks the node
+partway through conversion.<Cite src="stateless-fyi-preimages" /> The defence is verification — walk
+the tree, hash each preimage, check it matches — with a hardcoded checksum from client teams as a
+faster alternative that adds an assumption. And that verification time has to be budgeted into the
+gap between stage one and stage two.<Cite src="stateless-fyi-preimages" />
+
+<Misconception
+  belief="Migrating the state tree means converting all of it in one hard fork."
+  reality="Every proposal avoids that. The overlay design freezes the old trie, starts the new one empty, and sweeps the remainder over many blocks. The newest design converts the state entirely off-chain and swaps the commitment at one fork. A single-block conversion of hundreds of gigabytes has never been on the table."
+  why="One-shot migration is what the phrase 'hard fork' implies, and it is how a database migration usually works when the system can be stopped."
+  src="eip-7612"
+/>
+
+## What replaced it, and the reasoning
+
+In June 2026, EIP-8297 arrived: **Partitioned Binary Tree**, the successor to EIP-7864. Its Fork
+section does not point at EIP-7748. It points at **EIP-8347**, published in July 2026, and it
+describes something structurally different: migration happening "off the consensus-critical path in
+every case", with the tree becoming canonical "at a single coordinated hard
+fork".<Cite src="eip-8297" /><Cite src="eip-8347" />
+
+EIP-8347's own rationale frames it as a choice between two correct designs with different bills.
+Offline conversion buys three things:<Cite src="eip-8347" />
+
+**A smaller consensus change.** The overlay's cursor lives in the state. EIP-7748 tracks which
+account is converting, how far into it, and whether it has finished — so every client must agree on
+that cursor bit for bit at every block, the MPT traversal order becomes consensus-critical, avoiding
+stale writes becomes a correctness condition that only surfaces as a wrong root, and the stride must
+be chosen with long reorgs in mind because a reorg rewinds the cursor too. The offline design adds
+none of it: at one block, one header field starts being computed from a different
+tree.<Cite src="eip-8347" />
+
+**No hybrid proof verifiers.** Under an overlay, the header's root commits only to the converted
+part, so proving a key still held in the frozen trie needs a second proof against a root no header
+carries — and proving absence needs both. EIP-8347 counts the consequence for an on-chain bridge:
+three verifier deployments instead of two, and the middle one is "the only one that is not a plain
+tree lookup, built for a bounded window and then maintained
+anyway".<Cite src="eip-8347" />
+
+**No conversion inside a zkEVM proof.** In an overlay, a prover proving a block during the window
+must prove the conversion steps too. Offline, provers prove plain execution until the fork, then
+commit to the new root.<Cite src="eip-8347" />
+
+And it pays two costs, which the EIP states rather than minimises:<Cite src="eip-8347" />
+
+**More disk** — both trees held through the transition window, an extra **~300 GB** at mainnet
+scale. An overlay can delete converted entries as it goes and stores about one tree throughout.
+
+**No on-chain observability**, because conversion happens where consensus cannot see it. The
+substitute is a **shadow-commitment period**: attesters *should* publish the new tree's root for
+each block's post-state, signed with their validator key, so divergence becomes visible and
+attributable while it is still harmless. Publication stays a SHOULD and out of consensus, because
+enforcing it would make every validator compute the new root for every block just to decide block
+validity — "the exact property the offline model exists to avoid".<Cite src="eip-8347" />
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Overlay', note: 'EIP-7612 + EIP-7748', tone: 'muted' },
+    { title: 'Offline', note: 'EIP-8347', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'Where does the conversion run?', cells: ['Inside consensus, a bounded stride before each block', 'Off the consensus-critical path, canonical at one coordinated fork'] },
+    { label: 'What must every client agree on, block by block?', cells: [{ v: 'The cursor: which account, how far into it, whether it has finished', tone: 'warn' }, 'One header field, computed from a different tree from one block onward'] },
+    { label: 'What can go wrong silently?', cells: [{ v: 'A stale write, surfacing only as a wrong state root', tone: 'warn' }, 'Divergence nobody in consensus can see'] },
+    { label: 'How many proof verifiers during the window?', cells: [{ v: 'Three, and the middle one is not a plain tree lookup', tone: 'warn' }, 'Two, switched on a known block'] },
+    { label: 'What does a prover have to prove?', cells: ['Execution plus the conversion steps', 'Plain execution until the fork, then the new root'] },
+    { label: 'What does it cost in disk?', cells: ['About one tree throughout — converted entries can be deleted as it goes', { v: 'About 300 GB extra, both trees held through the window', tone: 'warn' }] },
+    { label: 'Can anyone watch it happen?', cells: ['Yes; the cursor is in consensus', 'No; a shadow-commitment period substitutes, and publishing stays a SHOULD'] },
+  ]}
+  caption="Both designs can be made correct. What differs is which party carries the risk, and whether anyone is checking."
+  alt="The overlay and offline state-tree migrations compared. The overlay converts inside consensus with a per-block stride, makes a conversion cursor consensus-critical, can fail silently through a stale write, needs three proof verifiers including a hybrid one, forces provers to prove conversion steps, holds about one tree throughout, and is observable on chain. The offline design converts off the consensus-critical path and switches at one fork, adds only a header field, risks divergence consensus cannot see, needs two verifiers switched on a known block, lets provers prove plain execution, costs about 300 GB of extra disk during the window, and substitutes a shadow-commitment period that stays a SHOULD."
+/>
+
+### The catch-up mechanism is the interesting part
+
+A conversion anchored at a finalized block lags the tip and keeps lagging. The overlay solved that
+by construction. The offline design solves it by **replaying Block-Level Access
+Lists**.<Cite src="eip-8347" />
+
+EIP-7928 has every block record the accounts and storage locations it touched along with
+post-execution values.<Cite src="eip-7928" /> A node with a verified snapshot applies each
+subsequent block's list directly to the new tree — no re-execution — fetching the lists from peers
+over `eth/71`, specified in EIP-8159.<Cite src="eip-8347" /><Cite src="eip-8159" /> Distributors
+re-anchor on a cadence of **50,400 blocks**, about a week at 12-second slots, to keep a late
+joiner's replay range inside the retention window.<Cite src="eip-8347" />
+
+The rationale's own summary of why: the lists "are already produced for other reasons and are
+already exchanged between peers", so catch-up reuses an existing wire protocol instead of adding a
+migration-specific one.<Cite src="eip-8347" />
+
+That is worth noticing as a pattern. EIP-7928 is one of the two headline items in the Glamsterdam
+upgrade, which as of this writing has not shipped: multi-client devnets reached their final stage in
+mid-June 2026, the upgrade is targeted for the second half of 2026, and no mainnet date is
+locked.<Cite src="eip-7928" /> The state-tree migration — a design with no fork, for a tree with no
+fork — has already been written to depend on it. **The thing that ships first becomes the
+infrastructure the unshipped things are designed against.**
+
+<Aside kind="warn">
+**EIP-7748 is still titled "State conversion to Verkle Tree".** Read on 26 August 2026, its title,
+abstract and body describe converting key-values from the MPT to a Verkle tree, and its `Requires`
+field names EIP-7612, which is Stagnant.<Cite src="eip-7748" /><Cite src="eip-7612" /> Meanwhile
+EIP-7864's rationale names EIP-7748 as the future fork "that migrates the MPT data to this Binary
+Tree".<Cite src="eip-7864" /> A current spec pointing at a document that describes a different
+destination. Nothing here is dishonest — the mechanism is largely tree-agnostic and the pointer was
+simply never rewritten — but a reader who checks only the status line and the referencing sentence
+would conclude Verkle is the migration target.
+</Aside>
+
+<Aside kind="warn">
+**Three current first-party sources, three migration stories.** The Stateless Book's active-projects
+page, read on **26 August 2026**, describes the conversion mechanism as using a system contract to
+store transition pointers, notes that preimage distribution is a major prerequisite, and states that
+"the transition strategy follows the EIP-7612 model".<Cite src="stateless-fyi-active-projects" />
+EIP-8297's Fork section says migration is specified in EIP-8347 and happens off the
+consensus-critical path.<Cite src="eip-8297" /> EIP-8347's rationale argues *against* the EIP-7612
+overlay by name.<Cite src="eip-8347" /> A book chapter, a spec and a spec, all current, describing
+two incompatible plans and a third variant with a system contract that neither EIP mentions.
+
+That page also carries a deployment aspiration for the binary tree. This module prints no date for
+it, because no EIP status line and no fork meta carries one: EIP-8297 and EIP-8347 are both Draft,
+and EIP-8347 states that it "names" the activation fork but "does not schedule
+it".<Cite src="eip-8297" /><Cite src="eip-8347" /> An aspiration on a summary page and a fork
+assignment are different kinds of object, and only one of them binds anybody.
+</Aside>
+
+## Partitioned binary trees: the successor to the successor
+
+EIP-8297 is not a tweak. Against EIP-7864 it changes:<Cite src="eip-8297" />
+
+- **Zones.** The first key byte labels the category, with `0x02`–`0xFE` reserved for future ones, so
+  a node can sync, prove or expire one category alone.
+- **Content-addressed code.** Code chunks are keyed by `code_hash`, not by account, so contracts
+  with identical bytecode share leaves — and a block witness holds at most one copy of a shared
+  chunk however many contracts touch it.
+- **Variable-length prefix-free keys** with `MAX_KEY_LENGTH` at 8,192 bytes, and no extension node
+  as a distinct type: a branch carries its shared bit-run as an explicit prefix.
+- **Zero collapses to absent** in the state transition function, so the root is a function of the
+  state alone and not of the writes that produced it — which is what lets a tree rebuilt from a
+  dump, and a tree maintained incrementally, agree.
+
+That last one is what makes replay-based catch-up sound. EIP-8347 says so directly: the invariant
+the whole verification story rests on is that converting at a block and replaying lists onto an
+earlier snapshot land on the same tree, and the zero-is-absent rule is what makes deletion behave
+identically on both paths.<Cite src="eip-8347" />
+
+**Count the lineage.** State tree: MPT → EIP-6800 Verkle → EIP-7864 unified binary → EIP-8297
+partitioned binary. Migration: EIP-7612 plus EIP-7748 overlay → EIP-8347 offline. Four tree designs
+and two migration designs in six years, none of them shipped, each taught in its window as the
+plan.<Cite src="eip-6800" /><Cite src="eip-7864" /><Cite src="eip-8297" /><Cite src="eip-8347" />
+
+<Misconception
+  belief="EIP-7864 is the binary tree proposal, so that is what to follow."
+  reality="EIP-7864's own discussion thread now opens with a pointer to EIP-8297, which changes the key format, moves code out of the account header, adds zones, and names a different migration EIP. Both are Draft; neither is assigned to a fork."
+  why="EIP-7864 is the number in every 2025 write-up, and a Draft EIP does not announce that it has been superseded anywhere except in its own discussion thread."
+  src="eip7864-magicians"
+/>
+
+<Check type="explain" concept="frozen-mpt-migration">
+Your team runs an on-chain light-client bridge that verifies Ethereum storage proofs inside a
+contract. You are asked what the state-tree migration means for you.
+
+Answer for both migration designs, and say which one you would rather ship against.
+
+<Answer>
+**Either way, the proof format changes and our verifier must be replaced.** Both tree proposals say
+so in their Backwards Compatibility sections: a tree structure change makes in-EVM verification of
+old-format state proofs stop working, and post-fork roots commit to the new
+tree.<Cite src="eip-7864" /><Cite src="eip-8297" /> That is not avoidable and it is not the
+interesting part.
+
+**Under the overlay, we need three deployments and the middle one is nasty.** During the conversion
+window the header's root commits only to what has been converted so far, so a key still living in
+the frozen trie needs a second proof against that frozen root — a root no header carries, which our
+contract would have to pin out of band. Proving *absence* needs both proofs. EIP-8347 names this
+cost precisely: an MPT verifier, then a hybrid verifier carrying an out-of-band root, then a
+new-tree verifier — "the middle one is the expensive one, the only one that is not a plain tree
+lookup, built for a bounded window and then maintained anyway".<Cite src="eip-8347" />
+
+**Under the offline design, we need two, and the switch is a known block.** The canonical root
+covers the whole state at every block: the old root before the fork, the new root
+after.<Cite src="eip-8347" /> Our contract branches on block number. That is a migration we can
+write, test and audit once.
+
+**So: offline, clearly, from our seat.** Which is worth saying out loud as a bias — the cost that
+design pays is roughly 300 GB of extra disk on converting nodes and the loss of on-chain
+observability of the conversion, and neither of those lands on
+us.<Cite src="eip-8347" /> Node operators are being asked to absorb a cost so that proof consumers
+are not. Preferring the design that charges someone else is a position, not an analysis.
+
+**What I would put in the plan today.** Not a rewrite. A written dependency: our verifier assumes
+MPT-format storage proofs against `stateRoot`; the two candidate replacements are EIP-8297's format
+under EIP-8347's single-swap activation, and EIP-7864's under the EIP-7612/7748 overlay; both are
+Draft, neither is fork-assigned, and the trigger to act is a fork assignment or a change to
+EIP-8297's `Fork` section.<Cite src="eip-8297" /><Cite src="eip-8347" /> Then a calendar reminder to
+re-read those two sections, because the last time this changed it changed in a discussion thread's
+first post.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The last lesson** puts statelessness beside the other route to a verifier that holds nothing —
+sending a validity proof instead of a witness — and takes state expiry seriously enough to explain
+why it keeps not happening.
+
+**In migration design generally**, the transferable question is the one EIP-8347 asks explicitly:
+which costs do you want, given that both designs can be made correct. Online conversion puts
+correctness inside consensus where everyone checks it, at the price of consensus-critical cursor
+state and hybrid proofs. Offline conversion keeps consensus simple, at the price of trusting
+verification that consensus never performs. Neither is safer in the abstract; they move the risk to
+different parties.
+
+**And for the reflection prompt at the end of this module**, this lesson is the concrete case. The
+signal that EIP-7864 had been superseded was one edited sentence at the top of a forum thread. The
+signal that the migration design had changed was a `Fork` section naming a different EIP. Both are
+free to check and neither is a notification.

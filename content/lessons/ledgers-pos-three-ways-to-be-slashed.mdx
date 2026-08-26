@@ -1,0 +1,337 @@
+---
+id: ledgers-pos-three-ways-to-be-slashed
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [consensus-specs-phase0-beacon-chain, consensus-specs-validator, eip-3076, eth2book-slashing, eth2book-casper-ffg, lighthouse-slashing-protection, lighthouse-doppelganger]
+stack: {}
+---
+
+Three post-mortems, from three different operators, all ending in the same sentence.
+
+The first: a container orchestrator decided a healthy validator was unhealthy, started a second copy,
+and for eleven minutes two processes held the same key.
+
+The second: a host's clock was corrected forward by several hours during a maintenance window, and the
+validator client woke up believing it was in an epoch it had already voted in.
+
+The third: a machine died, was rebuilt from a keystore backup, and came back with no record of
+anything it had ever signed.
+
+None of these operators attacked anything. All three produced the pair of messages the protocol
+defines as proof of an attempt to have it both ways, and all three were slashed. This lesson is about
+exactly what that proof looks like, because once you can construct each offence by hand you can also
+recognise the ordinary operational accident that produces it.
+
+## The whole definition, in two functions
+
+There is no discretion anywhere in this. The protocol's entire notion of a slashable consensus
+offence is two predicates over signed objects.
+
+For attestations, `is_slashable_attestation_data` is four lines and covers two of the three
+offences:<Cite src="consensus-specs-phase0-beacon-chain" />
+
+```python
+def is_slashable_attestation_data(data_1: AttestationData, data_2: AttestationData) -> bool:
+    """
+    Check if ``data_1`` and ``data_2`` are slashable according to Casper FFG rules.
+    """
+    return (
+        # Double vote
+        (data_1 != data_2 and data_1.target.epoch == data_2.target.epoch)
+        or
+        # Surround vote
+        (data_1.source.epoch < data_2.source.epoch and data_2.target.epoch < data_1.target.epoch)
+    )
+```
+
+For blocks, `process_proposer_slashing` covers the third: it asserts the two headers share a slot,
+share a proposer index, and are not identical — then verifies both
+signatures.<Cite src="consensus-specs-phase0-beacon-chain" />
+
+Everything below is commentary on those two definitions. Note what is absent from both: no notion of
+harm, no notion of intent, no notion of which message came first, and no reference to any state
+outside the two objects themselves. That is what makes the evidence self-contained and the accusation
+permissionless.
+
+<Compare
+  caption="Two of the three can be avoided by remembering the current slot or epoch; the third is only checkable against everything the key has ever signed."
+  alt="The three slashable offences — double proposal, double vote and surround vote — compared by what must be equal, what must differ, which consensus mechanism each threatens, how far back a validator must remember, and which ordinary accident produces it."
+  axis="Question"
+  columns={[
+    { title: 'Double proposal', note: 'two block headers' },
+    { title: 'Double vote', note: 'two attestations' },
+    { title: 'Surround vote', note: 'two attestations' },
+  ]}
+  rows={[
+    { label: 'What must be equal?', cells: ['The slot and the proposer index', 'The target epoch', 'Nothing'] },
+    { label: 'What must differ?', cells: ['Anything at all in the header', 'Anything at all in the data', 'Both ends: one span strictly inside the other'] },
+    { label: 'Which mechanism does it threaten?', cells: ['LMD GHOST, the head', 'Casper FFG, and the head as a special case', 'Casper FFG, finality'] },
+    { label: 'How far back must you remember?', cells: ['This slot', 'This epoch', 'Your entire signing history'] },
+    { label: 'Which accident produces it?', cells: ['Two processes holding one key', 'Re-attesting after a reorg moved your head', 'A clock jump forward, or a restore from an old backup'] },
+  ]}
+/>
+
+## Offence one: double proposal
+
+**The rule.** A proposer assigned to a slot may sign exactly one `BeaconBlockHeader` for it. Two
+distinct signed headers with the same slot and the same proposer index are
+slashable.<Cite src="consensus-specs-phase0-beacon-chain" />
+
+**Worked example.**
+
+```text
+slot          = 9,412,096
+proposer      = validator index 401,337
+
+header_1.slot           = 9,412,096
+header_1.proposer_index = 401,337
+header_1.body_root      = 0x8f2c…41ab
+
+header_2.slot           = 9,412,096
+header_2.proposer_index = 401,337
+header_2.body_root      = 0x1d7e…c093
+```
+
+Slots equal, proposer equal, headers different. The predicate is satisfied and the pair is complete
+evidence — no context needed about which chain either block was on, or whether either was ever
+included.
+
+**Read the strictness carefully.** The assertion is `header_1 != header_2`, on the whole header. Two
+headers that differ only in the graffiti field, or only in the state root because they were built
+against slightly different mempool views, are two distinct headers. "I built the same block twice"
+is not a defence, because the protocol never compares block *contents* — only header identity.
+
+**How it happens by accident.** Almost always: two processes holding one key, both convinced it is
+their turn. The honest-validator specification's countermeasure is an ordering constraint, not a
+clever algorithm — save a record to disk that a block has been signed for this slot, *then* generate
+and broadcast it, so that a crash mid-routine leaves evidence of a *potentially* signed
+block.<Cite src="consensus-specs-validator" />
+
+<Aside kind="note">
+That ordering — record first, sign second — is the same discipline as writing to a write-ahead log
+before applying a mutation, and for the same reason. The failure you are defending against is not
+"the signature was wrong", it is "the process died between deciding and remembering".
+</Aside>
+
+## Offence two: double vote
+
+**The rule.** Two attestations whose `AttestationData` differ in any way, but whose target epochs are
+equal.<Cite src="consensus-specs-phase0-beacon-chain" />
+
+**Worked example.**
+
+```text
+attestation_A.source.epoch = 293,880
+attestation_A.target.epoch = 293,881
+attestation_A.beacon_block_root = 0x77c1…9e40
+
+attestation_B.source.epoch = 293,880
+attestation_B.target.epoch = 293,881
+attestation_B.beacon_block_root = 0xa30f…2255
+```
+
+Same target epoch, different data. Slashable.
+
+**This is broader than it first reads, and the breadth is the trap.** The clause does not say "two
+different target checkpoints". It says the two `AttestationData` objects are unequal and their target
+epochs match. In the example above the source and target *epochs* are identical; the only difference
+is the head vote. That is still a double vote.
+
+So the operational surface is larger than the name suggests. A validator that attests, sees a reorg
+change its view of the head, and attests again in the same epoch has double-voted — even though
+nothing about its opinion on finality changed. Lighthouse's documentation names this case explicitly:
+a deep reorg can change the shuffling and prompt a validator to re-attest in an epoch where it has
+already attested, and the protection database exists to refuse the second
+signature.<Cite src="lighthouse-slashing-protection" />
+
+The canonical reference on slashing groups the offences differently for this reason, splitting them
+by which consensus mechanism they threaten: making two differing attestations for the same target
+checkpoint and making a surround vote are the Casper FFG offences, while proposing two blocks for one
+slot and attesting to two different head blocks with the same checkpoints are the LMD GHOST
+ones.<Cite src="eth2book-slashing" /> Both descriptions are correct. The specification simply
+implements the second FFG-style rule and the second LMD-style rule with a single predicate, because
+the second is a special case of the first.
+
+## Offence three: surround vote
+
+This is the one that needs a picture, and the one that cannot be checked without memory.
+
+**The rule.** `data_1` surrounds `data_2` when `data_1.source.epoch` is strictly less than
+`data_2.source.epoch` **and** `data_2.target.epoch` is strictly less than
+`data_1.target.epoch`.<Cite src="consensus-specs-phase0-beacon-chain" />
+
+**Worked example.**
+
+<Figure
+  caption="Surround is a relation between two spans, not a property of either vote read on its own."
+  alt="An epoch axis from 236 to 245. Attestation B runs from source epoch 236 to target epoch 245. Attestation A runs from source epoch 240 to target epoch 241 and sits entirely inside B, so B's source is strictly earlier and B's target is strictly later."
+>
+  <Timeline
+    from={236}
+    to={245}
+    unit="epochs"
+    ticks={[236, 240, 241, 245]}
+    spans={[
+      { label: 'B: source 236 → target 245', start: 236, end: 245, tone: 'danger' },
+      { label: 'A: source 240 → target 241', start: 240, end: 241, tone: 'accent', note: 'signed earlier' },
+    ]}
+  />
+</Figure>
+
+B strictly contains A on both ends, so `is_slashable_attestation_data(B, A)` is true.
+
+**Why this is the offence.** A is a signed statement that the history from epoch 240 to 241 is the one
+this validator supports. B is a signed statement that a *different, longer* stretch — from 236 all the
+way to 245 — is the one it supports, and that stretch spans and therefore contradicts the earlier
+claim. This is precisely the manoeuvre a validator would make to walk back an endorsement it had
+already given, which is why the span relationship itself is the offence rather than any particular
+block being wrong.<Cite src="eth2book-casper-ffg" />
+
+**It is slashable in either direction, and the mechanism is worth being precise about.** The predicate
+as written tests one ordering — whether `data_1` surrounds `data_2`. But the evidence submitter
+constructs the `AttesterSlashing` object and chooses which attestation goes in the first
+position.<Cite src="consensus-specs-phase0-beacon-chain" /> So if your later vote is surrounded by
+your earlier one, a reporter simply puts the earlier one first. There is no ordering you can adopt
+that escapes the rule.
+
+**What is deliberately *not* slashable.** Two attestations with the *same* source epoch and different
+target epochs — say 240 → 241 and 240 → 245 — satisfy neither clause. The source epochs are equal, so
+the surround clause's strict inequality fails; the target epochs differ, so the double-vote clause
+fails. And it must be that way: a validator whose justified checkpoint has not advanced for several
+epochs will honestly cast exactly that pattern. The two clauses are the Casper FFG commandments and
+nothing more; every additional pattern you might feel ought to be punished was left out on
+purpose.<Cite src="eth2book-casper-ffg" />
+
+<Misconception
+  belief="Surround voting is an attack technique, so an honest operator never has to think about it."
+  reality="It is produced by ordinary faults — a clock corrected forward, a restore from an old backup, a client migration without the signing history. In each case the validator's own past votes are what it collides with, and it has no way to see them."
+  why="The rule is described in terms of what an attacker would do to rewrite history, which makes it sound like a strategy rather than a failure mode. The mechanism does not distinguish between a validator that rewound its history on purpose and one that had its history rewound for it."
+  src="eip-3076"
+/>
+
+## The offence is defined against your own past, so something has to remember
+
+Double proposal and double vote can, in principle, be avoided by knowing what you did in the current
+slot or epoch. Surround voting cannot: it is defined against the entire span of your history, and the
+message that convicts you may be months old.
+
+This is the reason a validator client keeps a **slashing protection database** — a persistent record
+of every block slot and every source/target pair the key has signed, consulted before every signature
+and updated after it.<Cite src="lighthouse-slashing-protection" /> The specification's protection
+best-practices section states the requirement bluntly: the validator client should treat the beacon
+node as untrusted, validate the data, check it against a local slashing database, and update that
+database with the newly signed object.<Cite src="consensus-specs-validator" />
+
+**EIP-3076 standardises the portable form of that record**, so a key's signing history can move
+between clients. Its conditions are worth reading as the operational rules they
+are:<Cite src="eip-3076" />
+
+- Refuse to sign any block slashable against the imported blocks, and refuse to sign any block at a
+  slot at or below the minimum slot in the imported history.
+- Refuse to sign any attestation slashable against the imported attestations.
+- Refuse to sign any attestation with a source epoch below the minimum source epoch in the history.
+- Refuse to sign any attestation with a target epoch at or below the minimum target epoch in the
+  history.
+
+Those last two conditions are what makes a *minimal* database — only the latest messages, rather than
+every message — safe to use: refusing anything at or before the recorded watermark is a conservative
+over-approximation of the real predicate.<Cite src="eip-3076" />
+
+The EIP's motivating example is not an attack either. A client whose clock is accidentally set a day
+ahead — 225 epochs — votes on those epochs, and a validator that then migrates without carrying the
+history stands to vote on all of them again as real time catches up. The EIP notes that such time-skew
+bugs have been observed in the wild.<Cite src="eip-3076" />
+
+<Aside kind="note">
+One genuine narrowing worth knowing: signed data must be within a sequential fork context to
+conflict. Messages cannot be slashed across diverging forks — if a chain splits from fork version 1
+into versions 2 and 102, messages under 2 are not slashable against messages under 102, though both
+are slashable against messages under 1.<Cite src="consensus-specs-validator" /> This is why testnet
+keys and mainnet keys are not a slashing risk to each other, and it is the *only* place the rules
+care about anything beyond the two objects.
+</Aside>
+
+## Losing the database is not a restart problem
+
+The third post-mortem at the top of this lesson is the one that catches good operators, because the
+instinct — rebuild from the keystore and resume — is exactly wrong.
+
+A key with no signing history is a key that cannot answer the only question that matters before
+signing: *what have I already claimed?* Any attestation it now casts might duplicate or surround one
+it made before the loss, and it has no way to check. Clients treat this as a hard stop: Lighthouse
+refuses to start when it finds validator keys not registered in its protection database, and
+recovering a validator from a private key alone leaves an empty database that must be filled by
+importing the history from a trusted source before signing
+resumes.<Cite src="lighthouse-slashing-protection" /><Cite src="consensus-specs-validator" />
+
+If the history genuinely cannot be recovered, the only safe action is to wait. What you are waiting
+for is enough elapsed epochs that no vote you could now cast is capable of conflicting with a vote
+from before the loss — a new attestation's source and target both being later than anything you could
+have signed. Waiting costs inactivity penalties, which are the cheap instrument. Resuming costs a
+slashing, which is not.
+
+**Doppelganger protection is the other half of this**, and it deserves an honest description because
+it is routinely oversold. On startup, the validator client stays silent for two to three epochs and
+listens for messages from its own keys before signing anything
+slashable.<Cite src="lighthouse-doppelganger" /> Lighthouse's own documentation is explicit that the
+mechanism is imperfect and best-effort — your beacon node may simply not see the other instance's
+messages — and that it always costs two to three epochs of missed duties on every restart. Its stated
+guidance is that users should never rely on it and should treat duplicate validators with exactly the
+caution they would if it did not exist.<Cite src="lighthouse-doppelganger" />
+
+<Check type="spot-bug" concept="surround-vote-slashing">
+For each pair below, decide whether it is slashable and name the clause. Assume all messages are from
+one validator key.
+
+1. `(source 100, target 101, head 0xaa…)` and `(source 100, target 101, head 0xbb…)`
+2. `(source 100, target 104)` and `(source 101, target 103)`
+3. `(source 100, target 101)` and `(source 100, target 106)`
+4. Two signed block headers for slot 5,000,000, identical except that one has empty graffiti.
+5. `(source 98, target 102)` signed on Tuesday, and `(source 99, target 101)` signed last month.
+
+<Answer>
+**1 — slashable, double vote.** The target epochs are equal and the `AttestationData` objects are
+unequal, which is the whole test. The fact that only the head root differs is irrelevant; the clause
+compares the objects, not the checkpoint fields
+alone.<Cite src="consensus-specs-phase0-beacon-chain" />
+
+**2 — slashable, surround vote.** 100 is strictly less than 101 on the left, and 103 is strictly less
+than 104 on the right, so the first attestation strictly contains the
+second.<Cite src="consensus-specs-phase0-beacon-chain" />
+
+**3 — not slashable.** Target epochs differ, so it is not a double vote. Source epochs are equal, so
+the surround clause's strict left inequality fails. This is the honest pattern of a validator whose
+justified checkpoint has not advanced for several epochs.<Cite src="eth2book-casper-ffg" />
+
+**4 — slashable, double proposal.** Same slot, same proposer index, and the headers are not identical.
+`process_proposer_slashing` asserts header inequality, not that the blocks are meaningfully
+different.<Cite src="consensus-specs-phase0-beacon-chain" />
+
+**5 — slashable, surround vote, and the ordering is the point.** 98 is strictly less than 99, and 101
+is strictly less than 102, so the *Tuesday* attestation surrounds the one signed a month earlier. The
+predicate tests whether `data_1` surrounds `data_2`, and the reporter chooses which attestation
+occupies the first position — so submitting the newer message first makes the pair
+convict.<Cite src="consensus-specs-phase0-beacon-chain" /> This is also the pair that no
+current-epoch check would ever catch, which is why the protection database has to be persistent
+rather than a cache.<Cite src="eip-3076" />
+</Answer>
+</Check>
+
+## Where this pays off
+
+Every one of these offences carries the identical penalty — the protocol does not grade them, and the
+reference on slashing says so directly: when it comes to the punishment, it does not matter which rule
+was broken.<Cite src="eth2book-slashing" /> The variable that actually determines what a slashing
+costs is not the offence at all, and the next lesson is about what it is instead.
+
+The two FFG clauses are also the mechanical content of
+[accountable safety](/c/accountable-safety). The counting argument says a third of the stake must
+have signed contradictory messages for two conflicting checkpoints to finalise; these two clauses are
+what "contradictory" means, and the fact that both are decidable from two objects alone is what turns
+an economic argument into an enforceable one.
+
+And in the security track, this is the template for a whole class of designs: define misbehaviour as
+a locally-checkable predicate over signed artefacts, pay people to report it, and you get enforcement
+without a watchdog. Fraud proofs on optimistic rollups are the same idea with a different predicate.

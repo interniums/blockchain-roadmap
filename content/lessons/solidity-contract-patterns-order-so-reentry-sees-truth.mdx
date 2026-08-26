@@ -1,0 +1,405 @@
+---
+id: solidity-contract-patterns-order-so-reentry-sees-truth
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solidity-docs-security, solidity-docs-common-patterns, cyfrin-reentrancy-checklist, sok-root-cause-losses, eip-1153, eip-214, eip-721, eip-1884, oz-docs-utils-api, oz-reentrancy-guard-source, oz-changelog, solidity-changelog, solidity-0836-release, weird-erc20, measured-gas-constants]
+stack: { solidity: "0.8.36" }
+---
+
+Here are two functions. They contain the same three statements. The only difference is which line
+comes second.
+
+```solidity
+// Version A
+function withdraw() public {
+    (bool ok, ) = msg.sender.call{value: shares[msg.sender]}("");
+    if (ok) shares[msg.sender] = 0;
+}
+
+// Version B
+function withdraw() public {
+    uint share = shares[msg.sender];
+    shares[msg.sender] = 0;
+    (bool ok, ) = payable(msg.sender).call{value: share}("");
+    require(ok);
+}
+```
+
+Version A is the Solidity documentation's own worked example of a bug, published in its security
+chapter next to the words "THIS CONTRACT CONTAINS A BUG - DO NOT USE."<Cite src="solidity-docs-security" />
+Version B is the fix it prints immediately below. The docs actually print *two* broken versions: an
+older one using `send`, of which they say the problem is not too serious because of the limited gas
+`send` forwards, and then this one, which they note allows an attacker to refund multiple times
+because `call` does not limit the gas forwarded by default.<Cite src="solidity-docs-security" /> Hold
+on to that pair — the difference between them is the subject of the third lesson in this
+module.<Cite src="eip-1884" />
+
+You already know why A drains: the [message call](/c/evm-message-call) hands control to
+`msg.sender`, whose `receive` re-enters `withdraw`, and the [storage slot](/c/storage-slot) still
+holds the original share. What this lesson is about is the part that does not follow from knowing
+the mechanism — what the reordering actually guarantees, stated precisely enough that you can tell
+when it stops holding. Because it stops holding a lot sooner than the tutorials suggest, and the
+place it stops is where the money goes.
+
+<Figure
+  caption="Three questions about one function — when control leaves it, who was allowed to start it, and how many copies of it exist — and the seven patterns this module answers them with."
+  alt="The module as a hierarchy. Where control leaves you covers ordering in lesson one, guards in lesson two and pull payments in lesson three. Who is allowed to act covers rotation in lesson four and pausing in lesson five. One contract or a thousand covers factories in lesson six and clones in lesson seven."
+>
+  <Tree
+    root={{
+      label: 'this module',
+      tone: 'accent',
+      children: [
+        {
+          label: 'where control leaves you',
+          children: [
+            { label: 'ordering', note: 'lesson 1', tone: 'accent' },
+            { label: 'guards', note: 'lesson 2' },
+            { label: 'pull payments', note: 'lesson 3' },
+          ],
+        },
+        {
+          label: 'who is allowed to act',
+          children: [
+            { label: 'rotation', note: 'lesson 4' },
+            { label: 'pausing', note: 'lesson 5' },
+          ],
+        },
+        {
+          label: 'one contract or a thousand',
+          children: [
+            { label: 'factories', note: 'lesson 6' },
+            { label: 'clones', note: 'lesson 7' },
+          ],
+        },
+      ],
+    }}
+  />
+</Figure>
+
+## The external call is a yield point
+
+The EVM gives you no atomicity boundary inside a call frame. There is no lock, no transaction
+isolation level, no "commit" instruction. The documentation states the primitive in one sentence:
+any interaction from a contract A with another contract B, and any transfer of Ether, hands control
+over to B, which makes it possible for B to call back into A before the interaction is
+completed.<Cite src="solidity-docs-security" /> The only thing that ever interrupts your function's
+straight-line execution is an instruction that starts a new frame — `CALL`, `DELEGATECALL`,
+`STATICCALL`, `CREATE`. Everything else in your function body runs to completion without anyone
+else observing an intermediate state.
+
+That gives the whole pattern its one-sentence justification: **your external call is the only
+moment at which anybody can read your storage, so make sure that by the time you reach it, your
+storage is finished.**
+
+The Solidity documentation states this generally, and the generality is the part people drop:
+reentrancy is *not only an effect of Ether transfer but of any function call on another
+contract*.<Cite src="solidity-docs-security" /> An ERC-20 `transfer` to an unknown token address is
+a yield point. A price query on an oracle you do not control is a yield point. A `safeTransferFrom`
+that invokes a receiver hook is a yield point that most people do not read as a call at all.
+
+<Aside kind="note">
+This is also why "I only call trusted contracts" is a weaker defence than it sounds. The docs
+close the recommendation with exactly that caveat: calls to known contracts might in turn cause
+calls to unknown contracts, so it is probably better to just always apply the
+pattern.<Cite src="solidity-docs-security" /> Trust is not transitive across a call graph you did
+not write.
+</Aside>
+
+## The ordering, stated exactly
+
+The compiler team's own phrasing has three clauses, and each clause names a different kind of
+statement:<Cite src="solidity-docs-security" />
+
+- **Checks** — complete all required checks of the supplied parameters *before* modifying state.
+  Arguments in range, caller authorised, balance sufficient, deadline not passed.
+- **Effects** — only then make any changes to the state.
+- **Interactions** — call functions in other contracts only after *all planned state changes have
+  been written to storage*.
+
+Read the third clause literally. It does not say "after the state change relevant to this call." It
+says after all planned state changes. That distinction is the entire difficulty of applying CEI to
+a real function, and we will come back to it.
+
+### A worked trace, one slot at a time
+
+Take `shares[alice] = 10 ether` and an attacker contract whose `receive()` calls `withdraw()`
+again, up to a depth of three. Track a single quantity: the value in the storage slot at
+`keccak256(alice . slot)` at the moment each frame reads it.
+
+**Subgoal 1 — establish what the attacker needs.** The attacker needs the slot to still read
+`10 ether` when the re-entrant frame runs its check. Nothing else. So the only question worth
+tracing is whether the write happens before or after control leaves.
+
+**Subgoal 2 — trace version A, where the write is after the call.**
+
+<Figure
+  caption="Nothing in version A bounds the depth of this stack except the contract's own balance."
+  alt="Version A's call stack. Frame zero's withdraw reads ten ether and sends it, handing control to the attacker's receive, which calls withdraw again in frame two, which reads ten ether and sends it, and again in frame four. Only on the way back up do the writes land, all setting the slot to zero."
+>
+  <Flow
+    dir="down"
+    lanes={['frame 0', 'frame 1', 'frame 2', 'frame 3', 'frame 4', 'on the way back']}
+    nodes={[
+      { id: 'a0', label: 'withdraw()', note: 'reads 10 ether, sends it', col: 0, tone: 'danger' },
+      { id: 'a1', label: 'receive()', note: 'attacker code', col: 1 },
+      { id: 'a2', label: 'withdraw()', note: 'reads 10 ether, sends it', col: 2, tone: 'danger' },
+      { id: 'a3', label: 'receive()', note: 'attacker code', col: 3 },
+      { id: 'a4', label: 'withdraw()', note: 'reads 10 ether, sends it', col: 4, tone: 'danger' },
+      { id: 'a5', label: 'every write lands', note: 'all set the slot to zero, all too late', col: 5, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+Every frame reads the same value because no frame has reached its write yet. The writes do happen on
+the way back up — all setting the slot to zero, all too late. The contract is drained not because the
+accounting is wrong but because it is *scheduled after* the point at which it was needed.
+
+**Subgoal 3 — trace version B, where the write is before the call.**
+
+<Figure
+  caption="The re-entrant frame is not blocked. It is simply told the truth, and there is nothing left in it to take."
+  alt="Version B's call stack. Frame zero's withdraw reads ten ether, writes the slot to zero, then sends, handing control to the attacker's receive. The re-entrant withdraw in frame two reads zero and sends nothing, or reverts on a zero check."
+>
+  <Flow
+    dir="down"
+    lanes={['frame 0', 'frame 1', 'frame 2']}
+    nodes={[
+      { id: 'b0', label: 'withdraw()', note: 'reads 10 ether, writes 0, then sends', col: 0, tone: 'good' },
+      { id: 'b1', label: 'receive()', note: 'attacker code', col: 1 },
+      { id: 'b2', label: 'withdraw()', note: 'reads 0, sends 0 wei, or reverts on a zero check', col: 2, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+**Subgoal 4 — name what changed.** Not the amount of code, not a new check, not a guard. One
+statement moved above another, and in doing so the function's postcondition — *this account's
+share is zero* — became true at the yield point instead of after it.
+
+That is the whole guarantee, and it is worth stating as a formal-sounding sentence because the
+precision is what makes the next section possible:
+
+> **CEI makes a function's own postcondition hold at every point where control can leave it.**
+
+## What that sentence does not say
+
+It says nothing about other functions, other contracts, or readers. Three failure modes live in
+those gaps, and every one survives a perfectly CEI-ordered function.
+
+### Cross-function, same contract
+
+Your `withdraw` is textbook CEI. Somewhere else in the same contract is `transferShares`, which
+reads the same mapping. The attacker's `receive()` does not call `withdraw` again — it calls
+`transferShares`, moving the still-unspent balance to a second address they control, and then lets
+the stack unwind so `withdraw` finishes zeroing the *first* address. Two functions, one invariant,
+and CEI applied to each of them separately never had a chance: the ordering discipline is
+per-function, and the invariant is not.
+
+### Cross-contract, same system
+
+A lending pool and its interest-rate model. A vault and its strategy. Two contracts you wrote, one
+shared invariant, an external call from either. The docs say it in one line that is easy to read
+past: a called contract could modify the state of another contract you depend
+on.<Cite src="solidity-docs-security" /> If A's postcondition depends on B's storage, ordering A's
+statements correctly does not make B's storage correct.
+
+### Read-only reentrancy — the one nothing on this list covers
+
+This is the case worth slowing down for, because it defeats the intuition that a `view` function is
+harmless.
+
+A `view` function is compiled to be reached by `STATICCALL`, and
+[static call enforcement](/c/staticcall-is-the-enforcement) is real: EIP-214 forbids the frame from
+writing storage, emitting logs or sending value, and any attempt throws.<Cite src="eip-214" /> You know this. The trap is that the enforcement
+guarantees the getter *cannot change* anything, and says nothing about whether what it *reports* is
+true.
+
+Consider a vault whose share price is `totalAssets / totalSupply`, and a `withdraw` that decrements
+`totalSupply` before the transfer but `totalAssets` after it, or that simply sends ETH before
+updating one of the two. During the callback window, the ratio is arithmetically valid and
+semantically wrong. The attacker does not re-enter the vault at all. From inside the callback they
+call a *different* protocol — a lender that prices this vault's shares as collateral — and that
+lender queries the getter, gets the inconsistent number, and lends against it.
+
+Cyfrin's auditor checklist gives this its own numbered item — `SOL-AM-ReentrancyAttack-2`, phrased
+as the question "is there a view function that can return a stale value during
+interactions?"<Cite src="cyfrin-reentrancy-checklist" /> Read-only reentrancy occurs when a view
+function is called during a reentrant execution, and if the contract's state is temporarily
+inconsistent due to an ongoing external call, the view can return inaccurate data and mislead
+dependent protocols that rely on its output.<Cite src="cyfrin-reentrancy-checklist" /> The victim is
+not your contract. The victim is whoever believed your getter.
+
+<Misconception
+  belief="CEI alone makes a contract reentrancy-safe."
+  reality="It protects the one function it is applied to. Cross-function reentrancy, cross-contract reentrancy, and read-only reentrancy all survive it untouched."
+  why="Tutorials demonstrate the single-function withdraw bug, show the reordering, and stop. The demonstration is correct and the generalisation from it is not."
+  src="cyfrin-reentrancy-checklist"
+/>
+
+<Aside kind="warn">
+The read-only case has a specific consequence for how you publish state. Any `view` function that
+other protocols may integrate against is part of your external surface with the same seriousness as
+a state-changing one. If it can be reached mid-callback and it reads a value your writes have
+temporarily split apart, it is an oracle you did not mean to run. OpenZeppelin added a
+`nonReentrantView` modifier precisely for this in Contracts 5.5.0 — a read-only version of
+`nonReentrant` documented as blocking view functions from being called, preventing reading from
+inconsistent contract state.<Cite src="oz-changelog" /><Cite src="oz-docs-utils-api" /><Cite src="oz-reentrancy-guard-source" /> The next lesson covers what it costs and where it still does
+not reach.
+</Aside>
+
+## Why "write every state change" is the hard clause
+
+In the toy example there is one effect, so "all planned state changes" and "the obvious one"
+coincide. In a real function they do not, and the gap is where CEI is most often applied incorrectly
+by someone who believes they have applied it. A deposit might credit a balance, increment a total,
+stamp a rewards timestamp, and record a governance checkpoint. Put the external call after the
+balance write and before the checkpoint write and the function is CEI-ordered in the sense that its
+headline effect comes first, and unordered in the sense that matters.
+
+Two rules follow.
+
+**Write the invariant down first, then order against it.** Not "which write is the important one"
+but "which reads must agree with which writes for the accounting to be true." Every slot named in
+that sentence is an effect and must precede the interaction.
+
+**Treat the interaction as a single point, not a region.** If a function makes two external calls
+with state changes between them, the state changes between them are effects that happen after an
+interaction. The shape you want is: all checks, all effects, then a contiguous tail of calls with
+nothing but calls in it.
+
+<Check type="spot-bug" concept="cei-insufficient">
+An auction contract holds bids and refunds the previous highest bidder when someone outbids them.
+An auditor has already made the team fix `withdraw` to strict CEI order. Here is the result:
+
+```solidity
+mapping(address => uint256) public refunds;
+address public highestBidder;
+uint256 public highestBid;
+
+function bid() external payable {
+    require(msg.value > highestBid, "too low");
+    refunds[highestBidder] += highestBid;   // effect
+    highestBidder = msg.sender;             // effect
+    highestBid = msg.value;                 // effect
+}
+
+function withdraw() external {
+    uint256 amount = refunds[msg.sender];
+    refunds[msg.sender] = 0;                // effect, before the call
+    (bool ok, ) = msg.sender.call{value: amount}("");
+    require(ok);
+}
+
+function currentLeader() external view returns (address, uint256) {
+    return (highestBidder, highestBid);
+}
+```
+
+Both state-changing functions order effects before interactions. Say whether the contract is safe
+against reentrancy, and if not, name the specific path.
+
+<Answer>
+**`withdraw` is genuinely fixed and `bid` has no external call at all, so the classic single-function
+attack is gone.** The contract is still exploitable, in two directions, and neither is visible from
+inside either function.
+
+**Path one — cross-function reentrancy.** `withdraw` transfers value, handing control to the
+recipient, who calls `bid` from inside the callback. At that instant `withdraw` has zeroed
+`refunds[attacker]` but has not returned; the attacker bids with the ETH just sent, becomes
+`highestBidder`, and the displaced leader's refund is credited as normal. Nothing overdraws, so the
+"steal the same funds twice" reflex will not find it — but the auction's ordering is now
+attacker-chosen at a moment nobody modelled, and any logic assuming `bid` cannot run during a refund
+is wrong. The general form is the point: **CEI on `withdraw` protects `withdraw`'s postcondition, not
+the contract's invariants**, and `bid` shares state with it.
+
+**Path two — read-only reentrancy.** `currentLeader` is a `view` function that any other contract
+may integrate against, and it reads two slots that `bid` updates in sequence. That is safe today
+because `bid` makes no external call. Add one — an ERC-20 pull instead of `msg.value`, a fee sent
+to a treasury, an NFT `safeTransferFrom` — anywhere between the three effect lines, and
+`currentLeader` becomes readable in a state where `highestBidder` is the new bidder and `highestBid`
+is still the old amount. Any downstream contract that settles or prices on that pair reads a leader
+paired with the wrong number. The vulnerability would be introduced by an edit to `bid` that
+touches neither `withdraw` nor `currentLeader`.
+
+**What to actually change.** Move the refund out of `bid` entirely — the credit-then-let-them-pull
+shape is already here and is the right one. Then guard the shared invariant rather than each
+function: a mutex that covers `bid` and `withdraw` together closes path one, and applying a
+read-only guard to `currentLeader` closes path two. Both of those are the next lesson. The finding
+to take from this one is that you cannot answer "is this reentrancy-safe?" by reading one function,
+because the property is not a property of a function.
+</Answer>
+</Check>
+
+## When you cannot order it that way
+
+CEI is a discipline, not a law of the language, and some functions genuinely cannot obey it.
+Recognising them keeps you from either faking compliance or concluding the pattern is useless.
+
+**When the effect depends on the call's result.** Measuring an actual received amount —
+balance-before, transfer, balance-after, the shape used against fee-on-transfer tokens, of which
+there are enough deployed variants to have their own catalogue<Cite src="weird-erc20" /> — has an
+effect that cannot exist until after an interaction.
+
+**When the design is a callback by construction.** Flash loans, flash accounting, `onERC721Received`
+hooks, swap callbacks: your code calls out, arbitrary user code runs, and you check an invariant when
+it returns. No ordering removes the callback, because the callback is the feature.
+
+In both cases, do not pretend. Say explicitly which invariant is broken during the window, for how
+many lines, and what enforces it at the end — usually a final assertion that the books balance, plus
+a mutex so nothing re-enters. That is a different pattern with a different proof obligation, and
+writing `// CEI` above it is how you lose track of that.
+
+<Aside kind="stop">
+Never the answer: limiting the gas you forward so the recipient "cannot do anything." That reasoning
+produced `transfer` and its 2300-gas stipend, and solc 0.8.31 — 3 December 2025 — added a type-checker
+warning deprecating `send` and `transfer` on instances of `address`, with the documentation labelling
+both as scheduled for removal.<Cite src="solidity-changelog" /><Cite src="solidity-docs-security" />
+Gas limits are a pricing decision made by hard forks, not an access control mechanism.
+</Aside>
+
+## What ordering is worth
+
+Two calibrations before you leave, both of which matter for how much of your attention this deserves
+relative to the rest of the module.
+
+**It is free.** Reordering statements costs no gas, no bytecode, no storage slot. Compare that to the
+guard in the next lesson, whose storage variant is cold- and warm-dependent and ranges from roughly
+3,100 to roughly 7,100 gas of overhead per guarded call, measured on forge 1.7.1 and solc 0.8.36 —
+the current release since 9 July 2026 — with the optimizer
+off.<Cite src="measured-gas-constants" /><Cite src="solidity-0836-release" /> CEI first, always, and then decide what else
+you are buying.
+
+**It is also not where most of the money went.** A 2025 systematic review of the 50 most severe
+real-world attacks between 2022 and 2025, together over $1.09 billion in losses, tabulates reentrancy
+at 7 incidents and about $118.5 million, against access control at 13 incidents and about $418
+million — reentrancy fourth by value, behind access control, price manipulation and business-logic
+flaws.<Cite src="sok-root-cause-losses" /> The same review reports that only 19 of those 50 exploits
+hinged on a code defect alone.<Cite src="sok-root-cause-losses" /> Reentrancy is taught first because
+it is the most *demonstrable* bug, not the most costly one — a distinction the fifth lesson of this
+module is built around.
+
+The same review notes that the classic vulnerabilities persist but that attackers now use more
+sophisticated variants, naming read-only reentrancy specifically, and are targeting newer EVM
+features such as transient storage.<Cite src="sok-root-cause-losses" /><Cite src="eip-1153" /> That is
+the shape of the next two lessons: the cheap guard, and the exact edge of what it covers.
+
+## Where this pays off
+
+**The very next lesson** builds the mutex that closes the cross-function hole this one left open,
+measures it, and draws the coverage grid showing which cell still has nothing in it.
+
+**Pull payments**, two lessons on, is CEI taken to its conclusion: if the external call is the
+dangerous part and it must come last, the strongest version of "last" is *not in this function at
+all*. The Solidity docs reach the same place, presenting the withdrawal pattern as the recommended
+method of sending funds after an effect.<Cite src="solidity-docs-common-patterns" />
+
+**Token standards**, later in this track, is where the yield points stop looking like calls.
+`_safeMint` invoking the receiver's `onERC721Received` hook — required by EIP-721 whenever the
+recipient is a contract<Cite src="eip-721" /> — before your per-wallet counter is written is version A
+of this lesson wearing a different name, and it is the single most common NFT exploit.
+
+**Reading other people's code.** The skill is not spotting `call{value:}` above a state write. It is
+asking, at every external call in a diff, which invariant is currently untrue and who can see it —
+including through a getter you did not think of as an interface.

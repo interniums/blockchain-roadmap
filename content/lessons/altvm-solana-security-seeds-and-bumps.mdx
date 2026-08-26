@@ -1,0 +1,337 @@
+---
+id: altvm-solana-security-seeds-and-bumps
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solana-docs-pda-derivation, solana-docs-pda, sealevel-attacks, cantina-securing-solana, anchor-account-constraints, neodyme-workshop, solana-docs-token-extensions]
+stack: {}
+---
+
+Two users register with a program that gives each of them a vault, keyed by their handle and the pool
+they joined.
+
+```rust
+seeds = [user_name.as_bytes(), pool_name.as_bytes()]
+```
+
+The first user is `alice` in pool `pro`. The second is `ali` in pool `cepro`. They have the same
+vault.
+
+Nothing errored. No check was skipped — the seeds constraint is present, the derivation ran, the
+address matched. The derivation simply landed somewhere it should not have, and the program has no
+way to notice, because from its point of view exactly one account exists and both callers are
+entitled to it.
+
+This lesson is about the two ways a correct-looking derivation produces the wrong account. Both
+survive review by people who confirmed the constraint was there, because in both cases the constraint
+*is* there and it *does* pass.
+
+## How derivation actually works
+
+The mechanics matter here in a way they have not so far, so take them precisely.
+
+A program derived address is a 32-byte address deterministically derived from a program id and a set
+of seeds, guaranteed not to lie on the Ed25519 curve, which means no private key exists for it — only
+the program whose id was used in the derivation can sign for it, through `invoke_signed` during a
+cross-program invocation.<Cite src="solana-docs-pda" />
+
+The algorithm, as the documentation states it: validate that the number of seeds does not exceed
+`MAX_SEEDS`, which is 16, and that no individual seed exceeds `MAX_SEED_LEN`, which is 32 bytes,
+returning `PubkeyError::MaxSeedLengthExceeded` if either check fails; SHA-256 hash all the seeds, the
+program id, and the string `"ProgramDerivedAddress"` together to produce a 32-byte result; if that
+result is a valid point on the Ed25519 curve, return `PubkeyError::InvalidSeeds`, because such an
+address would have a corresponding private key and that violates the PDA security property; otherwise
+return it.<Cite src="solana-docs-pda-derivation" />
+
+**Subgoal: locate the sentence that contains the bug.** *SHA-256 hash all the seeds.* The seeds are
+concatenated before hashing. The documentation says the consequence out loud: `["ab", "cd"]` and
+`["abcd"]` produce the same PDA, and the remedy is fixed-length seeds or a
+separator — `["ab", "-", "cd"]` is unambiguous.<Cite src="solana-docs-pda-derivation" />
+
+That is the whole of the first failure mode, stated by the platform's own documentation, and it is
+still one of the most reliably present bugs in programs that key accounts by user-supplied strings.
+
+## Failure one: seeds that collide
+
+<Figure
+  caption="The seeds are concatenated before hashing, so nothing in the hash input records where one seed ended and the next began."
+  alt="The eight bytes alicepro bracketed into three spans — ali, ce and pro. Read as alice plus pro it is the first user and their pool; read as ali plus cepro it is the second user and theirs. Both tuples produce the same bytes."
+>
+  <Anatomy
+    value="alicepro"
+    parts={[
+      { from: 0, to: 3, label: 'ali', note: 'head of "alice"; all of "ali"', tone: 'warn' },
+      { from: 3, to: 5, label: 'ce', note: 'tail of "alice"; head of "cepro"', tone: 'danger' },
+      { from: 5, to: 8, label: 'pro', note: 'all of "pro"; tail of "cepro"', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+Two distinct logical keys, one address. What that means depends on the program, and none of the
+outcomes are good:
+
+- **Access.** If the vault stores no authority field and relies on the derivation for authorisation —
+  a common and otherwise reasonable design — then `ali` can act on `alice`'s vault by supplying the
+  parameters that derive to it.
+- **Accounting.** If both users deposit, the balances merge into one record, and whichever withdrawal
+  path runs first takes the combined total.
+- **Denial.** If creation uses `init`, which creates and funds the account and fails when it already
+  exists,<Cite src="anchor-account-constraints" /> the second user simply cannot register, and the
+  support ticket will describe it as a naming bug.
+
+**Subgoal: characterise when a program is exposed.** Two or more seeds, at least two of which are
+variable-length, with no delimiter and no fixed width between them. If every seed is a `Pubkey` — 32
+bytes, always — there is no collision, which is why the documented common patterns are safe: a global
+singleton on `["global"]`, a per-user account on `["user", user_pubkey]`, a per-user-per-entity vault
+on `["vault", user_pubkey, mint_pubkey]`, and a sequential record on `["order", user_pubkey,
+&order_id.to_le_bytes()]`.<Cite src="solana-docs-pda-derivation" /> Every variable-length seed in
+those patterns is a literal prefix, and literals are constant-width.
+
+The exposure appears when a product decision introduces a user-controlled string: handles, pool names,
+market symbols, market tickers, order memos.
+
+**Subgoal: fix it three ways, and know which one to prefer.**
+
+```rust
+// 1. Separator. Cheapest to retrofit; correct only if the byte cannot occur in a seed.
+seeds = [b"vault", user_name.as_bytes(), b"-", pool_name.as_bytes()]
+
+// 2. Length prefix. Correct unconditionally, since the length disambiguates the split.
+seeds = [b"vault", &[user_name.len() as u8], user_name.as_bytes(), pool_name.as_bytes()]
+
+// 3. Hash to fixed width. Correct, and sidesteps the 32-byte per-seed limit entirely.
+seeds = [b"vault", &hash(user_name.as_bytes()).to_bytes(), &hash(pool_name.as_bytes()).to_bytes()]
+```
+
+Option 1 is what the documentation suggests and it is fine *if you enforce elsewhere that the
+separator byte cannot appear in a name*.<Cite src="solana-docs-pda-derivation" /> If that enforcement
+lives in a different file from the derivation, it will eventually be relaxed by someone who does not
+know the derivation depends on it. Option 2 has no such coupling. Option 3 also solves the problem
+that a seed longer than 32 bytes is rejected outright with
+`MaxSeedLengthExceeded`,<Cite src="solana-docs-pda-derivation" /> which is a real constraint on any
+human-readable identifier.
+
+<Misconception
+  belief="The seeds and bump constraint is present in the accounts struct, so the PDA check is done."
+  reality="The constraint proves the passed account matches what those seeds derive to. It says nothing about whether those seeds identify one logical object. A collision makes the constraint pass for the wrong caller."
+  why="The constraint is the thing reviewers look for, and finding it terminates the search. There is no visual difference between a struct with safe seeds and a struct with colliding seeds — the difference is in the types of the values, not the shape of the code."
+  src="cantina-securing-solana"
+/>
+
+### The neighbouring class: seeds that are too coarse
+
+The canonical taxonomy has a separate class for a related problem, class 8, `pda-sharing`, and the
+audit-firm checklist covers it as "PDA substitution check".<Cite src="sealevel-attacks" /><Cite src="cantina-securing-solana" />
+Here the seeds do not collide; they are simply not specific enough.
+
+The usual shape: a program derives a withdrawal authority from `["authority", mint]` and signs
+transfers with it. The derivation is unambiguous and every constraint passes. But because the pool's
+identity is not in the seeds, *every pool for that mint shares one authority* — so an instruction that
+legitimately signs for one pool can be pointed at another pool's vault, and the signature is valid for
+both.
+
+The test is not "do these seeds collide". It is **"how many distinct logical objects derive to this
+address, and is that number one?"** Ask it of every PDA a program signs for, because a shared signing
+authority is a shared key — and the only entity that can produce that signature is the deriving
+program itself, through `invoke_signed`, on behalf of whichever caller happened to reach the
+instruction.<Cite src="solana-docs-pda" />
+
+## Failure two: bumps that multiply
+
+The second failure mode lives inside the derivation itself, and it exists because the derivation can
+fail.
+
+Recall the algorithm: hash the seeds and check whether the result lands on the Ed25519 curve; if it
+does, that is not a usable PDA, because a private key would exist for
+it.<Cite src="solana-docs-pda-derivation" /> Since roughly half of 32-byte values are on the curve,
+the raw seeds fail about half the time. The fix is an extra byte — the bump — appended to the seeds
+and varied until the result is off-curve. The documentation's summary: PDAs are derived by hashing
+seeds plus program id plus bump via SHA-256 until the result is off the Ed25519 curve, and **the
+canonical bump is the first value that produces an off-curve
+address**.<Cite src="solana-docs-pda-derivation" />
+
+**Subgoal: notice the word "first".** First implies an ordering, and implies that there are others.
+The documentation is explicit about both: `find_program_address` searches from 255 down to 1, calling
+`create_program_address` with each value until the result falls off the curve, and the first value
+that succeeds is the canonical bump — while using a non-canonical bump creates a second valid address
+for the same seeds, which can lead to vulnerabilities where an attacker substitutes a different
+account than expected.<Cite src="solana-docs-pda-derivation" /> The values the search never reached
+are not invalid. Any bump producing an off-curve address produces a real, usable, program-signable
+PDA, so one seed set admits several distinct addresses and only one of them is canonical.
+
+<Matrix
+  corner={<>Bump on <code>["vault", alice]</code></>}
+  cols={['The derived address', 'What the program can do with it']}
+  rows={[
+    { label: '255', cells: [{ v: 'on curve', tone: 'muted' }, 'rejected — a private key would exist for it'] },
+    { label: '254', cells: [{ v: 'off curve', tone: 'good' }, { v: 'canonical: what find_program_address returns', tone: 'good' }] },
+    { label: '253', cells: [{ v: 'on curve', tone: 'muted' }, 'rejected'] },
+    { label: '252', cells: [{ v: 'off curve', tone: 'danger' }, { v: 'also valid, also signable, an entirely different account', tone: 'danger' }] },
+    { label: '251', cells: [{ v: 'off curve', tone: 'danger' }, { v: 'and another', tone: 'danger' }] },
+    { label: '…', cells: [{ v: '…', tone: 'muted' }, { v: '…', tone: 'muted' }] },
+  ]}
+  caption="About half the candidates land off the curve, so the rows below the canonical one are the common case rather than the exception."
+  alt="A descending bump search for one seed set: 255 lands on the curve and is rejected, 254 lands off it and is the canonical bump the search returns, 253 is rejected, and 252 and 251 land off the curve too — each a valid, signable, entirely different address for the same seeds."
+/>
+
+**Subgoal: state the bug.** A program that accepts the bump as an *instruction argument* and derives
+from it with `create_program_address` has just let the caller choose which of those addresses to use.
+Every constraint passes — the derivation is real, the address matches what the supplied seeds and bump
+produce, the account is a genuine PDA of this program. The caller has simply selected a different one.
+
+The consequence is double accounting. `alice` deposits into her canonical vault. She then deposits
+again with bump 252 and gets a second, empty vault the program treats as hers. Now there are two
+records of one logical position, and any invariant the program maintains across positions — a supply
+cap, a collateral total, a one-claim-per-user flag — is computed over an account set that the attacker
+can extend at will.
+
+The canonical taxonomy files this as class 7, `bump-seed-canonicalization`, and the audit-firm
+checklist covers it under the same name.<Cite src="sealevel-attacks" /><Cite src="cantina-securing-solana" />
+
+### Why programs accept a user-supplied bump at all
+
+Nobody writes this bug for fun. They write it for compute units, and the numbers explain the
+temptation exactly.
+
+The on-chain `create_program_address` syscall charges 1,500 compute units per
+call.<Cite src="solana-docs-pda-derivation" /> The `try_find_program_address` syscall — the one that
+searches for the canonical bump — charges 1,500 compute units on entry, before the loop, and then an
+additional 1,500 for each failed bump attempt within
+it.<Cite src="solana-docs-pda-derivation" /> Since roughly half of candidate bumps land on the curve,
+a canonical search costs a multiple of a single derivation, and the worst case is worse. In a
+compute-constrained instruction deriving several PDAs, that is a real line item — and note the unit:
+these are compute units, not gas, and no EVM gas constant translates to them.
+
+So the optimisation is correct and the shortcut is not. Do this:
+
+```rust
+// At creation, once: search for the canonical bump and STORE it.
+state.bump = ctx.bumps.state;
+
+// Everywhere after: re-derive from the stored value, not from an argument.
+#[account(seeds = [b"state", user.key().as_ref()], bump = state.bump)]
+pub state: Account<'info, State>,
+```
+
+`seeds = [...], bump` checks that the given account is a PDA derived from the currently executing
+program and those seeds, and the `bump = <expr>` form pins a specific bump rather than searching for
+one.<Cite src="anchor-account-constraints" /> The distinction that matters is not stored-versus-derived
+— it is **where the stored value came from**. A bump read out of an account that only your program
+could have written is a cached canonical bump. A bump read out of the instruction payload is a
+caller's choice wearing the same syntax.
+
+<Aside kind="warn">
+Read `bump = expr` carefully in review, because the two cases look nearly identical:
+
+```rust
+bump = state.bump            // stored by this program at init. Safe.
+bump = params.bump           // supplied by the caller. Class 7.
+```
+
+One character of difference in a diff, and the second one is the exploit. This is the same shape as
+the safe and unsafe sysvar loaders differing by one word — the platform's dangerous APIs are
+frequently one token away from its safe ones.
+</Aside>
+
+<Check type="predict" concept="canonical-bump-matters">
+A lending program stores one borrow position per user, derived as `["position", user]`, and enforces a
+protocol-wide cap by summing every position's debt in an off-chain indexer that watches for account
+creations at addresses matching that derivation. The on-chain instruction takes `bump: u8` and calls
+`create_program_address`.
+
+An attacker with a single wallet wants to exceed the cap. Walk their sequence, and say which of the
+program's three defences fails first.
+
+<Answer>
+**They open one position per valid non-canonical bump, and the cap fails before anything else does.**
+
+The sequence:
+
+1. Off-chain, enumerate bumps from 255 downward for their own pubkey, keeping every value that yields
+   an off-curve address. Roughly half of the 256 candidates qualify, so this yields on the order of a
+   hundred distinct valid PDAs for one logical position.<Cite src="solana-docs-pda-derivation" />
+2. Call the open-position instruction once per bump. Each call passes: the derivation is real, the
+   account is a genuine PDA of this program, and every constraint the accounts struct declares is
+   satisfied.<Cite src="anchor-account-constraints" />
+3. Borrow the per-position maximum in each. Total borrowed is that maximum times the number of bumps.
+
+**Which defence fails first, and why the order is instructive.**
+
+- **The cap fails first**, because it was never a cap on a user — it was a cap on an account, and the
+  program's model assumed those were the same thing. The assumption lived in the derivation, not in
+  any check.
+- **The indexer does not fail; it does something worse.** It watches for accounts matching the
+  derivation, and every one of these *does* match — the seeds are correct, only the bump differs. So
+  the indexer faithfully reports a hundred positions and the alerting, if any, describes them as a
+  hundred users.
+- **The per-position limit never fails at all.** It is enforced correctly, on every position, exactly
+  as written. Correct local enforcement of a limit that was supposed to be global is the whole
+  failure, and it will look like working code in every log line.
+
+**The fix.** Derive canonically once at creation and store the result — `state.bump = ctx.bumps.state`
+— then use `bump = position.bump` on every subsequent instruction so the address is pinned to the one
+the program itself chose.<Cite src="anchor-account-constraints" /> Delete the `bump: u8` argument
+entirely; if it is not in the instruction payload it cannot be attacker-chosen. The compute saving
+that motivated taking it as an argument is preserved, because you are still avoiding the repeated
+canonical search — you are simply reading the cached answer from a place the caller cannot
+write.<Cite src="solana-docs-pda-derivation" />
+
+**And the generalisable form.** Any time a program accepts a parameter that participates in address
+derivation, ask how many addresses the full parameter space reaches. If the answer is more than one
+per logical object, the parameter is an account selector and should not be a parameter.
+</Answer>
+</Check>
+
+## A third way to derive the wrong address: the wrong program
+
+Both failures above kept the program id fixed and varied the seeds. The program id is a derivation
+input too, and getting it wrong produces the same silence.
+
+The framework has a constraint for the case where you are deriving a PDA belonging to *another*
+program: `seeds::program = <expr>` derives against that program's id rather than the currently
+executing one.<Cite src="anchor-account-constraints" /> Without it, the default is your own program,
+and deriving another program's account under your own id yields a perfectly valid address that will
+never hold anything.
+
+The place this bites hardest in practice is associated token accounts, because the token program id is
+one of the seeds. An address derived from the wallet, the mint, and the *legacy* token program id is a
+different address from the one derived with the Token Extensions program id, for the same wallet and a
+same-looking mint.<Cite src="solana-docs-token-extensions" /> Nothing errors. The derivation returns a
+real, valid, empty address, and everything downstream behaves as though the user has no balance — or
+creates an account nobody will ever fund. This is the failure mode of
+[the token program id as a seed](/c/token-program-id-is-a-seed), and it belongs in this lesson because
+its mechanism is identical to a seed collision: an input to the hash was wrong, so the output is a
+different account, and no layer of the system considers that an error.
+
+**Subgoal: extract the general rule.** Address derivation is a total function. Every input tuple maps
+to some address, and the vast majority of those addresses are empty accounts that nobody will ever
+create. The system has no concept of "the derivation you meant", so the only two outcomes of getting
+an input wrong are an account that does not exist — which surfaces as a confusing empty state — or, if
+an attacker chose the input, an account that does exist and belongs to them. Neither is an error, and
+this is why every failure in this lesson is quiet.
+
+## What this unlocks
+
+**Two questions to ask of every PDA in a program.** First: given the seed types, can two distinct
+logical inputs produce the same byte string? Second: given the seeds, how many valid addresses exist,
+and does the program pin itself to the canonical one? The first is answered by reading the seed types
+— any two adjacent variable-length seeds without a delimiter is a finding. The second is answered by
+finding where the bump comes from, and the only safe answer is "an account this program
+wrote".<Cite src="solana-docs-pda-derivation" />
+
+**A reframing of what a PDA is for.** The framework's `seeds`/`bump` constraint is what turns a PDA
+from a naming convention into an authorisation mechanism, because re-deriving and comparing is the act
+that proves the account is the one the caller is entitled
+to.<Cite src="anchor-account-constraints" /> That is the same third question lesson 3 answered with
+`has_one`, arriving through arithmetic instead of a stored field — and it is stronger, because there
+is no field an instruction could have forgotten to populate.<Cite src="sealevel-attacks" /> Both failures in this lesson are ways the proof is
+performed correctly about the wrong proposition — a real derivation of an address that identifies more
+than one thing.
+
+**And a handoff.** Every lesson so far has asked whether you were handed the right account. The next
+one asks a question the three questions cannot express at all: whether the account you were handed is
+in the *state* you think it is in. Accounts that can be initialised twice, accounts that were closed
+and came back with their old contents, and accounts that turn out to be the same account passed under
+two names. The workshop's vault levels are the best place to feel the difference before reading
+it.<Cite src="neodyme-workshop" />

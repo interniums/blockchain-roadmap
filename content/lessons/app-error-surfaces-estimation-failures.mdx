@@ -1,0 +1,416 @@
+---
+id: app-error-surfaces-estimation-failures
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [measured-revert-surfaces-1-7-1, geth-gasestimator-source, geth-ethapi-errors, geth-protocol-params, geth-ethconfig-defaults, geth-issue-21311, ethersjs-issue-1232, arbitrum-troubleshooting, eip-7825, eip-1474, viem-simulate-contract, viem-errors-glossary]
+stack: { foundry: "1.7.1", viem: "2.x", solidity: "0.8.36" }
+---
+
+Two JSON-RPC responses from the same node, five minutes apart. They describe unrelated problems.
+
+```json
+{"error":{"code":-32003,"message":"Out of gas: gas required exceeds allowance: 0"}}
+{"error":{"code":-32003,"message":"Out of gas: gas required exceeds allowance: 30000000"}}
+```
+
+The first is a call that would have **succeeded** — `custom(500)` on a contract whose only
+requirement is that the argument be at least 100 — sent from an address with a zero balance. The
+second is a genuinely unbounded loop that cannot complete within any limit the node will
+allow.<Cite src="measured-revert-surfaces-1-7-1" /> One is an account-funding problem. The other is
+a contract that will never work. Same code, same message shape, one integer apart.
+
+Now the two that are not even the same shape, from the same node, the same session:
+
+```json
+{"error":{"code":3,     "message":"execution reverted","data":"0x"}}
+{"error":{"code":-32603,"message":"EVM error InvalidFEOpcode"}}
+```
+
+A bare `revert()` and an `INVALID` opcode.<Cite src="measured-revert-surfaces-1-7-1" /> In the
+previous lessons those were indistinguishable — both produce zero bytes of revert data. Here they
+arrive with different error codes and different message text, because the *node* distinguishes them
+even though the *data* does not.
+
+This is the surface your interface actually consumes. Not revert bytes — a JSON-RPC error envelope
+produced by one implementation, possibly rewrapped by a provider, then rewrapped again by your
+client library. This lesson is about the four things that make estimation throw, why the envelope
+cannot reliably tell you which one happened, and the one call that can.
+
+## Four causes, and where each one is decided
+
+Walk the estimator's own steps from the previous lesson and the four failure points fall out in
+order.<Cite src="geth-gasestimator-source" />
+
+**One: the call genuinely reverts.** The estimator executes at the ceiling; if that fails for a
+reason other than out-of-gas, it returns immediately with `result.Revert()` — the revert bytes. In
+geth these become a `revertError` carrying JSON-RPC code `3` and, in `ErrorData()`, the hex-encoded
+revert data.<Cite src="geth-ethapi-errors" /> This is the only one of the four that carries revert
+data, and it is the only one that means what people assume all four mean.
+
+**Two: the sender cannot cover value plus gas.** Before executing anything, the estimator computes
+`available = balance - value`, then `allowance = available / feeCap`, and lowers its ceiling to that
+allowance.<Cite src="geth-gasestimator-source" /> If the call then cannot complete inside that
+lowered ceiling, the failure surfaces as `gas required exceeds allowance (%d)` — literally that
+format string, with the ceiling substituted.<Cite src="geth-gasestimator-source" /> Nothing
+reverted. The contract was never the problem. This is arithmetic on a balance, and the go-ethereum
+issue that documented it is still the canonical reference a decade
+later.<Cite src="geth-issue-21311" />
+
+Arbitrum's own troubleshooting FAQ states the conflation outright: during an `eth_estimateGas`
+call, "if the transaction reverts or if there aren't enough funds in the wallet that's making the
+call", the request returns an error stating `gas required exceeds
+allowance`.<Cite src="arbitrum-troubleshooting" /> Two causes, one string, documented as such by
+the chain's own docs.
+
+**Three: the estimate runs into a cap.** Three separate ceilings can bite. The block gas limit.
+The node's RPC gas cap for `eth_call` variants — geth's default is
+50,000,000.<Cite src="geth-ethconfig-defaults" /> And the per-transaction cap: since EIP-7825 a
+single transaction may not exceed 16,777,216 gas, which the estimator applies as
+`params.MaxTxGas` when the target fork is Osaka and not yet
+Amsterdam.<Cite src="eip-7825" /><Cite src="geth-protocol-params" /><Cite src="geth-gasestimator-source" />
+A transaction can therefore need more gas than any single transaction is allowed to use, while the
+block it would go in has room to spare.
+
+**Four: the node's state moved.** Estimation runs against a specific block. Between the read that
+populated your form and the estimate, that block advanced: an allowance was spent, a pool moved, a
+deadline passed, a nonce was consumed elsewhere. This one is not a distinct code path — it presents
+as cause one or cause two — but it is a distinct *diagnosis*, because retrying fixes it and nothing
+else on this list is fixed by retrying.
+
+It has a second form that is easy to miss, because it looks like inconsistency rather than
+staleness. The block an estimate runs against is a parameter, and the two obvious choices disagree
+by design: against `latest` the estimate sees the last mined block and knows nothing about the
+user's own pending transactions, while against `pending` it sees the node's view of what is queued —
+a view that is local to that node and differs between endpoints, because mempools are not shared
+state. A user who just sent an approval and immediately clicks the action that depends on it will
+get one answer from a node that has their approval pending and another from a node that does not.
+Neither node is wrong. If your application spreads requests across several endpoints, the same call
+can be estimated twice, seconds apart, against two different worlds — which is a good reason to
+pin the estimate and the simulation that preceded it to the same endpoint and the same block, and
+to say "still confirming" rather than "this will fail" while a dependency of the call is in flight.
+
+<Matrix
+  corner="Why estimation threw"
+  cols={['Decided by', 'Revert data', 'What actually fixes it']}
+  rows={[
+    {
+      label: 'The call reverts',
+      cells: ['Contract logic, executed at the ceiling', { v: 'yes', tone: 'good' }, 'A different request, or a different contract'],
+    },
+    {
+      label: 'The sender cannot cover value plus gas',
+      cells: [
+        <>Arithmetic on the balance, before any code runs<Cite src="geth-gasestimator-source" /></>,
+        { v: 'none', tone: 'danger' },
+        'Funding the account',
+      ],
+    },
+    {
+      label: 'The requirement hits a cap',
+      cells: [
+        <>The block limit, the node&apos;s RPC gas cap<Cite src="geth-ethconfig-defaults" />, or the per-transaction cap<Cite src="eip-7825" /></>,
+        { v: 'none', tone: 'danger' },
+        'Splitting the call — nothing else',
+      ],
+    },
+    {
+      label: "The node's state moved",
+      cells: ['The block the estimate ran against', { v: 'presents as one of the first two', tone: 'muted' }, 'Retrying, and only this one'],
+    },
+  ]}
+  caption="Only the first of the four is a statement about your contract, and it is the only one that hands back bytes."
+  alt="The four reasons eth_estimateGas throws, with what decides each, whether it carries revert data, and what fixes it. Only a genuine revert carries data; underfunding and caps are decided before or outside contract execution; staleness is the only one a retry fixes."
+/>
+
+<Misconception
+  belief="If eth_estimateGas throws, the transaction would revert."
+  reality="It also throws when the sender's balance cannot cover value plus gas at the searched limit, when the required gas exceeds a per-transaction or node-configured cap, and when state moved between your read and the estimate. Two of those are decided before any contract code executes."
+  why="Wallets surface all four as 'this transaction will fail', and the most common cause really is a revert, so the wrong model survives contact with most incidents."
+  src="geth-issue-21311"
+/>
+
+## Estimation sizes; simulation explains
+
+The single highest-leverage correction in this module is that these are two different calls
+answering two different questions, and most applications use the wrong one to produce their error
+message.
+
+`eth_estimateGas` returns a number or throws. When it throws, what you get is whatever the node's
+error-wrapping logic chose to include. `eth_call` executes the call once and returns either the
+return value or the revert bytes — the bytes you spent four lessons learning to decode.
+
+Look at what the wrapping actually does to a message. geth's `newRevertError` runs
+`abi.UnpackRevert` on the revert data and, *only if that succeeds*, appends the reason to the
+error:<Cite src="geth-ethapi-errors" />
+
+```go
+reason, errUnpack := abi.UnpackRevert(revert)
+if errUnpack == nil {
+    err = fmt.Errorf("%w: %v", vm.ErrExecutionReverted, reason)
+}
+```
+
+`abi.UnpackRevert` understands `Error(string)`. It does not understand custom errors. So on geth a
+`require` with a message produces `execution reverted: amount too small`, and a custom error
+produces bare `execution reverted` — with the bytes still present in `ErrorData()`, where an
+application that only reads `message` never looks.
+
+A different implementation makes a different choice. anvil 1.7.1, same revert data:
+
+```text
+require string   "execution reverted: amount too small"
+                 data: 0x08c379a0…
+
+custom error     "execution reverted: custom error 0xcf479181: \u0000\u0000…\u0005\u0000…d"
+                 data: 0xcf479181…
+```
+
+The second message embeds the raw argument words as text, control characters and
+all.<Cite src="measured-revert-surfaces-1-7-1" /> It is more informative than geth's and completely
+unparseable. Both nodes put the same correct hex in `data`. Neither `message` is something you can
+build on.
+
+<Aside kind="warn">
+This is the whole argument against string-matching error messages, in one comparison. The `data`
+field is the same on both implementations because it is derived from the EVM. The `message` field
+differs because it is derived from someone's formatting code, and formatting code changes in patch
+releases. Every substring check you have ever written against `error.message` is a bet on a string
+literal in a Go or Rust file that nobody promised you.
+</Aside>
+
+The practical shape of this is a two-call sequence, and viem's actions map onto it directly:
+`simulateContract` runs the call and gives you `{ result, request }`, throwing a decodable
+`ContractFunctionRevertedError` when it fails, and `request` is what you hand to the write
+action.<Cite src="viem-simulate-contract" /><Cite src="viem-errors-glossary" />
+
+```ts
+// Explain first. This is the call whose failure you can decode.
+const { request } = await client.simulateContract({ address, abi, functionName, args, account })
+
+// Then size. If this throws after the simulation passed, the cause is
+// almost never the contract — look at balance, caps and staleness.
+const gas = (await client.estimateContractGas({ address, abi, functionName, args, account }) * 125n) / 100n
+
+await walletClient.writeContract({ ...request, gas })
+```
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'eth_call', note: 'simulateContract', tone: 'good' },
+    { title: 'eth_estimateGas', note: 'estimateContractGas', tone: 'warn' },
+  ]}
+  rows={[
+    {
+      label: 'What does it answer?',
+      cells: ['Would this call succeed, and what does it return?', 'What limit makes this call succeed?'],
+    },
+    {
+      label: 'How many executions?',
+      cells: ['One', <>Several — one at the ceiling, then a bisection<Cite src="geth-gasestimator-source" /></>],
+    },
+    {
+      label: 'Does it check the sender can pay?',
+      cells: [
+        <>No<Cite src="geth-issue-21311" /></>,
+        <>Yes — <code>allowance = (balance − value) / feeCap</code>, before any code runs<Cite src="geth-gasestimator-source" /></>,
+      ],
+    },
+    {
+      label: 'Does a failure hand back the revert bytes?',
+      cells: ['Yes — that is what it returns', 'Only when the call genuinely reverts; the other three causes carry none'],
+    },
+    {
+      label: 'So what is it for?',
+      cells: ['Explaining the failure', 'Sizing the transaction'],
+    },
+  ]}
+  caption="Only one of these two carries the revert data, and only the other one checks whether the sender can pay."
+  alt="eth_call and eth_estimateGas compared: what each answers, how many executions each runs, whether each performs the affordability recap, whether a failure carries revert bytes, and what each is for."
+/>
+
+Ordering matters for the diagnosis, not just for the code. A simulation that passes and an estimate
+that then fails eliminates cause one entirely, which leaves balance, caps and staleness — three
+things you can check directly from the client. That is a real narrowing, obtained for the price of
+one extra RPC call.
+
+<Misconception
+  belief="Simulating and then estimating is wasteful — estimation already runs the call."
+  reality="Estimation runs the call several times and, on failure, may hand back a message that does not contain the revert data at all. Simulation is one execution that returns the bytes. The extra call buys the only reliable explanation of the failure, and it eliminates one of the four causes when it passes."
+  why="Both calls execute the transaction, so they look redundant; they differ in what they return, not in what they run."
+  src="viem-simulate-contract"
+/>
+
+## The same failure, different on every wire
+
+Error objects are not standardised across the RPC boundary, and the drift is larger than "different
+wording".
+
+**The error codes are partly invented.** EIP-1474 specifies the JSON-RPC error codes for Ethereum —
+`-32700` through `-32006`, including `-32003` "Transaction rejected". It does **not** define code
+`3`.<Cite src="eip-1474" /> Code 3 is a geth convention, defined in
+`internal/ethapi/errors.go`, which every other implementation then adopted to stay compatible with
+clients that had already hard-coded it.<Cite src="geth-ethapi-errors" /> It is a de-facto standard
+with no specification behind it, which is exactly the kind of thing that holds until it does not.
+
+**Two implementations can disagree about whether something is an error.** Measured: with a sender
+holding zero balance, a non-zero gas price and a one-ether value transfer, anvil 1.7.1 returned
+`{"result":"0x5208"}` — a successful estimate of 21,000 gas for a transfer the sender cannot
+possibly make.<Cite src="measured-revert-surfaces-1-7-1" /> geth's estimator, reading its source,
+compares the value against the available balance and returns
+`ErrInsufficientFundsForTransfer` before it reaches the plain-transfer short
+circuit.<Cite src="geth-gasestimator-source" /> Same request, same semantics on chain, opposite
+answers from the RPC.
+
+**Local caps are not mainnet caps.** anvil 1.7.1 at default settings accepted a transaction with a
+gas limit of 20,000,000 — above the EIP-7825 per-transaction cap of
+16,777,216.<Cite src="measured-revert-surfaces-1-7-1" /><Cite src="eip-7825" /> A transaction sized
+by a local estimate can therefore be rejected by the network your users are on, and your test suite
+will never see it.
+
+**L2s are a third population.** They run different node implementations with different gas models,
+and their error surfaces reflect that — Arbitrum's docs carry a dedicated FAQ entry for
+`gas required exceeds allowance` precisely because it arrives there
+too.<Cite src="arbitrum-troubleshooting" /> An error path validated on mainnet is not validated on
+the rollup you also ship to.
+
+**And the client library adds its own layer.** The long-running ethers issue on this is titled
+exactly what it is: gas estimation failure gives a misleading error
+message.<Cite src="ethersjs-issue-1232" /> Every abstraction between the node and your `catch`
+block has an opinion about how to present the failure, and each one is free to change it.
+
+<Misconception
+  belief="An error that decodes correctly in development will decode correctly in production."
+  reality="Providers wrap, reword, truncate and occasionally drop the data field. Node implementations disagree about which conditions are errors at all. A path that decodes cleanly against a local node can arrive as an unrecognisable string from a hosted endpoint, and differently again from an L2."
+  why="Local development runs against one implementation with no provider layer and no rate limiting, which is the least representative environment in the stack."
+  src="ethersjs-issue-1232"
+/>
+
+## Worked example: making the four causes distinguishable yourself
+
+The node will not separate them for you. You can separate them from the client, using information
+you already have, without parsing a single message string.
+
+**Subgoal 1 — get the revert data from the call that reliably carries it.** Simulate before you
+estimate. If the simulation throws with decodable revert data, you are in cause one and you are
+done: the transaction would revert, you know the error name and arguments, and no estimation error
+was involved.
+
+**Subgoal 2 — eliminate the balance cause with arithmetic, not with a message.** You have the
+sender's balance, the value, and the fee cap. Reproduce the node's own calculation:
+`allowance = (balance - value) / maxFeePerGas`.<Cite src="geth-gasestimator-source" /> If that
+allowance is below a plausible gas requirement for the call, the user is underfunded and the
+message writes itself: how much they have, how much the transaction needs, and the shortfall.
+
+```ts
+const balance = await client.getBalance({ address: account })
+const { maxFeePerGas } = await client.estimateFeesPerGas()
+const allowance = maxFeePerGas > 0n ? (balance - value) / maxFeePerGas : 0n
+// allowance is the gas ceiling the node will search under, in gas units
+```
+
+**Subgoal 3 — eliminate the cap cause by comparing against known ceilings.** If the simulation
+passed and the allowance is comfortable, compare the requirement against the per-transaction cap of
+16,777,216 and against the block gas limit you can read from the latest
+header.<Cite src="eip-7825" /> A call that needs more than the per-transaction cap needs to be
+split, and no amount of retrying or funding changes that.
+
+**Subgoal 4 — attribute the remainder to staleness and prove it by retrying.** Whatever survives
+those three checks is state drift. It is the only cause on the list where the correct interface is
+a retry button, and it is testable: re-simulate against the newest block. If the second attempt
+succeeds, that was it.
+
+**Subgoal 5 — record the raw envelope rather than the rendered string.** Log `code`, `message` and
+`data` verbatim, plus the provider identity, the chain id and the block number. The provider-drift
+problems in this lesson are invisible in an aggregated dashboard of rendered messages and obvious
+in thirty seconds of raw envelopes — you will see the same failure arriving with two shapes from
+two endpoints.
+
+**Subgoal 6 — test the error paths against the endpoint you ship on.** Not only against anvil.
+Trigger each of the four causes against your production provider, on each chain you support, and
+record the envelope each one produces. This is an afternoon of work that turns provider drift from
+an incident into a fixture, and it is the only way to find out that your fallback endpoint reports
+insufficient funds differently from your primary.
+
+<Check type="explain" concept="estimategas-failure-modes">
+A wallet-connected form shows "This transaction will fail" whenever `estimateGas` throws, derived by
+matching `error.message` against a list of substrings accumulated over two years. Three reports
+arrive in one week.
+
+*Report A.* A user with 0.0004 ETH tries a mint priced at 0 ETH. The button says the transaction
+will fail. Simulating the same call by hand succeeds.
+
+*Report B.* Users on the team's L2 deployment see "This transaction will fail" for a call that
+works. It began after the team switched their L2 endpoint to a different provider. Nothing about
+the contracts changed.
+
+*Report C.* A batch-claim button fails for users with more than about four hundred positions. The
+estimate throws. Splitting the batch in half makes both halves work.
+
+Diagnose each. Say which of the four causes it is, what the interface should show, and what single
+architectural change would have prevented all three from reaching users as the same string.
+
+<Answer>
+**A — cause two, the balance recap.** The mint costs nothing, so `value` is zero, but gas is not
+free. The estimator computes `allowance = balance / maxFeePerGas` before executing anything, lowers
+its ceiling to that, and reports failure when the call cannot complete inside
+it.<Cite src="geth-gasestimator-source" /> No contract code decided this. The hand-simulation
+succeeded because `eth_call` does not perform the affordability
+recap.<Cite src="geth-issue-21311" />
+
+*What to show:* "You need about 0.0009 ETH to cover network fees for this transaction and you have
+0.0004 ETH." A number, a shortfall, and a next action — not a prediction about the contract, which
+is not what failed.
+
+**B — provider drift, not a new cause.** The contract behaviour is unchanged; the *envelope* is.
+The new provider words its errors differently, or wraps them in a different structure, and the
+substring list was tuned against the old one. A message that no longer matches falls through to the
+generic branch. This is the failure the module has been building toward: the `data` field would
+have been identical across both providers because it comes from the EVM, and the `message` field is
+formatting code that differs per implementation and per version — geth appends a reason only when
+`abi.UnpackRevert` succeeds, anvil inlines raw argument bytes into the string, and neither promised
+stability.<Cite src="geth-ethapi-errors" /><Cite src="measured-revert-surfaces-1-7-1" /><Cite src="ethersjs-issue-1232" />
+
+*What to show:* whatever the *decoded* classification says. If the decode yields nothing, "Something
+went wrong reaching the network" plus a retry — never a claim about the transaction, which nothing
+here established.
+
+**C — cause three, a cap.** Gas scales with the number of positions, so past some batch size the
+requirement crosses a ceiling: the per-transaction cap of 16,777,216 since EIP-7825, the node's RPC
+gas cap, or the block gas limit.<Cite src="eip-7825" /><Cite src="geth-ethconfig-defaults" />
+Splitting the batch works because each half fits. "This transaction will fail" is true and useless;
+the transaction is impossible at that size and possible at half.
+
+*What to show:* "This claim is too large to submit in one transaction. Claim up to 300 positions at
+a time." That is a next action the user can take immediately, and it is derivable — you know the
+per-position cost from a smaller estimate and you know the cap.
+
+**The one architectural change.** Stop deriving the classification from `error.message`. Classify
+from structure: simulate first to establish whether the call reverts and to obtain decodable revert
+data; check the balance allowance arithmetically; compare the requirement against known caps; treat
+what remains as staleness. Each of the three reports then lands in a different branch with a
+different message, and — this is the part that matters over two years — none of the branches breaks
+when a provider changes its wording, because none of them reads the wording.
+
+**The tell that they were on the wrong footing all along.** The substring list "accumulated over two
+years". A classifier that grows one incident at a time is not converging on the problem; it is
+recording the history of one provider's phrasing. The four causes have been four causes the whole
+time.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You now have the two halves of the failure surface. Revert data: four shapes, decodable with an ABI
+assembled from the call graph. Estimation: four causes, separable by simulation, arithmetic and cap
+comparison rather than by reading strings. Both produce a *classification* — a small enumerated
+value that says what kind of thing went wrong.
+
+**The last lesson turns classification into interface.** Four buckets, each with a different shape
+of response: the user can fix it, your application is broken, the chain or the wallet is
+temporarily unhappy, or the user simply said no — and that last one is not an error at all, though
+almost every application treats it as one. The test that decides whether a bucket is real is
+whether you can write a sentence naming the next action, and if you cannot, the failure has not
+actually been classified yet.

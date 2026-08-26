@@ -1,0 +1,331 @@
+---
+id: solidity-contract-patterns-guards-and-their-scope
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [oz-reentrancy-guard-source, oz-reentrancy-guard-transient-source, oz-docs-utils-api, oz-changelog, eip-1153, eip-2200, eip-3529, eip-2929, eip-214, eip-7201, measured-gas-constants, chainsecurity-tstore, cyfrin-reentrancy-checklist, sok-root-cause-losses, solidity-changelog]
+stack: { solidity: "0.8.36", forge: "1.7.1" }
+---
+
+A mutex is four lines. Here is OpenZeppelin's, copied out of `utils/ReentrancyGuard.sol`:
+
+```solidity
+modifier nonReentrant() {
+    _nonReentrantBefore();
+    _;
+    _nonReentrantAfter();
+}
+
+function _nonReentrantBefore() private {
+    _nonReentrantBeforeView();                                   // revert if already ENTERED
+    _reentrancyGuardStorageSlot().getUint256Slot().value = ENTERED;
+}
+
+function _nonReentrantAfter() private {
+    _reentrancyGuardStorageSlot().getUint256Slot().value = NOT_ENTERED;
+}
+```
+
+Set a flag on entry, clear it on exit, revert if it was already
+set.<Cite src="oz-reentrancy-guard-source" /> You could have written that. The reason this lesson
+exists is not the mechanism — it is that almost every published claim about what a guard *costs* is
+wrong by a factor you would make design decisions on, and almost every published claim about what a
+guard *covers* is wrong in a direction that leaves a hole.
+
+Both of those are fixable in one sitting. Start with the parts of the implementation that are not
+obvious, because they explain the cost.
+
+## Why the flag is 1 and 2 rather than false and true
+
+The two constants are `NOT_ENTERED = 1` and `ENTERED = 2`, and the source carries a comment
+explaining both halves of that choice.<Cite src="oz-reentrancy-guard-source" />
+
+**Why not a `bool`.** Booleans are more expensive than a `uint256` or any type taking a full word,
+because each write emits an extra `SLOAD` first — to read the slot's contents, replace the bits the
+boolean occupies, and write the word back. The comment names it as the compiler's defence against
+contract upgrades and pointer aliasing, and says it cannot be
+disabled.<Cite src="oz-reentrancy-guard-source" /> A packed type is not free to write; you already
+know why from [slot packing](/c/slot-packing), and this is the case where it costs more than it saves.
+
+**Why not zero for the unlocked state.** If the resting value were `0`, every guarded call would
+write zero to non-zero and then non-zero back to zero — the expensive tier followed by a refund. The
+comment says the non-zero values make deployment slightly more expensive but keep the refund on
+every `nonReentrant` call lower, and gives the reason: refunds are capped to a percentage of the
+transaction's total gas, so it is best to keep them low, to increase the likelihood of the full
+refund coming into effect.<Cite src="oz-reentrancy-guard-source" /> That cap is EIP-3529's, which cut
+the maximum refund to one fifth of the transaction's gas.<Cite src="eip-3529" /> The clearing write
+still triggers a refund under EIP-2200's net metering, and the source points at that EIP for
+it.<Cite src="eip-2200" />
+
+Measured, this matters: `SSTORE` of zero to non-zero is 20,000, non-zero to non-zero is 2,900, and a
+warm no-op write is 100 — each plus 2,100 when the slot is cold.<Cite src="measured-gas-constants" />
+Choosing 1-and-2 over false-and-true moves the entry write from the 20,000 tier to the 2,900 tier
+on every call the contract will ever serve.
+
+<Aside kind="note">
+Modern OpenZeppelin also stopped using a plain state variable for the flag. The slot is a hard-coded
+constant `0x9b779b17…55f00`, derived as
+`keccak256(abi.encode(uint256(keccak256("openzeppelin.storage.ReentrancyGuard")) - 1)) & ~bytes32(uint256(0xff))`
+— the ERC-7201 namespaced-storage derivation.<Cite src="oz-reentrancy-guard-source" /><Cite src="eip-7201" />
+The guard therefore cannot collide with your own sequential variables, which is what makes it safe to
+mix into a contract that lives behind a proxy. There is an internal
+`_reentrancyGuardStorageSlot()` you can override if you need a different one.<Cite src="oz-docs-utils-api" />
+</Aside>
+
+## What it costs, measured rather than quoted
+
+Three figures circulate for reentrancy guards: about 7,100 gas for the storage version, about 5,000
+for the storage version, and about 200 for the transient version. Measured on forge 1.7.1 with solc
+0.8.36 and the optimizer off, **none of them matched**.<Cite src="measured-gas-constants" />
+
+| Guard | Guarded call | Unguarded call | Overhead |
+|---|---|---|---|
+| Storage `uint256` lock, warm slot | 4,312 | 1,208 | **3,104** |
+| Transient `TSTORE`/`TLOAD` | 1,490 | 1,206 | **284** |
+
+That is roughly an 11× difference, not the 35× the 7,100-versus-200 pairing
+implies.<Cite src="measured-gas-constants" />
+
+The reason the published numbers disagree is that **the storage guard does not have a cost — it has
+a range.** EIP-2929 prices the first touch of a storage slot in a transaction at the cold rate and
+every later touch at the warm rate.<Cite src="eip-2929" /> Measured here: cold `SLOAD` 2,100, warm
+100.<Cite src="measured-gas-constants" /> The lock slot is cold on the first guarded call of a
+transaction and warm on every one after it. So the honest statement is that the storage guard's
+overhead is **cold- and warm-dependent and runs from roughly 3,100 to roughly 7,100**, while the
+transient guard is flat at roughly 284 because transient storage has no cold tier at
+all.<Cite src="measured-gas-constants" />
+
+<Misconception
+  belief="A transient reentrancy guard is about 35× cheaper than a storage one — 200 gas versus 7,100."
+  reality="That pairing silently compares a cold storage slot against transient storage. Against a warm slot the measured ratio here is about 11×, with the storage guard at 3,104 and the transient at 284."
+  why="The two figures come from different measurements and get quoted together because they make a better headline. Neither source states its cold/warm assumption."
+  src="measured-gas-constants"
+/>
+
+<Matrix
+  corner="Guard"
+  cols={['First guarded call in a transaction', 'Every guarded call after it', 'Why']}
+  rows={[
+    {
+      label: 'Storage lock, one uint256',
+      cells: [
+        { v: 'up to about 7,100', tone: 'warn' },
+        { v: '3,104 measured, warm', tone: 'warn' },
+        'the lock slot is cold once, then warm',
+      ],
+    },
+    {
+      label: 'Transient lock, TSTORE and TLOAD',
+      cells: [
+        { v: 'about 284', tone: 'good' },
+        { v: 'about 284', tone: 'good' },
+        'transient storage has no cold tier',
+      ],
+    },
+  ]}
+  caption="Two of these four numbers are identical, and that flatness — not the headline ratio — is what transient storage actually sells."
+  alt="Reentrancy guard overhead on forge 1.7.1 and solc 0.8.36 with the optimizer off. The storage guard costs up to about 7,100 gas on the first guarded call of a transaction, when its lock slot is cold, and 3,104 as measured on every warm call after it. The transient guard costs about 284 either way, because transient storage has no cold tier."
+/>
+
+<Aside kind="warn">
+Do not take those absolute numbers into your own design review. They are one machine, one compiler,
+optimizer off, and a specific harness. Take the *shape*: a storage guard costs thousands and varies
+with warmth, a transient guard costs hundreds and does not. Then measure yours — and when you do,
+note that Foundry gas reports systematically under-report against mainnet, because test setup leaves
+slots warm. Track 05 makes that its own lesson.
+</Aside>
+
+## The transient variant, and one mechanical detail that matters
+
+`ReentrancyGuardTransient` is the same code with `TSTORE`/`TLOAD` behind it, added in OpenZeppelin
+5.1.0.<Cite src="oz-changelog" /><Cite src="oz-reentrancy-guard-transient-source" /> Both opcodes
+cost 100 gas, they never serialise to the state trie, and there is no original value to
+load.<Cite src="eip-1153" /><Cite src="measured-gas-constants" />
+
+The reentrancy lock is not an application the EIP acquired later. It is the motivating example in the
+text: contracts can be re-entered within one transaction, frames can communicate via call
+inputs/outputs or via storage, and if there is an intermediate frame belonging to another untrusted
+contract, communication via inputs and outputs is not secure — the notable example being a reentrancy
+lock that cannot rely on the intermediate frame to pass the state of the lock
+through.<Cite src="eip-1153" />
+
+Three semantics you need, all normative in EIP-1153:<Cite src="eip-1153" />
+
+- **All values are discarded at the end of the transaction.** Not at the end of the call.
+- **A revert undoes transient writes** made between entry to the frame and the return, including
+  those in inner calls — the same behaviour as persistent storage. A reverted attack therefore leaves
+  no stuck lock.
+- **Under `DELEGATECALL`, the owner of the transient storage is the caller**, exactly as with
+  persistent storage. A guard inside a clone or a proxy locks the *proxy's* slot, which is what you
+  want and worth knowing before you reason about it.
+
+The detail that explains an API shape: **`TSTORE` inside a `STATICCALL` throws; `TLOAD` is
+allowed.**<Cite src="eip-1153" /> That is why a `view` function cannot use `nonReentrant` — the
+modifier writes — and why OpenZeppelin added a separate `nonReentrantView` in 5.5.0, a read-only
+version documented as blocking view functions from being called and so preventing reads from
+inconsistent contract state.<Cite src="oz-changelog" /><Cite src="oz-docs-utils-api" /> It performs the
+check without changing the reentrancy status, which is exactly the operation
+[static-call enforcement](/c/staticcall-is-the-enforcement) permits.<Cite src="eip-214" />
+
+<Aside kind="note">
+Availability: the transient variant only works on chains where EIP-1153 is
+live.<Cite src="oz-docs-utils-api" /> On L1 that is settled, and solc's default EVM version has been
+`osaka` since 0.8.31, so `TSTORE` and `TLOAD` are assumed present unless you lower the target for an
+older chain.<Cite src="solidity-changelog" /> If you compile with `--evm-version` set back for an L2
+that has not caught up, the transient guard is not an option and the storage one still is.
+</Aside>
+
+## The scope, drawn as a grid
+
+This is the part worth memorising, because it is where the guard's reputation exceeds its reach.
+Five situations, four of which a `nonReentrant` modifier changes and one of which it does not.
+
+| Situation | CEI on one function | `nonReentrant` on the contract | Left over |
+|---|---|---|---|
+| Same function re-entered | closed | closed | — |
+| Different function, same contract, shared state | **open** | closed | — |
+| Same contract, one function guarded, one not | open | **open** | guard every function on the invariant |
+| Different contract in your own system | open | **open** | a shared lock, or restructure |
+| `view` getter read mid-callback by a third party | **open** | **open** | `nonReentrantView` |
+
+Two rows deserve their own sentences.
+
+**The guard is per-contract, not per-system.** It writes one slot in one account's storage. Two
+contracts of yours that share an invariant have two independent locks. Closing that requires an
+explicit shared lock — a third contract both consult, or an `AccessManager`-style hub — and that is a
+design decision, not a modifier.
+
+**Guarding some functions is the common real bug.** A mutex protects the set of functions that carry
+it. If `withdraw` is guarded and `transferShares` is not, and both touch the same mapping, the lock
+is decorative on the path an attacker will actually take. Cyfrin's auditor checklist treats "is
+every state-changing path on this invariant covered" as the question, not "is there a
+guard."<Cite src="cyfrin-reentrancy-checklist" />
+
+## The constraint that surprises people
+
+OpenZeppelin's own note, in the source and the docs both: because there is a single `nonReentrant`
+guard, **functions marked `nonReentrant` may not call one
+another**.<Cite src="oz-reentrancy-guard-source" /><Cite src="oz-docs-utils-api" /> Not "should not" —
+the second one reverts, because from the lock's point of view an internal call through an external
+entry point is indistinguishable from an attack.
+
+The documented workaround is a shape worth adopting on purpose: make the real logic a `private`
+function, and add thin `external nonReentrant` entry points that call
+it.<Cite src="oz-reentrancy-guard-source" /> Composition then happens below the lock rather than
+through it. If you have ever seen a codebase where two perfectly reasonable public functions cannot
+be used together and nobody could say why, this is usually it.
+
+There is also `_reentrancyGuardEntered()`, an internal view returning whether the guard is currently
+set — true when a `nonReentrant` function is somewhere in the call
+stack.<Cite src="oz-docs-utils-api" /> Exposing it publicly is how you let *other* protocols check
+whether your state is mid-update before they price it. That is the cooperative half of the read-only
+problem: `nonReentrantView` protects your getters, and a published lock-state view lets integrators
+protect themselves against getters you forgot.
+
+<Check type="predict" concept="reentrancy-guard-transient">
+A vault has three externally reachable functions on one invariant:
+
+```solidity
+function deposit(uint256 amount) external nonReentrant { ... }
+function withdraw(uint256 shares) external nonReentrant { ... }
+function pricePerShare() external view returns (uint256) {
+    return totalAssets / totalSupply;
+}
+```
+
+`withdraw` sends ETH before it decrements `totalAssets`. A lending market prices this vault's shares
+as collateral by calling `pricePerShare()`.
+
+Predict the outcome of three attempts, and say which of them the guard stops:
+
+1. The attacker's `receive()` calls `withdraw` again.
+2. The attacker's `receive()` calls `deposit`.
+3. The attacker's `receive()` calls the lending market, which calls `pricePerShare()`.
+
+<Answer>
+**1 — stopped.** The lock is set, the re-entrant call hits `_nonReentrantBefore`, reads `ENTERED`,
+and reverts with `ReentrancyGuardReentrantCall`.<Cite src="oz-reentrancy-guard-source" />
+
+**2 — also stopped, and this is the guard earning its cost.** `deposit` carries the same modifier and
+reads the same single slot, so cross-function reentrancy inside this contract is closed. Plain CEI on
+`withdraw` would not have closed it. This is the row where a guard buys something ordering cannot.
+
+**3 — not stopped, and nothing in this contract is reverting.** `pricePerShare` is a `view` with no
+modifier. It is reached by `STATICCALL` from the lending market, it reads two slots, and during the
+callback window `totalSupply` has been decremented while `totalAssets` has not. The ratio it returns
+is arithmetically correct and semantically a lie, and the attacker borrows against it. The vault is
+never re-entered; the guard never sees the call; the loss lands on the lender.
+
+**The fixes, in the order you should apply them.**
+
+First, **reorder** — decrement `totalAssets` before the transfer. Free, and it removes the window
+rather than policing it. This is the repair, not a mitigation.
+
+Second, add `nonReentrantView` to `pricePerShare` for the windows you cannot remove. It performs a
+`TLOAD` and reverts if the lock is held, which is legal inside a `STATICCALL` because EIP-1153
+forbids `TSTORE` there and permits `TLOAD`.<Cite src="eip-1153" /><Cite src="oz-docs-utils-api" /> Note
+what this does to your integrators: their call now *reverts* instead of returning a wrong number.
+That is the correct trade, and it is a breaking change to anyone who was calling it — say so in
+release notes.
+
+Third, and separately: a guard on `pricePerShare` protects callers who reach it during *your*
+reentrancy. It does nothing if the inconsistency comes from a second contract in your system. That
+row of the grid is still open, and closing it is architecture.
+
+**The general lesson.** Question one is not "is there a guard on this function." It is "which
+functions read the state this function is in the middle of changing" — and `view` functions are on
+that list.
+</Answer>
+</Check>
+
+## Two things a cheap guard does not buy
+
+**It does not replace CEI.** Reordering is free and removes the inconsistent window; a guard costs
+gas and forbids observation of a window that still exists. Anything that reads your state without
+going through the guard — a getter, a second contract, an off-chain indexer mid-transaction —
+still sees it. Order first, guard second.
+
+**Cheap guards change attacker economics in both directions.** ChainSecurity's analysis of the
+transient-storage rollout makes the point that making locks cheap also makes *attempting* reentrancy
+cheaper to probe: the class does not disappear, its price
+moves.<Cite src="chainsecurity-tstore" /> The 2025 systematic review of major incidents adds the
+matching observation from the other side — that classic vulnerabilities persist while attackers move
+to more sophisticated variants such as read-only reentrancy, and that new EVM features including
+transient storage are themselves becoming attack surface, naming a 2025 incident whose vector was the
+EIP-1153 opcodes.<Cite src="sok-root-cause-losses" /><Cite src="eip-1153" />
+
+<Aside kind="stop">
+EIP-1153's own security considerations warn about the failure mode you will be tempted into: because
+transient storage clears automatically at the end of the transaction, developers may skip clearing a
+slot to save gas — but leaving a lock set can prevent further legitimate interactions with the
+contract in the same transaction.<Cite src="eip-1153" /> With batched transactions now routine
+through delegated accounts, "the rest of this transaction" is no longer a rare case. OpenZeppelin's
+implementation clears the slot; if you write your own, clear it.
+</Aside>
+
+## The direction of travel
+
+OpenZeppelin has marked the storage-based `ReentrancyGuard` as **deprecated**, stating it will be
+removed and replaced by the `ReentrancyGuardTransient` variant in
+v6.0.<Cite src="oz-docs-utils-api" /><Cite src="oz-reentrancy-guard-source" /> There is no 6.0 yet —
+5.7.0, released 29 July 2026, is current, and 5.0 from October 2023 remains the last breaking
+major.<Cite src="oz-changelog" /> Treat the deprecation as a planning signal rather than an
+emergency: new contracts targeting chains with EIP-1153 should use the transient guard, and existing
+storage guards will keep compiling until a major you choose to take.
+
+## Where this pays off
+
+**Pull payments**, next, removes the external call from your critical path entirely — which is the
+only move on this page that makes the guard's cost optional rather than mandatory.
+
+**Token standards** later in this track are where guarded functions meet mandatory callbacks. Every
+receiver hook in ERC-721 and ERC-1155 is a yield point the standard requires you to have, and the
+guard plus the ordering is the whole defence.
+
+**Track 05's gas work** is where the measurement discipline lands: the table above is one machine's
+output, and the exercise is reproducing it on yours, including the trap that a read with no
+observable effect gets eliminated as dead code even with the optimizer off.
+
+**Track 06's vulnerability taxonomy** picks up the row this lesson leaves open — cross-contract and
+read-only reentrancy — as its own class, with the incidents attached.

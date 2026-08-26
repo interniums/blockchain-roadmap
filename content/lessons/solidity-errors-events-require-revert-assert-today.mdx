@@ -1,0 +1,385 @@
+---
+id: solidity-errors-events-require-revert-assert-today
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [solidity-docs-control-structures, solidity-blog-custom-errors, solidity-changelog, solidity-abi-spec, viem-contract-errors, measured-forge-1-7-1, solidity-0836-release]
+stack: { solidity: "0.8.36", foundry: "1.7.1" }
+---
+
+Fetch the Solidity team's own page on custom errors today, in August 2026, and this sentence is on
+it:
+
+> Using errors together with `require` is not yet supported (see
+> below).<Cite src="solidity-blog-custom-errors" />
+
+It has been wrong for nearly two years. `require(bool, error)` shipped in solc 0.8.26 on 21 May 2024
+for the via-IR pipeline and in 0.8.27 on 4 September 2024 for the legacy
+pipeline.<Cite src="solidity-changelog" /> The post has never been amended, it is the top result for
+its topic, and it is the reason a large fraction of Solidity written in 2026 still contains
+`if (!cond) revert Something();` written by people who believed they had no choice.
+
+This lesson is the current shape of the three constructs, one trap that catches even people who know
+the current shape, and a build-mode difference that decides the argument on its own.
+
+## Three overloads, and what each puts on the wire
+
+The documentation lists them plainly:<Cite src="solidity-docs-control-structures" />
+
+- `require(bool)` — reverts **without any data, not even an error selector**.
+- `require(bool, string)` — reverts with an `Error(string)`.
+- `require(bool, error)` — reverts with the custom error supplied as the second argument.
+
+Measured on solc 0.8.36, with the same failing condition and a message of the same meaning, the
+revert data is:<Cite src="measured-forge-1-7-1" />
+
+```text
+require(v > 10)
+  0x                                                                        0 bytes
+
+require(v > 10, "value too small for this operation")
+  0x08c379a0                                                              132 bytes
+    0000…0020   offset
+    0000…0022   length 34
+    76616c…     "value too small for this operation", padded to 64 bytes
+
+require(v > 10, TooSmall(v, 11))
+  0xe94fe3af                                                               68 bytes
+    0000…0001   got = 1
+    0000…000b   min = 11
+```
+
+The middle payload is 132 bytes rather than 100 because the message is 34 characters: four bytes of
+selector, an offset word, a length word, and 34 bytes padded up to two full
+words.<Cite src="solidity-abi-spec" /> Message length is charged, per character, on every revert.
+
+Notice what the third one buys that neither of the others can. The string says the value was too
+small. The custom error says it was 1 and needed to be 11. Getting *values* out of a failure is not
+a gas optimisation — it is the entire reason to prefer parameterised errors, and revert strings
+cannot do it without string concatenation nobody writes.
+
+Notice also what the error's *name* costs, which is nothing that scales. The documentation makes the
+point directly: with a custom error "you can use the name of the error to describe it, which is
+encoded in only four bytes", and a longer explanation belongs in NatSpec, which "does not incur any
+costs".<Cite src="solidity-docs-control-structures" /> A revert string is charged per character
+twice — once in the deployed bytecode that holds the literal and again in the payload — so authors
+shorten their messages until they stop being useful. An error's name is hashed and truncated to four
+bytes, so `WithdrawalExceedsAvailableCollateral` and `E1` cost the same on the wire. Name errors as
+carefully as you name functions; the wire does not care and every human reader does.
+
+## The bare `require` is not a message
+
+`require(cond)` deserves its own paragraph because almost everyone misreads what it does.
+
+It reverts with zero bytes. Not a generic error. Not a selector with an empty argument block.
+Nothing.<Cite src="solidity-docs-control-structures" /> The documentation says it twice, once in the
+overload list and once as a standalone note: "If you do not provide a string or custom error
+argument to `require`, it will revert with empty error data, not even including the error
+selector."<Cite src="solidity-docs-control-structures" />
+
+The string your users see comes from somewhere else entirely. In viem, when the revert data is
+absent or `0x`, the error's `reason` falls back to whatever message the JSON-RPC provider
+supplied.<Cite src="viem-contract-errors" /> "Execution reverted" is your node's phrasing of "the
+call failed and I have nothing to tell you". It is not from your contract, it is not standardised
+across providers, and it will change if you change providers.
+
+<Misconception
+  belief="require(cond) at least gives the client a generic 'execution reverted' message."
+  reality="It reverts with zero bytes. The message is invented downstream — by the node, or by the client library — to fill a gap where a payload should have been."
+  why="The generic string is delivered in the same field, on the same error object, as a real revert reason, so it is indistinguishable at the call site from something the contract said."
+  src="solidity-docs-control-structures"
+/>
+
+This makes the bare `require` strictly the worst of the three. It is not cheaper in any way that
+survives contact with an incident, and it destroys information at exactly the moment information is
+scarcest. The only defensible use is a condition that genuinely cannot fail — and if it genuinely
+cannot fail, you wanted `assert`.
+
+## The trap: arguments are evaluated on the happy path
+
+Here is where knowing the current syntax is not enough.
+
+`require` is a function, and the documentation is unusually direct about the consequence:
+
+> `require` arguments are evaluated unconditionally, so take special care to make sure that they are
+> not expressions with unexpected side-effects. For example, in
+> `require(condition, CustomError(f()));` and `require(condition, f());`, function `f()` will be
+> called regardless of whether the supplied condition is true or
+> false.<Cite src="solidity-docs-control-structures" />
+
+<Figure
+  caption="The two forms differ by where the branch sits: before the error is built, or after it."
+  alt="In the require form, f() is evaluated first, then the condition is tested, so f() has run on every call including successful ones. In the if-revert form, the condition is tested first and f() is evaluated only inside the failure branch."
+>
+  <Flow
+    lanes={['the form', 'happens first', 'happens second', 'on a successful call']}
+    nodes={[
+      { id: 'r0', label: 'require form', note: 'require(ok, E(f()))', col: 0, row: 0, tone: 'warn' },
+      { id: 'i0', label: 'if / revert form', note: 'if (!ok) revert E(f())', col: 0, row: 1, tone: 'good' },
+      { id: 'r1', label: 'evaluate f()', note: 'argument position', col: 1, row: 0, tone: 'warn' },
+      { id: 'i1', label: 'test ok', col: 1, row: 1, tone: 'good' },
+      { id: 'r2', label: 'test ok', col: 2, row: 0, tone: 'warn' },
+      { id: 'i2', label: 'evaluate f()', note: 'failure branch only', col: 2, row: 1, tone: 'good', dashed: true },
+      { id: 'r3', label: 'f() has run', note: 'gas and state, every time', col: 3, row: 0, tone: 'warn' },
+      { id: 'i3', label: 'f() never ran', col: 3, row: 1, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'r0', to: 'r1', tone: 'warn' },
+      { from: 'r1', to: 'r2', tone: 'warn' },
+      { from: 'r2', to: 'r3', tone: 'warn' },
+      { from: 'i0', to: 'i1', tone: 'good' },
+      { from: 'i1', to: 'i2', tone: 'good', dashed: true },
+      { from: 'i1', to: 'i3', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+Every boolean instinct you have says otherwise. `&&` short-circuits. A ternary evaluates one branch.
+An `if` body runs only when the test passes. `require` does none of that, because it is not a
+control-flow construct — it is a call whose arguments are laid out before it executes.
+
+### Worked demonstration
+
+This was run rather than reasoned about, on solc 0.8.36.<Cite src="measured-forge-1-7-1" />
+
+```solidity
+error NotEnough(uint256 have, uint256 need);
+
+contract Eager {
+    uint256 public calls;
+    function cost() internal returns (uint256) { calls++; return 7; }
+
+    function guarded(bool ok)   external { require(ok, NotEnough(cost(), 10)); }
+    function guardedIf(bool ok) external { if (!ok) revert NotEnough(cost(), 10); }
+}
+```
+
+**Subgoal: establish the baseline the reader expects.** `calls` starts at 0. Both functions are
+about to be invoked with `ok = true`, which is the *success* path in both cases. Intuition says
+`cost()` runs zero times.
+
+**Subgoal: run the `require` form on the happy path.** Call `guarded(true)`. It does not revert. It
+returns normally. `calls` reads **1**.
+
+**Subgoal: run the `if`/`revert` form on the same happy path.** Call `guardedIf(true)`. It does not
+revert either. `calls` still reads **1** — unchanged, because `cost()` was inside a branch that was
+not taken.
+
+**Subgoal: name what the difference costs.** On every successful call, the `require` version pays
+for `cost()` — its gas, and any state it touches. Here `cost()` writes storage, so the "guard" is
+performing a storage write on the happy path forever. If `cost()` could itself revert, the guard
+would be a new failure mode. If it read an oracle, every success would pay an external call.
+
+**Subgoal: generalise the rule correctly.** The problem is not `require`. It is *any* expression in
+argument position. `require(cond, MyError(a, b))` where `a` and `b` are plain local variables is
+completely fine and is the form you should reach for by default. What you must not do is put work
+inside the error constructor.
+
+<Misconception
+  belief="require(cond, CustomError(compute())) only calls compute() when the condition fails."
+  reality="Both arguments are evaluated before the check runs, so compute() executes on every successful call as well."
+  why="Short-circuit evaluation from && and || is so deeply learned that the argument position stops looking like an argument position. It reads as 'the failure branch', because that is the only place its value is ever used."
+  src="solidity-docs-control-structures"
+/>
+
+<Aside kind="note">
+The same rule applies inside a modifier, and for the same reason: a modifier's body is inlined
+around the `_` placeholder, so a `require` written in a modifier is a `require` written in the
+function. What a modifier does *not* do is add a layer of laziness. If the modifier's error
+constructor calls something, that call happens on every guarded invocation of every function the
+modifier decorates — which multiplies the cost by the number of decorated functions rather than
+containing it.
+</Aside>
+
+## The build-mode difference that settles it
+
+There is a compiler option, `--revert-strings strip`, that discards revert strings to shrink
+deployed bytecode. Teams reaching for it are usually near the contract size limit and have decided
+that error messages are the cheapest thing to give up.
+
+They give up more than they intend. Compiled with `--revert-strings strip` through the IR pipeline
+on solc 0.8.36, the same two functions from earlier produce:<Cite src="measured-forge-1-7-1" />
+
+```text
+require(v > 10, "value too small for this operation")
+  0x                                                                        0 bytes
+
+require(v > 10, TooSmall(v, 11))
+  0xe94fe3af 0000…0001 0000…000b                                           68 bytes
+```
+
+The string form silently degenerates into a bare `require` — the failure still happens, and now
+nothing at all comes back. The custom error form is untouched, arguments and all. Preserving the
+custom-error argument under stripping is a specific fix that landed in solc 0.8.35, recorded in the
+changelog under Yul IR code generation.<Cite src="solidity-changelog" />
+
+That is a sharper argument than any gas figure, and it does not depend on optimiser settings: under
+the size pressure that makes teams strip strings, custom errors are the only failure reporting that
+survives.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'require(cond)', note: 'no second argument', tone: 'danger' },
+    { title: 'require(cond, "…")', note: 'a revert string', tone: 'warn' },
+    { title: 'require(cond, MyError(…))', note: 'a custom error', tone: 'good' },
+  ]}
+  rows={[
+    {
+      label: 'What comes back on the wire?',
+      cells: [
+        'Zero bytes — not even a selector',
+        '0x08c379a0 and the encoded string: 132 bytes for a 34-character message',
+        'Your selector and its arguments: 68 bytes for two words',
+      ],
+    },
+    {
+      label: 'What can the user be told?',
+      cells: [
+        'Whatever the node invents',
+        'The sentence you wrote',
+        'The sentence you wrote, plus the values that caused it',
+      ],
+    },
+    {
+      label: 'What does the deployed bytecode carry?',
+      cells: [
+        'Nothing',
+        'The literal itself, charged per character',
+        'A four-byte constant, whatever the name is',
+      ],
+    },
+    {
+      label: 'What survives --revert-strings strip?',
+      cells: [
+        'Nothing to lose',
+        'Nothing — it degenerates into the first column',
+        'Everything, arguments included, since 0.8.35',
+      ],
+    },
+    {
+      label: 'When are the arguments evaluated?',
+      cells: [
+        'There are none',
+        'Always, but a literal costs nothing to evaluate',
+        'Always, before the check — so put no work in the constructor',
+      ],
+    },
+  ]}
+  caption="Three overloads that read almost identically at the call site and diverge at every point that matters after deployment."
+  alt="The three require overloads compared across what they put on the wire, what the user can be told, what the deployed bytecode carries, what survives revert-string stripping, and when their arguments are evaluated."
+/>
+
+## Which to reach for
+
+| Situation | Use | Because |
+|---|---|---|
+| Caller supplied bad input | `require(cond, MyError(values))` | Names the failure, carries the offending values, survives stripping |
+| Bad input, and building the error would do real work | `if (!cond) revert MyError(compute());` | Argument evaluation is lazy in this form and eager in `require` |
+| An invariant of your own code | `assert(cond)` | Produces `Panic(0x01)`, which correctly reads as "bug in this contract" |
+| Legacy code you are not rewriting today | leave the string | The refactor is safe but it is not free, and correctness is unchanged |
+| Anywhere | never `require(cond)` | Zero bytes of diagnostics for zero benefit |
+
+The `revert` statement and the `require` overload compile to equivalent code as long as the
+arguments have no side effects — the documentation states the equivalence and attaches exactly that
+condition.<Cite src="solidity-docs-control-structures" /> So the choice between them is a choice
+about evaluation order and readability, not about output.
+
+<Aside kind="warn">
+Two version pins if you write library code that others compile. `require(bool, error)` needs 0.8.27
+or later unless every consumer is on via-IR, where 0.8.26 suffices.<Cite src="solidity-changelog" />
+And `MyError.selector` in a `constant` expression needs 0.8.32 or later, because earlier versions
+did not treat error and event selectors as compile-time
+constants.<Cite src="solidity-changelog" /> Solidity 0.8.36, released 9 July 2026, is comfortably
+past both.<Cite src="solidity-0836-release" />
+</Aside>
+
+## `assert` has one job
+
+Nothing above changes what `assert` is for. It produces `Panic(uint256)` with code `0x01`, and the
+documentation's instruction is that properly functioning code should never create a panic, not even
+on invalid external input.<Cite src="solidity-docs-control-structures" />
+
+So `assert` is a claim, addressed to future readers and to analysis tools, that a condition is
+guaranteed by the code around it. Use it where you would write a comment saying "this cannot
+happen", and treat any production occurrence as a bug report against yourself. Use `require` for
+everything a caller could cause.
+
+The dividing question is short: **could a well-behaved caller trigger this?** Yes means `require`.
+No means `assert`. If you cannot answer, the check is doing two jobs and should be split.
+
+<Check type="spot-bug" concept="sol-require-args-eager">
+Review this excerpt from a lending contract. It compiles on solc 0.8.36 and its tests pass.
+
+```solidity
+error Undercollateralised(uint256 health, uint256 minimum);
+
+function borrow(uint256 amount) external {
+    require(!paused);
+    require(
+        healthFactorAfter(msg.sender, amount) >= MIN_HEALTH,
+        Undercollateralised(healthFactorAfter(msg.sender, amount), MIN_HEALTH)
+    );
+    _borrow(msg.sender, amount);
+}
+```
+
+`healthFactorAfter` is a `view` function that reads six storage slots and calls an external price
+oracle. Find every defect, in order of how much they cost.
+
+<Answer>
+**One: `healthFactorAfter` runs twice on every successful borrow.** `require`'s arguments are
+evaluated unconditionally, so the copy inside `Undercollateralised(...)` executes even when the
+condition holds.<Cite src="solidity-docs-control-structures" /> Every borrower pays for six extra
+storage reads and a second external oracle call, forever, to build an error that is discarded.
+
+This is also a correctness risk, not only a cost one. Two evaluations of an oracle-reading function
+are two separate reads. If the oracle updates between them — and in the same transaction it can, via
+any callback in between — the value reported in the error is not the value the check used.
+
+The fix is to evaluate once and reuse:
+
+```solidity
+uint256 health = healthFactorAfter(msg.sender, amount);
+require(health >= MIN_HEALTH, Undercollateralised(health, MIN_HEALTH));
+```
+
+Now there is one oracle read, the reported value is provably the value tested, and the error still
+carries both numbers.
+
+**Two: `require(!paused)` returns zero bytes.** A user hitting the pause gets an empty payload and
+their wallet invents a message for it.<Cite src="solidity-docs-control-structures" /> "Borrowing is
+paused" and "your position is undercollateralised" are completely different situations for a user,
+and this contract makes one of them indistinguishable from a node error. Give it an error of its
+own — a parameterless `error Paused();` costs four bytes on the wire.
+
+**Three, and it is not a bug in this file.** Nothing here tells a frontend that `Undercollateralised`
+exists unless the frontend holds *this* contract's ABI. If `borrow` is reached through a router or a
+proxy that the frontend actually talks to, the router's ABI will not contain this error at all, and
+the well-designed payload arrives as an unrecognised four-byte value. That is the next lesson.
+
+**What is not a defect.** Using `require` with a custom error is not a legacy pattern and does not
+need converting to `if (!cond) revert`. It has been supported since 0.8.26 on via-IR and 0.8.27 on
+the legacy pipeline.<Cite src="solidity-changelog" /> The `if`/`revert` form is worth choosing when
+the error's arguments are expensive to compute — but here the right fix removes the expense
+entirely, so either form is fine.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** is the third defect in that answer: a carefully designed error that the client
+cannot name, because ABIs do not compose the way call stacks do.
+
+**Reading other people's contracts** gets easier once `if (!cond) revert X();` reads as a date stamp
+rather than a style. It usually means the code predates 0.8.26, or its author read a page that
+does.<Cite src="solidity-blog-custom-errors" />
+
+**Gas work in Track 05** starts from the eager-evaluation rule, because a `require` whose second
+argument does work is one of the few optimisations that is unambiguously free — you delete
+computation from the success path without changing behaviour on the failure path.
+
+**Contract-size work** in the same track is where `--revert-strings strip` shows up for real, and
+where a codebase already on custom errors keeps its diagnostics while a codebase on strings loses
+all of them in one flag.

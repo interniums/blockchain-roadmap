@@ -1,0 +1,359 @@
+---
+id: toolchain-ci-the-baseline-job
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [foundry-ci, foundry-toolchain-action, foundry-dependencies, measured-forge-1-7-1, forge-test-reference, github-actions-cache, scopelift-foundry-template]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+The first CI run of every new Foundry repository fails, and it fails with this:
+
+```text
+Unable to resolve imports:
+      "forge-std/Test.sol" in "/home/runner/work/vault/vault/test/Vault.t.sol"
+      "forge-std/Script.sol" in "/home/runner/work/vault/vault/script/Vault.s.sol"
+with remappings:
+
+Error (6275): Source "forge-std/Script.sol" not found: File not found.
+```
+
+Read it as a reviewer would. It names an import. It prints the word *remappings* immediately above,
+followed by nothing. The natural next move is to open `remappings.txt` and start editing — and that
+is the wrong file. Nothing is wrong with the remappings. The directory they point into is
+empty.<Cite src="measured-forge-1-7-1" />
+
+This lesson is the four steps that have to work before any of the interesting layers in this module
+mean anything, and the two failures that eat the most hours: the one above, and the one where a
+pull request with a stray space burns eight minutes of runner time before anyone finds out.
+
+## The shape
+
+Foundry's own CI documentation gives one workflow, and it is worth reading as a specification rather
+than as a snippet to paste.<Cite src="foundry-ci" />
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  FOUNDRY_PROFILE: ci
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          cache: true
+
+      - name: Check formatting
+        run: forge fmt --check
+
+      - name: Run linter
+        run: forge lint --deny warnings
+
+      - name: Build
+        run: forge build
+
+      - name: Run tests
+        run: forge test -vvv
+
+      - name: Check gas snapshots
+        run: forge snapshot --check
+```
+
+<Figure
+  caption="Each step assumes the one above it succeeded, and the two that cost seconds sit above the ones that cost minutes."
+  alt="The baseline Foundry CI job as a vertical chain: actions/checkout with recursive submodules, the Foundry toolchain install, forge fmt --check, forge lint --deny warnings, forge build, forge test -vvv, and forge snapshot --check, each annotated with what it asserts."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'co', label: 'actions/checkout', note: 'submodules: recursive', col: 0, tone: 'accent' },
+      { id: 'fu', label: 'foundry-toolchain', note: 'installs the binary', col: 1 },
+      { id: 'fmt', label: 'forge fmt --check', note: 'exits 1 on a diff', col: 2 },
+      { id: 'lint', label: 'forge lint', note: '--deny warnings', col: 3 },
+      { id: 'build', label: 'forge build', note: 'the tree compiles', col: 4 },
+      { id: 'test', label: 'forge test -vvv', note: 'nothing reverted', col: 5 },
+      { id: 'snap', label: 'forge snapshot --check', note: 'gas matches the file', col: 6 },
+    ]}
+  />
+</Figure>
+
+Four load-bearing decisions are encoded there, and the rest of this module is layers added on top of
+them, each of which has to earn its runtime.
+
+**It runs on two events, not one.** Pushes to `main` and pull requests.<Cite src="foundry-ci" /> A
+pull-request run tests the *merge* of your branch into the base, which is not the same tree as your
+branch. The push run is what catches the case where two independently-green pull requests are red
+together — and it is also what populates the caches every later lesson depends on, because a cache
+written on the default branch is readable from other branches while the reverse is not.<Cite src="github-actions-cache" />
+
+**Dependencies come from the checkout, not from a package install.** There is no `npm ci` step,
+because there is no package manifest to install from. That is the whole content of
+`submodules: recursive`, and it is the next section.
+
+**Formatting and linting run before the build.** In the official workflow they are earlier steps of
+the same job. Whether they should be a *separate* job is a real decision with a real cost, and it
+comes later on this page.
+
+**`FOUNDRY_PROFILE: ci` is set at the workflow level**, so every step in every job picks it up. What
+that profile should contain is the [next lesson](/c/ci-profile).
+
+## Why the checkout is the failure
+
+`forge install` vendors a dependency by adding it as a git submodule under `lib/`, and the project
+layout you already know puts every dependency there rather than in a package
+directory.<Cite src="foundry-dependencies" /> That is a deliberate design choice, not an accident of
+history: the dependency is a commit, pinned by hash, with no resolver in the
+middle.<Cite src="foundry-dependencies" /> Your repository does not contain forge-std. It
+contains a 40-hex-character pointer to a commit in someone else's repository, recorded in
+`.gitmodules` and in the tree.
+
+`actions/checkout` does not fetch submodules unless told to.<Cite src="foundry-ci" /> So the runner
+gets your `src/`, your `test/`, your `foundry.toml`, your `remappings.txt` — and a `lib/` directory
+with nothing in it.
+
+### Reproducing it deliberately, so you recognise it instantly
+
+**Subgoal 1 — create the exact condition CI creates, on a machine where you can look at it.** A
+missing submodule and an empty `lib/` are the same state:
+
+```console
+$ rm -rf lib/forge-std
+$ forge build
+Unable to resolve imports:
+      "forge-std/Test.sol" in "…/test/Counter.t.sol"
+      "forge-std/Script.sol" in "…/script/Counter.s.sol"
+with remappings:
+
+Compiling 3 files with Solc 0.8.36
+Error: Compiler run failed:
+Error (6275): Source "forge-std/Script.sol" not found: File not found.
+```
+
+**Subgoal 2 — read the empty line, because it is the actual diagnosis.** `with remappings:` is
+followed by nothing.<Cite src="measured-forge-1-7-1" /> Foundry derives implicit remappings by
+looking at what is *in* `lib/`.<Cite src="foundry-dependencies" /> An empty `lib/` produces an empty
+remapping set, which produces a message that mentions remappings while telling you the opposite of
+what it looks like it is telling you. The mapping is not broken. There is nothing to map.
+
+**Subgoal 3 — confirm the fix restores the build and nothing else changed.**
+
+```console
+$ git submodule update --init --recursive
+$ forge build
+Compiler run successful!
+```
+
+In the workflow that is `submodules: recursive` on the checkout step. The `recursive` form matters
+if any dependency has dependencies of its own — a submodule's submodules are not fetched by the
+non-recursive form, and the resulting error is byte-for-byte the same message one level deeper.
+
+<Misconception
+  belief="`Source not found` in CI is a remappings problem, because the error prints the remapping list."
+  reality="It is almost always an unfetched submodule. Foundry generates implicit remappings from the contents of lib/, so an empty lib/ yields an empty remapping list and a message that points at the symptom."
+  why="The message puts the word 'remappings' directly above the import it could not resolve, and a blank list reads as a misconfigured list rather than an absent directory."
+  src="foundry-dependencies"
+/>
+
+<Aside kind="note">
+If your project uses a package manager instead of submodules — a choice covered in
+[dependency management](/c/dependency-management-choice) — this failure mode moves rather than
+disappears. The checkout no longer needs `submodules: recursive`, and instead needs the install step
+and a lockfile you actually commit. The invariant is the same: **CI must be able to reconstruct
+`lib/` from what is in the repository, with no interactive step and no ambient state.**
+</Aside>
+
+## The gates that cost seconds
+
+Two commands in that workflow do not run any of your tests, and both belong before the ones that do.
+
+`forge fmt --check` reformats nothing; it reports what it would change and exits non-zero if there
+is anything.<Cite src="foundry-ci" /> Against forge 1.7.1 the output is a unified diff and the exit
+code is 1:<Cite src="measured-forge-1-7-1" />
+
+```console
+$ forge fmt --check
+Diff in src/Ugly.sol:
+3        |-contract Ugly {   uint256   public x;
+4        |-  function set(uint256 v)   public {x=v;}
+    4    |+contract Ugly {
+    5    |+    uint256 public x;
+    6    |+
+    7    |+    function set(uint256 v) public {
+    8    |+        x = v;
+    9    |+    }
+$ echo $?
+1
+```
+
+`forge lint` is a first-party linter shipped inside the Foundry binary — not a separate Node
+dependency to install and pin.<Cite src="foundry-ci" /> Its interface on 1.7.1 is worth knowing
+precisely, because the flag most workflows copy is the deprecated spelling:<Cite src="measured-forge-1-7-1" />
+
+- `-D, --deny <LEVEL>` — "A compiler error will be triggered at the specified diagnostic level."
+  Values: `never`, `warnings`, `notes`. The help text states it **replaces the deprecated
+  `--deny-warnings` flag**.
+- `--severity <SEVERITY>...` — selects which lints run at all. Values: `high`, `med`, `low`, `info`,
+  `gas`, `code-size`.
+- `--only-lint <LINT_ID>...` — run one named lint, for example `incorrect-shift`.
+
+So `forge lint --deny warnings` from the official workflow means "run the default severity set, and
+treat any warning as an error".<Cite src="foundry-ci" /> If you want a gate that starts strict and
+stays quiet, `--severity high med --deny warnings` is the honest first setting: it fails on the
+findings that are defects rather than on style opinions, and you widen it deliberately.
+
+Both commands share three properties that matter more than what they check:
+
+- **They are fast.** No EVM, no fuzzing, no RPC. Both ship inside the binary the toolchain action
+  already installed, so there is nothing extra to fetch.<Cite src="foundry-toolchain-action" />
+- **They are deterministic.** The same input gives the same result on every runner, forever.
+- **They are actionable.** A red result names a file and a line, and the fix is
+  mechanical.<Cite src="measured-forge-1-7-1" />
+
+That combination is rare. Most of the checks in the rest of this module have at most two of the
+three, and the ones that have fewer are the ones people learn to ignore.
+
+### One job or two?
+
+The official workflow puts everything in a single `check` job.<Cite src="foundry-ci" /> Opinionated
+templates split it — the ScopeLift reference workflow runs tests, contract-size checks, coverage and
+static analysis as separate jobs.<Cite src="scopelift-foundry-template" /> Both are defensible, and
+the trade is concrete rather than aesthetic.
+
+<Compare
+  axis="One check job, or two?"
+  columns={[
+    { title: 'One job', note: "Foundry's own workflow" },
+    { title: 'Two jobs', note: 'opinionated templates' },
+  ]}
+  rows={[
+    { label: 'Where do fmt and lint run?', cells: ['Earlier steps of the same job', 'A job of their own'] },
+    { label: 'When does a formatting mistake go red?', cells: ['After every step above it has run', 'In well under a minute'] },
+    { label: 'What gets paid for twice?', cells: ['Nothing', 'A second checkout, a second Foundry install, a second submodule fetch'] },
+    { label: 'Which suite does this shape suit?', cells: ['One short enough that nobody walks away while it runs', 'One long enough that they do'] },
+    { label: 'What can a reviewer misread?', cells: ['Nothing — one ordered list of steps', 'Two red checks, one of which looks downstream of the other'] },
+  ]}
+  caption="One job pays the setup cost once and reports late; two jobs report in under a minute and pay it twice."
+  alt="The single-job and split-job CI shapes compared on where formatting and linting run, how soon a formatting mistake reports, what setup cost is duplicated, which suite length each suits, and how a reviewer can misread the result."
+/>
+
+A separate lint job means a pull request with a formatting mistake goes red in well under a minute
+instead of after the full suite. It also means paying the setup cost twice: a second checkout, a
+second Foundry install, and — on a repository with a large `lib/` — a second submodule fetch. On a
+suite that takes ninety seconds, splitting makes the *total* pipeline slower and the *feedback*
+barely faster. On a suite that takes twelve minutes with a fork stage, it is obviously right.
+
+The decision rule is the ratio, not the principle: **split when the expensive job costs enough that
+a developer will context-switch away while waiting.** Below that threshold, sequential steps in one
+job are simpler and cheaper.
+
+<Aside kind="warn">
+Splitting has one failure mode worth naming. If the lint job and the test job are independent, a
+pull request with both a formatting error and a broken test shows two red checks, and a reviewer who
+sees the formatting one first may assume the other is downstream of it. If you split, make the
+expensive job `needs:` the cheap one so it never runs on a tree that cannot pass the cheap one — the
+signal stays unambiguous and you stop paying for runs you were always going to discard.
+</Aside>
+
+## What a green baseline actually asserts
+
+It is worth being exact about this, because everything later in the module is a decision about what
+*else* to assert.
+
+A green run of the workflow above says: this tree compiles under the pinned compiler; every
+`test*` function that the runner discovered returned without reverting; the source is formatted; the
+default lint set found nothing above your denial level.<Cite src="forge-test-reference" /><Cite src="foundry-ci" />
+
+It says nothing about gas, nothing about which lines were never executed, nothing about whether the
+properties you care about survive an arbitrary sequence of calls, and nothing about whether the
+contract behaves the same against real mainnet state. Those are four separate feedback loops with
+four different latencies, and each of the remaining lessons adds one.
+
+<Misconception
+  belief="CI for a contract repository is 'run the tests', the same as any other service."
+  reality="It carries four loops at four latencies: lint in seconds, unit tests in minutes, a bounded random search in tens of minutes, a long campaign in hours. The failure of a contract pipeline is usually economic or probabilistic, not a red assertion."
+  why="On an application stack a regression is a failing test. On a contract, a regression can be a 4,000-gas increase nobody measured, or a state sequence nobody generated — neither of which any unit test will ever report."
+  src="foundry-ci"
+/>
+
+<Check type="spot-bug" concept="submodule-checkout">
+A repository's first workflow, written by someone porting habits from a TypeScript service:
+
+```yaml
+on: [pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge test
+      - run: forge fmt --check
+```
+
+It has four defects. Name them, and say which one produces the confusing error.
+
+<Answer>
+**1. No `submodules: recursive`, and this is the confusing one.** `lib/` arrives empty, Foundry
+derives an empty remapping set from it, and the build fails with `Source "forge-std/Test.sol" not
+found` printed under a blank `with remappings:` heading.<Cite src="foundry-dependencies" /><Cite src="measured-forge-1-7-1" />
+Everyone's first instinct is to edit `remappings.txt`, which is intact. Add:
+
+```yaml
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+```
+
+**2. It never runs on `main`.** With only `pull_request`, nothing checks the default branch after a
+merge — so two individually-green pull requests that conflict semantically both land, and nobody
+finds out until the next unrelated pull request goes red. It also means no cache is ever written on
+the default branch, and default-branch caches are the ones other branches can read.<Cite src="github-actions-cache" />
+Add `push: branches: [main]`.
+
+**3. `forge fmt --check` runs last.** It costs a second and it is the most likely thing to be wrong
+on a first-time contributor's pull request. Running it after the suite means paying for the suite to
+learn about a space. Move it above `forge test` — the official workflow puts formatting and linting
+before the build for exactly this reason.<Cite src="foundry-ci" />
+
+**4. No `FOUNDRY_PROFILE`, no version pin, no `cache`.** The toolchain action's `version` input
+defaults to a *channel*, so the binary running these tests can change between two runs of this same
+commit; `cache` defaults on but has nothing to cache without a fork suite.<Cite src="foundry-toolchain-action" />
+Both are the next lesson.
+
+**One thing that is not a defect:** the absence of `forge build` as its own step. `forge test`
+compiles what it needs. Keeping an explicit build step is still worth it in a pipeline that splits
+jobs, because it turns "compile error" into a distinct red step rather than a red test run — a
+distinction that matters a lot once anything is parsing results.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** takes the workflow above and asks the question this one deliberately skipped:
+what, in that YAML, can change without anyone editing the repository? The answers are the action
+tags, the Foundry channel, and the compiler — and one of them has a CVE attached.
+
+**Lessons 3 through 6** each add one layer to this job and, for each, give the reason not to. Fork
+caching, a gas-diff comment, a coverage report, a bounded fuzz gate. Every one of them makes the
+pipeline slower and some of them make it less trustworthy, which is why the baseline is worth
+holding in your head as the thing they are added *to*.
+
+**The transferable rule** is about diagnosability, and it generalises well past Foundry: when a tool
+reports a missing input, check whether the input is missing or whether the *source* of the input is
+missing. Foundry's remapping list is derived state. An empty derived list means an empty source,
+and the error message can only ever name the derived thing.

@@ -1,0 +1,332 @@
+---
+id: solidity-errors-events-what-a-log-actually-is
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solidity-docs-contracts, solidity-abi-events, solidity-abi-spec, solidity-changelog, solidity-0836-release, execution-specs-osaka-log, measured-forge-1-7-1]
+stack: { solidity: "0.8.36", foundry: "1.7.1" }
+---
+
+Here is what one `emit` compiles to. Not a paraphrase — this is the compiler's own intermediate
+representation for `emit Paid(msg.sender, a)`, from `forge inspect ... ir` on solc
+0.8.36, with only the source-location comments removed:<Cite src="measured-forge-1-7-1" />
+
+```text
+let _2 := 0x737c69225d647e5994eab1a6c301bf6d9232beb2759ae1e27a8966b4732bc489
+let _3 := convert_t_address_to_t_address(expr_14)
+{
+    let _4 := allocate_unbounded()
+    let _5 := abi_encode_tuple_t_uint256__to_t_uint256__fromStack(_4, expr_15)
+    log2(_4, sub(_5, _4), _2, _3)
+}
+```
+
+Six lines, one opcode, no call frame. You already know
+[what a log record looks like](/c/log-record-shape) and
+[that its first topic is a signature hash](/c/topic0-is-the-signature). This lesson is the layer in
+between: what the Solidity `event` declaration actually instructs the compiler to do, which parts of
+your declaration survive into the record and which are thrown away at compile time, and one
+consequence of the mechanism that no amount of design cleverness can route around.
+
+## Reading the compiler's output
+
+**Subgoal: find where the event's identity went.** Line one loads a 32-byte literal. That value is
+`keccak256("Paid(address,uint256)")`, computed by the compiler and baked into the bytecode as a
+constant.<Cite src="measured-forge-1-7-1" /> The string `"Paid(address,uint256)"` does not appear in
+the deployed contract anywhere. It was consumed at compile time.
+
+**Subgoal: watch an indexed parameter become a topic.** Line two takes `msg.sender`, cleans it to a
+valid `address`, and leaves it on the stack. That is the whole treatment: an indexed value of a type
+that fits in 32 bytes is padded and pushed. It never touches memory.
+
+**Subgoal: watch the non-indexed parameters become a byte string.** `allocate_unbounded()` is
+literally `mload(64)` — it reads [the free memory pointer](/c/solidity-free-memory-pointer) and
+returns it. `abi_encode_tuple_...` writes the encoded non-indexed arguments there and returns the
+address just past the end. The length handed to `log2` is the difference.
+
+**Subgoal: notice what did *not* happen to memory.** There is no `mstore(64, ...)` after the encode.
+The free memory pointer is never advanced. The event's data is written above it as scratch, consumed
+by the `LOG` opcode in the same breath, and the next allocation in the function overwrites it. An
+`emit` borrows memory; it does not allocate it. It can still push the high-water mark and trigger
+memory expansion, which is the term the next lesson has to price.
+
+**Subgoal: name the opcode and count its operands.** `log2(offset, length, topic0, topic1)`. Two
+topics, so `LOG2`. The compiler picks the opcode from how many topics the event needs — signature
+plus indexed parameters — and there are only five to pick from, `LOG0` through
+`LOG4`.<Cite src="execution-specs-osaka-log" />
+
+The thing to take from this is what `emit` is not. It is not a function call. There is no callee, no
+frame, no gas forwarding, no return value, no possibility of a "failed emit" you could catch. A
+Solidity `event` is a *typed façade over four stack pushes and one instruction*, and every property
+events have — their cost, their invisibility to contracts, their behaviour under revert — follows
+from that and not from anything Solidity added.
+
+<Aside kind="note">
+One place the façade leaks in a way worth knowing. Emitting is classified by the compiler as
+modifying state: declaring a function `view` and emitting inside it fails with error 8961, "Function
+cannot be declared as view because this expression (potentially) modifies the
+state."<Cite src="measured-forge-1-7-1" /> Logs are not state — they never enter the state trie —
+but they are an observable effect, `LOG` is forbidden in a static context at the EVM level, and the
+mutability system draws its line there.<Cite src="execution-specs-osaka-log" />
+</Aside>
+
+## What the declaration controls
+
+An event declaration does exactly three things, and it is worth separating them because they have
+very different blast radii.
+
+**It fixes the canonical signature**, and therefore `topics[0]`. The signature is the event name
+followed by the parameter types in declaration order, canonicalised the same way a function
+signature is.<Cite src="solidity-abi-events" /> Note what is *not* in it: parameter names, and the
+`indexed` markers. All parameter types appear, indexed or not.
+
+**It partitions the parameters.** The specification splits them into two sub-series: those marked
+`indexed`, which become topics alongside the signature hash, and those not marked, which "form the
+byte array of the event".<Cite src="solidity-abi-events" /> Up to three parameters may be indexed on
+a non-anonymous event; solc 0.8.36 refuses a fourth with error 7249, "More than 3 indexed arguments
+for event".<Cite src="measured-forge-1-7-1" />
+
+<Figure
+  caption="A log has the one thing revert data does not: an address field the EVM fills in, and fixed-width slots an indexer can filter on without decoding anything."
+  alt="A log record: a 20-byte emitter address written by the EVM, then topic zero holding the keccak hash of the canonical event signature, then up to three further 32-byte topics holding the indexed parameters, then a variable-length data field holding the ABI encoding of the non-indexed parameters."
+>
+  <ByteLayout
+    fields={[
+      { label: 'address', size: 20, tone: 'good', note: 'the EVM writes it' },
+      { label: 'topics[0]', size: 32, tone: 'accent', note: 'keccak(signature)' },
+      { label: 'topics[1]', size: 32, note: '1st indexed' },
+      { label: 'topics[2]', size: 32, note: '2nd indexed' },
+      { label: 'topics[3]', size: 32, note: '3rd indexed' },
+      { label: 'data', variable: true, tone: 'muted', note: 'the non-indexed tuple' },
+    ]}
+  />
+</Figure>
+
+**It fills in an ABI JSON entry** with `type: "event"`, a `name`, an `inputs` array where every entry
+carries an `indexed` boolean, and an `anonymous` boolean.<Cite src="solidity-abi-spec" /> That JSON
+is the *only* place the partition survives. The log itself records neither which parameters were
+indexed nor what the event was called — the documentation states it plainly: "Since the transaction
+log only stores the event data and not the type, you have to know the type of the event, including
+which parameter is indexed and if the event is anonymous in order to correctly interpret the
+data."<Cite src="solidity-docs-contracts" />
+
+Events may be declared at file level, or as inheritable members of contracts, interfaces and
+libraries.<Cite src="solidity-docs-contracts" /> File-level event declarations arrived in solc
+0.8.22.<Cite src="solidity-changelog" /> Declaring a system's events on its interfaces is the same
+habit that works for errors, and unlike errors it pays off fully, for the reason at the end of the
+last lesson: a log carries its emitter's address as a field the EVM writes, so an event's identity
+and its origin arrive together.
+
+<Aside kind="warn">
+Two version notes for anyone writing library code. `MyEvent.selector`, which yields the `bytes32`
+topic0 of a non-anonymous event, was not treated as a compile-time constant before solc
+0.8.32.<Cite src="solidity-docs-contracts" /><Cite src="solidity-changelog" /> And solc 0.8.36
+turned `@return` in event NatSpec from accepted into an error, which is a small but real break for
+codebases with older documented events.<Cite src="solidity-changelog" /><Cite src="solidity-0836-release" />
+</Aside>
+
+## The data field is a return tuple
+
+The non-indexed parameters are not appended one after another. They are ABI-encoded *as a group*, by
+the same routine, under the same rules, that encodes a function's return values — the specification
+says so directly, describing the data as the encoding of the non-indexed arguments using "the ABI
+encoding function used for returning a series of typed values from a
+function".<Cite src="solidity-abi-events" />
+
+So [head and tail](/c/abi-head-tail) apply, in full. Every non-indexed parameter contributes one
+head word; dynamic ones put an offset there and their contents in the tail.
+
+And here is the part that catches people, because it is invisible in the declaration: **the head is
+sized over the non-indexed subsequence, not over the parameter list.** Moving `indexed` from one
+parameter to another does not only change which topic slot is occupied — it changes how many head
+words the data field has, and therefore every offset inside it.
+
+### Worked decode: one real log
+
+Emitted on solc 0.8.36 and captured with `vm.recordLogs`:<Cite src="measured-forge-1-7-1" />
+
+```solidity
+event Settled(bytes32 indexed id, string indexed venue, string venueText, uint256 amount);
+// emit Settled(bytes32(uint256(7)), "binance", "binance", 42);
+```
+
+```text
+topics[0] f8cf82270b9e2adbca175de93de061f0dbde60658b7e8929a6db26b8daf1f0f3
+topics[1] 0000000000000000000000000000000000000000000000000000000000000007
+topics[2] 099e8cf4d817a6e4eec62bff4cdef05faa4a00fcde8d7e99f5090708d23ad9b2
+
+data
+[  0]     0000000000000000000000000000000000000000000000000000000000000040
+[ 32]     000000000000000000000000000000000000000000000000000000000000002a
+[ 64]     0000000000000000000000000000000000000000000000000000000000000007
+[ 96]     62696e616e636500000000000000000000000000000000000000000000000000
+```
+
+**Subgoal: predict the topic count from the declaration before looking.** One non-anonymous event,
+so one signature topic; two indexed parameters, so two more. Three topics, therefore `LOG3`.
+
+**Subgoal: identify the record.** `topics[0]` is `keccak256("Settled(bytes32,string,string,uint256)")`
+— all four types, including the two that are not indexed and the two that are.
+
+**Subgoal: read the indexed values.** `topics[1]` is the `bytes32` id, whole and readable, because
+`bytes32` fits a topic exactly. `topics[2]` is not the venue. It is
+`keccak256(bytes("binance"))`, which the next lesson takes apart properly.
+
+**Subgoal: size the data head, and get this right.** The non-indexed subsequence is
+`(string venueText, uint256 amount)` — two parameters, so a two-word head, 64 bytes. The parameters
+that went to topics are not in this count. Byte 0 holds `0x40` = 64, which is exactly the head size,
+because `venueText` is the first dynamic argument.
+
+**Subgoal: read the tail.** At byte 64, a length of 7; at byte 96, `62696e616e6365` — "binance" —
+right-padded to fill the word. The static `amount` sat inline in the head at byte 32: `0x2a` = 42.
+
+**Subgoal: run the counterfactual.** Delete `indexed` from `venue`. Now the non-indexed subsequence
+is `(string venue, string venueText, uint256 amount)`: a three-word head, 96 bytes, and the first
+offset word becomes `0x60`. Every byte position in the data field moves. `topics[0]` does not change
+at all, because `indexed` is not part of the signature. A consumer filtering on `topics[0]` still
+matches, and then decodes garbage. That is the failure mode to remember from this lesson: the marker
+that survives the edit is not the marker that describes the layout.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'venue indexed', note: 'as declared', tone: 'accent' },
+    { title: 'venue not indexed', note: 'one word deleted', tone: 'danger' },
+  ]}
+  rows={[
+    {
+      label: 'What is topics[0]?',
+      cells: [
+        'keccak of Settled(bytes32,string,string,uint256)',
+        'The same hash, byte for byte',
+      ],
+    },
+    { label: 'How many topics?', cells: ['Three, so LOG3', 'Two, so LOG2'] },
+    { label: 'How wide is the data head?', cells: ['Two words, 64 bytes', 'Three words, 96 bytes'] },
+    { label: 'What does the first offset word read?', cells: ['0x40', '0x60'] },
+    { label: 'Does a deployed topic filter still match?', cells: ['Yes', 'Yes — which is the problem'] },
+    {
+      label: 'Does a deployed decoder still work?',
+      cells: ['Yes', 'No, and nothing anywhere reports it'],
+    },
+  ]}
+  caption="Two events with one identity and two incompatible layouts: the ABI JSON is the only artifact that records which one you are looking at."
+  alt="The Settled event compared with and without indexed on its venue parameter: topic zero is unchanged, the opcode drops from LOG3 to LOG2, the data head grows from two words to three, the first offset word changes from 0x40 to 0x60, deployed topic filters keep matching, and deployed decoders silently break."
+/>
+
+## No contract will ever read this back
+
+The Solidity documentation puts it in one clause, inside a paragraph about where logs live: "The Log
+and its event data are not accessible from within contracts (not even from the contract that created
+them)."<Cite src="solidity-docs-contracts" />
+
+There is no read instruction. Not a restricted one, not an expensive one — the `LOG` family is
+write-only by construction, and logs go to the receipt rather than to the state
+trie.<Cite src="execution-specs-osaka-log" /> No opcode takes a log as input. This is not a
+limitation the compiler could lift.
+
+The documentation does describe one thing that sounds like an exception and is not:
+
+> It is possible to request a Merkle proof for logs, so if an external entity supplies a contract
+> with such a proof, it can check that the log actually exists inside the blockchain. You have to
+> supply block headers because the contract can only see the last 256 block
+> hashes.<Cite src="solidity-docs-contracts" />
+
+Read that carefully against what you know about [receipt tries](/c/receipt-contents). The contract is
+not reading a log. Somebody hands it a claim and a proof, and it verifies the proof against a
+block hash — and it can only anchor against the last 256 block hashes, roughly fifty minutes on
+mainnet, unless the header is itself established some other way. That is a verification primitive
+for bridge-shaped problems, not a query interface, and it costs vastly more than the storage write
+it would be replacing.
+
+<Misconception
+  belief="A contract can read its own past events, or at least check whether it emitted one."
+  reality="Logs are written into the transaction receipt, never into state, and no EVM instruction reads one back — including for the contract that emitted it."
+  why="'Emitting an event' sounds like appending to a durable, queryable record, which is exactly what it is for everyone outside the EVM. The asymmetry is that the audience for a log is never on chain."
+  src="solidity-docs-contracts"
+/>
+
+The design rule that follows is short and worth applying mechanically. **Any value your contract
+logic will need to consult later must be in storage.** Events are for consumers outside the machine.
+When you need both — durable on-chain checkability and cheap off-chain readability — the shape is
+the one Track 03 arrived at from the gas side: put a commitment in storage and the full value in the
+log, and have the reader supply the value back for checking against the commitment.
+
+<Check type="predict" concept="sol-event-data">
+A contract declares:
+
+```solidity
+event OrderFilled(
+    address indexed maker,
+    address indexed taker,
+    bytes32 orderHash,
+    uint256 price,
+    bytes signature
+);
+```
+
+Answer four questions without compiling anything.
+
+1. Which `LOG` opcode does `emit OrderFilled(...)` produce?
+2. How many words does the data field's head occupy, and what does each contain?
+3. A teammate proposes marking `orderHash` as `indexed` so it can be filtered on. What changes in
+   `topics[0]`, in the topics, and in the data?
+4. Someone asks whether a later `disputeOrder` function can check that a given order was filled by
+   reading the event. What do you tell them?
+
+<Answer>
+**1 — `LOG3`.** One signature topic plus two indexed parameters. The event is not anonymous, so
+`topics[0]` is present.<Cite src="solidity-abi-events" />
+
+**2 — three words.** The non-indexed subsequence is `(bytes32 orderHash, uint256 price, bytes
+signature)`, and every argument contributes exactly one head word regardless of its
+type.<Cite src="solidity-abi-events" /><Cite src="solidity-abi-spec" />
+
+- word 0: `orderHash`, inline — `bytes32` is static.
+- word 1: `price`, inline — `uint256` is static.
+- word 2: an *offset* to the signature's contents, which will be `0x60` = 96, because the head is 96
+  bytes and this is the first dynamic argument. The tail then holds a length word and the padded
+  bytes.
+
+**3 — `topics[0]` does not change; everything else does.** The canonical signature is
+`OrderFilled(address,address,bytes32,uint256,bytes)` before and after, because `indexed` is not part
+of it.<Cite src="solidity-abi-events" /> The event becomes `LOG4`: `orderHash` moves into
+`topics[3]`, whole and readable, since `bytes32` fits a topic. And the data head drops to two words,
+so the offset that used to read 96 now reads 64 and the entire tail shifts down by 32 bytes.
+
+That combination is the dangerous one. Every deployed filter keyed on `topics[0]` keeps matching
+after the change, and every deployed decoder built against the old ABI reads the offset word from the
+wrong position and produces plausible-looking nonsense. Nothing errors — not the compiler, not the
+node, not the indexer.
+
+**4 — no, and not "not efficiently": not at all.** No instruction reads a log, and that includes the
+contract that emitted it.<Cite src="solidity-docs-contracts" /> If `disputeOrder` must know that an
+order was filled, `OrderFilled` was the wrong and only mechanism, and the fill has to leave something
+in storage.
+
+The cheap version is a commitment rather than the whole record: store `orderHash` as a key in a
+mapping to a boolean or a timestamp — one slot per fill — and keep emitting the full event for the
+indexer. `disputeOrder` then checks the mapping, and anything richer the disputant needs (the price,
+the signature) they supply as calldata and the contract checks against the hash it stored.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** is the decision this one deliberately deferred: which parameters to mark
+`indexed`, what each topic costs on every emission, and why an indexed `string` is a one-way door.
+
+**Reading a raw log** in an explorer or an indexer's dead-letter queue is now mechanical: count the
+topics to recover the opcode, hash candidate signatures to identify the event, then decode the data
+field as a tuple of the non-indexed types — checking that the head size matches the number of
+non-indexed parameters, which is the fastest way to catch an ABI that has drifted from the contract.
+
+**Storage versus events** is a decision you will make on every feature. The rule from this lesson is
+absolute rather than economic: on-chain readers force storage, off-chain readers permit logs, and no
+gas argument moves the boundary.
+
+**Upgrades and migrations** are where the counterfactual in the worked example becomes an incident.
+A signature change breaks loudly, because filters stop matching. An `indexed` change breaks silently,
+because they do not. The last lesson of this module is about which edits to an event you are
+committing never to make.

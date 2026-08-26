@@ -1,0 +1,376 @@
+---
+id: altvm-solana-security-attacker-supplied
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [sealevel-attacks, fuzz-on-the-beach, neodyme-workshop, helius-solana-security-guide, cantina-securing-solana, solana-docs-accounts, solana-docs-account-modification-rules, solana-docs-cpi-execution, solana-docs-transactions, anchor-account-constraints, helius-solana-hacks]
+stack: {}
+---
+
+Here is a Solidity function you have read a hundred times.
+
+```solidity
+function withdraw(uint256 amount) external {
+    require(balances[msg.sender] >= amount, "insufficient");
+    balances[msg.sender] -= amount;
+    payable(msg.sender).transfer(amount);
+}
+```
+
+Count the things the caller controls. One: `amount`. Everything else — who `msg.sender` is, which
+storage slot `balances[msg.sender]` resolves to, what bytes live in that slot — is decided by the
+machine and by the contract, and the caller has no way to influence any of it. The EVM computes the
+sender from a signature it verified before your code ran, and the callee, not the caller, decides
+which state it reads.
+
+Now the same operation on Solana. The caller supplies `amount`, and also supplies the vault account,
+the user's record account, the authority account, the token program, the destination token account,
+and the system program — every one of them as a raw 32-byte address in a list attached to the
+transaction, and every one of them chosen freely by whoever built that transaction.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'The EVM', note: 'the machine answers', tone: 'muted' },
+    { title: 'The SVM', note: 'the program answers', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'Who is the sender?',
+      cells: [
+        <>The machine computes it from a signature verified before your code ran</>,
+        { v: <>An <code>is_signer</code> flag per account, and no ambient value to fall back on</>, tone: 'warn' },
+      ],
+    },
+    {
+      label: 'Which state does the code read?',
+      cells: [
+        'Whatever the callee reaches for; the caller cannot redirect it',
+        { v: 'Every byte arrives as an account the caller chose', tone: 'warn' },
+      ],
+    },
+    {
+      label: 'Who decides it is the right state?',
+      cells: [
+        'The machine — storage is reached through the contract that owns it',
+        { v: 'Your program. The runtime protects only its own ownership invariant', tone: 'warn' },
+      ],
+    },
+    {
+      label: 'What happens when the wrong one is passed?',
+      cells: [
+        'Usually a revert: a missing selector, or bytes that fail to decode',
+        { v: 'Deserialization succeeds and execution continues on someone else’s data', tone: 'danger' },
+      ],
+    },
+  ]}
+  caption="Both platforms let you reach for the wrong thing. Only one of them tells you."
+  alt="EVM and SVM compared on four questions: who the sender is, which state the code reads, who decides the state is right, and what happens when the wrong account or address is supplied."
+/>
+
+That is the whole subject of this module. Not a new class of bug: a new *default*. The two properties
+the EVM hands you for nothing — an authenticated sender and callee-controlled state access — are
+absent here, and every vulnerability class in the Solana taxonomy is what happens when a program
+assumed one of them anyway.
+
+## What the runtime actually promises
+
+Start from the guarantees, because they are narrow enough to state completely and they are almost
+never stated completely.
+
+**Subgoal: name what the runtime checks before your program runs.** The transaction's signatures are
+verified. Every account listed as a signer produced a valid Ed25519 signature over the message, and
+each signature is 64 bytes.<Cite src="solana-docs-transactions" /> The account list itself is
+size-limited — a maximum of 64 accounts per transaction, and the whole transaction must fit in 1,232
+bytes, derived from the IPv6 minimum MTU of 1,280 bytes minus 48 bytes of network
+headers.<Cite src="solana-docs-transactions" /> The blockhash it references must be recent: valid for
+150 slots.<Cite src="solana-docs-transactions" />
+
+**Subgoal: name what the runtime checks after each instruction.** Only the account's owner program
+can modify its data or debit its lamports; any program can credit lamports to any writable
+account.<Cite src="solana-docs-accounts" /> The runtime enforces that after each instruction executes,
+and rolls the transaction back if a check fails — a lamport debit by a non-owner raises
+`ExternalAccountLamportSpend`, a data write by a non-owner or an unauthorised owner reassignment
+raises `ModifiedProgramId`.<Cite src="solana-docs-account-modification-rules" /> Owner reassignment
+additionally requires that the account be writable and that its data be
+zero-initialised.<Cite src="solana-docs-account-modification-rules" />
+
+**Subgoal: state the residue.** That is the list. The runtime does not claim that an account holds
+the data your program expects, that it is the instance the caller is entitled to act on, that it has
+any relationship to any other account in the same instruction, or that the program you were handed
+under the name "the token program" is the token program.
+
+Read that as a security boundary and it is a strange one. The runtime protects *its own* invariant —
+nobody writes state they do not own — and delegates the whole question of whether the right state was
+passed in to the program. Which is to say: to you.
+
+<Misconception
+  belief="Solana programs cannot have reentrancy, so they are structurally safer than Solidity contracts."
+  reality="The reentrancy rule is real but narrow, and the account-validation class it does not touch has no EVM equivalent at all. That class is what the canonical Solana taxonomy is made of, and it has cost more money on Solana than reentrancy ever did on Ethereum."
+  why="People arriving from one platform compare a new one against the vulnerability list they already know, and score it on the entries that happen to be missing."
+  src="sealevel-attacks"
+/>
+
+Since the reentrancy claim is the first thing every EVM engineer says about Solana, it is worth
+getting exactly right rather than approximately right, because the approximate version is backwards.
+The runtime's rule, as documented: a program calling **itself** directly, A to A, is *allowed*; a
+program A calling B which calls back into A — indirect reentrancy — is *rejected* with
+`ReentrancyNotAllowed`.<Cite src="solana-docs-cpi-execution" /> Maximum instruction stack depth is 5,
+rising to 9 with SIMD-0268, so a program can nest cross-program invocations up to 4 levels deep, or 8
+under that SIMD.<Cite src="solana-docs-cpi-execution" />
+
+So the shape of the classic Ethereum reentrancy attack — your contract calls out, the callee calls
+back in before your state settled — is genuinely blocked at the runtime level. That is a real
+property and it is worth something. It is also the *only* item on the EVM vulnerability list that
+Solana closes for free, and it removes nothing from the list this module is about.
+
+The runtime is similarly precise about privileges across a call boundary, and the rules are worth
+reading now because lesson 4 depends on them. A cross-program invocation extends the caller's
+privileges to the callee with strict enforcement: if the caller marked an account read-only, the
+callee cannot mark it writable, and the attempt raises
+`PrivilegeEscalation`.<Cite src="solana-docs-cpi-execution" /> An account can be a signer in the
+callee only if it was already a signer in the caller, or if it is a PDA derived from the caller's own
+seeds; otherwise the runtime refuses.<Cite src="solana-docs-cpi-execution" /> Privilege, in other
+words, can only ever shrink as you descend — which is exactly the guarantee that
+[delegatecall](/c/delegatecall-is-the-proxy-primitive) does not give you on the EVM, where the callee
+executes with the caller's full authority over the caller's own storage.
+
+## The three questions
+
+Every account an instruction touches raises exactly three questions, and the entire classic taxonomy
+is what happens when one of them goes unasked.
+
+<Matrix
+  corner="Question"
+  cols={['What the code compares', 'If it goes unasked']}
+  rows={[
+    {
+      label: '1. Who owns it?',
+      cells: [
+        <><code>account.owner</code> against the program id you expect</>,
+        { v: 'The data inside was written by someone else, and someone else may be the attacker', tone: 'danger' },
+      ],
+    },
+    {
+      label: '2. Did it sign?',
+      cells: [
+        <><code>is_signer</code> on this account</>,
+        { v: 'Naming an account as an authority proves nothing, and there is no implicit sender to fall back on', tone: 'danger' },
+      ],
+    },
+    {
+      label: '3. Is it the one?',
+      cells: [
+        'A field stored inside one account against the key of another in the same instruction, or an address re-derived from seeds',
+        { v: 'Owner and type both pass for someone else’s vault; only a relational check separates them', tone: 'danger' },
+      ],
+    },
+  ]}
+  caption="Each question is one comparison, and each unasked question is a whole branch of the taxonomy."
+  alt="The three account questions — who owns it, did it sign, is it the one — each paired with the comparison that answers it and the consequence of skipping it."
+/>
+
+The first two are the ones people ask. They feel like a complete audit because they establish what an
+account *is*: a record of the right shape, written by the right program, presented by a key that
+consented. The third establishes *whose* it is, and it is structurally different — it is a statement
+about the relationship between two accounts, not a property of either one alone.
+
+**Subgoal: notice why the third gets skipped.** Questions 1 and 2 are answerable by looking at a
+single account. Question 3 is not answerable by looking at a single account at all: it requires
+comparing a field stored inside one account against the key of another account in the same
+instruction, or re-deriving an address from seeds that include the caller. Reviewers scanning a struct
+field by field find the first two and structurally cannot find the third, because the third is not in
+any single field.
+
+This is why the [three questions](/c/three-questions-per-account) are worth carrying as a literal
+checklist rather than as a sensibility. A sensibility catches the questions that are visible on the
+account. A checklist catches the one that is not.
+
+## Mapping the taxonomy onto the questions
+
+The canonical reference is `coral-xyz/sealevel-attacks`, which describes itself as examples of common
+exploits unique to the Solana programming model together with recommended idioms for avoiding them
+using the Anchor framework, each program deliberately incomplete so that one issue and one fix show
+in isolation.<Cite src="sealevel-attacks" /> Its eleven numbered classes are signer authorization,
+account data matching, owner checks, type cosplay, initialization, arbitrary CPI, duplicate mutable
+accounts, bump seed canonicalization, PDA sharing, closing accounts, and sysvar address
+checking.<Cite src="sealevel-attacks" /> An audit firm's independently maintained checklist covers the
+same ground under the same names and adds account reloading, plus a separate list of general pitfalls
+including integer overflow, precision loss, division by zero, unhandled errors, writability checks
+and timely state reset.<Cite src="cantina-securing-solana" />
+
+Sorted by which question is missing:
+
+<Matrix
+  corner="Missing question"
+  cols={['Classes it accounts for', 'Answerable by looking at']}
+  rows={[
+    {
+      label: 'Q1 — who owns it',
+      cells: [
+        'owner checks · sysvar address checking · type cosplay (owner passes, type does not)',
+        'the account alone',
+      ],
+    },
+    {
+      label: 'Q2 — did it sign',
+      cells: [
+        'signer authorization (SlowMist: "missing check for the permission of caller")',
+        'the account alone',
+      ],
+    },
+    {
+      label: 'Q3 — which instance',
+      cells: [
+        'account data matching · PDA sharing · bump seed canonicalization · arbitrary CPI (which program is the instance)',
+        { v: 'two accounts, or an address re-derived from seeds', tone: 'warn' },
+      ],
+    },
+    {
+      label: 'not an account question at all',
+      cells: [
+        'initialization / reinitialization · closing accounts / revival · duplicate mutable accounts · integer overflow',
+        { v: 'the account across time, or one key in two positions of the same struct', tone: 'warn' },
+      ],
+    },
+  ]}
+  caption="The column that predicts whether a reviewer finds the bug is the second one, not the first."
+  alt="The canonical Solana vulnerability classes sorted by which of the three account questions is missing, with a fourth group that no account question reaches, and what each group requires the reviewer to look at."
+/>
+
+That last group matters. Several classic classes are not answered by any of the three questions,
+because they are not about *which* account you were handed — they are about lifecycle and aliasing.
+Lesson 6 is entirely about that group, and is the longest lesson here for a reason.
+
+The academic treatment is narrower and useful because of it: a peer-reviewed study of fuzzing Solana
+programs formalises missing-signer-check and missing-owner-check as its two named vulnerability types
+and studies them empirically.<Cite src="fuzz-on-the-beach" /> When you need a citable definition rather
+than a blog post, that is where it lives.
+
+<Aside kind="note">
+A useful way to hold the difference from the EVM security track. There, the vulnerability classes are
+mostly about *ordering and reachability*: reentrancy is a call happening at the wrong point in a
+sequence, [access control failure](/c/access-control-failure) is a function reachable by the wrong
+address, [oracle manipulation](/c/oracle-manipulation) is a value read at the wrong moment. Here, the
+dominant classes are about *identity*: the machine handed you an object and did not tell you what it
+was. Both platforms have both kinds. The proportions are completely different.
+</Aside>
+
+## What "attacker-chosen" means in practice
+
+It is easy to nod at "accounts are untrusted input" and still write code that assumes otherwise,
+because the assumption hides in a helper three functions down. Two concrete forms make it stick.
+
+**Form one: the attacker can fabricate an account's contents.** Anyone can create an account, assign
+it to a program they control, and write arbitrary bytes into its data — ordinary account creation, not
+an attack yet. It becomes one the moment your program reads those bytes as though it had written them
+itself. The runtime's ownership rule protects your accounts from their writes; it does nothing to stop
+them handing you *their* account.<Cite src="solana-docs-accounts" /> Crema Finance lost roughly $8.8
+million in July 2022 to exactly this, through a forged tick account supplying fabricated pricing
+data.<Cite src="helius-solana-hacks" />
+
+**Form two: the attacker can pass a legitimate account that is not yours.** No forgery, no custom
+program, nothing malformed. They pass another user's vault: real, owned by your program, correct
+type, internally consistent. Every check that looks at the account in isolation passes, because there
+is nothing wrong with the account. What is wrong is the pairing. Cashio, in March 2022, lost a figure
+reported between roughly $48 million and $52.8 million to a version of this — sources disagree on the
+total and this module will not pick one — where one link in a chain of accounts had a `mint` field
+that was never validated.<Cite src="helius-solana-hacks" /> Lesson 3 works that incident properly.
+
+**And a third form, easy to miss because it is not an account at all.** The same key can be passed
+twice, in two different positions of one accounts struct — nothing forbids it, and 64 accounts per
+transaction is a generous ceiling.<Cite src="solana-docs-transactions" /> A "move value from A to B"
+instruction where A and B are the same account credits without debiting, and is invisible to a test
+suite that only ever passes distinct accounts.<Cite src="sealevel-attacks" />
+
+<Check type="explain" concept="accounts-are-untrusted-input">
+An engineer moving from Solidity says: "This is overblown. In Solidity I also take addresses as
+arguments all the time — `transferFrom(address from, address to, uint256 amount)` takes two. I check
+them. Same discipline, different syntax."
+
+What are they getting right, and what is the specific thing they are missing?
+
+<Answer>
+They are right that caller-supplied addresses exist on both platforms, and right that the discipline
+rhymes. The gap is that on Solana **there is no other kind of state access**.
+
+In Solidity, caller-supplied addresses are the *exception*. `balances[msg.sender]`, `owner`,
+`totalSupply`, every mapping keyed on something the contract derived — all of that is state the
+callee reached for on its own, and no caller can redirect it. A Solidity engineer's habit is "audit
+the arguments", and the argument list is short and conspicuous precisely because most state access
+does not go through it.
+
+On Solana the program has no storage of its own, so *every byte it reads or writes arrives as an
+account chosen by the caller*. The argument list is not the exception, it is the entire surface. And
+critically, the ones that look least like arguments — "the vault", "the config", "the token program"
+— are exactly the ones a Solidity habit would classify as infrastructure rather than input, because
+their Solidity equivalents are immutables and storage variables.
+
+There is a second, sharper difference in the failure mode. In Solidity, passing an address where a
+contract of a different type lives usually reverts: the call hits a missing selector, or returns
+garbage that fails to decode. On Solana, handing over an account with a compatible byte layout does
+not fail — Borsh deserialization succeeds and your program proceeds confidently on someone else's
+data.<Cite src="cantina-securing-solana" /> Silence is the default outcome, which is why the classes
+in this module survive review by people who were paying attention.
+</Answer>
+</Check>
+
+## Where the checks actually live
+
+One structural fact makes the rest of the module readable: on Solana, validation is *code you write
+or code a framework generates for you*, and it costs compute units either way.
+
+Anchor's account constraints are not declarations evaluated by some outside verifier. Each attribute
+inside `#[account(...)]` expands at compile time into ordinary Rust that runs inside your program:
+`owner = expr` checks the account owner matches `expr`, `address = expr` checks the account key
+matches the pubkey, `has_one = target` checks that the `target` field on the account matches the key
+of the `target` field in the accounts struct, and `seeds`/`bump` checks that the given account is a
+PDA derived from the currently executing program and those
+seeds.<Cite src="anchor-account-constraints" /> That is [generated code](/c/constraints-are-generated-code),
+not magic, and it is the reason the framework's safety and its compute cost move together.
+
+Which sets up the module's real tension, and the reason it exists in 2026 rather than 2022. For a
+program written in Anchor with typed account wrappers and relational constraints, most of the classic
+taxonomy is closed by construction. For a program that reaches for `UncheckedAccount`, or hand-rolls
+its deserialization, or drops to a lower-level framework for compute savings, every class in the list
+is live again — [none of it is validated for you](/c/no-automatic-validation).
+
+<Misconception
+  belief="Using Anchor makes account-validation bugs impossible, so a program that compiles against the framework has this class handled."
+  reality="Anchor closes the default-unsafe cases. UncheckedAccount and AccountInfo, a missing has_one, init_if_needed without a guard, an unvalidated CPI program id, and a user-supplied bump are all still fully live inside a normal Anchor program."
+  why="Safe defaults get read as safety. The framework's whole design is that the dangerous options remain available and are made visible — UncheckedAccount forces you to write a CHECK comment — and 'visible' is not 'absent'."
+  src="helius-solana-security-guide"
+/>
+
+Reviewing an Anchor program therefore starts somewhere specific: find every field typed as
+`UncheckedAccount` or `AccountInfo`, read the `/// CHECK:` comment its author was forced to write,
+and decide whether the justification is true. Those are the places the framework explicitly stopped
+answering the three questions and handed them back.
+
+## Where this leaves you
+
+You now have the frame the rest of the module fills in. The runtime guarantees signature validity and
+ownership-scoped writes and nothing else.<Cite src="solana-docs-accounts" /><Cite src="solana-docs-account-modification-rules" />
+Every account is caller-chosen. Three questions cover most of the taxonomy, a lifecycle-and-aliasing
+group covers the rest, and each item maps to a specific Anchor constraint that closes
+it.<Cite src="sealevel-attacks" /><Cite src="anchor-account-constraints" />
+
+**Immediately useful, on any program you can read today.** Open one instruction. List its accounts.
+For each, write which of the three questions the code answers and where. The blanks in column three
+are the findings — and you will have them before you understand what the program does, which is the
+point: the check does not depend on the business logic.
+
+**The next four lessons are the questions in order.** Owner and signer, with the Crema Finance
+forged-account exploit attached.<Cite src="helius-solana-hacks" /> Then the third question and its two
+shapes — a byte-compatible type wearing another's clothes, and the right type belonging to somebody
+else. Then the same three questions asked about *programs* rather than data accounts, which is where
+arbitrary CPI and the unchecked sysvar live. Then addresses that were derived rather than passed,
+where the failure is a collision.
+
+**And then the module turns.** The three questions are a 2022 curriculum: correct, and largely closed
+for anyone using the framework. The last lesson follows where the money actually went in 2025 and
+2026, which was somewhere else entirely. If you want a working exercise in the meantime, an audit
+firm's hands-on workshop walks these classes as a capture-the-flag — a first vulnerability, a
+personal vault, a supposedly secure personal vault, a tip pool and an SPL-token vault, each with
+hints, a stated bug and a solution.<Cite src="neodyme-workshop" />

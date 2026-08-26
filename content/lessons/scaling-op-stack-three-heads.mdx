@@ -1,0 +1,366 @@
+---
+id: scaling-op-stack-three-heads
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [op-specs-derivation, op-specs-deposits, op-docs-transaction-finality, op-docs-derivation-pipeline]
+stack: {}
+---
+
+A payments product credits a user's account when their deposit "confirms". The integration was
+written against an L2 RPC endpoint, and `eth_getTransactionReceipt` returned a receipt with a block
+number, so the code credited the account. It ran that way for a year.
+
+The bug is not in the code. It is that the endpoint answered a question the code did not ask. An OP
+Stack chain does not have a head; it has three, and the RPC surface hands you the least committed one
+by default.
+
+This lesson is about the gap between them — where each label comes from, what it costs to wait for
+the next one, and the one transaction type that behaves differently at every level because it was
+never submitted to the chain in the first place.
+
+## Three references, one stage
+
+The three labels are not a presentation layer. They are state held by the Engine Queue, the innermost
+stage of the pipeline you worked through last lesson. The specification defines them
+precisely:<Cite src="op-specs-derivation" />
+
+- **The finalized L2 head.** Everything up to and including this block can be fully derived from the
+  finalized — canonical and forever irreversible — part of the L1 chain.
+- **The safe L2 head.** Everything up to and including this block can be fully derived from the
+  currently canonical L1 chain.
+- **The unsafe L2 head.** Blocks between the safe and unsafe heads are blocks that have *not* been
+  derived from L1. They come from sequencing, in sequencer mode, or from unsafe sync to the
+  sequencer, in validator mode. This is also known as the "latest" head.
+
+Read the three definitions as one sentence each about *L1*, because that is what they are. Finalized
+is a claim about L1 finality. Safe is a claim about L1 canonicality. Unsafe is the absence of any
+claim about L1 at all — it is the only one of the three whose truth condition mentions the sequencer.
+
+<Figure
+  caption="The arrow that runs backwards is the whole difference between safe and finalized."
+  alt="The three L2 heads as a progression: unsafe, served as the latest tag and coming from the sequencer, is consolidated into safe once derived from canonical L1 data, which becomes finalized when that L1 data is finalised. A backward edge shows safe blocks being downgraded to unsafe on an L1 reorg."
+>
+  <Flow
+    nodes={[
+      { id: 'unsafe', label: 'unsafe', note: 'served as latest; not derived from L1', col: 0, tone: 'warn' },
+      { id: 'safe', label: 'safe', note: 'derived from the canonical L1 chain', col: 1 },
+      { id: 'final', label: 'finalized', note: 'derived from finalised L1 data', col: 2, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'unsafe', to: 'safe', label: 'consolidation' },
+      { from: 'safe', to: 'final', label: 'L1 finality, received' },
+      { from: 'safe', to: 'unsafe', label: 'downgraded on an L1 reorg', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+The engine queue also buffers a short history of recently processed safe L2 blocks together with the
+L1 blocks each was derived from. That history does not have to be complete; its job is to let later
+L1 finality signals be translated into L2 finality.<Cite src="op-specs-derivation" /> Finality on an
+OP Stack chain is therefore not computed. It is *received*, and then looked up in a table.
+
+### What the RPC layer does with them
+
+These security levels map to the `headBlockHash`, `safeBlockHash` and `finalizedBlockHash` values
+transmitted over the [Engine API](/c/engine-api).<Cite src="op-specs-derivation" /> The docs then
+state the part that matters for your integration: these are the labels OP Stack nodes expose over
+JSON-RPC, with the unsafe head served as the `latest` block and the safe and finalized heads backing
+the `safe` and `finalized` block tags.<Cite src="op-docs-transaction-finality" />
+
+The default block tag in most client libraries is `latest`. So the default answer to "has my
+transaction confirmed" is an answer about the unsafe head.
+
+<Matrix
+  corner={<>What the user sees<Cite src="op-docs-transaction-finality" /></>}
+  cols={['RPC block tag', 'Typical time on OP Mainnet', 'What you are trusting']}
+  rows={[
+    {
+      label: 'Subblock preconfirmation, where subblocks are streamed',
+      cells: [<><code>pending</code> state</>, '~200 ms', { v: 'The sequencer', tone: 'warn' }],
+    },
+    {
+      label: 'Soft finality: the transaction is in an L2 block',
+      cells: [<><code>latest</code> (unsafe)</>, '~2 s', { v: 'The sequencer', tone: 'warn' }],
+    },
+    {
+      label: "The transaction's data is in an Ethereum block",
+      cells: [<code>safe</code>, 'A few minutes', 'Ethereum ordering; the L1 block can still reorg'],
+    },
+    {
+      label: 'Hard finality: Ethereum finalises the block holding the data',
+      cells: [<code>finalized</code>, '~15 to 30 minutes', { v: "Ethereum's consensus and finality guarantees", tone: 'good' }],
+    },
+  ]}
+  caption="The top two rows trust the same party. Only the bottom two are claims about Ethereum at all."
+  alt="Four confirmation levels on OP Mainnet: a subblock preconfirmation at the pending state in about 200 milliseconds, trusting the sequencer; soft finality at the latest tag in about 2 seconds, trusting the sequencer; the safe tag after a few minutes, trusting Ethereum ordering though the L1 block can still reorg; and the finalized tag after roughly 15 to 30 minutes, trusting Ethereum's consensus and finality guarantees."
+/>
+
+Those figures are the documentation's own, for OP Mainnet.<Cite src="op-docs-transaction-finality" />
+Every one of them is chain-specific and configuration-specific, and the docs say so: how long the
+`safe` step takes depends on the chain's batcher configuration and throughput, with high-throughput
+chains posting every few minutes while chains tuned for lower data costs may hold data back for up to
+their configured maximum channel duration, which can be several hours. The sequencing window — 12
+hours in the standard configuration — is the hard upper bound for that step.<Cite src="op-docs-transaction-finality" />
+
+<Aside kind="warn">
+"A few minutes" is a property of a chain that has traffic. On a quiet chain the batcher has nothing
+to fill a channel with, so the same code path produces a `safe` lag measured in hours. If you are
+building against a new or low-volume OP Stack chain, measure the lag yourself rather than inheriting
+OP Mainnet's numbers from a blog post.
+</Aside>
+
+## How a block actually becomes safe
+
+The promotion from unsafe to safe has a name — **consolidation** — and it is stricter than "the data
+showed up".
+
+If the unsafe head is ahead of the safe head, the node attempts consolidation: it takes the oldest
+unsafe block, the one directly after the safe head, and checks whether the payload attributes it just
+derived from L1 match that block. If they match, the block becomes the new safe
+head.<Cite src="op-specs-derivation" /> The fields compared for equality are enumerated:
+`parent_hash`, `timestamp`, `randao`, `fee_recipient`, the transaction list — first length, then each
+encoded transaction including deposits — `gas_limit`, `withdrawals` from Canyon onward, and
+`parent_beacon_block_root` for Ecotone blocks.<Cite src="op-specs-derivation" />
+
+If consolidation *fails*, the derived attributes win. The spec is explicit: the payload attributes are
+chosen in favour of the previous unsafe L2 block, creating an L2 chain reorg on top of the current
+safe block.<Cite src="op-specs-derivation" />
+
+That is the whole sequencer-trust story in one rule. The sequencer's gossiped block is a prediction
+of what derivation will produce. When the prediction is right — which is essentially always — the
+block is promoted. When it is wrong, L1 wins and the gossiped block is discarded, along with every
+block built on it.
+
+And when a derived block cannot be inserted at all because of a validation error, the batch is
+dropped, the safe head does not advance, and the queue tries the next batch for that timestamp. If no
+valid batch is found, the node creates a **deposit-only batch**, which the spec notes should always
+pass validation because deposits are always valid.<Cite src="op-specs-derivation" />
+
+<Misconception
+  belief="`safe` and `finalized` are two words for the same thing, the way they nearly are on L1."
+  reality="Safe means the block was derived from batch data that is on the canonical L1 chain. Finalized means that L1 data is itself finalised under Ethereum consensus. A shallow L1 reorg can un-safe a block that is not yet finalized: OP Stack nodes downgrade safe transactions back to unsafe if needed, while the sequencer republishes the data."
+  why="Ethereum's own block tags get borrowed without their L2 meanings, and on L1 the gap between them is small enough to ignore in most products."
+  src="op-docs-transaction-finality"
+/>
+
+The recovery path is worth stating in full, because it is the thing that makes `safe` genuinely
+weaker than `finalized` rather than theoretically weaker. If Ethereum reorgs, OP Stack chains attempt
+a graceful recovery: nodes downgrade "safe" transactions to "unsafe" if needed, while the sequencer
+republishes transaction data to maintain chain continuity, and "finalized" OP Stack transactions are
+protected from reorgs.<Cite src="op-docs-transaction-finality" /> Derivation being deterministic, a
+replacement L1 block carrying the same batch data reproduces an identical L2 chain and the reorg is a
+no-op from the L2 side.
+
+## The transaction that was never submitted
+
+Now the second half, and the reason `deposit-only block` keeps appearing above.
+
+Everything in an L2 block that came from a user's L2 wallet arrived through the sequencer. Deposits
+did not. A deposit transaction is derived from an L1 log by the same pipeline that derives everything
+else, which makes it the one transaction type whose inclusion is not a decision anybody makes.
+
+The spec defines it as an EIP-2718 type with the prefix `0x7E`, chosen because type identifiers are
+currently allowed to go up to `0x7F` and a high identifier minimises the risk of colliding with a
+future L1 type — with `0x7F` itself left alone in case it becomes a variable-length encoding
+scheme.<Cite src="op-specs-deposits" /> You already know how to decode a typed transaction; what
+matters here is which fields are missing and which are new.
+
+<Figure
+  caption="The two fields that are missing — a signature and a nonce — are what make this transaction derivable rather than submitted."
+  alt="The deposit transaction encoding: type byte 0x7E followed by an RLP list of sourceHash, from, to, mint, value, gas, isSystemTx and data. sourceHash stands in for a nonce, from carries no signature, mint is credited unconditionally, and isSystemTx is enforced false from Regolith onward."
+>
+  <Anatomy
+    value="0x7E || rlp([sourceHash, from, to, mint, value, gas, isSystemTx, data])"
+    parts={[
+      { from: 0, to: 4, label: 'EIP-2718 type', note: 'high, to dodge future L1 types', tone: 'accent' },
+      { from: 13, to: 23, label: 'no nonce', note: 'uniqueness comes from the L1 log', tone: 'accent' },
+      { from: 25, to: 29, label: 'no signature', note: 'attested by the deposit contract' },
+      { from: 35, to: 39, label: 'unconditional', note: 'credited even if the call fails', tone: 'warn' },
+      { from: 53, to: 63, label: 'fossil', note: 'enforced false since Regolith', tone: 'muted' },
+    ]}
+  />
+</Figure>
+
+Three distinctions the spec draws out:<Cite src="op-specs-deposits" />
+
+- **They are derived from L1 blocks and must be included as part of the protocol.** Not "should".
+- **They do not include signature validation.** There is no signature field; `from` is explicit, and
+  API responses carry zeroed `v`, `r`, `s` for backwards compatibility.
+- **They buy their L2 gas on L1, so the L2 gas is not refundable.**
+
+There is also no nonce, because the transaction is identified by its `sourceHash`
+instead.<Cite src="op-specs-deposits" /> The spec explains the choice: without a `sourceHash`, two
+different deposited transactions could have the same exact hash, and the sender's nonce was not used
+for uniqueness because that would require an extra L2 EVM state read from the execution engine during
+derivation.<Cite src="op-specs-deposits" /> Derivation has to be cheap and side-effect-free at the
+point of decoding, so uniqueness is pushed into a hash the L1 log already determines.
+
+**Subgoal: see where authorisation moved to.** With no signature to check, what stops anyone forging a
+deposit from your address? The spec answers directly: authorisation is handled by the L2 chain
+derivation process, which when correctly applied will only derive transactions with a `from` address
+attested to by the logs of the L1 deposit contract.<Cite src="op-specs-deposits" /> The
+authorisation did not disappear. It moved to L1, where it was already checked when the deposit
+transaction was signed and mined.
+
+**Subgoal: notice that the mint is unconditional.** In execution, the balance of the `from` account
+must first be increased by the amount of `mint`, and this is unconditional and does not revert on
+deposit failure.<Cite src="op-specs-deposits" /> A deposit whose call fails still delivers the ETH.
+That is deliberate — a failed cross-domain call must not also destroy the value it was carrying — and
+it is a detail worth knowing before you write a contract that assumes a reverted deposit is a no-op.
+
+### Two kinds, one type
+
+Although only one transaction type exists, the spec distinguishes two kinds by position in the block.
+The first transaction MUST be an **L1 attributes deposited transaction**, followed by an array of
+zero-or-more **user-deposited transactions** submitted to the deposit feed contract on L1 — and
+user-deposited transactions are only present in the first block of an L2
+epoch.<Cite src="op-specs-deposits" />
+
+The `sourceHash` domains make the distinction machine-checkable. A user deposit hashes domain `0`
+over the L1 block hash and the log index; an L1-attributes deposit hashes domain `1` over the L1 block
+hash and a sequence number `seqNumber = l2BlockNum - l2EpochStartBlockNum`; an upgrade deposit hashes
+domain `2` over a UTF-8 intent string.<Cite src="op-specs-deposits" /> That sequence number is how
+each L2 block in an epoch records its position within the epoch, which is why an L2 block can always
+tell you both which L1 block it descends from and how far into that epoch it sits.
+
+### Why every block starts with a deposit
+
+The mandatory first transaction is easy to skip past, and it answers a question the EVM cannot answer
+on its own: an L2 block has no idea what is happening on L1.
+
+The L1 attributes deposited transaction is the mechanism. Derivation reads the L1 block header of the
+epoch's origin and writes those attributes into the first transaction of every L2 block, which records
+information about the L1 block matching that block's epoch.<Cite src="op-specs-derivation" /> That is
+why an L2 contract can read an L1 block number and an L1 base fee at all: the value was not fetched,
+it was *deposited*, by the same protocol rule that delivers user deposits, and it is therefore part of
+the deterministic function rather than an oracle bolted to the side of it.
+
+Notice the consequence for the labels. Every L2 block — including a deposit-only block produced during
+a sequencer outage — carries an L1 attributes deposit, because the rule that each epoch must contain
+at least one L2 block exists precisely so that all relevant information from L1 is represented on
+L2 even when the epoch has no sequencer batches.<Cite src="op-specs-derivation" /> A chain whose
+sequencer has been dead for a day still has a correct, advancing view of L1.
+
+One field on the type is a fossil worth recognising when you read old material. `isSystemTx`, when
+true, meant the transaction did not interact with the L2 block gas pool — and the boolean is disabled,
+enforced to be false, from the Regolith upgrade onward.<Cite src="op-specs-deposits" /> Regolith also
+changed what the `nonce` attribute in API responses means: always `0` before it, and the receipt's
+`depositNonce` after.<Cite src="op-specs-deposits" /> If you are parsing deposits and comparing
+against a pre-Regolith example, those are the two fields that will not line up.
+
+<Misconception
+  belief="A forced transaction is a special escape-hatch mechanism, separate from ordinary L1-to-L2 messaging."
+  reality="They are the same mechanism. An ordinary bridge deposit and a censorship-escaping forced transaction both emit a log from the L1 portal and both become 0x7E transactions through the same derivation rule. The only difference is who sent the L1 transaction and why."
+  why="The two are documented on different pages for different audiences, and 'forced inclusion' sounds like an override rather than the normal path."
+  src="op-specs-deposits"
+/>
+
+That equivalence is the reason the [forced-inclusion](/c/forced-inclusion) argument works at all. If
+forcing needed its own path, that path could be broken independently. Because it is the same path
+that carries every bridge deposit, breaking forcing means breaking the bridge.
+
+## Where the three heads and deposits collide
+
+Put the two halves together and a specific operational picture falls out.
+
+Deposits enter at the *derivation* level, which means they are `safe` the moment the epoch containing
+them is derived — there is no unsafe-deposit stage where the sequencer has gossiped one and L1 has not
+confirmed it. Sequenced transactions enter at the *unsafe* level and have to be consolidated
+afterwards. So the two transaction classes in an OP Stack block reach the labels in opposite orders.
+
+This is what makes a deposit-only block coherent rather than a degenerate case. When the sequencer is
+absent or its batches are invalid, the pipeline can still produce blocks, because the only
+transactions it needs are the ones it can read from L1 on its own. The docs describe the outcome
+plainly: if the sequencing window is exceeded without a valid batch being discovered on L1, the
+derivation pipeline reverts all unsafe blocks from that period and progresses using a default block
+that is empty except for deposits.<Cite src="op-docs-derivation-pipeline" />
+
+Note the word *reverts*. Blocks users saw at the `latest` tag, with receipts, are discarded. Their
+transactions were never on L1, so nothing about them was ever a fact about the chain.
+
+<Check type="explain" concept="unsafe-safe-finalized">
+You are designing the crediting rule for an exchange that accepts deposits on an OP Stack chain.
+Three proposals are on the table. For each, say what it is trusting, what the worst realistic failure
+looks like, and who absorbs the loss.
+
+1. Credit on the receipt returned at the `latest` tag.
+2. Credit when the transaction's block number is at or below the `safe` head.
+3. Credit only at `finalized`, and advertise deposits as taking half an hour.
+
+Then answer the design question: which one would you ship, and what would you add to it?
+
+<Answer>
+**Proposal one trusts the sequencer, and nothing else.** The receipt is real and the block exists, but
+it has no L1 backing: unsafe blocks are blocks that have not been derived from L1 and come from
+sequencing or from unsafe sync to the sequencer.<Cite src="op-specs-derivation" /> The worst realistic
+failure is not sequencer malice; it is an outage. If the batcher stops and the sequencing window
+elapses, the pipeline reverts all unsafe blocks from that period and produces deposit-only
+blocks.<Cite src="op-docs-derivation-pipeline" /> Every credit issued against a reverted block is a
+credit against a transaction that never happened. The exchange absorbs it, and it discovers the
+problem in bulk rather than one case at a time.
+
+**Proposal two trusts Ethereum's ordering but not yet its finality.** Once the data is in an Ethereum
+block, the ordering no longer depends on the sequencer.<Cite src="op-docs-transaction-finality" /> The
+residual risk is a shallow L1 reorg dropping the L1 block that carried the batch: nodes downgrade safe
+transactions to unsafe if needed while the sequencer republishes the
+data.<Cite src="op-docs-transaction-finality" /> In the overwhelming majority of cases the batch
+reappears and derivation reproduces an identical L2 chain, so the credit stays valid. The exposure is
+a narrow window at the L1 tip, and it is the same exposure any L1-native integration carries between
+inclusion and finality.
+
+**Proposal three trusts only Ethereum consensus.** Finalized blocks are derived from finalised L1
+data.<Cite src="op-specs-derivation" /> The failure mode is commercial, not technical: on OP Mainnet
+that is roughly 15 to 30 minutes,<Cite src="op-docs-transaction-finality" /> and on a chain whose
+batcher posts on a long interval it is dominated by the batch submission interval rather than by
+Ethereum. Your users absorb it, by going elsewhere.
+
+**What to ship.** Proposal two for ordinary amounts, proposal three above a value threshold — the same
+shape every mature L1 integration already has, with `safe` playing the role that "N confirmations"
+plays there. Two additions make it safe to operate.
+
+First, **alert on the `latest` minus `safe` gap, not on the block number.** A stalled batcher shows up
+there and nowhere else, and it is the leading indicator for every failure above.
+
+Second, **never let the crediting path use a default block tag.** The default is `latest`, so a
+library upgrade or a refactor that drops an explicit tag silently downgrades you to proposal one
+without changing any observable behaviour until the day it matters.
+
+**The deposit asymmetry, for completeness.** If the flow is a *bridge* deposit from L1 rather than an
+L2-native transfer, it arrives as a `0x7E` transaction derived from an L1 log and is safe as soon as
+its epoch is derived.<Cite src="op-specs-deposits" /> Applying an L2-native crediting rule to it is
+conservative, not wrong — but knowing why it is conservative is what tells you the two flows need
+different rules.
+</Answer>
+</Check>
+
+## Below unsafe: a fourth thing that is not a head
+
+One more label exists on some chains, and it is worth naming so you do not mistake it for a fourth
+head. On chains that stream subblocks, applications can act on a preconfirmation about 200
+milliseconds after submission, before the full block is
+published.<Cite src="op-docs-transaction-finality" /> The documentation places it at the `pending`
+state, not at a head.<Cite src="op-docs-transaction-finality" />
+
+That is the correct filing. A preconfirmation is a stronger promise from the same party you were
+already trusting at `latest` — faster, and no more backed by L1. If you would not credit at `latest`,
+you would not credit at 200 milliseconds either, and the gradient stays three-deep.
+
+## Where this pays off
+
+**The Superchain lessons**, next, are about chains that share contracts and a governance process. Once
+you know what `safe` means for one chain, "chains that share an upgrade key" reads as what it is: a
+shared way for many chains' safe heads to become wrong at once.
+
+**The interop lesson** re-derives these three labels across chains. The rule there — a block is only
+safe once every initiating message it references is also safe — is exactly the rule you just learned,
+with the dependency set added to the input.
+
+**The proof-systems module** you have already done now sits in the right place. Output roots and the
+seven-day withdrawal window are claims about *outputs*, unrelated to the chain's own finalisation. A
+transaction is final when its data is in a finalised L1 block, not when a withdrawal clears.
+
+**Your own systems.** The single highest-value change most L2 integrations can make is to stop using
+the default block tag in any code path that moves value, and to chart `latest` minus `safe` on the
+same dashboard as latency. Both are one RPC call.

@@ -1,0 +1,461 @@
+---
+id: app-passkeys-onchain-verification
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [webauthn-l2, webauthn-l3, webauthn-sol, certik-passkey-wallets, eip-7951, oz-changelog, solidity-global-variables, eip-4337, nist-fips-180-4]
+stack: { solidity: "0.8.36" }
+---
+
+A verifier with a clean test suite. Every test passes. Fuzzing finds nothing. It rejects tampered
+signatures, tampered digests, tampered public keys, and every corrupted byte a property test can
+generate.
+
+It also accepts, as authorisation to drain an account, an assertion the user produced while
+registering a passkey on a completely different website.
+
+Nothing in it is wrong at the level it operates. The P-256 arithmetic is correct, the digest
+reconstruction is correct, and the signature genuinely verifies. The bug is that a valid signature over
+a structure is not the same claim as *this user authorised this operation here*, and the difference is
+made up of four field checks that no cryptographic test will ever fail you for omitting.
+
+This lesson builds the reconstruction, then adds the four checks, then explains why each one has to be
+stricter than the obvious version.
+
+## What has to travel on-chain
+
+The signature is `(r, s)`. The message is `authenticatorData ‖ SHA-256(clientDataJSON)`, and the
+contract cannot recompute either half — both were produced by software it has no access to. So both
+halves have to be shipped as calldata.
+
+Coinbase's `webauthn-sol` transports them like this, and the layout has converged across
+implementations:<Cite src="webauthn-sol" />
+
+```solidity
+struct WebAuthnAuth {
+    bytes authenticatorData;
+    string clientDataJSON;
+    /// The index at which "challenge":"..." occurs in clientDataJSON
+    uint256 challengeIndex;
+    /// The index at which "type":"..." occurs in clientDataJSON
+    uint256 typeIndex;
+    uint256 r;
+    uint256 s;
+}
+```
+
+Two of those six fields are the ones to notice. `challengeIndex` and `typeIndex` are byte offsets into
+the JSON, and CertiK is explicit that they **come from `webauthn-sol` and are not part of the WebAuthn
+standard**.<Cite src="certik-passkey-wallets" /> They exist because a contract cannot afford a JSON
+parser, and they carry a cost you will meet twice in this lesson: an offset supplied by the caller is an
+input the caller controls.
+
+The calldata bill is worth pricing before you design around it. `authenticatorData` is 37 bytes at
+minimum.<Cite src="webauthn-l2" /> `clientDataJSON` was 114 bytes for the localhost vector in the
+previous lesson and is longer for any real origin. Add two 32-byte offsets and two 32-byte signature
+components. You are transporting on the order of 250 bytes of authorisation data per operation, on top of
+whatever the operation itself carries — and on a rollup, calldata is the dominant term in what a
+transaction costs. This is the reason production accounts strip `clientDataJSON` to the shortest form
+that still verifies rather than shipping it verbatim with the trailing fields the client added.
+
+## Rebuilding the digest
+
+Six lines of Solidity, each with a purpose worth naming.
+
+**Subgoal 1 — hash the client data with the right hash function.** Solidity exposes
+`sha256(bytes memory) returns (bytes32)` as a built-in alongside `keccak256`.<Cite src="solidity-global-variables" />
+
+```solidity
+bytes32 clientDataHash = sha256(bytes(auth.clientDataJSON));
+```
+
+`keccak256` here is the single most common reconstruction failure, and it fails silently: it returns a
+perfectly good 32-byte value that is not the one the authenticator used. WebAuthn specifies SHA-256 for
+this step, and ES256's own digest step is SHA-256 as well.<Cite src="webauthn-l2" /><Cite src="nist-fips-180-4" />
+Ethereum's reflex is Keccak; this structure predates that reflex by decades and does not share it.
+
+**Subgoal 2 — concatenate in the specified order.** `authenticatorData` first, then the hash.
+
+```solidity
+bytes memory message = abi.encodePacked(auth.authenticatorData, clientDataHash);
+```
+
+Use packed encoding, not `abi.encode`. Standard [ABI encoding](/c/abi-encoding) would add offsets and
+length words, producing a byte string that is correct ABI and wrong input.
+
+**Subgoal 3 — hash again to obtain the value the verifier consumes.**
+
+```solidity
+bytes32 h = sha256(message);
+```
+
+This is the `h` that EIP-7951's precompile takes as its first 32-byte word.<Cite src="eip-7951" />
+
+**Subgoal 4 — hand `h`, `r`, `s` and the stored public key to the P-256 verifier.** Which verifier, and
+how to read what it returns, is the next lesson, and it has a trap in it that this ordering is designed
+to set up: the verifier's answer is necessary and nowhere near sufficient.
+
+Any deviation in steps 1 to 3 — wrong hash function, reversed concatenation, ABI encoding instead of
+packed — yields a digest that will not verify against any signature ever produced. That is the good
+case. The bad cases are all in the checks you have not made yet.
+
+## The four checks the signature does not perform
+
+A correct verifier does more than check the signature. It confirms the ceremony was the right kind, that
+the challenge is the expected value at the expected place, that the relying-party binding matches, and
+that the flags claim the user interaction your policy requires.<Cite src="certik-passkey-wallets" />
+
+Take them in the order in which omitting one is most damaging.
+
+<Matrix
+  corner="Check"
+  cols={['What it compares', 'What omitting it accepts']}
+  rows={[
+    {
+      label: 'ceremony type',
+      cells: [
+        <>The bytes at typeIndex against &quot;type&quot;:&quot;webauthn.get&quot;<Cite src="webauthn-l2" /></>,
+        'A registration assertion, presented as authorisation to spend',
+      ],
+    },
+    {
+      label: 'challenge, by position',
+      cells: [
+        { v: 'The expected base64url challenge, with its closing quote, at a caller-supplied offset', tone: 'warn' },
+        'An assertion whose origin merely contains the expected string',
+      ],
+    },
+    {
+      label: 'relying-party binding',
+      cells: [
+        <>authenticatorData[0:32] against a constant fixed at deployment<Cite src="webauthn-l2" /></>,
+        'An assertion for any relying party whose credential this user holds',
+      ],
+    },
+    {
+      label: 'flags',
+      cells: [
+        <>Bit 0 (UP) always; bit 2 (UV) when your policy requires it<Cite src="webauthn-l3" /></>,
+        'An assertion where nothing established that a person was there',
+      ],
+    },
+  ]}
+  caption="The signature is genuine in every row of the right-hand column — what these four comparisons establish is that the assertion was meant for this account."
+  alt="The four field checks a verifier must make beyond the signature: ceremony type, challenge by position, relying-party binding and flags, each with what it compares and what omitting it accepts."
+/>
+
+### Check one: the ceremony type
+
+`clientDataJSON` declares `type` as `"webauthn.create"` during registration and `"webauthn.get"` during
+authentication, and the specification states its purpose exactly: to prevent signature confusion attacks
+where an attacker substitutes one legitimate signature for another.<Cite src="webauthn-l2" />
+
+Require `"webauthn.get"`. A registration assertion and an authentication assertion are the same
+structure signed by the same key over the same kind of payload; the string is the only thing separating
+them, and it is not covered by `userOpHash`.<Cite src="certik-passkey-wallets" />
+
+### Check two: the challenge, by value *and* by position
+
+The naive check is "the expected base64url string appears somewhere in `clientDataJSON`". It is not
+enough, and the reason is instructive rather than pedantic.
+
+`origin` is a string inside the same document, written by the client, and its value is a domain an
+attacker can choose — by registering one. A verifier that searches the whole document for the expected
+challenge will accept an assertion whose *challenge* is something else entirely and whose *origin*
+happens to contain the target string. The check has to be positional: the challenge must appear as the
+value of the `challenge` member, not merely as a substring of the document.
+
+This is what `challengeIndex` is for, and it is also where a caller-supplied offset becomes a liability.
+OpenZeppelin's changelog records the shape of the failure: in Contracts **5.7.0 (29 July 2026)** the
+`WebAuthn` library's verification "now returns `false` instead of reverting when client data contains an
+out-of-bounds `challengeIndex`".<Cite src="oz-changelog" /> A caller who supplies an offset past the end
+of the string is not producing a valid assertion — they are producing a revert, inside a validation
+function that ERC-4337 requires to *return* a failure code rather than throw for a signature
+mismatch.<Cite src="eip-4337" /> The fix was to make the malformed case a `false` like every other
+malformed case.
+
+### Check three: the relying-party binding
+
+`authenticatorData` bytes 0 to 31 are `SHA-256` of the relying party id, computed and signed by the
+authenticator.<Cite src="webauthn-l2" /> Compare them against a constant fixed at deployment.
+
+This is the cheapest strong check available: one 32-byte comparison, no string handling, and it is signed
+by the authenticator rather than asserted by the client. A verifier that skips it will accept an assertion
+produced for any relying party whose credential the user happens to hold — which, for a user with dozens
+of passkeys, is a large set.
+
+Whether you *also* check `origin` is a separate decision. `rpIdHash` binds to the registrable domain;
+`origin` binds to scheme, host and port, so it is the only way to distinguish subdomains that share a
+relying party id.<Cite src="webauthn-l2" /> It costs string comparison and calldata. Choose deliberately.
+
+### Check four: the flags
+
+Byte 32 of `authenticatorData` is the flags byte: bit 0 UP, bit 2 UV.<Cite src="webauthn-l3" /> Require UP
+always. Whether to require UV is your account's policy, and it is the *only* one of the three layers an
+attacker cannot reconfigure — the request options live in a frontend and the authenticator's behaviour is
+its own.<Cite src="certik-passkey-wallets" />
+
+OpenZeppelin models this as a policy hook rather than a constant: **5.7.0** added an internal `_requireUV`
+function to `ERC7913WebAuthnVerifier` that can be overridden to disable the UV check.<Cite src="oz-changelog" />
+That it is a function rather than a flag is the right shape — the answer differs per account, and possibly
+per operation value.
+
+### How the comparisons are actually written
+
+The four checks above are stated as intentions. Turning them into Solidity has two recurring shapes, and
+`webauthn-sol` shows both — worth reading in the original, because the details that make them safe are easy
+to drop.<Cite src="webauthn-sol" />
+
+**Fixed-length slice, then hash-compare.** The ceremony type is a string of known length, so the library
+slices exactly that many bytes from the claimed offset and compares hashes:
+
+```solidity
+bytes32 private constant _EXPECTED_TYPE_HASH = keccak256('"type":"webauthn.get"');
+
+// bytes('"type":"webauthn.get"').length = 21
+string memory _type = clientDataJSON.slice(typeIndex, typeIndex + 21);
+if (keccak256(bytes(_type)) != _EXPECTED_TYPE_HASH) return false;
+```
+
+The comparison is length-exact by construction. A longer string at that offset does not match, because the
+slice is 21 bytes whatever follows it, and `keccak256` over the wrong 21 bytes is a different word.
+
+**Build the expected string, including its delimiter.** The challenge varies per operation, so the expected
+bytes are constructed and compared the same way:
+
+```solidity
+bytes memory expectedChallenge =
+    bytes(string.concat('"challenge":"', Base64.encodeURL(challenge), '"'));
+string memory actualChallenge =
+    clientDataJSON.slice(challengeIndex, challengeIndex + expectedChallenge.length);
+if (keccak256(bytes(actualChallenge)) != keccak256(expectedChallenge)) return false;
+```
+
+Notice the **trailing quote** in the constructed string. It is not decoration. Without it, the expected bytes
+would be a prefix of any *longer* challenge value that begins with the same characters, and a prefix match on
+a caller-supplied offset is exactly the hole the positional check exists to close. Including the closing
+delimiter is what turns "the challenge starts with the right bytes" into "the challenge is the right value".
+It is the same reasoning as the specification's terminator test in the limited verification
+algorithm.<Cite src="webauthn-l2" />
+
+### Indexing a byte that may not exist
+
+One more failure mode with no cryptographic flavour, and it is the one that turns a rejection into a revert.
+
+The flags check reads `authenticatorData[32]`. The specification says `authenticatorData` is 37 bytes or
+more, so byte 32 always exists — *in a well-formed structure*.<Cite src="webauthn-l2" /> But
+`authenticatorData` arrives as caller-supplied `bytes`, and a caller can supply four of them. Solidity's
+bounds check then reverts, inside a function ERC-4337 requires to return a failure code rather than
+throw.<Cite src="eip-4337" />
+
+The same shape applies to the slices above: `challengeIndex` and `typeIndex` are caller-controlled, and a
+slice past the end of the string is an out-of-bounds read. This is precisely the class OpenZeppelin fixed in
+Contracts 5.7.0, making verification return `false` instead of reverting on an out-of-bounds
+`challengeIndex`.<Cite src="oz-changelog" />
+
+The rule that covers all of them: **validate lengths before you index, and treat every malformed input as a
+rejection rather than an exception.** One length check at the top of the function — `authenticatorData` at
+least 37 bytes, both offsets plus their comparison lengths within the JSON — removes the entire family, and
+it costs a handful of gas against a `staticcall` you have not made yet.
+
+<Misconception
+  belief="Verifying the P-256 signature is the whole check — the rest is defence in depth."
+  reality="The signature proves that a key signed two structures. The type, the challenge value and its position, the relying-party hash and the flag bits establish that the structures are the ones this account asked for. Omit them and a genuine assertion produced for another origin, another ceremony or another operation is accepted here."
+  why="The verifier returns a satisfying boolean and the work feels done, and every tutorial's example ends at that boolean. The four checks have no cryptographic flavour, which makes them read like validation rather than security."
+  src="certik-passkey-wallets"
+/>
+
+## Checking JSON without a JSON parser
+
+The specification anticipated verifiers that cannot parse JSON and defined a procedure for them: the
+**Limited Verification Algorithm**.<Cite src="webauthn-l2" /> It is worth reading in the original, because
+it is the closest thing to a normative on-chain verification strategy that exists.
+
+The idea is to build the expected prefix byte by byte and compare, rather than to parse. The exact byte
+strings are given in the specification:<Cite src="webauthn-l2" />
+
+```
+0x7b2274797065223a              {"type":
+0x2c226368616c6c656e6765223a    ,"challenge":
+0x2c226f726967696e223a          ,"origin":
+0x2c2263726f73734f726967696e223a ,"crossOrigin":
+```
+
+You append the expected type, then the base64url-encoded challenge, then the expected origin, then
+`true` or `false`, and then perform three tests: `expected` must be a prefix of `clientDataJSON`;
+`clientDataJSON` must be at least one byte longer than `expected`; and the byte at that offset must be
+`0x7d` (`}`) or `0x2c` (`,`).<Cite src="webauthn-l2" />
+
+That last test is the subtle one and the one hand-rolled verifiers omit. A **prefix** match plus a
+terminator check accepts documents that carry additional trailing members — which the specification
+requires you to tolerate, since the dictionary may be extended — while refusing a document where your
+expected prefix is a prefix of a *longer value*.<Cite src="webauthn-l2" /> Equality on the whole document
+would be wrong in the other direction: it would break the first time a client added a field.
+
+Level 3 extends the algorithm rather than replacing it. `topOrigin` is appended after `crossOrigin` when
+present, and there is an explicit `requireTopOrigin` input; the specification states that the algorithm
+remains backwards compatible with the Level 2 serialization if and only if `requireTopOrigin` is
+false.<Cite src="webauthn-l3" /> And the stability promise is renewed: future versions must not remove
+`type`, `challenge`, `origin`, `crossOrigin` or `topOrigin`, must not reorder them, and must not insert
+new fields between them.<Cite src="webauthn-l3" />
+
+<Aside kind="note">
+Notice what that promise is *for*. The W3C constrained its own future revisions specifically so that
+verifiers without a JSON parser keep working. When a contract locates the challenge at an offset, it is
+relying on a compatibility commitment that a standards body made on purpose and has already honoured once,
+through a revision that added a field. That is a much better foundation than "the string looks stable in
+the browsers we tested", which is what the same technique would rest on without the promise. It is still
+a dependency, and it belongs in your trust inventory next to the compiler and the library.
+</Aside>
+
+## The verifier, assembled
+
+Putting the pieces in order, with the checks before the arithmetic — because the checks are comparisons
+and the arithmetic is the expensive part:
+
+<Figure
+  caption="A verifier that reaches the arithmetic has already settled everything the arithmetic cannot tell it."
+  alt="The verification order: four field comparisons first, then rebuilding the digest with SHA-256, then the call to the P-256 verifier, and finally a returned boolean rather than a revert."
+>
+  <Flow
+    nodes={[
+      { id: 'checks', label: 'four field checks', note: 'type, challenge, rpIdHash, flags', col: 0, tone: 'accent' },
+      { id: 'digest', label: 'rebuild the digest', note: 'sha256, concatenate, sha256', col: 1 },
+      { id: 'verify', label: 'call the verifier', note: 'the only step that costs real gas', col: 2, tone: 'warn' },
+      { id: 'answer', label: 'return true or false', note: 'never revert — validation returns a value', col: 3, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+```solidity
+function verify(
+    bytes32 expectedChallenge,   // e.g. the userOpHash
+    bool requireUV,
+    WebAuthnAuth calldata auth,
+    uint256 qx,
+    uint256 qy
+) internal view returns (bool) {
+    // 1. ceremony type
+    if (!_matchesAt(auth.clientDataJSON, auth.typeIndex, '"type":"webauthn.get"')) return false;
+
+    // 2. challenge, at the position the caller claims, and that position is the real one
+    if (!_matchesAt(auth.clientDataJSON, auth.challengeIndex, '"challenge":"')) return false;
+    if (!_challengeEquals(auth.clientDataJSON, auth.challengeIndex, expectedChallenge)) return false;
+
+    // 3. relying-party binding, signed by the authenticator
+    if (bytes32(auth.authenticatorData[0:32]) != RP_ID_HASH) return false;
+
+    // 4. flags
+    uint8 flags = uint8(auth.authenticatorData[32]);
+    if (flags & 0x01 != 0x01) return false;                   // UP
+    if (requireUV && flags & 0x04 != 0x04) return false;      // UV
+
+    // 5. only now, the expensive part
+    bytes32 h = sha256(abi.encodePacked(
+        auth.authenticatorData,
+        sha256(bytes(auth.clientDataJSON))
+    ));
+    return _verifyP256(h, auth.r, auth.s, qx, qy);
+}
+```
+
+Three properties of that ordering are deliberate.
+
+**Every failure is a `return false`, never a revert.** ERC-4337 requires an account to return
+`SIG_VALIDATION_FAILED` without reverting on signature mismatch, with any other error reverting — so a
+revert on a malformed input turns a rejected signature into a failed operation, and takes the gas
+estimation path down with it.<Cite src="eip-4337" /> This is the constraint behind OpenZeppelin's fix
+for out-of-bounds offsets, and behind their parallel change making the multi-signer decoder return false
+on malformed encoding rather than reverting inside `abi.decode`.<Cite src="oz-changelog" />
+
+**The caller-supplied offsets are verified, not trusted.** `typeIndex` and `challengeIndex` are used to
+*locate* a comparison, and then the comparison confirms the label is actually there. An offset that points
+somewhere else fails on the label, not on the value.
+
+**The signature check is last.** It is the only step that costs real gas, and every check above it is a
+handful of comparisons. Failing early is both cheaper and — more importantly — makes the security
+properties independent of whether the arithmetic ran.
+
+<Misconception
+  belief="Using a well-known library like webauthn-sol means the checks are handled."
+  reality="A library verifies an assertion against a challenge you pass in. It cannot know what your challenge should have been, whether your account's policy requires user verification, or which relying party id is yours — those are arguments you supply, and supplying them wrongly type-checks."
+  why="The library's name describes the whole problem, so it reads as a complete solution. Its signature is the honest description: verify(challenge, requireUserVerification, auth, x, y) takes the two policy decisions as parameters, which means the library is asking you to make them, not making them for you."
+  src="webauthn-sol"
+/>
+
+<Check type="spot-bug" concept="webauthn-clientdata-checks">
+A team writes their own verifier to avoid a dependency. It passes their tests, including a test that a
+signature from a different keypair is rejected and a test that a modified `userOpHash` is rejected.
+
+```solidity
+function isValid(WebAuthnAuth calldata a, bytes32 userOpHash) internal view returns (bool) {
+    string memory expected = Base64Url.encode(abi.encode(userOpHash));
+    if (!LibString.contains(a.clientDataJSON, expected)) return false;
+
+    bytes32 h = sha256(abi.encodePacked(a.authenticatorData, sha256(bytes(a.clientDataJSON))));
+    (bool ok, bytes memory ret) = P256_VERIFIER.staticcall(
+        abi.encode(h, a.r, a.s, ownerX, ownerY)
+    );
+    require(ok, "verify failed");
+    return true;
+}
+```
+
+Find every defect. There are more than the obvious one.
+
+<Answer>
+**1 — no ceremony type check.** Nothing requires `"webauthn.get"`. An assertion produced during a
+`"webauthn.create"` ceremony verifies here, which matters because registration ceremonies happen in
+flows with different UI, different consent, and often on a different surface.<Cite src="webauthn-l2" />
+
+**2 — the challenge is checked by containment, not by position.** `contains` will match the expected
+string anywhere in the document, including inside `origin`. An attacker who registers a domain whose name
+embeds the target encoding, and induces one assertion from the user on it, has an assertion this verifier
+accepts as authorisation for the target operation.<Cite src="certik-passkey-wallets" />
+
+**3 — no relying-party check.** `authenticatorData[0:32]` is never read. Any credential this user holds,
+for any site, produces an assertion this account accepts — so the phishing resistance that motivated the
+whole design is discarded at the last step.
+
+**4 — no flag checks.** Neither UP nor UV is examined, so an assertion where nothing established user
+presence is accepted.<Cite src="webauthn-l3" />
+
+**5 — `require(ok, ...)` reads the wrong thing.** This is the defect the next lesson is about, so only the
+headline here: EIP-7951's precompile does not revert on an invalid signature. It returns zero-length output
+and charges the same gas.<Cite src="eip-7951" /> `ok` is true for every input. The function returns `true`
+unconditionally once containment passes, and `ret` is never examined at all.
+
+**6 — the function reverts inside validation.** Even if `require(ok)` were the right check, reverting is
+the wrong failure mode inside an ERC-4337 account, which must return a failure code rather than throw on a
+signature mismatch.<Cite src="eip-4337" />
+
+**7 — `abi.encode(userOpHash)` before base64url.** `abi.encode` of a single `bytes32` produces the same 32
+bytes, so this one happens to be harmless — today. It is still a latent bug, because the same idiom applied
+to any other argument shape produces padded, offset-prefixed output that the client would never have
+encoded.
+
+**Why the tests passed.** Both tests vary something *inside* the digest — a different key, a different hash
+— and the digest reconstruction is correct, so both fail as expected. Not one test varies the type, the
+origin, the relying party, the flags, or the validity of the signature while keeping the digest well
+formed. The test suite only probes the one dimension the code got right.
+
+**The general habit.** Write one negative test per field you check, and one per field you decided *not* to
+check, with the second group asserting the behaviour you chose deliberately. The fields with no tests in
+either group are the ones nobody made a decision about.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** is the one line this lesson deferred: `_verifyP256`. It is a `staticcall` to an
+address, and reading its answer correctly is not what a decade of Solidity habits will tell you to do.
+
+**Lesson six** revisits the same call from the other side: the verifier will accept two different `s`
+values for the same message, on purpose, and an account that treats a signature as an identity is broken
+by that.
+
+**Every operation your account supports** — transferring, registering a new credential, rotating an
+owner, revoking a delegation — reaches this function. The checks above are not transfer-specific. They
+are the account's entire authentication surface, which is why the recovery lesson can talk about
+"widening the set of accepted parties" as a single concept rather than a per-feature one.

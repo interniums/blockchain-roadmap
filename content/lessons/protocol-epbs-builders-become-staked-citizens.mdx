@@ -1,0 +1,441 @@
+---
+id: protocol-epbs-builders-become-staked-citizens
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [eip-7732, eip-8282, consensus-specs-gloas-beacon-chain, consensus-specs-gloas-builder, consensus-specs-gloas-validator, consensus-specs-gloas-p2p, consensus-specs-mainnet-config-gloas, consensus-specs-mainnet-preset-phase0, consensus-specs-mainnet-preset-gloas, ethresearch-epbs-threads, ethereum-pm]
+stack: {}
+---
+
+A bid says `value: 3000000000`. Three ether, promised to the proposer.
+
+Two questions follow immediately and the entire payment design is the answer to them. What stops a
+builder from promising three ether it does not have? And once the proposer has signed, what makes the
+builder actually pay?
+
+The out-of-protocol answer today is that the payment is a transaction inside the builder's own block,
+so it happens if and only if the block lands, and the relay checked the block before offering it.
+That is a tidy answer with one property this module has spent two lessons attacking: it needs the
+relay.
+
+The enshrined answer is to make the builder something the consensus layer has on its books.
+
+## A registry entry that is not a validator
+
+Beacon state gains a `builders` list. Each entry is small:<Cite src="consensus-specs-gloas-beacon-chain" />
+
+```python
+class Builder(Container):
+    pubkey: BLSPubkey
+    version: Uint8
+    execution_address: ExecutionAddress
+    balance: Gwei
+    deposit_epoch: Epoch
+    withdrawable_epoch: Epoch
+```
+
+Six fields. A key to verify signatures with, an execution-layer address for withdrawals, a balance,
+and two epochs marking the ends of its life. Nothing about duties, nothing about committees, no
+effective balance, no participation flags, no slashing record.
+
+That absence is the design. **Builders are staked, and builders are not [validators](/c/validator).** The honest
+builder guide states it plainly: because builders are not validators they do not attest, do not
+propose, and therefore *earn no yield on their stake*.<Cite src="consensus-specs-gloas-builder" />
+The stake is not there to secure anything. It is there to be spendable — a bonded balance the state
+transition can debit when the builder promises to pay someone.
+
+<Misconception
+  belief="Enshrining builders means builders join the validator set and start earning staking rewards."
+  reality="A builder is a separate kind of registry entry with no duties and no yield. Its stake exists so the protocol can debit it, not so the builder can earn on it."
+  why="'Staked entity in beacon state' describes validators, and validators are the only staked entity anyone has met before."
+  src="consensus-specs-gloas-builder"
+/>
+
+### Getting in, and getting out
+
+Registration happens on the execution layer, not the beacon chain. A builder submits a **builder
+deposit request** to a builder deposit predeploy — a mechanism specified separately in EIP-8282,
+which defines the request types and contracts that carry builder deposits and exits on the request
+bus.<Cite src="eip-8282" /><Cite src="consensus-specs-gloas-builder" /> The request carries a BLS
+public key, withdrawal credentials whose first byte is `BUILDER_WITHDRAWAL_PREFIX` and whose last
+twenty bytes are the execution address that will receive withdrawals, an amount, and a proof of
+possession.<Cite src="consensus-specs-gloas-builder" />
+
+Two details in that sentence carry real consequences.
+
+**The prefix is load-bearing and unforgiving.** A builder deposit request whose withdrawal
+credentials do not start with `BUILDER_WITHDRAWAL_PREFIX` is *ignored, and the funds are
+lost*.<Cite src="consensus-specs-gloas-builder" /> That is the specification's own wording. The
+deposit-contract genre has this failure mode throughout, and it has cost people real money in the
+validator case; it is now available in a second flavour.
+
+**The minimum is one ether, and it is not a magic number to memorise.** The stake floor is
+`MIN_DEPOSIT_AMOUNT`, which the mainnet preset sets to 1,000,000,000 gwei — one
+ether.<Cite src="consensus-specs-mainnet-preset-phase0" /><Cite src="consensus-specs-gloas-builder" />
+The EIP describes the same thing as being able to stake "for as little as 1
+ETH".<Cite src="eip-7732" /> This is exactly the sort of parameter that gets revisited late in an
+upgrade's life, so read it from the merged specification at the tag you care about rather than from
+any article, including this one.<Cite src="ethereum-pm" />
+
+Activation is finality-gated. A builder is active only once the epoch in which it was assigned an
+index has been *finalised*, which in practice means roughly two epochs after the deposit
+arrives:<Cite src="consensus-specs-gloas-builder" />
+
+```python
+def is_active_builder(state: BeaconState, builder_index: BuilderIndex) -> bool:
+    builder = state.builders[builder_index]
+    return (
+        # Placement in builder list is finalized
+        builder.deposit_epoch < state.finalized_checkpoint.epoch
+        # Has not initiated exit
+        and builder.withdrawable_epoch == FAR_FUTURE_EPOCH
+    )
+```
+
+Note what the second clause does: `withdrawable_epoch == FAR_FUTURE_EPOCH` is how "has not initiated
+exit" is spelled. Exiting sets that field to the current epoch plus
+`MIN_BUILDER_WITHDRAWABILITY_DELAY`, which the mainnet configuration sets to 64
+epochs.<Cite src="consensus-specs-gloas-beacon-chain" /><Cite src="consensus-specs-mainnet-config-gloas" />
+A builder cannot bid, take payment obligations, and walk out with the balance in the same epoch.
+
+Unlike validators, builders are **not subject to the deposit and exit churn queues** that pace
+validator entry and exit.<Cite src="eip-7732" /> They are a different kind of participant with a
+different lifecycle, and the protocol treats them as such.
+
+## Solvency is checked before the proposer is bound
+
+Now the first of the two opening questions. What stops a bid the builder cannot cover?
+
+```python
+def can_builder_cover_bid(
+    state: BeaconState, builder_index: BuilderIndex, bid_amount: Gwei
+) -> bool:
+    builder_balance = state.builders[builder_index].balance
+    pending_withdrawals_amount = get_pending_balance_to_withdraw_for_builder(state, builder_index)
+    min_balance = MIN_DEPOSIT_AMOUNT + pending_withdrawals_amount
+    if builder_balance < min_balance:
+        return False
+    return builder_balance - min_balance >= bid_amount
+```
+
+<Figure
+  caption="Two reserves come off the top before a single gwei is available to bid with."
+  alt="The solvency inequality: the builder's balance minus the sum of the permanent minimum deposit and everything already pending must still cover this bid."
+>
+  <Anatomy
+    value="balance - (MIN_DEPOSIT_AMOUNT + pending) >= bid"
+    parts={[
+      { from: 0, to: 7, label: 'staked balance' },
+      { from: 11, to: 29, label: 'permanent floor', note: 'one ether, never spendable', tone: 'warn' },
+      { from: 32, to: 39, label: 'already owed', note: 'bids won earlier this epoch', tone: 'warn' },
+      { from: 44, to: 47, label: 'this bid', note: 'what the block may promise', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+Read it as three claims.<Cite src="consensus-specs-gloas-beacon-chain" />
+
+**Subgoal: reserve the floor.** `MIN_DEPOSIT_AMOUNT` is subtracted before anything is available to
+bid with. The minimum stake is not a starting balance the builder can spend down to zero — it is a
+permanent reserve. A builder cannot bid its way out of the registry.
+
+**Subgoal: reserve what is already owed.** Payments already queued for withdrawal are also subtracted.
+A builder that has won three slots this epoch cannot bid the same ether four times, because each
+accepted bid reduces the pool the next bid is measured against.
+
+**Subgoal: only then, check the bid.** What remains must cover the new promise.
+
+And crucially, this runs inside `process_execution_payload_bid` — the state transition for the
+beacon block itself.<Cite src="consensus-specs-gloas-beacon-chain" /> A block containing a bid the
+builder cannot cover is not a block that fails to pay. It is an **invalid block**, rejected by every
+client. The solvency question is settled before the proposer's signature has bound it to anything,
+by the same machinery that decides whether a block exists.
+
+That is the shape of enshrinement. The relay used to answer "can this builder pay?" by checking a
+transaction. Now nobody answers it, because the question cannot arise.
+
+## Payment is unconditional — say exactly what that means
+
+The second question. Once the proposer signs, what makes the builder pay?
+
+The specification's answer, from the honest builder guide, is one sentence: if a proposer accepts a
+builder's bid, the builder will pay the proposer what it promised **whether it submits the payload or
+not**.<Cite src="consensus-specs-gloas-builder" />
+
+That single design decision is what makes relays unnecessary. Escrow existed to stop each side
+cheating on delivery. If payment does not depend on delivery, there is nothing to escrow. The
+proposer's exposure — sign now, receive later, hope — is gone, because the receiving does not depend
+on anyone's cooperation.
+
+<Misconception
+  belief="Under ePBS a proposer risks not being paid if the builder disappears."
+  reality="Payment is owed the moment the bid is accepted into a block. What the builder can deny the proposer is not the payment but the payload — the slot may simply end with no execution content."
+  why="Escrow intuition says no goods, no payment. Here the goods and the payment were deliberately decoupled."
+  src="eip-7732"
+/>
+
+### Unconditional on the payload, conditional on the block
+
+Here is where a lot of secondary writing goes slightly wrong, and where the accurate version is more
+interesting than the slogan.
+
+Accepting a bid does not debit the builder immediately. It records a *pending*
+payment:<Cite src="consensus-specs-gloas-beacon-chain" />
+
+```python
+pending_payment = BuilderPendingPayment(
+    weight=0,
+    withdrawal=BuilderPendingWithdrawal(
+        fee_recipient=bid.fee_recipient,
+        amount=amount,
+        builder_index=builder_index,
+    ),
+    proposer_index=get_beacon_proposer_index(state),
+)
+state.builder_pending_payments[SLOTS_PER_EPOCH + bid.slot % SLOTS_PER_EPOCH] = pending_payment
+```
+
+`weight` starts at zero. It grows as attestations for that slot are processed: for each attester
+voting for the block, its effective balance is added to the payment's
+weight.<Cite src="consensus-specs-gloas-beacon-chain" /> The pending-payments vector is two epochs
+long — `Vector[BuilderPendingPayment, 2 * SLOTS_PER_EPOCH]` — so a slot's payment sits there
+accumulating votes while the epoch completes.<Cite src="consensus-specs-gloas-beacon-chain" />
+
+Then, at epoch processing:<Cite src="consensus-specs-gloas-beacon-chain" />
+
+```python
+def process_builder_pending_payments(state: BeaconState) -> None:
+    quorum = get_builder_payment_quorum_threshold(state)
+    for payment in state.builder_pending_payments[:SLOTS_PER_EPOCH]:
+        if payment.weight >= quorum:
+            state.builder_pending_withdrawals.append(payment.withdrawal)
+    ...
+```
+
+The threshold is six tenths of one slot's share of total active
+balance:<Cite src="consensus-specs-gloas-beacon-chain" />
+
+```python
+def get_builder_payment_quorum_threshold(state: BeaconState) -> Uint64:
+    per_slot_balance = get_total_active_balance(state) // SLOTS_PER_EPOCH
+    quorum = per_slot_balance * BUILDER_PAYMENT_THRESHOLD_NUMERATOR
+    return Uint64(quorum // BUILDER_PAYMENT_THRESHOLD_DENOMINATOR)
+```
+
+with the numerator and denominator fixed at 6 and 10.<Cite src="eip-7732" />
+
+So the precise statement is: **the payment is unconditional with respect to the builder's reveal, and
+conditional on the proposer's block being genuinely accepted by the network.** A payment whose block
+never gathered sixty percent of a slot's attesting balance is dropped rather than settled.
+
+<Figure
+  caption="The payment's whole life is an epoch long, and it ends on the withdrawal rail rather than inside the block it paid for."
+  alt="An accepted bid becomes a pending payment with zero weight; attesting balance accumulates into it through the epoch; at the epoch boundary a payment that reached the quorum becomes a builder pending withdrawal to the proposer's nominated address, and one that did not is dropped and charges the builder nothing."
+>
+  <Flow
+    dir="down"
+    lanes={['block processing', 'beacon state', 'through the epoch', 'epoch boundary', 'withdrawal sweep']}
+    nodes={[
+      { id: 'bid', label: 'bid accepted', note: 'solvency checked as block validity', col: 0, tone: 'accent' },
+      { id: 'pend', label: 'BuilderPendingPayment', note: 'weight starts at zero', col: 1 },
+      { id: 'grow', label: 'attestations add weight', note: 'each voter effective balance', col: 2 },
+      { id: 'ok', label: 'quorum reached', note: 'six tenths of one slot share', col: 3, tone: 'good' },
+      { id: 'no', label: 'quorum missed', note: 'dropped, builder charged nothing', col: 3, tone: 'warn', dashed: true },
+      { id: 'wd', label: 'BuilderPendingWithdrawal', note: 'to the address the proposer nominated', col: 4 },
+    ]}
+    edges={[
+      { from: 'bid', to: 'pend' },
+      { from: 'pend', to: 'grow' },
+      { from: 'grow', to: 'ok', tone: 'good' },
+      { from: 'grow', to: 'no', tone: 'warn', dashed: true },
+      { from: 'ok', to: 'wd', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+That second condition is not a hedge, it is the *builder's* protection, and the EIP names it: builder
+withhold safety, meaning that if a beacon block carrying a builder's commitment is withheld and
+revealed late, the builder is not charged the bid's value — the payload does not even need to be
+revealed in that case.<Cite src="eip-7732" /> Without it, a malicious proposer could sign a bid,
+sit on the block until the slot was lost, and collect from a builder who never had a chance to
+deliver.
+
+<Aside kind="note">
+Two safety properties, two directions, both needed. **Proposer unconditional payment** protects the
+proposer against a builder that does not reveal. **Builder withhold safety** protects the builder
+against a proposer that does not publish. The fork-choice rules are where both are enforced, and the
+EIP states the guarantees hold "under specified margins of
+security" — not absolutely.<Cite src="eip-7732" />
+</Aside>
+
+### And the margin has a number attached
+
+Read the security considerations rather than the abstract and the honest limit appears. A colluding
+set of proposers and attesters controlling consecutive blocks and **more than twenty percent of total
+stake** can reorg a builder's payload and force it to pay the bid's
+value.<Cite src="eip-7732" /> Builder safety is a threshold property, not an absolute one.
+
+Notice how different that is in kind from what it replaced. Under relays, the builder's exposure was
+"the relay behaves as documented and its code is correct" — unquantifiable, and demonstrably
+breakable by one missing conditional.<Cite src="ethresearch-epbs-threads" /> Under enshrinement it is
+"no colluding coalition exceeds twenty percent of stake with consecutive proposals" — a number you can
+argue about, monitor, and reason about against the rest of the protocol's assumptions. Replacing an
+unquantified trust assumption with a quantified economic one is the actual deliverable here, and it is
+worth saying in those words rather than as "trustless".
+
+## What a one-ether floor does and does not buy
+
+One ether is a low bar. It is deliberately low, and it is tempting to read that as the design opening
+block building to anyone. Work out what the bar is actually for and the reading collapses.
+
+The stake exists so that a bid can be backed. That is its whole job: the state transition needs a
+balance it can check against and later debit.<Cite src="consensus-specs-gloas-beacon-chain" /> A high
+floor would exclude small builders from the *bidding* mechanism without doing anything useful, because
+the amount that has to be available is the bid, and the bid is checked
+separately.<Cite src="consensus-specs-gloas-beacon-chain" /> So the floor is set at the smallest value
+that still makes registry entries non-free — spam resistance and a permanent reserve, not a
+qualification.
+
+What it emphatically does not do is lower the cost of *being competitive*. A builder still needs order
+flow, simulation capacity and latency engineering to produce a block worth bidding on, and a builder
+that cannot outbid the incumbents wins no slots regardless of how cheaply it registered. The capital
+requirement was never the barrier to entry in this market, so removing it changes nothing about who
+wins.
+
+<Misconception
+  belief="A one-ether minimum stake means block building is now open to small operators."
+  reality="The stake floor is spam resistance for a registry entry. Winning slots still requires outbidding builders whose advantage comes from order flow and infrastructure, which enshrinement does not touch."
+  why="Low capital requirements read as low barriers to entry, which is usually true and is not true in a market whose costs are almost entirely operational."
+  src="eip-7732"
+/>
+
+There is a second-order effect worth noticing, though, and it is real. A builder that registers
+in-protocol no longer needs a relay to accept it. Today a builder that no major relay will connect has
+no route to proposers at all; under this design its route is a public gossip topic, and the proposer's
+client evaluates bids directly.<Cite src="consensus-specs-gloas-builder" /> That removes a
+gatekeeper. Whether removing the gatekeeper changes market shares is a different question — the
+answer, examined later in this module, appears to be mostly no — but the permissioning genuinely
+changes.
+
+## What the registry costs the chain
+
+Beacon state grows. The Gloas additions are `builders`, `next_withdrawal_builder_index`,
+`execution_payload_availability`, `builder_pending_payments`, `builder_pending_withdrawals`,
+`latest_block_hash` and `payload_expected_withdrawals`, alongside the removal of
+`latest_execution_payload_header` in favour of
+`latest_execution_payload_bid`.<Cite src="consensus-specs-gloas-beacon-chain" /><Cite src="eip-7732" />
+
+The registry limit is generous — `BUILDER_REGISTRY_LIMIT` is `2**40`, over a trillion
+entries — which is a Merkleisation bound rather than an expectation about how many builders will
+exist.<Cite src="eip-7732" /> The bound that actually matters operationally is
+`MAX_BUILDERS_PER_WITHDRAWALS_SWEEP` at 16,384, which paces how fast the payment queue can drain into
+the execution layer.<Cite src="consensus-specs-mainnet-preset-gloas" />
+
+For anyone who reads beacon state programmatically, the practical note is that the state container's
+shape changes in two ways at once in this fork: new fields from EIP-7732, and a retyping of existing
+fields by the forward-compatibility work landing in the same
+upgrade.<Cite src="consensus-specs-gloas-beacon-chain" /> Code that indexes state by field position,
+or that hardcodes a generalised index for a Merkle proof, needs both accounted for.
+
+## The money's route to the execution layer
+
+The payment is denominated on the beacon chain and spent on the execution layer, so it travels the
+withdrawal path. A settled payment becomes a `BuilderPendingWithdrawal` carrying the
+`fee_recipient`, the amount, and the builder's index. The withdrawal sweep drains that queue into
+execution-layer withdrawals, bounded per payload, with the mainnet preset capping the sweep at 16,384
+builders per pass.<Cite src="consensus-specs-gloas-beacon-chain" /><Cite src="consensus-specs-mainnet-preset-gloas" />
+
+Which means: **the proposer's payment arrives as a withdrawal to an execution address it nominated,
+not as a transaction inside the block it proposed.** For anyone whose accounting reconciles proposer
+revenue today by parsing the last transaction of a block, that pipeline stops working — the revenue
+is no longer in the block at all, and the timing is no longer the slot.
+
+## What changes for the person running the proposer
+
+Strip this down to the operator's view and the diff is smaller than the specification diff, but it is
+not nothing.
+
+**A binary goes away.** The middleware that polls relays has no role: bids arrive on a gossip topic
+the consensus client already subscribes to, and bid selection happens inside the
+client.<Cite src="consensus-specs-gloas-p2p" /> One fewer process, one fewer configuration file of
+relay URLs, and one fewer thing whose failure mode is "your validator silently stopped selling its
+slots".
+
+**A message goes out in advance.** A proposer may broadcast `SignedProposerPreferences` for its
+upcoming slots, naming the fee recipient it wants paid and the gas limit it wants
+targeted.<Cite src="consensus-specs-gloas-validator" /> Builders are directed to read those
+preferences and honour them when constructing a bid.<Cite src="consensus-specs-gloas-builder" /> The
+proposer's gas-limit preference — today expressed by configuring your own execution client and
+partially surrendered when you outsource — becomes an input to the bid the builder must satisfy.
+
+**Revenue arrives on a different rail.** As above, the payment is a beacon-chain withdrawal to the
+nominated execution address rather than a transaction in the block, which means it does not appear at
+the moment of proposal and does not appear in the block you
+proposed.<Cite src="consensus-specs-gloas-beacon-chain" />
+
+**A new duty appears, occasionally.** Some of your validators will be selected for the payload
+timeliness committee and will owe a message per assigned slot. It is a small duty and it is the
+subject of the next lesson.<Cite src="consensus-specs-gloas-validator" />
+
+None of that is a large operational change on its own. The reason to enumerate it is that "removing
+the relay" is often heard as an abstraction, and the concrete version is a list of four things that
+appear in a runbook.
+
+<Check type="predict" concept="unconditional-payment">
+A builder wins slot N with a bid of 5 ETH and holds a balance of exactly 6 ETH with nothing else
+pending. Immediately after the beacon block for slot N is accepted, the builder tries to bid 5 ETH
+again for slot N+1. Separately, suppose the block for slot N goes on to attract only a third of the
+attesting balance for that slot, because a network partition split the view.
+
+Walk both threads: what happens to the second bid, and what happens to the first payment?
+
+<Answer>
+**The second bid is rejected, and the rejection is a block-validity failure, not a payment failure.**
+
+`can_builder_cover_bid` reserves `MIN_DEPOSIT_AMOUNT` — one ether — plus everything already pending
+for that builder.<Cite src="consensus-specs-gloas-beacon-chain" /><Cite src="consensus-specs-mainnet-preset-phase0" />
+With 6 ETH of balance, 1 ETH reserved as the floor and 5 ETH pending from slot N, the available
+amount is zero. Any non-zero bid fails the check, and a beacon block carrying it is invalid — so a
+proposer for slot N+1 that included this bid would produce a block every client
+rejects.<Cite src="consensus-specs-gloas-beacon-chain" />
+
+The practical consequence for a builder is that its bidding capacity is its balance minus the floor
+minus its outstanding obligations, and obligations clear on the epoch boundary rather than the slot
+boundary. A builder that wants to bid every slot has to hold a working balance sized to a full epoch
+of wins, not to one bid.
+
+**The first payment is dropped, not settled.** Weight accumulates from attestations for that
+block.<Cite src="consensus-specs-gloas-beacon-chain" /> A third of the attesting balance is below the
+sixty-percent quorum, so at epoch processing the payment is not appended to
+`builder_pending_withdrawals`; it is cleared with the rest of the epoch's
+slots.<Cite src="consensus-specs-gloas-beacon-chain" />
+
+The builder pays nothing and the proposer receives nothing. That is not a bug — it is builder
+withhold safety operating exactly as specified: a block that the network did not actually converge on
+does not get to charge a builder for it.<Cite src="eip-7732" />
+
+The uncomfortable corollary is worth stating: "the proposer is always paid" is true for a proposer
+whose block was accepted. A proposer whose block loses is not paid — but then it also has no block,
+which is the pre-existing risk every proposer already carries.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now answer the two questions this lesson opened with, in the specification's own terms: a bid
+is covered because block validity requires it, and it is paid because acceptance of the block queues
+the payment independently of anything the builder does afterwards.
+
+You can also state the thing that most short summaries get wrong, in one line: *unconditional* means
+unconditional on the reveal, not unconditional on everything. The payment still has to clear a
+sixty-percent attestation-weight quorum for the block that carried the bid, and that quorum exists to
+protect the builder rather than to hedge the proposer's
+guarantee.<Cite src="consensus-specs-gloas-beacon-chain" /><Cite src="eip-7732" /> Anyone who tells
+you the proposer is paid no matter what has compressed a two-sided safety property into a one-sided
+slogan.
+
+That leaves a hole shaped exactly like the next two lessons. If the builder can decline to reveal and
+still pay, somebody has to notice whether the payload showed up — that is a committee, and it votes on
+less than you would expect. And once "no payload" is a legal outcome, the chain needs somewhere to
+record it and fork choice needs an opinion about it. Both are next.<Cite src="eip-7732" />

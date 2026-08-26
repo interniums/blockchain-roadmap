@@ -1,0 +1,456 @@
+---
+id: app-wagmi-reads-and-writes
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [wagmi-tanstack-query, wagmi-use-read-contract, wagmi-use-write-contract, wagmi-use-balance, wagmi-use-block-number, wagmi-create-config, wagmi-migrate-v2-v3, wagmi-write-to-contract-guide, wagmi-src-use-write-contract, wagmi-src-query-read-contract, wagmi-src-react-query-utils, tanstack-query-keys, tanstack-query-invalidation, viem-write-contract, viem-simulate-contract]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+Two hooks, one component, and a difference the names do not mention:
+
+```tsx
+const balance = useReadContract({ abi, address: token, functionName: 'balanceOf', args: [me] })
+const transfer = useWriteContract()
+```
+
+The first line issued a JSON-RPC request before the component finished its first render, and will
+issue more on its own schedule. The second line issued nothing, will never issue anything on its own,
+and is inert until some event handler calls `transfer.mutate(...)`.
+
+That asymmetry is not a wagmi design decision. It is TanStack Query's distinction between a **query**
+and a **mutation**, inherited wholesale: queries fetch data, are tied to a unique query key, and are
+typically invoked on mount by default; mutations mutate data or cause side effects, are not coupled
+to a query key, and are typically invoked in response to a user
+interaction.<Cite src="wagmi-tanstack-query" /> Every wagmi hook is one or the other, and knowing
+which one you are holding tells you when it runs, whether its result is cached, and who is
+responsible for it being out of date.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'A read hook', note: 'useReadContract — a query', tone: 'accent' },
+    { title: 'A write hook', note: 'useWriteContract — a mutation', tone: 'warn' },
+  ]}
+  rows={[
+    {
+      label: 'When does it run?',
+      cells: [
+        'On mount, by default — before the first render finished',
+        'Only when an event handler calls it',
+      ],
+    },
+    {
+      label: 'Is the result in the cache?',
+      cells: [
+        'Yes, under a query key that two components can share',
+        'No — a mutation is not coupled to a query key at all',
+      ],
+    },
+    {
+      label: 'What is in data?',
+      cells: [
+        'The last successfully resolved value',
+        'A transaction hash, returned well before anything is mined',
+      ],
+    },
+    {
+      label: 'What makes it run again?',
+      cells: [
+        'refetchOnMount, refetchOnWindowFocus and refetchOnReconnect, all defaulting to true',
+        'You, calling it again',
+      ],
+    },
+    {
+      label: 'Does success mean it worked?',
+      cells: [
+        'It means a value arrived',
+        'It means the wallet returned a hash; the receipt status decides',
+      ],
+    },
+  ]}
+  caption="The two lines at the top of this lesson differ in every row, and neither name says so."
+  alt="A wagmi read hook and a write hook compared: the read is a TanStack query that runs on mount, caches under a key and refetches on three ambient triggers, while the write is a mutation that runs only when called, caches nothing, and resolves with a transaction hash rather than a result."
+/>
+
+## A read hook returns a cache entry, not a value
+
+`useReadContract` returns TanStack's full query result. The fields you will actually reason about,
+with the defaults wagmi's documentation states for them:<Cite src="wagmi-use-read-contract" />
+
+| Field | Meaning |
+|---|---|
+| `data` | The last successfully resolved value. `undefined` until one exists. |
+| `error` | The error object if one was thrown, otherwise `null`. |
+| `status` / `isPending` / `isSuccess` / `isError` | Whether the cache entry has a value yet. |
+| `fetchStatus` / `isFetching` | Whether the query function is executing *right now*. |
+| `isLoading` | `isFetching && isPending` — the first fetch, specifically. |
+| `refetch` | Imperative re-run. |
+| `queryKey` | The key this hook is using. You will need it. |
+
+The pair that gets misused is `isPending` and `isFetching`, and the fix is to stop treating them as
+two spellings of "loading". **`isPending` describes the cache entry: there is no data.**
+**`isFetching` describes the network: a request is in flight.** They are independent because a
+background refetch of an entry that already has data is `isFetching` and not `isPending` — which is
+exactly the state in which you want to keep showing the old number rather than a
+skeleton.<Cite src="wagmi-use-read-contract" />
+
+That gives a UI rule with no judgement in it:
+
+- `isPending` — render a skeleton. There is nothing to show.
+- `isFetching && !isPending` — render the data, optionally with a quiet refreshing indicator. Never
+  a skeleton; you would be replacing a correct number with a grey box.
+- `isError && data !== undefined` — a refetch failed but the previous value survives. Decide
+  deliberately whether stale-and-shown beats an error state. For a balance next to a Send button,
+  it usually does not.
+
+Two other defaults are worth knowing before they surprise you. `staleTime` defaults to `0`, meaning a
+cached read is considered stale the instant it arrives and will refetch on the next trigger.
+`gcTime` defaults to five minutes, or `Infinity` during server rendering — that is when an *unused*
+entry is dropped from memory, not when it stops being trusted.<Cite src="wagmi-use-read-contract" />
+People conflate the two constantly. Staleness decides whether to refetch; garbage collection decides
+whether the old value is still there to show while you do.
+
+<Aside kind="note">
+`structuralSharing` defaults to `true`, which means when a refetch returns a deeply equal result you
+get back the *same object reference* rather than a new one.<Cite src="wagmi-use-read-contract" /> In
+wagmi's implementation this is TanStack's `replaceEqualDeep`.<Cite src="wagmi-src-react-query-utils" />
+It is the reason a polling read does not re-render half your tree every four seconds, and the reason
+a `useEffect` with `[balance.data]` in its dependency array does not fire when nothing changed. Turn
+it off and you will get correctness plus a performance problem.
+</Aside>
+
+## One question asked five times is one request
+
+Two components rendering the identical read share one cache entry and one in-flight request. This is
+not deduplication logic in wagmi; it is what a cache keyed by a value does. TanStack manages caching
+based on query keys, and two queries whose keys hash identically *are* the same
+query.<Cite src="tanstack-query-keys" />
+
+wagmi builds that key for you. For a contract read it is a two-element tuple — the literal
+`'readContract'` and a filtered copy of the options you
+passed.<Cite src="wagmi-src-query-read-contract" /> So this pair shares everything:
+
+```tsx
+// Component A
+useReadContract({ abi, address: token, functionName: 'balanceOf', args: [me] })
+// Component B, elsewhere in the tree
+useReadContract({ abi, address: token, functionName: 'balanceOf', args: [me] })
+```
+
+and this pair shares nothing:
+
+```tsx
+useReadContract({ abi, address: token, functionName: 'balanceOf', args: [me] })
+useReadContract({ abi, address: token, functionName: 'balanceOf', args: [me], chainId: 8453 })
+```
+
+because `chainId` is part of the key. The failure mode this creates is quiet in both directions. Five
+components that look identical can produce five requests because one of them was handed a subtly
+different argument — a `bigint` where the others have a `number`, an address in a different case, an
+extra `scopeKey`.<Cite src="wagmi-use-read-contract" /> And two components that were *meant* to ask
+different questions can collapse into one because the field that distinguished them is not in the
+key. The next lesson is about exactly which fields those are, because the list is not the one you
+would guess.
+
+The diagnostic is always the same and takes thirty seconds: render `JSON.stringify(read.queryKey)`
+in both components and compare the strings.
+
+## A write hook is a trigger with status attached
+
+`useWriteContract` returns a mutation. It does not run on render, its result is not put in the query
+cache, and it exposes an imperative function plus status flags. In wagmi v3 that function is
+`mutate` (fire-and-forget, errors go to `error`) or `mutateAsync` (returns a promise you must
+catch).<Cite src="wagmi-use-write-contract" /><Cite src="wagmi-migrate-v2-v3" />
+
+```tsx
+const transfer = useWriteContract()
+
+transfer.mutate({
+  abi,
+  address: token,
+  functionName: 'transfer',
+  args: [recipient, amount],
+})
+```
+
+The v3 rename is the reason `transfer` is not destructured here: naming the whole result lets two
+`useWriteContract` calls in one component read as `transfer.mutate` and `approve.mutate` instead of a
+pile of aliased keys.<Cite src="wagmi-migrate-v2-v3" /> The old `writeContract` name still resolves —
+it is retained as a deprecated alias for `mutate`<Cite src="wagmi-src-use-write-contract" /> — which
+is why you will find both spellings in wagmi's own material. The API reference uses
+`writeContract.mutate(...)`; the Write to Contract guide still destructures
+`{ data: hash, writeContract }`.<Cite src="wagmi-use-write-contract" /><Cite src="wagmi-write-to-contract-guide" />
+When two pages of one docs site disagree, the reference page is the one generated from the types.
+
+Three things about what comes back matter more than the naming.
+
+**`data` is a transaction hash, not a result.** The mutation resolves when the wallet returns a hash,
+which happens well before anything is mined. Everything you know about the
+[transaction lifecycle](/c/tx-lifecycle-states) applies from that instant, and the hook that waits is
+`useWaitForTransactionReceipt`.<Cite src="wagmi-write-to-contract-guide" />
+
+**A mined transaction can still have failed.** A receipt with `status: 'reverted'` is a successful
+mutation by TanStack's reckoning and a failed operation by the user's. The mutation's `isSuccess` is
+not the answer to "did it work"; the [receipt status](/c/tx-receipt-status-zero) is.
+
+**Simulate first, for the user's sake rather than yours.** viem's `writeContract` does not validate
+that the call would succeed — it signs and broadcasts, and a reverting transaction is still mined and
+still burns gas.<Cite src="viem-write-contract" /> `useSimulateContract` runs the call against
+pending state first so the failure arrives before the signature prompt rather than after the fee. It
+costs an extra RPC round-trip per render of the button, and it is
+[not a guarantee](/c/viem-simulation-is-not-a-guarantee) — state can change between the simulation
+and inclusion.<Cite src="viem-simulate-contract" />
+
+<Aside kind="note">
+`useWriteContractSync` also exists, built on the synchronous send path.<Cite src="wagmi-use-write-contract" />
+It waits for a receipt inside the call instead of handing you a hash. That is a genuinely different
+UX primitive, and the constraint attached to it in viem's documentation — fast block times and fast
+finality, not L1 mainnet — is a product decision, not a preference.<Cite src="viem-write-contract" />
+</Aside>
+
+## Nothing invalidates your cache. Not even your own write
+
+Here is the sentence to carry out of this lesson.
+
+> A wagmi read hook is a cached question, not a subscription. When the answer changes on-chain,
+> nothing in this stack finds out.
+
+This is not a wagmi gap; it is the shape of the problem. A REST cache can be invalidated by the
+mutation that changed the resource, because your server owns the resource and your client owns both
+calls. Chain state has neither property. **Another account can change your balance while your tab is
+idle**, and no mutation of yours was involved. There is no push channel that a query cache
+subscribes to by default, so the cache serves the last value it fetched, indefinitely, and every
+flag on the hook says everything is fine.
+
+The half of this that surprises people most is that **your own successful write does not invalidate
+anything either**. The mutation is not coupled to a query key.<Cite src="wagmi-tanstack-query" />
+TanStack has no idea that the mutation named `transfer` has anything to do with the query named
+`readContract balanceOf`; that relationship exists only in your head until you write it down.
+
+<Misconception
+  belief="wagmi hooks re-render when on-chain state changes — that is what a hook is for."
+  reality="They are cached queries. Without an explicit refresh trigger they will serve a stale balance forever, with isSuccess true and no error."
+  why="The hook name reads like a subscription, and in most React data libraries the thing that fetches is also the thing that watches."
+  src="wagmi-tanstack-query"
+/>
+
+### Except for the ambient triggers you did not configure
+
+"Nothing refreshes it" is true about chain events and false about the browser, and the gap between
+those two statements is why these bugs are intermittent rather than permanent. Three of TanStack's
+refetch triggers are on by default in wagmi's read hooks, and each fires *if the data is stale* —
+which, with `staleTime` at its default of `0`, means always:<Cite src="wagmi-use-read-contract" />
+
+- `refetchOnMount` — defaults to true. Navigating away and back refetches.
+- `refetchOnWindowFocus` — defaults to true. Alt-tabbing to your wallet and back refetches.
+- `refetchOnReconnect` — defaults to true. A network blip refetches.
+
+Read that list against the bug report you will actually receive. The user switches to MetaMask,
+confirms, switches back to your tab — window focus fires, the read refetches, the new balance
+appears, and the bug does not reproduce for them. The user who leaves the tab open on a second
+monitor and watches never focuses anything, so their balance sits unchanged for an hour. **Same code,
+same cache, opposite experiences**, and the variable is a browser event that has nothing to do with
+your application or the chain.
+
+The corollary is a QA instruction worth writing into the ticket: **reproduce staleness bugs without
+touching the tab.** Trigger the state change from a second account, from `cast send`, or from a
+script, and do not click into the window to check. Any test that involves focusing the browser has
+already refreshed the thing it was meant to test.
+
+<Aside kind="warn">
+Raising `staleTime` above zero — a common and reasonable move to cut request volume — silences all
+three of these triggers for the duration, because each is conditional on the data being
+stale.<Cite src="wagmi-use-read-contract" /> That is usually what you want and it is also how a
+tolerable intermittent bug becomes a permanent one. If you raise `staleTime`, you have taken on the
+obligation to invalidate explicitly, and the ambient safety net you were relying on without noticing
+is gone.
+</Aside>
+
+### The two mechanisms that actually exist
+
+**A `watch` option, on the hooks that have one.** `useBlockNumber` takes `watch: true`, or an object
+of watch parameters passed through to `useWatchBlockNumber`.<Cite src="wagmi-use-block-number" />
+Note what that list does *not* include: `useBalance`'s parameters in wagmi 3.x are `address`,
+`blockNumber`, `blockTag`, `chainId`, `scopeKey` and `query` — there is no `watch`, and there is none
+on `useReadContract` either.<Cite src="wagmi-use-balance" /><Cite src="wagmi-use-read-contract" />
+Half the answers you will find online say otherwise, because `useBalance({ watch: true })` was real
+in an earlier major. Copying it today is a silent no-op: an unknown key in an options object is not
+a type error at runtime, and nothing warns.
+
+**Invalidation, which is the pattern wagmi's own documentation prescribes.** Watch the block number,
+and when it changes, mark the relevant queries stale so the rendered ones
+refetch:<Cite src="wagmi-tanstack-query" />
+
+```tsx
+const queryClient = useQueryClient()
+const { data: blockNumber } = useBlockNumber({ watch: true })
+const { data: balance, queryKey } = useBalance()
+
+useEffect(() => {
+  queryClient.invalidateQueries({ queryKey })
+}, [blockNumber])
+```
+
+Invalidating does two things: it marks the entry stale — overriding any `staleTime` — and, if the
+query is currently rendered, refetches it in the background.<Cite src="tanstack-query-invalidation" />
+Both halves matter. An entry nobody is rendering is marked and left alone until something mounts;
+that is the behaviour you want, and it is why invalidating broadly is cheaper than it sounds.
+
+**Choosing neither of these is choosing stale.** It is a legitimate choice for a token's `decimals`
+and an indefensible one for the balance beside a Send button. Which is the point of the module's
+reflection prompt: the staleness budget is a per-read product decision, and the reads whose budget
+you cannot state are the ones about to embarrass you.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'The mutation onSuccess', note: 'cheapest to write', tone: 'danger' },
+    { title: 'The receipt', note: 'useWaitForTransactionReceipt' },
+    { title: 'A new block', note: 'useBlockNumber with watch', tone: 'good' },
+  ]}
+  rows={[
+    {
+      label: 'What moment does it fire on?',
+      cells: [
+        'The wallet returned a hash',
+        'The transaction was mined',
+        'Every new block',
+      ],
+    },
+    {
+      label: 'Does it catch your own write?',
+      cells: [
+        'Too early — nothing is mined yet',
+        'Yes, and it is the tightest loop for your own action',
+        'Yes',
+      ],
+    },
+    {
+      label: 'Does it catch a keeper, a liquidation or another account?',
+      cells: [
+        'No',
+        'No',
+        'Yes — this is the only column that does',
+      ],
+    },
+    {
+      label: 'What does it cost?',
+      cells: [
+        'One refetch per write',
+        'One refetch per write',
+        'A watched block number per tab, plus every rendered read, every block',
+      ],
+    },
+  ]}
+  caption="Two of these three triggers only ever see events your own application caused."
+  alt="Three invalidation triggers compared: a mutation's onSuccess fires before inclusion, a receipt fires on inclusion but only for your own transaction, and a watched block number is the only trigger that notices state changed by anyone else."
+/>
+
+## Making one balance update, and pricing the choice
+
+The module's fix exercise hands you an app whose balance never changes after a transfer. Here is the
+reasoning, with each step named by what it is for.
+
+**Subgoal — prove the staleness is in the cache, not the chain.** Before touching any code, query the
+same value out of band: `cast call` against the same node, or a second browser profile. If the node
+reports the new balance and the UI reports the old one, the chain is fine and the cache is the
+subject. If the node also reports the old value, you have a transaction problem and none of what
+follows applies. This step takes a minute and saves an hour of invalidating something that was never
+wrong.
+
+**Subgoal — choose the trigger, because the three candidates have different guarantees.**
+*On new block* catches every change including ones your app did not cause, which is the only option
+that survives a second user moving your tokens. *On receipt* — invalidate inside
+`useWaitForTransactionReceipt`'s success path — is the tightest loop for your own action and catches
+nothing else. *On user action*, from the mutation's `onSuccess`, is the cheapest and the most wrong:
+it fires when the wallet returned a hash, which is before anything was mined. Pick block for
+correctness, add receipt for latency, never ship the third alone.
+
+**Subgoal — scope the invalidation to something you can name.** `invalidateQueries` with no key
+invalidates everything in the cache; with a key it matches by prefix.<Cite src="tanstack-query-invalidation" />
+Passing the `queryKey` a hook handed you is exact and safe. Passing `['readContract']` invalidates
+every contract read in the app on every block, which on a busy dashboard is a self-inflicted RPC
+bill. Start exact; widen only with a reason.
+
+**Subgoal — put the effect where the key is, or build the key deliberately.** The snippet above works
+because `queryKey` comes from a hook in the same component. An effect somewhere else does not have
+that hook and must construct the key — which is the whole of the next lesson, and the reason it
+exists as a lesson rather than a footnote.
+
+**Subgoal — cost it before you ship it.** `pollingInterval` defaults to `4_000`
+milliseconds.<Cite src="wagmi-create-config" /> A watched block number is therefore roughly fifteen
+requests a minute per open tab on its own, before any invalidation cascade. If each new block
+invalidates six reads that are all currently rendered, that is six more requests per block, per tab.
+Multiply by your concurrent users and compare against your provider's plan. This arithmetic is the
+entire content of the "count the requests" exercise, and doing it in advance is how you avoid
+discovering the answer from a billing alert.
+
+<Misconception
+  belief="Invalidating after my own write is enough — my app is the only thing that changes my app's data."
+  reality="Chain state is shared. Another account, a keeper, a liquidation or an airdrop changes the same values with no involvement from your code, and only a chain-driven trigger such as a watched block number sees those."
+  why="Every REST caching tutorial is written for a resource your own server owns, where invalidate-after-mutate really is sufficient."
+  src="wagmi-tanstack-query"
+/>
+
+<Check type="predict" concept="wagmi-no-auto-invalidation">
+A team ships a vault page. `useReadContract` reads the user's share balance; a Deposit button uses
+`useWriteContract`, and its `onSuccess` calls `queryClient.invalidateQueries({ queryKey })` with the
+balance hook's key. In QA on Anvil it works perfectly. In production, three complaints arrive:
+
+1. After depositing, the balance updates about half the time.
+2. A user watching the page while a liquidation bot repays their position sees no change for
+   twenty minutes.
+3. On a slow connection the balance flashes to a grey skeleton every few seconds.
+
+Diagnose each and give the fix.
+
+<Answer>
+**1 — the trigger fires too early, and Anvil hid it.** A mutation's `onSuccess` runs when the wallet
+returns a transaction hash, not when the transaction is mined.<Cite src="wagmi-write-to-contract-guide" />
+The invalidation therefore refetches the balance from a chain that has not yet included the deposit,
+gets the old value, caches it as fresh, and stops. It appears to work "about half the time" because
+sometimes the refetch lands after inclusion by luck. On Anvil with automining, the block exists
+before the promise resolves, so the race never shows up — which is a general warning about
+auto-mining local nodes as a correctness environment. The fix is to move the invalidation to the
+receipt: wait with `useWaitForTransactionReceipt` and invalidate when *that* succeeds, and check
+`status` on the receipt so a reverted deposit does not report success.
+
+**2 — the app only listens to itself.** Nothing about a bot repaying the position involves this
+user's session, so no mutation of theirs fires and no invalidation happens. The cached entry stays
+`isSuccess` with a stale value and no error.<Cite src="wagmi-tanstack-query" /> Twenty minutes is not
+a bound; it would have stayed wrong until a remount or a window-focus refetch. The fix is a
+chain-driven trigger — `useBlockNumber({ watch: true })` plus invalidation in an effect keyed on the
+block number, which is the pattern wagmi documents.<Cite src="wagmi-use-block-number" /><Cite src="wagmi-tanstack-query" />
+
+**3 — a render bug, not a data bug.** The component is branching on `isFetching` (or on `isLoading`
+without understanding it) and showing a skeleton for every background refetch. Since invalidation now
+fires roughly every block, that is a skeleton every few seconds. Branch on `isPending` instead: it is
+true only when there is no data to show.<Cite src="wagmi-use-read-contract" /> Keep the last good
+value on screen and, if you want to signal freshness, use a subdued indicator driven by `isFetching`.
+Note that this bug only became visible once bugs 1 and 2 were fixed — adding correct invalidation
+made a latent rendering mistake user-facing, which is the usual order in which these three appear.
+
+**What the three have in common.** Each is a mismatch between an event the code treats as meaningful
+and the event that actually changes the answer. Signature returned, mined, and *someone else acted*
+are three different moments, and only the third one has no representation in your app unless you
+build it.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The next lesson is the missing half of the invalidation pattern.** The snippet above works only
+because a hook in the same component handed you `queryKey`. Invalidating from a websocket callback, a
+router transition or an event handler with no hook in scope means constructing the key yourself — and
+a key that is merely plausible fails silently, because `invalidateQueries` succeeds whether or not
+anything matched.
+
+**Then the shape of the key itself**, including which of your arguments are in it, which are stripped
+out before hashing, and why a `bigint` in a key needs a custom hash function that wagmi ships and
+your `QueryClient` does not use by default.
+
+**And the freshness budget is now a thing you can write down.** For each read in your app: how stale
+may this be, and what event should refresh it. That is the module's reflection prompt, and it is
+answerable only after this lesson.

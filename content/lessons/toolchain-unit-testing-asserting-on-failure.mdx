@@ -1,0 +1,434 @@
+---
+id: toolchain-unit-testing-asserting-on-failure
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    foundry-cheatcode-expect-revert,
+    foundry-inline-test-config,
+    foundry-writing-tests,
+    forge-std-vm-1-16-2,
+    forge-std-repo,
+    solidity-docs-control-structures,
+    solidity-abi-spec,
+    measured-forge-cli-1-7-1,
+    measured-forge-1-7-1,
+  ]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Here is a passing test, and its trace, from forge 1.7.1:
+
+<Figure
+  caption="A green revert test can mean the expectation was consumed by a call you never wrote down."
+  alt="The four frames of the trace: the expectRevert cheatcode frame registers at zero gas, Target.reverting() costs 475 and reverts with inner, Target.takes(0) costs 594 and returns 0, and the test reports PASS at 11330 gas."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'reg', label: 'VM::expectRevert(...)', note: '[0] ← [Return]', col: 0, tone: 'accent' },
+      { id: 'inner', label: 'Target::reverting()', note: '[475] ← [Revert] inner', col: 1, tone: 'danger' },
+      { id: 'outer', label: 'Target::takes(0)', note: '[594] ← [Return] 0', col: 2, tone: 'warn' },
+      { id: 'pass', label: '[PASS]', note: 'test_F_NestedArgument, gas: 11330', col: 3, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+The source was one line: `vm.expectRevert(); t.takes(t.reverting());`<Cite src="measured-forge-cli-1-7-1" />
+
+Read the trace and count what actually happened. `reverting()` was called and reverted. Then
+`takes(0)` was called — with a zero argument that came from nowhere real — and **returned normally**.
+The test passed. `takes` is a function that cannot revert under any input. The test was written to
+assert that it reverts.
+
+This is the module's title made literal, and it is not an exotic case: the documentation gives the
+same trap in the same shape, warning that for a call like `stable.donate(sUSD.balanceOf(user))`, the
+next call expected to revert is `sUSD.balanceOf(user)`, not
+`stable.donate()`.<Cite src="foundry-cheatcode-expect-revert" />
+
+`expectRevert` is the most-used assertion cheatcode and the one with the most ways to succeed
+without asserting anything. This lesson is the taxonomy.
+
+## Register, then consume
+
+The mechanism is two calls, not one statement. `vm.expectRevert(...)` is a call into the cheatcode
+address that **registers** an expectation. The next call **consumes** it. Asserting that the next
+call reverts is the whole contract.<Cite src="foundry-cheatcode-expect-revert" />
+
+You saw this shape one lesson ago with `vm.prank`, and it is the same shape: something is armed, and
+the next external call — as the EVM counts calls, not as your eye reads statements — is what it
+applies to. Every trap below is a disagreement between those two ways of counting.
+
+<Misconception
+  belief="expectRevert wraps the statement after it, like a try/catch around that line."
+  reality="It registers an expectation that the next call consumes. Which call is 'next' is decided by evaluation order in the EVM, and it is frequently not the call you wrote at the end of the line."
+  why="The two lines are adjacent and read as a block, and every other language's assertion-of-failure construct really is a wrapper."
+  src="foundry-cheatcode-expect-revert"
+/>
+
+### The nesting trap, and the mechanical fix
+
+Solidity evaluates arguments before it makes the outer call. So in
+`vm.expectRevert(); target.f(other.g());` the next call is `other.g()`. The expectation binds there,
+and the assertion about `f` is never made — the test passes whether or not `f` is
+correct.<Cite src="foundry-cheatcode-expect-revert" />
+
+The trace at the top of this lesson shows the aftermath in detail: after the inner call reverted and
+the expectation was satisfied, execution continued and the outer call ran with a zero
+argument.<Cite src="measured-forge-cli-1-7-1" /> Nothing about that outcome is reported as unusual,
+because from the harness's point of view the assertion it was given was met.
+
+**Subgoal — make the trap visible.** The statement after `expectRevert` must contain exactly one
+call. Count them by hand, including the ones hidden in getters:
+`vault.withdraw(token.balanceOf(user))` is two, `vault.withdraw(amount)` is one,
+`vault.withdraw(user.balance)` is one (a balance read is not a call).
+
+**Subgoal — hoist, on the line before.**
+
+```solidity
+uint256 amount = token.balanceOf(user);   // outside the expectation
+vm.expectRevert(Vault.Insolvent.selector);
+vault.withdraw(amount);
+```
+
+**Subgoal — check that the fix changed the outcome.** Break the contract on purpose — make
+`withdraw` return without reverting — and confirm the test now fails. If it still passes, the
+expectation is still binding somewhere you did not intend. A test you have never seen fail is a test
+whose failure mode you have never verified.
+
+<Misconception
+  belief="vm.expectRevert(); target.f(other.g()); tests that f reverts."
+  reality="The next call is other.g(), so that is where the expectation binds. The test can pass with a perfectly healthy f, which then runs anyway with whatever the swallowed call left behind."
+  why="People read the statement outside-in — 'call f with the result of g' — while the EVM evaluates arguments first."
+  src="foundry-cheatcode-expect-revert"
+/>
+
+## "External" means depth, not source structure
+
+The rule is usually stated as "expectRevert only works on external calls", which is true and
+routinely misunderstood. The distinction is about **call depth relative to the cheatcode**, not about
+whether the reverting `revert` statement sits in a function marked `internal`.
+
+Two probes on forge 1.7.1 make the line exact.<Cite src="measured-forge-cli-1-7-1" />
+
+**A revert raised inside an internal function of the contract under test matches fine:**
+
+```solidity
+// contract Two { function inner() internal pure { revert Bad(); }
+//                function callsInner() external pure { inner(); } }
+vm.expectRevert(Two.Bad.selector);
+two.callsInner();                    // PASSES
+```
+
+There is an external call, it reverts, and the revert data that propagates out is `Bad()`. That the
+error originated in an internal function is invisible and irrelevant.
+
+**A call to an internal function of the *test* contract does not:**
+
+```solidity
+function _internalBoom() internal pure { revert("nope"); }
+
+vm.expectRevert(bytes("nope"));
+_internalBoom();                     // FAILS
+```
+
+The failure message is the diagnostic worth memorising:
+`[FAIL: call didn't revert at a lower depth than cheatcode call depth]`. The documentation names this
+exact string and tells you what it means: you are likely using `expectRevert` on an internal
+function.<Cite src="foundry-cheatcode-expect-revert" /> No new call frame was created, so there was
+no frame at a lower depth to observe.
+
+The opt-in exists. Adding the documented comment above the test makes the same test
+pass:<Cite src="foundry-cheatcode-expect-revert" /><Cite src="measured-forge-cli-1-7-1" />
+
+```solidity
+/// forge-config: default.allow_internal_expect_revert = true
+function test_InternalRevert() public {
+    vm.expectRevert(bytes("nope"));
+    _internalBoom();
+}
+```
+
+<Aside kind="warn">
+Two things about that comment. First, it corresponds to a real configuration key — `forge config` on
+1.7.1 reports `allow_internal_expect_revert = false` as the default, so material claiming
+`expectRevert` "just works" on internal functions predates the
+opt-in.<Cite src="measured-forge-cli-1-7-1" />
+
+Second, the inline comment names a **profile**.<Cite src="foundry-inline-test-config" /> A
+`default.`-prefixed comment describes the `default` profile. If CI runs the suite under a different
+profile, do not assume the comment applies there — verify it, because the resulting symptom is a test
+that passes on your machine and fails in CI, which reads as flakiness and gets retried rather than
+diagnosed.
+</Aside>
+
+### A revert someone catches is a revert you cannot see
+
+`expectRevert` observes the revert that propagates **out** of the next call. If the callee wraps the
+failing operation in `try`/`catch`, or makes it with a low-level `.call` and inspects the boolean,
+the revert never reaches the boundary — you already know that a low-level call returns `false`
+instead of bubbling.<Cite src="solidity-docs-control-structures" /> Your expectation goes unmet and
+the test fails, which is the safe direction; but the diagnosis ("the contract did not revert") is
+wrong, and the actual answer is that it handled the failure.
+
+<Misconception
+  belief="expectRevert catches a revert anywhere inside the next call tree."
+  reality="It matches the revert that propagates out of the next call. Reverts caught inside are invisible, and calls that create no new frame need the opt-in."
+  why="It reads like a try/catch wrapper, and in the common case — an external call that reverts all the way out — the two descriptions coincide."
+  src="foundry-cheatcode-expect-revert"
+/>
+
+## Choosing how precisely to match
+
+forge-std v1.16.2 declares a ladder of overloads, and the skill is picking a rung rather than
+defaulting to either end.<Cite src="forge-std-vm-1-16-2" />
+
+**`expectRevert()` — any revert.** The loosest rung, and the one that reproduces the behaviour of the
+`testFail` prefix that is no longer in the documented
+set.<Cite src="foundry-writing-tests" /><Cite src="forge-std-vm-1-16-2" /> It is satisfied by an
+arithmetic panic in your own
+test arithmetic, by a call to a mistyped address with no code, by an unpayable `receive`. You already
+know that revert data comes in four shapes — `Error(string)`, `Panic(uint256)`, a custom error's
+four-byte selector plus arguments, or nothing at all — and the bare form does not look at
+any of them.<Cite src="solidity-docs-control-structures" /> Use it when you genuinely do not care,
+which is rarer than its usage suggests.
+
+**`expectRevert(bytes4 revertData)` — an exact four-byte match, which is narrower than it looks.**
+The doc comment says "Expects an error on next call that **exactly matches** the revert
+data".<Cite src="forge-std-vm-1-16-2" /> The selector is derived from the canonical signature the
+same way a function selector is.<Cite src="solidity-abi-spec" /> Read "exactly" literally: this rung
+matches when the callee's entire revert blob *is* those four bytes — that is, when the custom error
+takes no arguments.
+
+This is the rung almost everyone reaches for and it is the one with a surprise attached. Measured on
+forge 1.7.1: against `error Plain()`, `vm.expectRevert(V.Plain.selector)` passes. Against
+`error Insufficient(uint256 available, uint256 requested)` reverting as `Insufficient(50, 100)`, the
+same form **fails**, with
+`[FAIL: Error != expected error: Insufficient(50, 100) != custom error 0xe8620800]`.<Cite src="measured-forge-cli-1-7-1" />
+The revert data is four bytes of selector followed by two words of arguments, and four bytes is not
+an exact match for sixty-eight.
+
+**`expectRevert(bytes revertData)` — the exact bytes, arguments included.** So
+`abi.encodeWithSelector(V.Insufficient.selector, 50, 100)` matches `Insufficient(50, 100)` and will
+not be satisfied by `Insufficient(50, 101)`; verified on forge
+1.7.1.<Cite src="measured-forge-cli-1-7-1" /> Correct when the arguments are part of the contract's
+promise — an error reporting a deadline, or a required amount a frontend renders. Expensive when they
+are incidental: every unrelated change to a fee or a decimals constant now edits this test.
+
+**`expectPartialRevert(bytes4)` — the selector of a parameterised error.** Matches only the four-byte
+selector, ignoring arguments.<Cite src="foundry-cheatcode-expect-revert" /> The `Vm.sol` comment
+draws the contrast precisely: this one expects an error that **starts with** the revert
+data.<Cite src="forge-std-vm-1-16-2" /> Against the same `Insufficient(50, 100)`, it
+passes.<Cite src="measured-forge-cli-1-7-1" /> **This — not `expectRevert(bytes4)` — is the rung for
+a custom error that carries arguments you do not want to pin.**
+
+<Matrix
+  corner="Overload"
+  cols={['What it matches', 'Against a revert of Insufficient(50, 100)']}
+  rows={[
+    {
+      label: 'expectRevert()',
+      cells: ['Any revert, including a panic in your own test arithmetic', { v: 'Passes — and would pass against any other error', tone: 'danger' }],
+    },
+    {
+      label: 'expectRevert(bytes4)',
+      cells: ['Revert data that is exactly those four bytes', { v: 'Fails: Error != expected error', tone: 'warn' }],
+    },
+    {
+      label: 'expectRevert(bytes)',
+      cells: ['The exact bytes, arguments included', 'Passes for 50 and 100, and for nothing else'],
+    },
+    {
+      label: 'expectPartialRevert(bytes4)',
+      cells: ['Revert data that starts with those four bytes', { v: 'Passes', tone: 'good' }],
+    },
+  ]}
+  caption="One custom error carrying two arguments separates the four rungs completely."
+  alt="Four expectRevert overloads compared on what each matches and on what each does against a revert of Insufficient(50, 100)."
+/>
+
+<Misconception
+  belief="vm.expectRevert(MyError.selector) is how you assert a custom error, whatever its arguments."
+  reality="The bytes4 form requires the revert data to equal those four bytes exactly, so it matches a parameterless error only. A parameterised error needs expectPartialRevert, or the full ABI-encoded data."
+  why="It works the first time you try it — on a parameterless error — and the failure on a parameterised one reports a value mismatch rather than 'wrong overload'."
+  src="forge-std-vm-1-16-2"
+/>
+
+The failure direction here is safe, and the *response* to it usually is not. Someone hits
+`Error != expected error`, concludes that `expectRevert` is fussy about custom errors, and replaces
+the line with a bare `vm.expectRevert()`. The test goes green, and it is now satisfied by any revert
+at all. A trap that fails loudly has been converted into one that passes silently — which is the
+single most common way the assertions in a real suite decay.
+
+**`expectRevert(address reverter)` — pin who reverted.** The `Vm.sol` comment is precise about what
+`reverter` is matched against: the address associated with the frame that produced the revert — for a
+`CALL`, the address that was called; for a `CREATE`/`CREATE2`, the would-be deployed address of the
+failed deployment. For a single expected revert, the **innermost reverting frame
+wins**.<Cite src="forge-std-vm-1-16-2" /> That last clause is the one to remember. Pinning the
+reverter does not pin "the contract I called"; it pins whichever frame actually threw, which in a
+call chain through a proxy or a router is frequently not the address you typed.
+
+**`expectRevert(..., uint64 count)` — how many.** And `count = 0` asserts that **no** revert
+occurs.<Cite src="foundry-cheatcode-expect-revert" /> Verified on forge 1.7.1: an
+`expectRevert(bytes(""), uint64(0))` in front of a call that returns normally
+passes.<Cite src="measured-forge-cli-1-7-1" /> This is a genuinely useful and under-used assertion —
+it lets you state "this path must not revert" as an explicit claim rather than relying on the test
+not blowing up.
+
+**The rule for choosing:** take the loosest overload that still fails when the *wrong* error is
+raised. In practice that is the `bytes4` selector for almost everything, exact bytes when the
+arguments carry meaning a consumer depends on, and the bare form only when you are asserting that
+some guard exists at all and have written down why you did not name it.
+
+### Working the ladder on one case
+
+Take a vault whose `withdraw` reverts with `InsufficientBalance(uint256 available, uint256 requested)`
+when the caller asks for more than they hold.
+
+**Subgoal — notice that the error takes arguments, before choosing an overload.** It does, so
+`vm.expectRevert(Vault.InsufficientBalance.selector)` is the wrong rung and will fail with a value
+mismatch.<Cite src="measured-forge-cli-1-7-1" /> Checking the error's signature first saves the
+confused ten minutes that leads people to the bare form.
+
+**Subgoal — start at the rung that names the failure and ignores its payload.**
+`vm.expectPartialRevert(Vault.InsufficientBalance.selector)` matches the four-byte selector and
+ignores the arguments.<Cite src="foundry-cheatcode-expect-revert" /> This test now fails if the vault
+starts reverting with `Paused()`, `NotOwner()` or an arithmetic panic — the property you actually
+wanted, and for most tests you can stop here.
+
+**Subgoal — decide whether the arguments are a promise.** If a frontend renders "you have X, you
+asked for Y" from this error, the numbers are part of the contract's interface and pinning them is
+correct: `vm.expectRevert(abi.encodeWithSelector(Vault.InsufficientBalance.selector, 50e18, 100e18))`.
+If they are diagnostic only, pinning them buys nothing and costs an edit every time a fixture
+constant changes.
+
+**Subgoal — write the negative case explicitly.** The complement of `test_RevertWhen_...` is a test
+that says this path must *not* revert, and `count = 0` lets you say it as an assertion rather than
+as an absence.<Cite src="foundry-cheatcode-expect-revert" /> A withdrawal of exactly the available
+balance is the boundary where an off-by-one lives, and "the test did not blow up" is a weaker
+statement about it than "no revert occurred here".
+
+<Aside kind="note">
+The same Assertions family has a cheatcode for the other half of the question. `expectRevert` asserts
+how a call *ended*; `vm.expectCall(address callee, bytes data)` asserts that a call *happened* — with
+calldata that can be a strict or a partial match.<Cite src="forge-std-vm-1-16-2" />
+
+That matters when the thing you care about is delegation rather than outcome. A router that is
+supposed to forward to a market, a vault that is supposed to call `transferFrom` before crediting
+shares, a proxy that is supposed to reach its implementation: all of those can produce the correct
+final state through the wrong path, and only an assertion about the call catches it. Reach for it
+whenever a test's real claim is "and it went through *there*".
+</Aside>
+
+## The status boolean lies, and lies in the safe direction
+
+The last trap has no defence except knowing about it.
+
+When `vm.expectRevert` wraps a low-level `.call()`, the boolean the call returns no longer reports
+the callee's outcome. It reports whether the **expectation** was
+met.<Cite src="foundry-cheatcode-expect-revert" /> Measured on forge 1.7.1: with a correctly
+predicted revert, `success` comes back `true`.<Cite src="measured-forge-cli-1-7-1" />
+
+```solidity
+vm.expectRevert(abi.encodeWithSelector(Target.NotOwner.selector, address(this)));
+(bool success, ) = address(t).call(abi.encodeWithSignature("boom()"));
+assertFalse(success);   // FAILS — success is true
+```
+
+So the intuitive assertion makes the test fail while the contract behaves exactly as intended. That
+is the safe direction — you get a red test rather than a false green — but the failure message points
+at the wrong thing, and the usual repair is for someone to conclude that `expectRevert` "does not
+work with low-level calls" and delete it.
+
+<Misconception
+  belief="After expectRevert around a low-level call, success == false confirms the revert happened."
+  reality="success reports whether the expectation was met, so a correctly predicted revert produces true. Asserting false makes a correct contract fail its test."
+  why="Everywhere else, the first return value of .call is the callee's own success flag — that is the entire point of the low-level form."
+  src="foundry-cheatcode-expect-revert"
+/>
+
+<Check type="spot-bug" concept="expect-revert-argument-nesting">
+Four tests from a lending protocol's suite. Each is green. For each, say whether it asserts what its
+name claims, and if not, what it actually asserts.
+
+```solidity
+function test_RevertWhen_BorrowExceedsCollateral() public {
+    vm.expectRevert();
+    market.borrow(oracle.maxBorrowable(alice) + 1);
+}
+
+function test_RevertWhen_RepayFromStranger() public {
+    vm.expectRevert(Market.NotBorrower.selector);
+    market.repay(alice, market.debtOf(alice));
+}
+
+function test_RevertWhen_LiquidateHealthyPosition() public {
+    vm.expectRevert(Market.Healthy.selector, address(market));
+    router.liquidateVia(address(market), alice);
+}
+
+function test_RevertWhen_WithdrawWhilePaused() public {
+    market.pause();
+    vm.expectRevert(Market.Paused.selector);
+    (bool ok, ) = address(market).call(abi.encodeCall(Market.withdraw, (100)));
+    assertFalse(ok);
+}
+```
+
+<Answer>
+**1 — asserts almost nothing.** Two defects compound. The argument contains a call, so the next call
+is `oracle.maxBorrowable(alice)`; if that ever reverts — a stale feed, an empty position, a division
+by a zero total — the expectation binds there and `borrow` runs afterwards with a garbage
+argument.<Cite src="foundry-cheatcode-expect-revert" /> And the bare `expectRevert()` would not
+distinguish the collateral check from an arithmetic panic on `+ 1` even if the binding were right.
+Hoist the maximum into a local, then pin the selector.
+
+**2 — asserts the wrong function, and the nesting is only half the problem.** `market.debtOf(alice)`
+is evaluated first and is the call the expectation binds to. Note that this one is *more* likely to
+look correct than case one: `debtOf` is a view that will not revert, so the expectation goes unmet
+and the test fails — loudly, and for a reason that looks like "repay does not revert". The author's
+likely response is to loosen the selector rather than to hoist. Hoist `debtOf` and keep the selector —
+and check whether `NotBorrower` carries arguments, because if it does, the `bytes4` form is the wrong
+overload and produces a second confusing failure stacked on the
+first.<Cite src="measured-forge-cli-1-7-1" />
+
+**3 — asserts something real, but not what the name says.** The reverter overload matches against the
+frame that produced the revert, and for a single expected revert the innermost reverting frame
+wins.<Cite src="forge-std-vm-1-16-2" /> The call goes through `router`, so if the router itself
+rejects the request before ever reaching the market — an unknown-market check, a paused router — the
+innermost reverting frame is the router, the address does not match, and the test fails. Green here
+therefore does tell you the market reverted. What it does not tell you is that the *router path*
+works; a green test plus a router that never forwards is indistinguishable from a green test plus a
+router that does.
+
+**4 — fails, and would fail against a perfectly correct contract.** Under `expectRevert`, the status
+boolean from a low-level call reports whether the expectation was met, so `ok` is
+`true` and `assertFalse(ok)` fails.<Cite src="foundry-cheatcode-expect-revert" /><Cite src="measured-forge-cli-1-7-1" />
+There is a second problem hiding behind the first: `market.pause()` on the line above is an external
+call made *before* the expectation is registered, which is correct here — but move it one line down
+and it would consume the expectation instead.
+
+**The pattern.** Three of the four have a defect that lives in evaluation order rather than in
+anything the test appears to say. The habit that catches all of them is mechanical and takes two
+seconds: after writing `vm.expectRevert`, look at the next statement and count the calls in it.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next lesson:** the same register-and-consume machinery applied to events, where it acquires an
+ordering rule and a boolean set that reads stricter than it is. If `expectRevert` can bind to the
+wrong call, `expectEmit` can be satisfied by the wrong *contract* — and the flags most people write
+to prevent that do not check the emitter at all.
+
+**In the fuzzing module:** an `expectRevert` inside a fuzz test needs the selector, not the bare form,
+because across 256 generated inputs your contract has 256 chances to revert for a reason you did not
+intend, and the bare form accepts all of them.
+
+**And a rule for reviews, which is the whole module compressed:** for any test whose name contains
+"Revert", ask two questions. *Which call does the expectation bind to?* and *would this test fail if
+the contract reverted with a different error?* Both are answerable in seconds from the source, both
+are almost never asked, and between them they catch every trap in this lesson — as measured against
+forge 1.7.1 and forge-std v1.16.2.<Cite src="measured-forge-1-7-1" /><Cite src="forge-std-repo" />

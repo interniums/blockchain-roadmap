@@ -1,0 +1,378 @@
+---
+id: ledgers-mempool-where-flow-really-goes
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [arxiv-private-orderflow, arxiv-private-rpc-benchmark, mev-blocker-ofa, flashbots-protect-docs, flashbots-protect-mev-refunds, flashbots-protect-cancellations, flashbots-protect-nonce-management, mev-boost-docs, ethereum-roadmap-pbs, eip-7805, eip-7773, devp2p-eth-wire]
+stack: {}
+---
+
+You run your own node. You subscribe to pending transactions, you have tuned your peer count, your
+machine sits in the same datacentre region as half the network, and your liquidation bot is faster
+than your competitors'.
+
+It still loses, and not occasionally. The reason is not latency and no amount of engineering on your
+side addresses it: **the transactions that matter are not in the stream you are watching.** They went
+straight to a builder. By the time you can see them, they are in a block.
+
+This lesson is about where transactions actually travel in 2026, why so many of them skip the pool
+you have spent four lessons learning to reason about, and what that route costs — for the user who
+takes it, and for the network that has come to depend on it.
+
+## The supply chain, named
+
+The path from a signed transaction to a block has more stages than "broadcast and wait", and each one
+is a party with its own incentives.
+
+A **user** signs. Their **wallet** chooses a submission route: gossip it to the public pool, or send
+it to a private endpoint. A **searcher** looks for profitable sequences involving other people's
+transactions and assembles bundles. A **builder** assembles complete blocks from everything it can
+see and bids for the right to have its block used. A **relay** holds the block body and gives the
+proposer only the header, so the proposer cannot steal the contents. The **proposer** signs the
+header of the winning bid.<Cite src="mev-boost-docs" /><Cite src="ethereum-roadmap-pbs" />
+
+The wallet's routing choice at step two is the whole lesson. Everything downstream is a consequence
+of it.
+
+<Figure
+  caption="The wallet decides who is allowed to see the transaction, and every later stage inherits that decision."
+  alt="A signed transaction reaches a wallet that picks one of two routes: gossip to the public pool, or a private endpoint held by one operator. Both feed a builder, which passes its block to a relay, which shows the proposer only the header."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'u', label: 'user signs', note: 'nonce and fees now fixed', col: 0 },
+      { id: 'w', label: 'wallet picks a route', note: 'the whole lesson is this step', col: 1, tone: 'accent' },
+      { id: 'pub', label: 'public pool', note: 'gossiped to every peer that will listen', col: 2 },
+      { id: 'prv', label: 'private endpoint', note: 'one operator holds it', col: 2, tone: 'warn', dashed: true },
+      { id: 'b', label: 'builder', note: 'assembles a block from all it can see', col: 3 },
+      { id: 'r', label: 'relay', note: 'holds the body, hands over the header', col: 4, tone: 'muted' },
+      { id: 'p', label: 'proposer', note: 'signs a header it cannot read', col: 5, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'u', to: 'w' },
+      { from: 'w', to: 'pub' },
+      { from: 'w', to: 'prv', tone: 'warn', dashed: true },
+      { from: 'pub', to: 'b' },
+      { from: 'prv', to: 'b', tone: 'warn', dashed: true },
+      { from: 'b', to: 'r' },
+      { from: 'r', to: 'p' },
+    ]}
+  />
+</Figure>
+
+The public route is what the previous lessons described: full objects to a random fraction of peers,
+hashes to the rest, and a pool synchronisation protocol that works hard to spread your transaction
+everywhere.<Cite src="devp2p-eth-wire" /> The private route is mechanically much simpler. It is the
+same `eth_sendRawTransaction` call, pointed at a different URL, which forwards the transaction to one
+or more builders instead of gossiping it.
+
+## What a private endpoint actually offers
+
+Take one and read what it promises, because the promises are specific and the trade-offs are in them.
+
+Flashbots Protect describes itself as sending transactions to a private mempool where they are hidden
+from frontrunning and sandwich bots; it advertises refunds when a transaction generates extractable
+value or pays high priority fees; and it states that transactions are only included if they do not
+revert, so users do not pay for failed transactions.<Cite src="flashbots-protect-docs" /> Submission
+is an ordinary RPC call to the operator's endpoint.<Cite src="flashbots-protect-docs" />
+
+Three of those are worth translating out of marketing language.
+
+**"Hidden from frontrunning bots" means hidden from everyone except the operator and whoever they
+choose to show it to.** By default, Protect shares hints about the transaction with searchers through
+MEV-Share: the documentation lists the default configuration as sharing the transaction hash and
+partial logs — the pool id and the fact that a swap occurred — for several classes of
+trade.<Cite src="flashbots-protect-mev-refunds" /> A user can request maximum privacy by setting only
+the hash hint, and the documentation is candid that doing so makes opportunities harder for searchers
+to spot and will very likely reduce the refund.<Cite src="flashbots-protect-mev-refunds" /> Privacy
+and rebate are explicitly traded against each other, by a query parameter.
+
+**"Only included if they do not revert" is a real feature with a real cost.** It removes the class of
+failure where a user pays for a transaction that accomplished nothing. It also means a transaction
+that would have reverted is simply never included, which from the outside is indistinguishable from
+a transaction that vanished — and the previous lessons' diagnostics do not apply, because it is not
+in any pool to be found.
+
+**Operator custody makes some things possible that the protocol cannot do.** Protect exposes a real
+cancellation: same address, same nonce, `from` and `to` both set to the sender, empty `data`. The
+documentation states it costs nothing, because the cancellation "serves solely for authentication
+purposes" and is never included on-chain, and that transactions may sit at the operator for up to six
+minutes.<Cite src="flashbots-protect-cancellations" /> Correspondingly, the operator treats the
+derived nonce as sensitive: a transaction it holds appears in `eth_getTransactionCount` only for the
+`pending` tag and only when the request is signed with the sender's own
+key.<Cite src="flashbots-protect-nonce-management" />
+
+Every one of those behaviours exists because one party holds the transaction. That is the trade in a
+sentence: **you exchange broadcast for custody.** Broadcast means everyone can see it and nobody can
+recall it. Custody means one party can see it, can recall it, and can decide what to do with it
+within whatever rules they publish.
+
+## Order flow auctions: selling the intent instead of leaking it
+
+The second-generation version of this does not merely hide the transaction. It sells access to it and
+gives the proceeds back.
+
+MEV Blocker's documentation describes the mechanism concretely. User transactions go to a private
+pool of searchers rather than the public mempool. Those searchers compete to backrun the
+transaction — to trade immediately after it, in the state it created — and the winning bid returns up
+to 90% of its value to the user, with the remaining 10% used to reward builders and
+validators.<Cite src="mev-blocker-ofa" /> Builders who want access post a bond and pay weekly dues
+calculated on the value attributable to that flow.<Cite src="mev-blocker-ofa" /> By default the
+service shares the transaction without its signature and mixes real transactions with generated fake
+ones, so that a searcher reading the stream cannot reliably tell which intents are
+real.<Cite src="mev-blocker-ofa" />
+
+Read the shape of that rather than the numbers. An order flow auction takes the thing that was
+previously extracted from users — advance knowledge of what they are about to do — and sells it on
+their behalf. The user's position changes from victim of an information leak to seller of an
+information asset.
+
+It is still a trade, and the terms are legible if you look. The user grants one operator exclusive
+early sight of their intent. The operator monetises that sight under published rules and returns a
+share. The rebate is real; so is the fact that the operator now knows every transaction that user
+sends before anyone else does, including the ones that generate no rebate at all.
+
+<Misconception
+  belief="Watching the public mempool tells you what is about to happen on-chain."
+  reality="A large and growing share of value-bearing flow never appears in any public pool. Mempool-based analytics, liquidation bots and 'pending transaction' dashboards are sampling a systematically biased subset, and the bias is worst exactly where the value is."
+  why="It was substantially true in 2020, when the public pool was the only route to inclusion, and the tooling built in that era still works well enough to look correct. Nothing in the data announces that it is incomplete — the missing transactions are missing."
+  src="arxiv-private-orderflow"
+/>
+
+## The number you have read, and why this lesson will not repeat it
+
+You will encounter a percentage for how much of Ethereum's transaction flow is private. You should
+not trust any of them, including from otherwise excellent sources, and it is worth seeing exactly why
+because the failure mode generalises.
+
+Published figures measure at least three different quantities:
+
+- **Share of transactions** — what fraction of transaction *count* arrived privately.
+- **Share of gas** — what fraction of the gas consumed in blocks came from private flow.
+- **Share of block value** — what fraction of what builders could pay proposers came from
+  transactions others could not see.
+
+These are not close to each other, and they cannot be, because private flow is skewed toward
+high-value activity. A route carrying a small fraction of transactions can carry a large fraction of
+value. Quoting one number as though it answered the others is the error, and it is extremely common.
+
+The most widely repeated figure appears in the introduction of a 2025 benchmark study of private
+RPCs — where it is a citation to another work rather than anything those authors
+measured.<Cite src="arxiv-private-rpc-benchmark" /> The measurement that *is* first-hand answers a
+different question entirely: it covers block value, over Ethereum blocks from January 2023 to May
+2024, and attributes the majority of block value in that sample to private order
+flow.<Cite src="arxiv-private-orderflow" /> Both are legitimate. They are answers to different
+questions from different periods, and neither of them is "the share of private order flow".
+
+So this lesson states the direction, which is settled and well supported, and refuses the magnitude,
+which is not:
+
+**Private submission has gone from a niche route to a primary one, and value-bearing flow is more
+private than transaction count.**<Cite src="arxiv-private-orderflow" /><Cite src="arxiv-private-rpc-benchmark" />
+
+If you need a number, measure it against the definition your decision depends on, date it, and treat
+it as perishable.
+
+<Aside kind="note">
+The same discipline applies to builder market share, which you will also see quoted. Published pairs
+for the top two builders disagree materially, and they name different builders — a consequence of a
+market that reshuffles faster than analyses are published. The concentration is high; the specific
+figure is contested. Pull it from a live relay dashboard on the day you need it rather than from any
+document, including this one.
+</Aside>
+
+## The measured costs, and how to read a vendor benchmark
+
+Private routing is often presented as costless. There is real empirical work, and reading it properly
+is a lesson in itself.
+
+The 2025 benchmark study compared four order flow auctions — MEV Blocker, Flashbots Protect, Blink
+and Merkle — by submitting identical transactions to each simultaneously and comparing
+outcomes.<Cite src="arxiv-private-rpc-benchmark" /> Its measures are the right ones: success rate,
+defined as landing on-chain without reverting; time to inclusion, measured in *blocks* rather than
+seconds because block times are discrete and arriving a second earlier often changes nothing; and
+execution quality, measured as relative swap price against a reference
+provider.<Cite src="arxiv-private-rpc-benchmark" /> The sample was 273 transactions over blocks
+spanning December 2024 to January 2025, comprising approvals, transfers and swaps on both liquid and
+illiquid pairs.<Cite src="arxiv-private-rpc-benchmark" />
+
+Three things to notice, in order of importance.
+
+**The method is worth copying and the rankings are not worth carrying.** Submitting the same
+transaction to every candidate route simultaneously and comparing outcomes is exactly right, and it
+is the only way to get an answer that applies to your traffic. The rankings are from a sample of a
+few hundred transactions during one two-month window, in a market that has since moved.
+
+**The authors work for one of the four services benchmarked.** The paper is authored from CoW DAO,
+which operates MEV Blocker, and MEV Blocker is used as the reference against which the others are
+compared.<Cite src="arxiv-private-rpc-benchmark" /> That does not make the work dishonest — the
+methodology is stated plainly enough that you can see the choice — but it does mean the ranking is a
+vendor's ranking of its competitors and should be read as such.
+
+**Inclusion latency is a real cost and it is measurable in blocks.** Time to inclusion varied between
+providers, with the paper reporting a single outlier at seven blocks against a second-worst of
+four.<Cite src="arxiv-private-rpc-benchmark" /> For a swap, several blocks of delay is a price
+movement you did not choose. This is the concrete form of "private RPCs are not strictly better".
+
+<Misconception
+  belief="Private RPCs are strictly better for users, so routing everything through one is a free upgrade."
+  reality="They swap a public frontrunning risk for trust in a single operator, they can cost inclusion latency measured in blocks, they make your transaction undiagnosable through ordinary pool tooling, and in aggregate they concentrate block building. It is a trade with measured costs on both sides."
+  why="'MEV protection' is marketed as costless, and for the common case of a modest swap it very nearly is — the costs are borne either rarely (latency, a transaction that silently never lands) or collectively (builder concentration), which is exactly the shape of cost that does not show up in a user's own experience."
+  src="arxiv-private-rpc-benchmark"
+/>
+
+## Why exclusivity decides who builds blocks
+
+Now the structural claim, which is the most important thing in this lesson and the least intuitive.
+
+Block building is an auction. Builders assemble candidate blocks and bid for the right to have theirs
+used; the highest bid wins.<Cite src="mev-boost-docs" /> Set up the comparison carefully:
+
+**Subgoal — establish the symmetric case.** Suppose every builder sees exactly the same candidate
+set, namely the public pool. Then every builder can construct approximately the same most-valuable
+block, and competition drives bids toward the full value of that block. Nobody has an advantage
+because nobody has information the others lack. This is the outcome proposer-builder separation was
+designed to produce: block value flowing to proposers rather than accumulating with
+specialists.<Cite src="ethereum-roadmap-pbs" />
+
+**Subgoal — introduce one asymmetry.** Now let one builder receive transactions the others cannot
+see. Its candidate set is a strict superset. Its most-valuable block is therefore worth at least as
+much as anyone else's, and usually more.
+
+**Subgoal — follow the bidding.** A builder holding a more valuable block can win while bidding a
+smaller *fraction* of that block's value. Competitors bidding their full value still lose. So the
+advantaged builder wins more often **and** keeps more per win — an outcome the empirical work states
+directly: builders with more private order flow have higher block valuations, are more likely to win,
+and retain a larger proportion of profits.<Cite src="arxiv-private-orderflow" />
+
+**Subgoal — close the loop.** Order flow is sent to whoever is most likely to include it, and the
+builder winning most often is the safest place to send it. So winning attracts flow, and flow causes
+winning. The paper's own framing of where this leads is in its title: the road to monopoly in
+Ethereum's block building market.<Cite src="arxiv-private-orderflow" />
+
+**Subgoal — state what this is not.** It is not a side effect of concentration; it is the mechanism
+producing it. And it is not a failure of proposer-builder separation to work as specified. The
+authors' conclusion is sharper than that: PBS in its current stage does not balance profit
+distribution, it transfers the centralisation of block profits from institutional stakers to a
+monopolistic builder.<Cite src="arxiv-private-orderflow" />
+
+<Compare
+  caption="Nothing separates the two columns but who was allowed to see what; no builder here is better at building."
+  alt="The symmetric case where every builder sees the same candidate set, set against one builder holding exclusive order flow, compared by what the candidate set is, how valuable the best block each can build is, what fraction it must bid to win, who keeps the surplus, and where the next transaction is sent."
+  axis="Question"
+  columns={[
+    { title: 'Every builder sees the same set', note: 'the symmetric case', tone: 'muted' },
+    { title: 'One builder sees more', note: 'exclusive order flow', tone: 'warn' },
+  ]}
+  rows={[
+    { label: 'What is the candidate set?', cells: ['The public pool, for everyone', 'The public pool plus what only this builder was sent'] },
+    { label: 'How valuable is the best block it can build?', cells: ['Approximately the same for all of them', 'At least as valuable as anyone else’s, usually more'] },
+    { label: 'What fraction must it bid to win?', cells: ['Close to all of it — competition drives bids up', 'Less than its rivals bid, because it starts from a higher total'] },
+    { label: 'Who keeps the surplus?', cells: ['The proposer, which is what PBS was designed for', 'The builder, which is what the empirical work observes'] },
+    { label: 'Where is the next transaction sent?', cells: ['Anywhere; no builder is a safer bet', 'To the builder that wins most often, which is this one'] },
+  ]}
+/>
+
+Sit with the uncomfortable part. The best available protection for an individual user is private
+routing. Its aggregate effect is to concentrate the power to decide what goes into blocks. Each
+individual choice is correct and the sum is a property nobody chose — which is why the answers being
+worked on are protocol-level rather than advisory.<Cite src="eip-7805" />
+
+## What to do with this when you are shipping something
+
+**Choose the route deliberately, per transaction class.** A transaction with no extractable value —
+an approval, a claim, a small transfer — gains little from private routing and pays the latency. A
+large swap or a liquidation-triggering action gains a lot. Routing everything one way is a decision
+you should be able to defend.
+
+**Never build a product feature on public pool observation.** "See your transaction in the mempool",
+"watch pending activity", "detect incoming transfers before confirmation" — all of these are
+sampling a biased subset that is missing exactly the transactions users care about most.
+
+**Treat the operator as a dependency with an SLA you do not have.** They can be down, rate-limited,
+or slow. They see everything you send. Have a fallback route and know what it changes about your
+transaction's behaviour, including whether your cancellation logic still works.
+
+**Instrument your own inclusion latency.** It is the one number in this lesson you can obtain
+honestly: submit through each route you are considering, in parallel, and measure blocks to
+inclusion. The benchmark study's method transfers directly, and your traffic is the only sample that
+is definitely relevant to you.<Cite src="arxiv-private-rpc-benchmark" />
+
+<Check type="explain" concept="private-orderflow">
+You are choosing the default submission route for a consumer wallet with a few hundred thousand
+users. A colleague argues for routing everything through a private endpoint: users stop being
+sandwiched, some of them earn rebates, and it costs the company nothing.
+
+Give the strongest version of the argument against defaulting everything to private, and then say
+what you would actually ship.
+
+<Answer>
+**The strongest argument against is not about the users, and that is what makes it hard.** For almost
+every individual user, on almost every transaction, private routing is the better choice. Sandwich
+protection is real, the rebate is real, and paying nothing for a reverted transaction is
+real.<Cite src="flashbots-protect-docs" /><Cite src="mev-blocker-ofa" /> An argument that pretends
+otherwise will not survive contact with the data.
+
+The argument that does survive has three parts.
+
+*It concentrates block building, and your wallet is a large enough share of flow to matter.* Exclusive
+order flow is the input that lets one builder outbid the rest while keeping more of the
+value, which attracts more flow, which compounds.<Cite src="arxiv-private-orderflow" /> A few hundred
+thousand users' default is not a personal choice; it is a policy decision about where a meaningful
+volume of flow goes. If you route it all to one operator you are buying your users protection with a
+property — many independent parties able to build blocks — that those same users depend on for
+censorship resistance.
+
+*It creates a dependency your users cannot see and cannot route around.* The operator sees every
+transaction before anyone else, decides what to do with it under rules they can change, and holds it
+for a period they specify — up to six minutes in one documented
+case.<Cite src="flashbots-protect-cancellations" /> If they are down, your wallet is down in a way
+your users will attribute to you.
+
+*It costs latency, sometimes.* Measured time to inclusion differs between routes, with outliers of
+several blocks.<Cite src="arxiv-private-rpc-benchmark" /> For a swap, blocks are price movement.
+
+**What I would ship: private by default, with three qualifications.**
+
+*Route by transaction class rather than uniformly.* Transactions with no plausible extractable value
+go public — they gain nothing from privacy and they are the ones where latency is pure loss. Swaps,
+large transfers and anything touching a lending position go private. This also keeps some of your
+flow contributing to the public set that inclusion-list designs depend on.
+
+*Use more than one operator and rotate.* This is a decision with a cost — you cannot optimise rebates
+across operators you split between — and it is the only lever a wallet has against the
+concentration dynamic. Measure both, honestly, and choose with the trade-off visible.
+
+*Do not let the routing choice leak into your correctness assumptions.* A privately routed
+transaction is absent from every public pool, so your status logic cannot depend on seeing it there,
+your nonce management must use the operator's signed-query path rather than a public `pending`
+count<Cite src="flashbots-protect-nonce-management" />, and your cancel flow is operator-specific
+rather than a same-nonce replacement. Each of those is a source of production bugs when a route is
+changed later by someone who did not know they were load-bearing.
+
+**And disclose it.** The user is entering a relationship with a third party who sees their intent
+before anyone else. That is a reasonable default and it is not one to make silently.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Nothing guarantees inclusion** is the next and final lesson in this module, and it starts exactly
+where this one ends: if builders choose, and a few builders do most of the choosing, what obliges
+anyone to include you?
+
+**Inclusion lists** are the protocol's answer to the concentration mechanism described here. EIP-7805
+would have a committee force-include eligible transactions, and it names the cause in its own
+motivation: the right to build blocks was auctioned to specialised entities, a few sophisticated
+builders came to dominate, and censorship resistance deteriorated.<Cite src="eip-7805" /> It was
+declined for the Glamsterdam upgrade.<Cite src="eip-7773" />
+
+**The MEV track** takes each mechanism referenced here — searchers, bundles, backruns, sandwiches,
+rebates — and works through the economics properly. Everything there rests on the two facts this
+module established: intent is visible, and ordering is discretionary.
+
+**Enshrined proposer-builder separation** is the other half of the response, moving the builder role
+into the protocol rather than leaving it to out-of-protocol software. Unlike inclusion lists, it is
+scheduled for Glamsterdam.<Cite src="eip-7773" />

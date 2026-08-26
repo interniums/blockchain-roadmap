@@ -1,0 +1,444 @@
+---
+id: altvm-anchor-binding-accounts-together
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [anchor-account-constraints, solana-docs-pda, anchor-lang-error-docsrs, anchor-docs-account-types, anchor-docs-program-structure, anchor-repo-changelog, cantina-securing-solana, sealevel-attacks, anchor-docs-security-exploits, solana-docs-compute-budget, anchor-docs-errors]
+stack: {}
+---
+
+One line of Solidity, doing work you have probably never noticed it doing.
+
+```solidity
+mapping(address => Position) positions;
+
+function close() external {
+    Position storage p = positions[msg.sender];
+    // ...
+}
+```
+
+`positions[msg.sender]` is not a lookup the caller participates in. The slot is
+`keccak256(abi.encode(msg.sender, slotOf(positions)))`, computed by generated code from an
+authenticated caller and a compile-time constant. There is no parameter for "which position", because
+there is no way to offer one. Identity is welded into the address by arithmetic the caller cannot
+reach.
+
+The Solana version of that mapping is a set of separate accounts, each at its own address, and the
+client passes the one it wants into the transaction. The welding is gone. `close()` now receives a
+`Position` chosen by whoever called it.
+
+This lesson is about the two constraints that put the weld back, and about why it takes two rather
+than one.
+
+## The derivation, done again on chain
+
+A program derived address is deterministic from a program id and a set of seeds, and is guaranteed
+not to lie on the Ed25519 curve, so no private key exists for it.<Cite src="solana-docs-pda" /> That
+determinism is what makes `["position", user_pubkey]` a usable analogue of a mapping key: the same
+seeds always produce the same address, so any client can compute where a given user's position
+lives.<Cite src="solana-docs-pda" />
+
+But determinism is a property of the *derivation*, not of the account you were handed. The client
+computed an address. The client also chose which account to put in the transaction. Nothing so far
+connects those two acts.
+
+So the program must derive the address itself and compare. By hand:
+
+```rust
+// manual: re-derive and compare, or the seed convention means nothing
+let (expected, _bump) = Pubkey::find_program_address(
+    &[b"position", owner.key.as_ref()],
+    program_id,
+);
+if expected != *position_info.key {
+    return Err(ProgramError::InvalidSeeds);
+}
+```
+
+With Anchor, `seeds` and `bump` check that the given account is a PDA derived from the currently
+executing program, the seeds, and — if provided — the bump.<Cite src="anchor-account-constraints" />
+
+```rust
+#[account(seeds = [b"position", owner.key().as_ref()], bump)]
+pub position: Account<'info, Position>,
+```
+
+**That comparison is what turns a PDA from a naming convention into an authorization mechanism.**
+Without it, "the position is at `["position", user]`" is a statement about where your client chooses
+to look, and an attacker's client chooses differently. With it, the address is a claim the program
+verifies, and an account at any other address is rejected with `ConstraintSeeds`,
+2006.<Cite src="anchor-lang-error-docsrs" />
+
+<Misconception
+  belief="Deriving an account from the user's pubkey means only that user can use it."
+  reality="Derivation happens in the client. Unless the program re-derives and compares, any account can be passed in the position where a derived one was expected — including another user's, which is a perfectly valid PDA of exactly the right type."
+  why="On the EVM the derivation and the access are the same operation, performed by generated code. Splitting them into 'client computes' and 'program verifies' has no counterpart there, so the second half is invisible until somebody points at it."
+  src="anchor-account-constraints"
+/>
+
+### Four seed facts worth carrying
+
+The seed system has hard limits, and each of them shapes a design decision.
+
+**At most 16 seeds, each at most 32 bytes.**<Cite src="solana-docs-pda" /> A pubkey is exactly 32
+bytes, so a seed slot holds one key and no more. Anything longer must be hashed down first, which
+means you are choosing a hash and taking responsibility for its collision behaviour.
+
+**The bump is one byte, range 0–255, appended as the final seed element.**<Cite src="solana-docs-pda" />
+
+**Derivation can fail, and that is the point.** If the hash lands on the curve, the derivation fails
+and a different bump is tried.<Cite src="solana-docs-pda" /> That retry loop is why bumps exist at
+all.
+
+**Only the deriving program can sign for a PDA**, via `invoke_signed` during a
+CPI.<Cite src="solana-docs-pda" /> This is the mechanism behind every "the program is the authority"
+pattern — a vault whose owner is an address nobody holds a key for — and it is the closest Solana gets
+to a contract holding funds in its own name. At most 16 PDA signers per CPI.<Cite src="solana-docs-pda" />
+
+### What a PDA scheme cannot do that a mapping can
+
+Worth naming before the mechanics, because the constraint is architectural rather than a matter of
+syntax. A Solidity mapping can be read from anywhere in the contract, at any depth, on a key computed
+mid-execution. A PDA cannot: the account has to be in the transaction's declared account list, which
+means the *client* resolved it before the transaction was built. That is
+[declared access as a tax](/c/declared-access-is-a-tax) arriving in the place you feel it most.
+
+So an instruction that would be a loop over a mapping in Solidity becomes, on Solana, an instruction
+whose caller must know every account it will touch — or several instructions, or a design with fewer
+accounts. Deterministic derivation is what makes this survivable: because the address is a pure
+function of public seeds, a client can compute the whole account list without an index. It is also
+why seed schemes tend to be shallow and pubkey-shaped. A scheme that needs a lookup to compute the
+next seed has pushed the resolution problem back onto infrastructure you now have to run.
+
+### `bump` versus `bump = state.bump`, and why the difference has a price
+
+Both forms are supported: a bare `bump`, which makes Anchor find the bump, and `bump = <expr>`, which
+supplies one.<Cite src="anchor-account-constraints" />
+
+The mechanical difference is a search versus a single evaluation, and the Solana documentation prices
+both. `create_program_address` — one derivation with a bump you already have — costs 1,500 CU. The
+worst case for `find_program_address` is 1,500 on entry plus 1,500 for every failed
+bump.<Cite src="solana-docs-pda" /> The search starts high and walks down, so a PDA whose canonical
+bump is 255 costs one derivation and one whose canonical bump is 248 costs eight.
+
+Two consequences.
+
+**Cost.** Storing the canonical bump in the account when you create it and reusing it thereafter
+replaces a search with a single derivation, on every subsequent instruction, forever. Anchor makes
+this cheap to do: bump seeds found during constraint validation are exposed on
+`ctx.bumps` precisely so handlers do not have to recalculate them or take them as
+arguments.<Cite src="anchor-docs-program-structure" /> Write it into the account in your `init`
+instruction; read it back with `bump = position.bump` afterwards.
+
+**Correctness, which matters more.** The canonical bump is the first one the search finds. But it is
+not the only bump that produces a valid off-curve address for those seeds — several may. A program
+that accepts a caller-supplied bump without pinning it to the stored canonical value admits *several
+valid addresses for one logical key*.<Cite src="cantina-securing-solana" /> The consequences are
+protocol-specific and always bad: two "the" positions for one user, a second vault for the same pool,
+a fee account that can be shadowed. Bump seed canonicalization appears as its own class in the
+Solana security literature for this reason.<Cite src="cantina-securing-solana" /><Cite src="sealevel-attacks" />
+This connects to [canonical bump matters](/c/canonical-bump-matters) — the reasoning is the same, and
+the constraint is where it gets enforced.
+
+<Aside kind="warn">
+The dangerous middle ground is `bump = some_instruction_argument`. It looks like the efficient form —
+you are supplying a bump rather than searching — but the value came from the caller. If you supply a
+bump, supply one your program stored. `bump = position.bump` is safe because `position` was already
+validated; `bump = args.bump` is the vulnerability wearing the safe form's clothes.
+</Aside>
+
+### Seeds that reference other things
+
+Two forms extend the basic pattern and both appear constantly in real programs.
+
+**`seeds::program = <expr>`** derives against a different program's id rather than the executing
+one.<Cite src="anchor-account-constraints" /> This is how you validate that an account belongs to
+some other program's PDA scheme — an associated token account, say — without hard-coding an address.
+
+**`#[instruction(...)]`** gives the `Accounts` struct access to the instruction's arguments so seeds
+can reference them.<Cite src="anchor-docs-program-structure" /> Necessary for anything keyed on a
+value the caller supplies, such as a market id, and it is also the point at which seed design starts
+being able to go wrong, which is the next section.
+
+## The seed-collision failure, in full
+
+Seeds are concatenated before hashing. Two sets of seeds that concatenate to the same byte string
+derive the same address.
+
+Take a program that keys a membership account on an organisation name and a team name:
+
+```rust
+seeds = [org_name.as_bytes(), team_name.as_bytes()]
+```
+
+`("acme", "ops")` and `("acmeo", "ps")` are different pairs. As a byte stream both are `acmeops`.
+They derive the same PDA. One organisation's membership record is reachable through another's
+parameters, and neither party did anything unusual — one of them merely registered a name with an
+adversarially chosen boundary.<Cite src="cantina-securing-solana" />
+
+<Compare
+  columns={[
+    { title: 'org "acme", team "ops"' },
+    { title: 'org "acmeo", team "ps"' },
+  ]}
+  rows={[
+    {
+      label: 'What does the client pass as seeds?',
+      cells: [
+        <>Two seeds: <code>acme</code> then <code>ops</code></>,
+        <>Two seeds: <code>acmeo</code> then <code>ps</code></>,
+      ],
+    },
+    {
+      label: 'What reaches the derivation?',
+      cells: [
+        { v: <code>acmeops</code>, tone: 'warn' },
+        { v: <code>acmeops</code>, tone: 'warn' },
+      ],
+    },
+    {
+      label: 'Which account does it address?',
+      cells: [
+        { v: 'The same PDA', tone: 'danger' },
+        { v: 'The same PDA', tone: 'danger' },
+      ],
+    },
+  ]}
+  caption="One address, two organisations: the derivation cannot see a boundary that concatenation already destroyed."
+  alt="Two different pairs of organisation and team names, acme plus ops and acmeo plus ps, concatenate to the identical byte string acmeops and therefore derive the identical program-derived address."
+/>
+
+**The fixes, in order of how much they actually help.**
+
+*Fixed-length seeds.* A pubkey is always 32 bytes, so `[b"member", org.key().as_ref(), user.key().as_ref()]`
+cannot be re-split. This is why so much idiomatic Solana keys on pubkeys rather than on names: not
+because names are unclean, but because they have no length.
+
+*A constant prefix per account type.* `b"position"` versus `b"vault"` ensures two different account
+families cannot collide even if their remaining seeds coincide. Cheap, and it also makes accounts
+identifiable when you are staring at raw data.
+
+*Length prefixes or a hash, if variable-length data is unavoidable.* Both work, both are code you
+now own.
+
+*The constraint itself.* Note that `seeds = [...]` does not detect any of this. It faithfully derives
+whatever you wrote. The constraint enforces *your* seed scheme; it does not audit it. This is the
+general shape of the framework's limit, and it is worth stating plainly: Anchor checks that the
+account matches your specification, and has no view on whether your specification is a good one.
+
+## `has_one`, and the third question
+
+Seeds bind identity into the *address*. The other mechanism binds it into the *data*.
+
+By hand:
+
+```rust
+// manual: does this vault's stored authority match the account passed as authority?
+if vault.authority != *authority_info.key {
+    return Err(ProgramError::InvalidAccountData);
+}
+```
+
+With Anchor, `has_one = authority` checks that the target field on the account matches the key of the
+target field in the `Accounts` struct.<Cite src="anchor-account-constraints" /> Failure is
+`ConstraintHasOne`, 2001.<Cite src="anchor-lang-error-docsrs" /> The names must match — the field
+inside the account and the field in the struct — which is a small piece of magic worth knowing
+explicitly, because renaming one and not the other is how the constraint quietly stops referring to
+what you think it refers to.
+
+<Figure
+  caption="Two pubkeys from two different places — one read out of the account's own bytes, one taken from the instruction's account list."
+  alt="The has_one constraint compares the authority field stored inside the vault's data against the key of the authority account passed in the same instruction; equality binds the vault to that account, inequality returns ConstraintHasOne 2001."
+>
+  <Flow
+    nodes={[
+      { id: 'field', label: 'vault.authority', note: 'a Pubkey inside the account data', col: 0 },
+      { id: 'acct', label: 'authority.key()', note: 'an account in this instruction', col: 0, row: 1 },
+      { id: 'cmp', label: 'equal?', note: 'otherwise 2001', col: 1, tone: 'accent' },
+      { id: 'ok', label: 'bound', note: 'this vault, that account', col: 2, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'field', to: 'cmp' },
+      { from: 'acct', to: 'cmp' },
+      { from: 'cmp', to: 'ok' },
+    ]}
+  />
+</Figure>
+
+This is the third of [three questions every account must answer](/c/three-questions-per-account):
+
+<Matrix
+  corner="Question"
+  cols={['Mechanism', 'Failure']}
+  rows={[
+    {
+      label: 'Who owns this account?',
+      cells: [
+        <><code>Account&lt;'info, T&gt;</code>'s owner check</>,
+        <>3007<Cite src="anchor-lang-error-docsrs" /></>,
+      ],
+    },
+    {
+      label: 'Did the authority sign?',
+      cells: [
+        <><code>Signer&lt;'info&gt;</code></>,
+        <>3010<Cite src="anchor-lang-error-docsrs" /></>,
+      ],
+    },
+    {
+      label: <>Is this <em>this caller's</em> instance?</>,
+      cells: [
+        <><code>has_one</code> or <code>seeds</code></>,
+        { v: <>2001 or 2006<Cite src="anchor-lang-error-docsrs" /></>, tone: 'accent' },
+      ],
+    },
+  ]}
+  caption="Three questions, three mechanisms, three error codes — and the third one is the only question Solidity never had to ask."
+  alt="Ownership is answered by the Account wrapper failing 3007, consent by the Signer type failing 3010, and instance identity by has_one or seeds failing 2001 or 2006."
+/>
+
+**`has_one` alone authorises nothing.** It asserts that two pubkeys are equal. If the `authority`
+field in the struct is an `UncheckedAccount`, then all you have proved is that the caller knows the
+authority's public key — which is public. The authorization comes from `Signer`, and the binding
+comes from `has_one`, and a program with one and not the other has a hole shaped exactly like
+[missing signer check](/c/missing-signer-check).<Cite src="anchor-docs-security-exploits" />
+
+```rust
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(mut, has_one = authority)]   // binds vault to authority
+    pub vault: Account<'info, Vault>,
+    pub authority: Signer<'info>,          // proves authority consented
+}
+```
+
+Two lines, two different guarantees, and neither is redundant.
+
+<Misconception
+  belief="`has_one = authority` proves the authority approved this call."
+  reality="It proves two public keys are equal. Consent comes from the field's type being `Signer`. A `has_one` pointing at an `UncheckedAccount` proves only that the caller knows a public key, which is public information by definition."
+  why="The constraint reads as an ownership assertion in English — 'the vault has this authority' — and English does not distinguish 'is owned by' from 'was authorised by'."
+  src="anchor-account-constraints"
+/>
+
+### Choosing between seeds and `has_one`
+
+Both answer "which instance". They are not interchangeable, and the choice has consequences you feel
+months later.
+
+**Seeds put the relationship in the address.** Advantages: the address is derivable by any client
+from public information, with no index and no lookup; there is exactly one account per key by
+construction, so "duplicate position for the same user" is not a state the program can reach; and the
+program can sign for the account via `invoke_signed`.<Cite src="solana-docs-pda" /> Disadvantage: the
+relationship is immutable. A position derived from Alice's key belongs to Alice for as long as it
+exists. Transferring it means closing and recreating.
+
+**`has_one` puts the relationship in the data.** Advantages: it is mutable — an authority transfer is
+a field write; one account can carry several such links (`has_one = authority, has_one = market`);
+and the account can be an ordinary keypair account when you want one. Disadvantage: the address
+carries no information, so clients need an index or a stored pointer to find it, and nothing prevents
+two accounts claiming the same authority.
+
+**The common design uses both**, and the reason is worth stating: seeds make the account findable and
+unique, `has_one` makes the authority changeable. A config PDA at
+`[b"config", market.key().as_ref()]` with a `has_one = admin` field gives you a deterministic address
+and a rotatable admin key at once.
+
+<Aside kind="note">
+Anchor 1.0 relaxed the seed syntax to allow more flexible PDA seed expressions, so seeds can be built
+from a wider range of expressions than older material shows.<Cite src="anchor-repo-changelog" /> That
+flexibility interacts with IDL generation in ways the sixth lesson covers — seeds that reference
+account fields are exactly the case where the build has had trouble emitting a usable description.
+</Aside>
+
+<Check type="explain" concept="seeds-bump-constraint">
+Review this instruction from a lending program. Every account is typed, nothing is
+`UncheckedAccount`, and the team points out that it uses both a seed constraint and a `has_one`.
+
+```rust
+#[derive(Accounts)]
+#[instruction(market_id: u64, bump: u8)]
+pub struct Repay<'info> {
+    #[account(
+        mut,
+        seeds = [b"loan", borrower.key().as_ref()],
+        bump = bump,
+        has_one = borrower,
+    )]
+    pub loan: Account<'info, Loan>,
+    #[account(mut, seeds = [b"market", &market_id.to_le_bytes()], bump = market.bump)]
+    pub market: Account<'info, Market>,
+    pub borrower: Signer<'info>,
+}
+```
+
+Say what is sound, what is wrong, and what an attacker gets from each defect.
+
+<Answer>
+**Sound: the `loan` account is genuinely bound to the borrower, twice over.** The seeds derive from
+`borrower.key()`, `has_one = borrower` checks the stored field, and `borrower: Signer` proves
+consent. All three questions are answered, and the redundancy is not a
+waste — the seed binding fixes the address and the `has_one` survives if the seed scheme is ever
+changed.<Cite src="anchor-account-constraints" /><Cite src="anchor-docs-account-types" />
+
+**Sound: `market` uses `bump = market.bump`.** The bump comes from the account's own stored value
+rather than from the caller, which is the correct form: it replaces a `find_program_address` search
+with a single `create_program_address` — 1,500 CU rather than 1,500 plus 1,500 per failed
+bump — and it pins the address to the canonical one.<Cite src="solana-docs-pda" /><Cite src="anchor-account-constraints" />
+
+**Defect one, and it is the real bug: `bump = bump` takes the bump from an instruction argument.**
+The `#[instruction(market_id: u64, bump: u8)]` line makes the caller's `bump` visible to the struct,
+and the `loan` constraint uses it.<Cite src="anchor-docs-program-structure" /> That admits every
+non-canonical bump that still derives a valid off-curve address for `[b"loan", borrower]`. The
+attacker is the borrower themselves: derive a second, non-canonical loan address, initialise a loan
+there, and now one borrower has two loan accounts for the same seeds. What that buys depends on the
+protocol — borrow twice against collateral accounted once, repay the empty one to clear a health
+check, or make the off-book loan invisible to any indexer that only derives the canonical
+address.<Cite src="cantina-securing-solana" /> The fix is `bump = loan.bump`, with the canonical bump
+written at creation from `ctx.bumps`.<Cite src="anchor-docs-program-structure" />
+
+**Defect two: nothing links the loan to the market.** Both accounts are validated, and neither
+constraint says the loan belongs to *this* market. If the program has more than one market — and the
+`market_id` seed says it does — an attacker repays a loan taken in an expensive market by passing a
+market with favourable parameters. This is the same relational gap the previous lesson's spot-bug had,
+and it recurs because each constraint reads as sufficient in isolation. The fix is one more
+`has_one`: give `Loan` a `market` field and write `has_one = borrower, has_one = market`, so the
+constraint fails with 2001 rather than succeeding against the wrong
+object.<Cite src="anchor-account-constraints" /><Cite src="anchor-lang-error-docsrs" />
+
+**Defect three, minor but worth flagging in review: `market` is `mut` and nothing here appears to
+need it.** A writable account is one the runtime takes an exclusive lock on, which costs contention
+against every other transaction touching that market. Beyond the concurrency cost, `mut` on an
+account you do not write is a claim the reader has to verify against the handler body, and it makes
+the `Accounts` struct less useful as a specification.
+
+**The general habit this exercise is training.** For each account, ask the three questions and then
+ask one more: is this account related to the *other* accounts in this instruction in a way the
+constraints state? Seed and `has_one` constraints bind an account to a key. They do not bind accounts
+to each other unless you write the link, and instructions with three or more accounts are where the
+missing link hides.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You now have the constraints that answer "which instance". The next lesson is about the one whose
+failure mode runs the other way — a constraint that lets a call through when it should not.
+
+- **`init` and `init_if_needed`** are next. `init_if_needed` is the constraint that hands you the
+  [re-initialization attack](/c/reinitialization-attack) surface, and the reason it is gated behind a
+  cargo feature is that the framework cannot know which of your fields must never be
+  reset.<Cite src="anchor-account-constraints" />
+- **The IDL** describes PDA seeds where it can, which is how a generated client derives addresses
+  without hand-written code — and the place where a build can under-describe a program badly enough
+  to produce a wrong client.
+- **Compute cost** now has a concrete example attached: the difference between `bump` and
+  `bump = state.bump` is a real number of compute units per invocation, on every
+  call.<Cite src="solana-docs-pda" /><Cite src="solana-docs-compute-budget" />
+
+The practice exercise for this module deletes a `has_one` from a working program and asks you to
+write the attack. Do it before reading on. Watching a well-typed, fully-constrained-looking
+instruction pay out to the wrong person is the fastest way to stop reading `Accounts` structs as
+declarations and start reading them as claims.<Cite src="anchor-docs-errors" />

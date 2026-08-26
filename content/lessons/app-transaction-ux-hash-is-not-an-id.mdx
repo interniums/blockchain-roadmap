@@ -1,0 +1,274 @@
+---
+id: app-transaction-ux-hash-is-not-an-id
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    viem-wait-for-transaction-receipt,
+    wagmi-use-wait-for-transaction-receipt,
+    ethereum-org-json-rpc,
+    eip-1559,
+    viem-errors-glossary,
+  ]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The order is stuck in `awaiting_payment`. It has been stuck for four days. The customer has the goods
+in their basket, the funds left their wallet on Tuesday, and the on-chain transfer is right there in
+the explorer, confirmed, with the right amount to the right address.
+
+Your `orders` table has a `tx_hash` column. It contains a hash that does not exist.
+
+The user pressed **Speed Up** in their wallet on Tuesday afternoon. That produced a new transaction —
+same intent, same nonce, higher fee, **different hash** — and the one you were watching lost the race
+and evaporated. Your webhook subscription, your polling job and your primary key are all pointed at a
+transaction that was never mined and never will be.
+
+This lesson is short because the fix is one decision. It is a separate lesson because that decision has
+to be made before the schema exists, and almost nobody makes it in time.
+
+## Why the hash moves
+
+A transaction hash is a hash of the signed transaction's contents. The fee fields are part of those
+contents — [EIP-1559](/c/eip-1559-fee-fields) put `max_priority_fee_per_gas` and `max_fee_per_gas` into
+the transaction itself.<Cite src="eip-1559" /> Change either one and the bytes differ, so the hash
+differs.
+
+Which means the hash is a fingerprint of *a particular attempt*, and every fact you care about lives
+one level up from it:
+
+- The **user's intent** did not change when they pressed Speed Up.
+- The **account** did not change.
+- The **nonce** did not change — that is the whole reason the replacement works.
+- The **hash** changed.
+
+You keyed on the only one of those four that is not stable.
+
+<Misconception
+  belief="The transaction hash is a stable identifier for what the user did."
+  reality="It identifies one signed attempt. Speeding up, cancelling or otherwise replacing produces a different hash for the same nonce, and only one of the attempts will ever exist on chain."
+  why="A 32-byte hex string looks exactly like the immutable ids every other system hands you, and it *is* immutable — it just is not an identifier for the thing you think it identifies."
+  src="viem-wait-for-transaction-receipt"
+/>
+
+## The durable key
+
+**`(address, chainId, nonce)`.**
+
+That triple identifies a slot in one account's ordered history on one chain, and exactly one
+transaction can ever occupy it. It is assigned before broadcast, it survives every replacement, and it
+is the thing the chain itself uses to decide which of two competing transactions executes.
+
+Each component earns its place:
+
+- **`address`** — nonces are per-account and start at zero for every account, so a nonce alone
+  collides constantly.
+- **`chainId`** — the same account has an independent nonce sequence on every chain, so nonce 41 on
+  mainnet and nonce 41 on an L2 are different actions by the same person.
+- **`nonce`** — the slot.
+
+<Compare
+  caption="One of these is decided before the transaction exists and survives every attempt at it. The other is a fingerprint of an attempt that may never happen."
+  alt="The transaction hash and the address-chainId-nonce triple compared on when each exists, what each names, whether a Speed Up changes it, how many exist per user action, what a lookup returns after the attempt lost, and whether each is safe as an idempotency key."
+  axis="Question"
+  columns={[
+    { title: 'The transaction hash', note: 'what the API hands back', tone: 'warn' },
+    { title: 'address, chainId, nonce', note: 'what your schema needs', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'When does it exist?', cells: ['Only once the attempt is signed', 'Before you sign, while you are still building'] },
+    { label: 'What does it name?', cells: ['One signed attempt', "One slot in one account's ordered history on one chain"] },
+    { label: 'Does a Speed Up change it?', cells: ['Yes — new fee bytes, new hash', 'No — the same nonce is what makes the replacement work'] },
+    { label: 'How many exist per user action?', cells: ['One per attempt, and most attempts lose', 'Exactly one, forever'] },
+    { label: 'What does looking it up return once it lost?', cells: [<>null, indefinitely<Cite src="ethereum-org-json-rpc" /></>, 'Whatever actually executed in that slot'] },
+    { label: 'Safe as an idempotency key?', cells: ['No — it changes under you, from software you do not control', 'Yes — assigned once and never reassigned'] },
+  ]}
+/>
+
+The hash becomes what it always was: a mutable attribute of the record, useful for explorer links and
+for correlating with a receipt, and never the thing anything joins on. Keep a history of the hashes
+you have seen for a record rather than overwriting — when you are reconciling later, "we watched these
+three hashes, the third one landed" is a far better artifact than a single column that changed under
+you.
+
+There is a second, quieter reason the triple is the right shape, and it shows up the first time you
+support more than one chain. A multi-chain product built on hashes looks fine — hashes are globally
+unique in practice, so nothing collides and nothing forces you to think about chains. Then a support
+engineer pastes a hash into the wrong explorer, or a reconciliation query joins across chains without
+noticing, and the bug is invisible because the data model never made the chain part of the identity.
+The triple makes it impossible to forget: you cannot construct a key without saying which chain you
+mean.
+
+<Aside kind="warn">
+One boundary worth naming before it bites. This triple identifies an *externally-owned account's*
+transactions. A batched call through a wallet API, or an operation routed through a smart account, is
+not one transaction at your user's own nonce, and the identifier the wallet gives you back for the
+batch is its own thing — [the final lesson](/c/tx-one-intent-many-transactions) deals with that case
+directly. Do not stretch this key over a mechanism it was not describing.
+</Aside>
+
+## Worked example: re-keying without a migration you cannot run
+
+**Subgoal: find every place the hash is load-bearing, because the schema is rarely the only one.** In
+practice there are four, and teams usually remember the first.
+
+1. The primary key or unique index on your own table.
+2. Any external subscription — a webhook registered with a data provider, an alert, a monitoring rule —
+   keyed on that hash, living in a system you may not be able to update transactionally with your own.
+3. URLs you have already handed out: explorer links in emails, support tickets, receipts.
+4. Idempotency keys on downstream calls, which is the one that causes double-spends rather than
+   confusion.
+
+The third is the only one you cannot fix, which is an argument for treating explorer links as
+disposable from the start: render them from the *current* hash on the record at the moment the page is
+built, rather than baking one into stored content that outlives the attempt it names.
+
+**Subgoal: give each record its identity at construction time, not at broadcast time.** You know the
+nonce before you have the hash. Create the row when you build the transaction, keyed on the triple,
+with the status set to something like `constructed`. This also removes an entire class of race where
+the broadcast succeeds and your process dies before it writes the hash down: with the hash as the key
+that row is unrecoverable; with the triple, the row already exists and the hash is a later update.
+
+```sql
+-- identity
+PRIMARY KEY (address, chain_id, nonce)
+-- attributes that change
+current_tx_hash   TEXT,
+observed_hashes   TEXT[],
+status            TEXT NOT NULL
+```
+
+<Figure
+  caption="Two of these three hashes will never resolve to anything, and the row was already correct before the first one existed."
+  alt="One user intent produces three successive transaction hashes: an initial broadcast, a replacement after Speed Up, and the one that is mined. All three target the same nonce, which is consumed exactly once, and that nonce is what the single database row is keyed on."
+>
+  <Flow
+    lanes={['the intent', 'the attempts', 'the slot', 'your record']}
+    nodes={[
+      { id: 'intent', label: 'pay invoice', note: 'one thing the user did', col: 0, tone: 'accent' },
+      { id: 'h1', label: '0xabc…', note: 'first broadcast', col: 1, tone: 'muted', dashed: true },
+      { id: 'h2', label: '0xdef…', note: 'after Speed Up', col: 1, tone: 'muted', dashed: true },
+      { id: 'h3', label: '0x123…', note: 'the one mined', col: 1, tone: 'good' },
+      { id: 'slot', label: 'nonce N', note: 'consumed exactly once', col: 2, tone: 'warn' },
+      { id: 'row', label: 'one row', note: 'address, chainId, nonce', col: 3 },
+    ]}
+    edges={[
+      { from: 'intent', to: 'h1', tone: 'muted', dashed: true },
+      { from: 'intent', to: 'h2', tone: 'muted', dashed: true },
+      { from: 'intent', to: 'h3', tone: 'accent' },
+      { from: 'h1', to: 'slot', tone: 'muted', dashed: true },
+      { from: 'h2', to: 'slot', tone: 'muted', dashed: true },
+      { from: 'h3', to: 'slot', tone: 'good', label: 'landed' },
+      { from: 'slot', to: 'row' },
+    ]}
+  />
+</Figure>
+
+**Subgoal: subscribe to the replacement signal so the re-key is automatic.** `waitForTransactionReceipt`
+detects a replacement by scanning new blocks for a transaction sent from the same nonce and calls
+`onReplaced` with the reason and the replacing transaction;<Cite src="viem-wait-for-transaction-receipt" />
+wagmi exposes the same callback on `useWaitForTransactionReceipt`.<Cite src="wagmi-use-wait-for-transaction-receipt" />
+The handler is three lines and it is the entire point of the callback existing:
+
+```ts
+onReplaced: ({ reason, transaction }) => {
+  recordHash(key, transaction.hash)          // append, do not overwrite
+  setStatus(key, reason === 'cancelled' ? 'abandoned' : 'pending')
+}
+```
+
+**Subgoal: build the path for when you were not watching, because you will not always be.** The
+callback only fires in a process that is running. A backend that restarts, a browser tab that closed, a
+deploy in the middle of the window — all of them mean the replacement happened while nobody was
+listening.
+
+The recovery does not need the callback, because the chain still knows. For a record at
+`(address, chainId, nonce)` with no receipt:
+
+1. Read `eth_getTransactionCount` for that address at `latest`.<Cite src="ethereum-org-json-rpc" />
+2. If the count is greater than the nonce, that slot has been consumed. Something executed there.
+3. Scan blocks from your last-known point for a transaction from that sender at that nonce, and read
+   its receipt. That is precisely what the library's own replacement detection does, and doing it
+   yourself is the same operation without needing to have been present.<Cite src="viem-wait-for-transaction-receipt" />
+4. If the count still equals the nonce, nothing executed there — you are in the parked-or-dropped
+   territory of [lesson two](/c/tx-dropped), not the replaced territory.
+
+Notice what step 3 recovers that the callback cannot: the case where the replacement was made by
+someone or something *other than your app*. Users press Speed Up in their wallet. Operators cancel from
+a hardware wallet at 3am. A second process shares a key it should not. None of those go through your
+code, and all of them are visible from the nonce.
+
+<Aside kind="note">
+The reconciliation job is not an optimisation. It is the only component in this design whose
+correctness does not depend on your application having been running at a particular moment, which
+makes it the only one you can point at when someone asks how you know the ledger is right. Every other
+path here is an accelerator for it.
+</Aside>
+
+<Check type="explain" concept="tx-replacement-changes-the-hash">
+You run a payments service. When a customer pays on-chain you create a row keyed on the transaction
+hash, register a webhook with your data provider for that hash, and on receipt you mark the invoice
+paid and email a receipt.
+
+A customer pays, then speeds the transaction up sixty seconds later. Then, four minutes after that,
+your process is restarted by a routine deploy.
+
+Walk through what your system observes, what it fails to observe, and what state it ends in. Then say
+what changes if the customer had pressed Cancel instead — and whether that is better or worse for you.
+
+<Answer>
+**What happens.** The original transaction never lands; the replacement does. Your row, your webhook
+and your polling job all reference the original hash. The provider's webhook for that hash never fires,
+because the event it describes never occurs. Your poll returns `null` forever, which is the same value
+it returns for a transaction that is merely pending.<Cite src="ethereum-org-json-rpc" /> After your
+client-side timeout you have a
+`WaitForTransactionReceiptTimeoutError`,<Cite src="viem-errors-glossary" /> which is not evidence of
+failure — and after the deploy, even the in-memory watcher that produced it is gone.
+
+**Terminal state:** the customer has paid, on chain, confirmed. Your invoice is unpaid, no receipt was
+sent, and nothing in your system is capable of noticing, because every route to noticing was keyed on a
+hash that does not exist. This resolves through support, manually, with the customer supplying the
+proof.
+
+**What you failed to observe, precisely.** Not the payment — the *re-keying*. `onReplaced` would have
+fired in the sixty-second window if a watcher had been running and had been passed the
+callback,<Cite src="viem-wait-for-transaction-receipt" /> but that is a process-lifetime guarantee and
+the deploy removes it. The durable observation is that the account's transaction count advanced past
+this nonce,<Cite src="ethereum-org-json-rpc" /> and nothing in this design ever asks that question.
+
+**If they pressed Cancel instead.** The nonce is consumed by a zero-value self-send. No payment
+occurred. Your invoice is unpaid, which is *correct*, and your system is accidentally right for the
+wrong reason: it never learned anything, and the thing it never learned happened to be that nothing
+happened.
+
+**Which is worse.** The cancel case is worse, and this is the part that is easy to get backwards. The
+speed-up case fails loudly — a customer with proof of payment and an unpaid invoice files a ticket
+within the hour. The cancel case fails silently and identically for a genuine cancellation, a dropped
+transaction and a network problem, so it produces no signal at all, generates no ticket, and leaves you
+believing the flow works. The failure that reaches you is cheaper than the failure that does not.
+
+**The fix, in order of what it buys.** Key on `(address, chainId, nonce)` and create the row at
+construction time, so the identity exists before any hash does. Handle `onReplaced` to keep the current
+hash fresh while a watcher is alive. Register the provider webhook against the address rather than a
+single hash, so a replacement still reaches you. And run the reconciliation sweep over open rows,
+because it is the only one of the four that survives a deploy.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The rest of this module assumes the durable key.** Confirmation policies are attached to a record,
+not to a hash. Reorg handling has to un-apply a record. Batched calls in the last lesson return a
+different identifier again, and the reason that does not break everything is that you were never
+depending on the hash.
+
+**The change to make this week is in the schema, not the UI.** Anywhere a transaction hash is a primary
+key, a unique index, an idempotency key, or a subscription target, it is a bug that has not fired yet.
+The trigger is a user pressing a button in software you do not control.
+
+**And the general form is worth carrying past this domain:** the identifier a system hands back to you
+is not automatically an identifier for the thing you asked it to do. Here the chain gives you one for
+the *attempt* and a different one for the *slot*, and only the second one is what your product means by
+"the payment".

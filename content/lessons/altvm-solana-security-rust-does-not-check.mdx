@@ -1,0 +1,289 @@
+---
+id: altvm-solana-security-rust-does-not-check
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [rust-cargo-profiles, cantina-securing-solana, sealevel-attacks, anchor-error-code-offset, solidity-docs-control-structures, helius-solana-security-guide, anchor-docs-security-exploits]
+stack: {}
+---
+
+A withdrawal handler, in a language whose entire reputation is safety:
+
+```rust
+ctx.accounts.position.balance -= amount;
+```
+
+The position holds 100. The caller asks for 101. In the binary that is running on mainnet, `balance`
+becomes 18,446,744,073,709,551,615, and the transaction succeeds.
+
+Not a panic. Not a rejected transaction. A silent wrap to near the top of `u64`, which the next
+instruction will read as an enormous balance and honour — because the release profile's documented
+default is `overflow-checks = false`.<Cite src="rust-cargo-profiles" />
+
+This is the shortest lesson in the module because it is one fact, and it takes ninety seconds to
+verify against your own repository. It is here because the fact contradicts something almost every
+Rust engineer believes, and because the belief is *nearly* true.
+
+## The two profiles
+
+Cargo's `overflow-checks` setting controls the compiler's `-C overflow-checks` flag, which controls
+the behaviour of runtime integer overflow; when overflow checks are enabled, a panic occurs on
+overflow.<Cite src="rust-cargo-profiles" />
+
+The defaults differ by profile, and this is the whole lesson:
+
+```toml
+# The dev profile's documented defaults include:
+[profile.dev]
+debug-assertions = true
+overflow-checks  = true      # panics on overflow
+
+# The release profile's documented defaults include:
+[profile.release]
+debug-assertions = false
+overflow-checks  = false     # wraps, silently
+```
+
+Those are the values the Cargo book publishes for each
+profile.<Cite src="rust-cargo-profiles" /> Programs are deployed as release builds.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'dev / test profile', note: 'where you learned the language' },
+    { title: 'release profile', note: 'what runs on mainnet', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: <>What does <code>overflow-checks</code> default to?</>,
+      cells: [
+        { v: <><code>true</code></>, tone: 'good' },
+        { v: <><code>false</code></>, tone: 'danger' },
+      ],
+    },
+    {
+      label: <>What does <code>balance -= amount</code> do past zero?</>,
+      cells: [
+        { v: 'Panics, and the transaction aborts', tone: 'good' },
+        { v: 'Wraps to 18,446,744,073,709,551,615 and the transaction succeeds', tone: 'danger' },
+      ],
+    },
+    {
+      label: 'Which commands run in it?',
+      cells: [
+        <><code>cargo run</code>, and <code>cargo test</code> through the test profile that inherits from dev</>,
+        'The build that is deployed',
+      ],
+    },
+    {
+      label: 'What does a passing test suite prove about it?',
+      cells: [
+        'That a bad input was rejected — which an overflow panic also satisfies',
+        { v: 'Nothing. This profile was never the one under test', tone: 'danger' },
+      ],
+    },
+  ]}
+  caption="The build you validated and the build you deployed do not have the same arithmetic semantics."
+  alt="The dev and release Cargo profiles compared: the default value of overflow-checks, what an underflowing subtraction does in each, which commands use each profile, and what a passing test suite proves about the release build."
+/>
+
+**Subgoal: name where the belief comes from.** Every Rust engineer learned the language by running
+`cargo run` and `cargo test`, both of which use profiles that inherit dev's settings — the test
+profile is the default for `cargo test` and inherits from
+dev.<Cite src="rust-cargo-profiles" /> They have seen the overflow panic fire, many times, and
+concluded that the language checks arithmetic. The language does check arithmetic, in the
+configuration they were standing in. It stops when you optimise.
+
+**Subgoal: state the consequence precisely.** "Rust is a safe language" is a claim about memory —
+about use-after-free, data races, and out-of-bounds access — and it is a true and load-bearing claim.
+It is not a claim about arithmetic. The two are unrelated properties that arrived in the same
+marketing sentence.
+
+<Misconception
+  belief="Rust prevents integer overflow, so arithmetic bugs are a Solidity problem I left behind."
+  reality="Release builds wrap silently unless overflow-checks is turned on or checked arithmetic is used explicitly, and programs ship as release builds."
+  why="The debug-build panic is what everyone remembers from learning the language, because learning happens in debug builds and shipping does not."
+  src="cantina-securing-solana"
+/>
+
+## The one-line fix, and the trap inside it
+
+Turn it on:
+
+```toml
+# Cargo.toml at the workspace root
+[profile.release]
+overflow-checks = true
+```
+
+**And here is the trap, stated by the Cargo book itself: Cargo only looks at the profile settings in
+the `Cargo.toml` manifest at the root of the workspace, and profile settings defined in dependencies
+are ignored.**<Cite src="rust-cargo-profiles" />
+
+So a program crate that sets `overflow-checks = true` in its own manifest, and is then built as a
+member of a workspace whose root manifest does not, gets nothing. The setting is present, it is
+committed, it reads as done in review, and it has no effect on the artifact. Verify at the root, not
+in the crate you happened to open.
+
+This also means the setting is a property of the *build*, not of the *code*. Two teams building the
+same source produce binaries with different arithmetic semantics. A dependency's arithmetic is
+governed by your root manifest, not by whatever its author intended. If you have ever wanted a reason
+to reproduce builds and verify the deployed program hash, this is a good one.
+
+## What to write instead of relying on the profile
+
+Turn the profile on, and also do not depend on it. A panic is a denial of service that aborts the
+transaction; in most financial logic what you want is a named error, not an abort.
+
+```rust
+// Explicit, and independent of the build profile.
+position.balance = position.balance
+    .checked_sub(amount)
+    .ok_or(ErrorCode::InsufficientBalance)?;
+```
+
+The audit-firm checklist rates integer overflow and underflow as high severity, and its remediation is
+this family — `checked_add`, `checked_sub`, `checked_mul`,
+`checked_div`.<Cite src="cantina-securing-solana" />
+
+Two neighbouring entries on the same checklist are worth taking together with it, because both are
+ways of *avoiding* the panic that produce a different bug instead.
+
+**Saturating arithmetic is not a fix.** The checklist is explicit: `saturating_add`, `saturating_mul`
+and `saturating_sub` prevent overflow and underflow by clamping to the valid range, but relying on
+them alone can produce inaccurate or unexpected results when the logic assumes saturation guarantees
+accuracy — its example is a fee computed as `paid_amount.saturating_sub(actual_amount)`, and its
+recommendation is the checked family instead.<Cite src="cantina-securing-solana" /> Think about what
+saturation means for an underflowing balance: the wrap becomes a clamp to zero, so instead of a
+gigantic balance you get a silent write-off. Both are wrong; only one is loud.
+
+**Rounding direction is a security parameter.** The checklist rates loss of precision as high severity
+and gives a concrete instance — rounding up with `try_round_u64()` where `try_floor_u64()` is
+required, to prevent arbitrage attacks.<Cite src="cantina-securing-solana" /> That is the same
+[rounding-direction invariant](/c/rounding-direction-invariant) the DeFi track established, arriving
+in a new language: round in the direction that favours the protocol, always, and state which direction
+that is for each computation.
+
+**Division by zero panics, and unhandled errors are their own entry.** The checklist lists both as
+separate pitfalls — panic due to division by zero, and error not
+handled.<Cite src="cantina-securing-solana" /> An `.unwrap()` in a handler is an abort, and an abort
+in a path an attacker can reach at will is a denial of service against everyone else using that
+account.
+
+<Matrix
+  corner="Subtracting a balance"
+  cols={['In a release build', 'What the caller sees', 'In review']}
+  rows={[
+    {
+      label: <><code>balance - amount</code></>,
+      cells: [
+        { v: 'Wraps to near the top of u64', tone: 'danger' },
+        { v: 'Success, and an enormous balance', tone: 'danger' },
+        'A finding',
+      ],
+    },
+    {
+      label: <><code>checked_sub</code></>,
+      cells: [
+        { v: <>Returns <code>None</code>, independent of the profile</>, tone: 'good' },
+        { v: 'The named error you chose', tone: 'good' },
+        <>The remediation the checklist names<Cite src="cantina-securing-solana" /></>,
+      ],
+    },
+    {
+      label: <><code>saturating_sub</code></>,
+      cells: [
+        { v: 'Clamps to zero', tone: 'warn' },
+        { v: 'Success, and a silent write-off', tone: 'warn' },
+        'A finding of a different kind',
+      ],
+    },
+  ]}
+  caption="Two of the three return success. Only one of the three returns the right number."
+  alt="Three ways to subtract a balance in a Solana program — bare subtraction, checked_sub and saturating_sub — against what each does in a release build, what the caller observes, and how each should be treated in review."
+/>
+
+## Why the diagnosis is worse here than in Solidity
+
+You have a habit from the EVM that will not fire, and it is worth knowing why.
+
+Since 0.8, Solidity's arithmetic is checked by default at the *language* level, and a failure produces
+a `Panic` carrying a code that names which compiler-inserted check fired — `0x11` for arithmetic
+overflow or underflow, `0x12` for division or modulo by
+zero.<Cite src="solidity-docs-control-structures" /> You have read those codes in a trace and gone
+straight to the line. The failure is loud, typed, and self-describing, and reaching one from valid external input is
+itself the finding.
+
+Solana gives you none of that resolution. When overflow checks are off there is no event at all — the
+number is simply wrong and the transaction succeeds. When they are on you get a panic and a program
+log, with no structured code identifying the arithmetic as the cause. What the framework does give
+you is a coarser but genuinely useful signal: it reserves the lower error-code ranges for its own
+framework and constraint failures and defines `ERROR_CODE_OFFSET` — documented as the starting point
+for user-defined error codes — as 6,000, so a raw error number tells you immediately whether a
+generated constraint rejected the call or your own logic
+did.<Cite src="anchor-error-code-offset" /> Reading the number before reading the logs is the fastest
+triage step available, and it is exactly why returning a named error beats panicking.
+
+So the practical difference is not that the bug is more likely here. It is that on the EVM the bug
+announces itself with a code you can look up, and here it either announces nothing or announces
+something unstructured.
+
+<Check type="explain" concept="rust-overflow-not-automatic">
+A team reports: "Our fuzzing suite has run for weeks and never found an arithmetic bug, and we use
+`u64` everywhere with the ranges bounded by our own validation. We are not worried about this."
+
+Give them the two specific reasons their evidence does not support their conclusion.
+
+<Answer>
+**Reason one: the fuzzer is almost certainly running in a profile where the bug cannot manifest as a
+failure.** `cargo test` uses the test profile, which inherits from
+dev,<Cite src="rust-cargo-profiles" /> and dev's documented defaults include `overflow-checks =
+true`.<Cite src="rust-cargo-profiles" /> So under test, an overflow *panics* — and if any test asserts
+that a bad input is rejected, an overflow panic satisfies that assertion. The suite is not silent
+because the bug is absent; it is silent because in the test profile the bug produces the outcome the
+test was hoping for. In release, the same input wraps and succeeds. The build that was validated and
+the build that was deployed do not have the same arithmetic semantics.
+
+The fix for the evidence problem, separate from the fix for the bug: run at least one test pass with
+`overflow-checks` explicitly disabled, or better, set it to `true` in the workspace root release
+profile so both builds behave identically and the question stops
+existing.<Cite src="rust-cargo-profiles" />
+
+**Reason two: "our own validation bounds the ranges" is a claim about inputs, and overflow is a
+property of intermediates.** A multiplication of two individually-valid `u64` values overflows long
+before either operand does. `amount * price / SCALE` is the standard shape, and the product overflows
+while `amount` and `price` are both entirely reasonable — which is why the correct form promotes to
+`u128` for the intermediate and checks the demotion back down. Validating the arguments to a function
+does not validate the expressions inside it.
+
+**And a third thing to hand them, since they raised confidence rather than a specific claim.** Ask
+where the `overflow-checks` setting lives in their repository. If it is in the program crate's own
+`Cargo.toml` rather than the workspace root, it is being ignored — Cargo reads profile settings only
+from the root manifest.<Cite src="rust-cargo-profiles" /> That check takes one command and it
+resolves the disagreement without anyone arguing about fuzzing methodology.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**A ninety-second check on any Solana repository, including one you are auditing.** Open the
+workspace root `Cargo.toml`. Look for `[profile.release]` and `overflow-checks = true`. If the setting
+is absent, or present in a member crate instead of the root, every arithmetic operation in the
+deployed program wraps.<Cite src="rust-cargo-profiles" /> Write it up before you read any of the
+program logic.
+
+**A reading habit for arithmetic in review.** Bare `+`, `-` and `*` on balances are findings.
+`saturating_*` on anything financial is a finding of a different kind — a silent clamp where a named
+error belongs.<Cite src="cantina-securing-solana" /> `unwrap()` in a reachable path is a denial of
+service. And every division has a rounding direction that someone chose, deliberately or
+not.<Cite src="cantina-securing-solana" />
+
+**And the module's turn.** That is the taxonomy complete: the three questions, the lifecycle classes,
+and arithmetic. All of it is 2022 curriculum — correct, still exploitable in programs that leave the
+framework,<Cite src="helius-solana-security-guide" /> and thoroughly documented by the canonical
+reference and its worked insecure-and-secure pairs,<Cite src="sealevel-attacks" /> which the
+framework's own documentation carries as a reference
+page.<Cite src="anchor-docs-security-exploits" /> The last lesson
+asks what a 2022 curriculum cannot: where the money actually left in 2025 and 2026. None of it left
+through anything in these seven lessons.

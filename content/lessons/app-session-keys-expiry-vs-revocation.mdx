@@ -1,0 +1,391 @@
+---
+id: app-session-keys-expiry-vs-revocation
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [erc-7715, erc-7710, erc-7579, eip-4337, erc-7562, metamask-disable-delegation, metamask-caveats-reference, metamask-permission-rules-reference, metamask-advanced-permissions, geth-rpc-txpool, flashbots-protect-cancellations]
+stack: { viem: "2.x" }
+---
+
+The ticket says *"Add a Revoke button to session settings"*, and it is a good ticket. Someone will
+estimate it at half a day, because in every other product they have shipped, revoking a session is
+deleting a row.
+
+Here it is a transaction. It costs gas, it needs a signer who is present and funded, it is announced
+to the public before it takes effect, and until it lands the thing being revoked still works.
+
+Meanwhile the other way a session ends — the timestamp you set at grant time — costs nothing, needs
+nobody, announces nothing, and cannot be raced. Two mechanisms for the same outcome with completely
+different economics. Most products build the expensive one first because it is the one with a button.
+
+ERC-7710 states the operational consequence plainly, as a requirement on you rather than on the
+account: dapps MUST NOT assume that having received a delegation in the past guarantees future
+execution rights, because delegations can be revoked, expire, or become invalid due to state
+changes.<Cite src="erc-7710" /> This lesson is what sits underneath that sentence.
+
+## Expiry is a return value, not an event
+
+Start with the mechanism, because the mechanism is the reason expiry is free.
+
+Nothing runs at the moment a session key expires. There is no scheduler, no keeper, no cron. The
+timestamp is data the account carries, and it is compared against a block's clock at the moment
+someone tries to use the key.
+
+You already know from the module lesson why the comparison cannot happen inside an ERC-4337
+validator: `TIMESTAMP` is on ERC-7562's blocked-opcode list, because validation code is deliberately
+isolated from environmental information like the current block
+timestamp.<Cite src="erc-7562" /> So ERC-4337 moves the comparison out. `validateUserOp` returns a
+packed value carrying an authorizer field, a `validUntil` timestamp and a `validAfter` timestamp,
+each six bytes, with `validUntil` of zero meaning infinite.<Cite src="eip-4337" /> The EntryPoint
+does the comparing, outside the sandbox, where reading the block's time is fine.
+
+Three consequences follow directly, and all three are the reason expiry is the cheap default.
+
+**Nobody has to be online.** The authority does not need to be withdrawn. It fails a check the next
+time it is presented. If the user closes the tab, loses the laptop and never returns, the key still
+stops working on schedule.
+
+**Nobody pays.** There is no state to change, so there is no transaction, so there is no gas and no
+inclusion delay. Compare that with the grant, which is also free — MetaMask's product description of
+its ERC-7715 implementation is explicit that granting is a signature, not an onchain
+transaction<Cite src="metamask-advanced-permissions" /> — and the shape of the whole system appears:
+**both ends of the happy path are free, and only the exception path costs money.**
+
+**There is nothing to race.** A revocation is a transaction someone can be faster than. A timestamp
+is not a transaction, so there is no ordering question, no fee auction and no mempool.
+
+The expression of it varies by layer, but the semantics do not. ERC-7715 defines exactly one rule
+type in the specification text — `expiry`, carrying a `timestamp` which is the unix timestamp at
+which the permission becomes invalid.<Cite src="erc-7715" /> MetaMask's rules reference implements
+that as a required `timestamp` in Unix seconds and its example grants a week by adding
+604800.<Cite src="metamask-permission-rules-reference" /> At the delegation layer the same idea is a
+`timestamp` caveat with an `afterThreshold` and a `beforeThreshold`, either of which is disabled by
+setting it to zero.<Cite src="metamask-caveats-reference" />
+
+<Aside kind="warn">
+Two zero-means-forever defaults sit in this material, in two different layers, and they fail the same
+way. ERC-4337's `validUntil` of zero means infinite rather than expired.<Cite src="eip-4337" /> The
+`timestamp` caveat's `beforeThreshold` of zero disables the upper bound rather than closing
+it.<Cite src="metamask-caveats-reference" /> A struct that is default-initialised and returned
+unmodified therefore grants a permanent authority in both. Any test that asserts "expired keys are
+rejected" by constructing an expiry in the past will pass while the zero case ships.
+</Aside>
+
+<Aside kind="note">
+Which clock does the checking depends on how you deliver the operation, and this is the same
+architectural fork the module lesson drew. Through the ERC-4337 alt-mempool, the window is a return
+value the EntryPoint compares.<Cite src="eip-4337" /> Through an ordinary transaction to an ERC-7710
+delegation manager there is no bundler and no sandbox, so a `timestamp` caveat enforcer reads
+`block.timestamp` itself during redemption.<Cite src="erc-7710" /><Cite src="metamask-caveats-reference" />
+Same policy, two enforcement points. A module tested only on one path has not been tested.
+</Aside>
+
+## Revocation is a state change, and it has four shapes
+
+Now the expensive half. "Revoke" is not one operation, and the four implementations differ in cost,
+in blast radius and in what they leave behind.
+
+**Uninstall the validator module.** ERC-7579's `uninstallModule` MUST implement authorization
+control, MUST call `onUninstall` on the module with the `deInitData` if provided, MUST emit
+`ModuleUninstalled`, and — the clause worth memorising — **MUST revert if the module is not installed
+or the deInitialization on the module failed**.<Cite src="erc-7579" /> Read that last clause as a
+property, not a detail: the module you are removing gets to run code during its own removal, and if
+that code reverts, the removal reverts. A module whose `onUninstall` reverts unconditionally cannot
+be uninstalled through the standard path. That is a supply-chain question about whose module you
+install, and it belongs in the same inventory as every other
+[upgrade key risk](/c/upgrade-key-risk).
+
+**Disable the specific delegation on-chain.** MetaMask's guide is the concrete version: encode
+`disableDelegation` and send it to the delegation manager, at which point any attempt to redeem that
+delegation will revert.<Cite src="metamask-disable-delegation" /> Its own example sends that calldata
+as a UserOperation through a bundler.<Cite src="metamask-disable-delegation" /> Note what that
+implies about prerequisites — revocation here needs a working bundler path, which is more moving
+parts than "delete the row" and each part can be down at the moment you need it most.
+
+**Bump a nonce and retire a generation.** The `nonce` caveat adds a nonce to a delegation and revokes
+previous delegations by incrementing the current nonce, through
+`incrementNonce(address _delegationManager)`.<Cite src="metamask-caveats-reference" /> This is the
+only one of the four that scales: one transaction invalidates every grant issued under the old nonce
+at once. If you expect to issue many session grants to the same user, designing them to share a nonce
+generation from day one is the difference between an incident response that is one transaction and
+one that is a loop.
+
+**Tell the wallet.** ERC-7715 defines `wallet_revokeExecutionPermission`, taking a
+`permissionContext`, with the wallet responding with an empty response on
+success.<Cite src="erc-7715" /> The `context` field exists precisely as a catch-all to identify a
+permission for revoking or redeeming it.<Cite src="erc-7715" /> The ERC's reference-implementation
+note says the MetaMask Permissions Snap keeps user-encrypted storage for all permissions granted
+through the wallet handler **to enable revocation mechanisms**.<Cite src="erc-7715" />
+
+That fourth shape needs care, because the vendor's UX claim and the vendor's own docs describe
+different things. The product post says users can revoke any active permission directly through
+MetaMask at any time.<Cite src="metamask-advanced-permissions" /> The engineering doc says a
+delegation is disabled by sending `disableDelegation` to the delegation
+manager.<Cite src="metamask-disable-delegation" /> Both can be true — a wallet can offer the button
+and perform the transaction behind it — but they are claims about different layers, and only the
+second one has a defined effect on whether a redemption reverts. The public documentation does not
+settle how the wallet-side control relates to on-chain redeemability, so do not design as though it
+does. **If you need the guarantee, drive the on-chain path you control.**
+
+<Misconception
+  belief="Revoking takes effect the moment the user clicks revoke."
+  reality="Every real revocation is a state change: an uninstall, a disable, or a nonce bump. It costs gas, needs a signer who is available and funded, and does nothing until a block includes it. Until then the key is fully valid."
+  why="Every other session system in a product engineer's experience revokes by deleting server-side state, where the deletion and its effect are the same event. Here they are two events with a gap between them, and the gap is adversary-visible."
+  src="erc-7715"
+/>
+
+<Aside kind="warn">
+The funded-signer requirement has a failure mode teams discover during the incident rather than
+before it. If the user's account pays its own gas, revocation requires the user to hold the native
+token — and a user whose session key is being drained may have nothing left to pay with. If a
+[paymaster](/c/paymaster) sponsors it, revocation requires your sponsorship infrastructure to be
+healthy, which is a poor assumption at the exact moment you have concluded that a key you issued has
+leaked. Write down which of the two you depend on, and what the other one is.
+</Aside>
+
+## The race, stated precisely
+
+Here is the sequence, with nothing rounded off.
+
+1. Your user clicks Revoke. Your app builds the revocation and submits it.
+2. It enters a mempool. On the public path, the pending set is readable by anyone — geth exposes it
+   through `txpool_content`, `txpool_inspect` and `txpool_status` as an ordinary RPC
+   namespace.<Cite src="geth-rpc-txpool" /> This is not an exotic observation channel. It is a
+   documented method with a name.
+3. An attacker holding the session key sees a transaction to the delegation manager, or an
+   `uninstallModule` call naming their module, and knows the window is closing.
+4. They submit their own operation — a redemption within the still-valid policy — with a fee that
+   competes for earlier position in the same block or an earlier one.
+5. A block is produced. Whichever landed first, landed.
+
+<Figure
+  caption="The revocation announces itself before it takes effect, and the key it is retiring stays fully valid until a block says otherwise."
+  alt="A revocation is built and submitted, enters the pending set where it is readable through a documented RPC method, is observed by an attacker holding the session key who submits a redemption of their own, and both transactions then compete for position in the block that is produced."
+>
+  <Flow
+    lanes={['the user', 'the mempool', 'the attacker', 'the block']}
+    nodes={[
+      { id: 'click', label: 'Revoke submitted', note: 'gas, and a funded signer', col: 0, tone: 'warn' },
+      { id: 'pool', label: 'the pending set', note: 'readable by anyone', col: 1, tone: 'muted' },
+      { id: 'atk', label: 'a redemption', note: 'still inside the policy', col: 2, tone: 'danger' },
+      { id: 'blk', label: 'a block is produced', note: 'whichever landed first, landed', col: 3 },
+    ]}
+    edges={[
+      { from: 'click', to: 'pool' },
+      { from: 'pool', to: 'atk', label: 'observed' },
+      { from: 'atk', to: 'blk' },
+      { from: 'click', to: 'blk', label: 'ordering contest', dashed: true },
+    ]}
+  />
+</Figure>
+
+Two things about this are commonly stated wrongly.
+
+**It is not a replacement race.** The user is not replacing the attacker's transaction and the
+attacker is not replacing the user's. They are two independent transactions from two different
+senders with two different nonces. The price-bump rules you know from
+[transaction replacement](/c/tx-replacement-same-nonce) do not apply here at all — there is no
+incumbent to outbid by a percentage. This is an ordering contest, and ordering is decided by whoever
+builds the block, under whatever policy they use.
+
+**Private submission changes the observation channel, not the race.** Sending the revocation through
+a private endpoint keeps it out of the public pending set — Flashbots Protect documents that model
+directly, including that a cancellation there is itself a request to the service rather than a
+broadcast.<Cite src="flashbots-protect-cancellations" /> That removes step 2 as an alert. It does not
+remove step 4, because an attacker who has already decided to steal does not need to be told to
+hurry; a script that redeems the maximum the policy allows, continuously, from the moment it obtains
+the key, has no revocation to observe. The honest framing is that privacy narrows the class of
+attacker who wins the race, and does not bound the loss.
+
+**And the window is not measured in seconds. It is measured in blocks.** A slot happens on a fixed
+cadence whether or not a block is proposed in it — you have the mechanism in
+[slot versus block](/c/slot-vs-block) — so "how long is my revocation window" is a question with a
+distribution rather than an answer, and it differs by an order of magnitude between mainnet and a
+fast rollup. This is exactly why the module's measurement practice asks you to broadcast a revocation
+and a session-key operation on Anvil with auto-mining disabled and record which one lands. A number
+you measured on your own chain, at your own fee level, is worth more than any number in this lesson.
+
+<Aside kind="note">
+There is one more window nobody puts in the diagram: the gap between your *decision* and the user's
+*click*. Detection, triage, and a support ticket are all upstream of step 1, and they are usually
+minutes to hours rather than blocks. If your incident story depends on revocation, the revocation
+window is the smallest term in the sum and the one you spent all your engineering on.
+</Aside>
+
+## What follows from the asymmetry
+
+Put the two mechanisms side by side and the design falls out.
+
+<Compare
+  axis=""
+  columns={[
+    { title: 'Expiry', tone: 'good' },
+    { title: 'Revocation', tone: 'warn' },
+  ]}
+  rows={[
+    {
+      label: 'Mechanism',
+      cells: [
+        <>A timestamp compared during validation or redemption<Cite src="eip-4337" /></>,
+        <>A state change: uninstall, disable, or nonce bump<Cite src="erc-7579" /><Cite src="metamask-disable-delegation" /><Cite src="metamask-caveats-reference" /></>,
+      ],
+    },
+    { label: 'Cost', cells: ['Nothing', 'Gas, plus a funded and available signer'] },
+    { label: 'Latency', cells: ['Exact, at the timestamp', 'Whenever a block includes it'] },
+    {
+      label: 'Can it be raced?',
+      cells: ['No', <>Yes — it is a public, identifiable transaction<Cite src="geth-rpc-txpool" /></>],
+    },
+    {
+      label: 'Can it fail?',
+      cells: [
+        'No',
+        <>Yes — insufficient funds, bundler down, <code>onUninstall</code> reverts<Cite src="erc-7579" /></>,
+      ],
+    },
+    {
+      label: 'Scales to many grants?',
+      cells: ['Each carries its own', <>Only the nonce-bump form<Cite src="metamask-caveats-reference" /></>],
+    },
+  ]}
+  caption="Every row where the two differ is a way revocation can fail to happen at all."
+  alt="Expiry and revocation compared across mechanism, cost, latency, whether each can be raced, whether each can fail, and whether each scales to many grants."
+/>
+
+The conclusion is not "skip the revoke button". Users are entitled to it, ERC-7715 specifies a method
+for it, and an incident without one is worse. The conclusion is about which mechanism carries the
+security argument.
+
+**Expiry is the primitive. Revocation is the exception path.** A short window that is re-granted is
+strictly better than a long window that is revocable, because the short window's guarantee holds when
+your infrastructure is down, when the user is asleep, and when an attacker is actively racing you —
+and the long window's guarantee holds in none of those cases.
+
+The cost of the short window is a re-grant, which is a consent screen, which the last lesson of this
+module is about. That is a real cost and it is a product decision. But it is a decision between two
+things you can measure, rather than a decision that quietly assumes a guarantee you do not have.
+
+<Misconception
+  belief="A shorter expiry is always the safer choice, so set it as short as the flow tolerates."
+  reality="Shorter windows mean more re-grants, and more grant screens mean more habituation. MetaMask's own framing of why it built Advanced Permissions names the endpoint: users started habitually approving requests without reading them, the opposite of informed consent."
+  why="Window length is the one dial in this system that is trivially adjustable, so it absorbs pressure from every direction — and the cost it pushes onto the consent screen is invisible in the security review and visible only in a funnel."
+  src="metamask-advanced-permissions"
+/>
+
+## Worked example: sizing the window from the loss you can accept
+
+A subscription product wants to charge 10 USDC per month, automatically, for twelve months.
+
+**Subgoal — write the exposure as an arithmetic expression before choosing any parameter.** With a
+per-period cap the maximum an attacker can extract is `periodAmount × (periods remaining before you
+stop them)`. That expression has two terms you control and one you do not: the cap, the period
+length, and how long "before you stop them" is.
+
+**Subgoal — decide the third term honestly, because it is the one people set to zero.** "Before you
+stop them" is detection plus triage plus click plus inclusion. If your monitoring is a daily job,
+that term is a day, and no revocation design changes it. Write down the real number. Everything else
+is arithmetic against it.
+
+**Subgoal — pick the period so that one period of loss is acceptable, not one grant.** A twelve-month
+grant with a monthly cap of 10 USDC bounds a leak at 10 USDC per month of undetected use, which is a
+good bound. The same twelve-month grant with a single 120 USDC allowance bounds it at 120 USDC
+immediately, which is the same product with twelve times the exposure. The dimension that did the
+work was the *period*, not the *expiry*.
+
+**Subgoal — set the expiry to the shortest value that does not add a prompt the user will resent.**
+Twelve months of authority for a monthly charge means eleven months of standing authority you do not
+need at any given moment. Ninety days with a re-grant offered inside the product's existing renewal
+touchpoint costs one screen a quarter and cuts the tail. There is no formula here; there is the
+question *what is this authority for during the months it is not being used?*, and if the answer is
+"nothing", the window is too long.
+
+**Subgoal — now design revocation, knowing exactly what it buys.** Against the numbers above, a
+successful revocation saves at most one period's cap plus whatever full periods remain. Against a
+racing attacker it saves one period less. If that difference does not justify the engineering, build
+the button anyway for the user's sake, and stop describing it as the control that bounds the loss.
+
+**Subgoal — make the grants share a nonce generation.** If this user ends up with several grants
+across several features, `incrementNonce` retires all of them in one
+transaction.<Cite src="metamask-caveats-reference" /> Deciding this at design time costs nothing.
+Retrofitting it during an incident is not possible.
+
+<Check type="predict" concept="session-key-revocation-race">
+A game issues session keys with a 24-hour expiry and a cap of 0.05 ETH per hour. At 09:00 the team
+detects that a build published at 08:00 leaked session keys to an error-reporting service. At 09:04
+they push a revocation for every affected account, each as a UserOperation through their bundler,
+fee-bumped generously, batched twenty accounts per transaction.
+
+An attacker has been draining since 08:10. Predict what the revocations achieve, and name the
+decision made months earlier that determined the answer.
+
+<Answer>
+**What the revocations achieve is bounded by what was already gone.** From 08:10 to 09:04 is roughly
+54 minutes, so a script redeeming the maximum has taken about 0.05 ETH per affected account already,
+regardless of anything done at 09:04. Revocation cannot recover value; it can only stop the next
+hour. The loss was set by the per-hour cap multiplied by the detection delay, and both of those were
+decided before the incident.
+
+<Figure
+  caption="The revocation acts on the tail. Everything to the left of it was decided by the cap and by how long nobody was looking."
+  alt="A timeline of the incident in minutes after the leaked build shipped: the build goes out at minute zero, the attacker begins redeeming at minute ten, the leak is detected at minute sixty, and the revocation is submitted at minute sixty-four — so the undetected span dominates the span in which revocation could have acted."
+>
+  <Timeline
+    from={0}
+    to={64}
+    unit="min"
+    ticks={[0, 10, 60, 64]}
+    caption="minutes after the leaked build went out"
+    marks={[
+      { at: 60, label: 'detected', tone: 'warn' },
+      { at: 64, label: 'revocation submitted', tone: 'accent' },
+    ]}
+    spans={[
+      { label: 'nobody is looking', start: 0, end: 60, tone: 'warn', note: 'the largest term in the sum' },
+      { label: 'draining at the hourly cap', start: 10, end: 64, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+**The revocations will also partly fail, in ways worth predicting specifically.** Batching twenty
+accounts into one transaction means one revert reverts all twenty — and ERC-7579 requires
+`uninstallModule` to revert if the module is not installed or its deinitialization
+failed,<Cite src="erc-7579" /> so a single account that already uninstalled the module, or a single
+module whose `onUninstall` reverts, takes the batch with it. The fee bump helps against ordering but
+does nothing about that. Small batches, or per-account transactions with independent failure, would
+have been the right shape.
+
+**The attacker wins any race worth having.** The revocation is a transaction to a known address
+naming known accounts, visible in the pending set through a documented RPC
+method.<Cite src="geth-rpc-txpool" /> But this attacker does not need to see it: they have been
+extracting the cap continuously since 08:10, so at every moment the remaining allowance is near zero
+anyway. Front-running matters when the attacker is waiting; here they were not.
+
+**The decision made months earlier was the cap, not the expiry.** 0.05 ETH per hour multiplied by a
+detection delay measured in hours is the whole exposure. A 24-hour expiry sounds short and is not the
+binding constraint — the binding constraint is the rate, because the rate is what converts elapsed
+time into loss. The
+[policy-dimension lesson's](/c/session-key-policy-dimensions) distinction between a cumulative cap
+and a per-period cap is exactly this: one bounds the total loss, the other bounds the loss before you
+can intervene, and only the second one is affected by how fast you react.
+
+**And the second decision was detection.** The gap from 08:00 to 09:00 is the largest term in the
+sum and has nothing to do with session keys. If you want a smaller number, instrument the redemption
+path and alert on rate, rather than optimising a button that is downstream of the alert.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The next lesson** takes the arithmetic in the worked example and makes it the whole security
+argument. If revocation cannot be relied on and expiry only bounds the window, what is left is the
+size of the policy — and stating that size out loud, as a sentence about what you are willing to
+lose, is the deliverable.
+
+**It also asks the question this lesson has stepped around:** all of the above assumes the key leaks
+from somewhere. Where the private key actually sits — page memory, IndexedDB, a non-exportable
+browser key, your server — decides whether that assumption is a formality or a Tuesday.
+
+**And the module's measurement practice** is the honest version of this lesson: measure your own
+revocation gas, measure click-to-receipt on a real testnet, then reproduce the race on Anvil with
+auto-mining off. The window you measure is the only one that describes your product.

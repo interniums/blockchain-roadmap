@@ -1,0 +1,334 @@
+---
+id: ledgers-mempool-you-cannot-cancel
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [geth-txpool, geth-legacypool, geth-legacypool-list, geth-txpool-errors, geth-rpc-txpool, geth-cli-options, devp2p-eth-wire, eip-1559, flashbots-protect-cancellations, flashbots-protect-docs, geth-blobpool-config]
+stack: {}
+---
+
+The user taps **Cancel**. The wallet shows a spinner, then a green tick: *Transaction cancelled.*
+
+Twenty-two seconds later the original swap executes at a price the user was trying to escape, and
+the wallet — correctly, from its own point of view — shows both transactions. One succeeded. One
+failed with "nonce too low". The user is looking at a screen that told them they had stopped
+something, followed by evidence that they had not.
+
+Nothing malfunctioned. The button did exactly what buttons like it do everywhere, which is to
+broadcast a second transaction and hope it wins. This lesson is about what that operation actually
+is, why it can lose, and what the loss costs.
+
+## There is no withdraw message
+
+Start from the wire. Look through the `eth` protocol's message set and there is no message that
+removes a transaction from a peer's pool. Transactions are announced with
+`NewPooledTransactionHashes`, requested with `GetPooledTransactions`, and pushed with
+`Transactions`.<Cite src="devp2p-eth-wire" /> Nothing retracts.
+
+There could not be one, and it is worth seeing why rather than accepting it. A retraction would have
+to be authenticated, or anyone could evict anyone else's transactions — a free denial-of-service
+against the whole network. An authenticated retraction is a signed message from the sender, which is
+a signed statement about a nonce. And a signed statement about a nonce is already available: it is a
+transaction. The protocol has no cancel because the only safe cancel is a transaction, and it already
+has those.
+
+So the sole mechanism is the nonce. The account nonce for an EOA is the count of transactions that
+account has sent, and a transaction is valid only when its nonce equals the account's current
+nonce — see [nonce ordering](/c/nonce-total-ordering) and [the account nonce](/c/account-nonce-eoa).
+That gives exactly one lever: **broadcast a different transaction at the same nonce.** Whichever one
+is included first consumes the nonce, and the other becomes permanently invalid.
+
+That is replacement. It is not cancellation, not editing, and not a guarantee. It is entering a
+second horse in a race that has already started.
+
+The geth documentation states the resulting condition plainly: in `txpool_content`, "there may be
+multiple transactions associated with the same account and nonce. This can happen if the user
+broadcast multiple ones with varying gas allowances (or even completely different
+transactions)."<Cite src="geth-rpc-txpool" /> A pool holds candidates. Some of them are mutually
+exclusive, and the pool is perfectly comfortable with that.
+
+<Misconception
+  belief="I can cancel a transaction I already broadcast."
+  reality="You can broadcast a competing transaction at the same nonce and let the network decide which one lands. It can lose. Every Cancel button in every wallet is this operation and nothing more."
+  why="The button says Cancel, and in every other system the reader has used — a payment processor, an email client, a print queue — cancel means the pending item is removed by the party holding it. Here nobody is holding it. Thousands of independent caches have a copy and none of them takes instructions from you."
+  src="geth-txpool"
+/>
+
+## The acceptance rule, read from the implementation
+
+A node will not swap one transaction for another at the same nonce just because you asked. Doing so
+freely would let anyone churn every pool on the network at negligible cost, so clients impose a
+minimum improvement.
+
+go-ethereum's comparison is short enough to state exactly, and the exactness matters because almost
+every wallet gets one half of it wrong. Given an incumbent transaction `old` at the same nonce and a
+candidate `tx`:<Cite src="geth-legacypool-list" />
+
+**Gate one — strict improvement on both fields.** If the incumbent's fee cap is greater than or equal
+to the candidate's, *or* the incumbent's tip cap is greater than or equal to the candidate's, the
+candidate is rejected immediately. Both `maxFeePerGas` and `maxPriorityFeePerGas` must be strictly
+higher. The source comment gives the reason: the check exists so the rule stays accurate for
+wei-level replacements, where a percentage threshold rounds away to nothing.<Cite src="geth-legacypool-list" />
+
+**Gate two — the percentage threshold, on both fields.** The thresholds are computed as
+`old * (100 + priceBump) / 100` for the fee cap and for the tip cap independently, using integer
+arithmetic, and the candidate must meet or exceed both.<Cite src="geth-legacypool-list" />
+
+Fail either gate and the node returns `replacement transaction
+underpriced`.<Cite src="geth-txpool-errors" />
+
+Two fields, two gates, and no partial credit. Raising only the tip fails gate one. Raising only the
+fee cap fails gate one. Raising both by an amount that clears one threshold but not the other fails
+gate two.
+
+### The number is client policy, and it is genuinely contested
+
+`priceBump` is a configuration field, not a constant of the protocol. go-ethereum's default is 10 —
+readable in the pool's `DefaultConfig` as `PriceBump: 10`<Cite src="geth-legacypool" /> and exposed
+on the command line as `--txpool.pricebump`.<Cite src="geth-cli-options" />
+
+Three things follow, and all three are load-bearing:
+
+**It is not in any EIP.** There is no consensus rule about replacement. A block containing a
+transaction that no pool would have accepted as a replacement is a perfectly valid block, because
+pools are not consulted during validation.
+
+**Published figures disagree.** The threshold is very widely cited as 10%, and also very widely cited
+as 12.5%. Sources disagree, and the cross-client picture has not been established here — Nethermind,
+Besu, Erigon and Reth each set their own. What is verifiable is narrower: go-ethereum's own
+documented default is 10, as a configurable flag.<Cite src="geth-cli-options" /> Treat any single
+number you read, including this one, as a fact about one client at one version.
+
+**Operators change it.** It is a flag. An RPC provider running a stricter pool will reject
+replacements that a public node would accept, and your users will experience that as your app being
+broken.
+
+The engineering conclusion is not "use 12.5% to be safe" — that is still a magic number, and it does
+not help against a client using a different rule entirely. It is: **discover the threshold from
+behaviour.** Bump, catch `replacement transaction underpriced`, bump again, and record what the
+endpoint you actually use accepted. That number has a date and an endpoint attached. The one you
+remember has neither.
+
+<Misconception
+  belief="Any higher gas price replaces a pending transaction."
+  reality="Both fee fields must be strictly higher than the incumbent's, and both must independently clear a percentage threshold. Plus one wei on either field is rejected, and raising one field alone is rejected however much you raise it."
+  why="The rule lives in client code rather than in a specification, so it appears in no EIP, no yellow paper section and almost no tutorial. Most developers meet it for the first time as an opaque error string in production."
+  src="geth-legacypool-list"
+/>
+
+## Worked example: three attempts, one accepted
+
+An incumbent transaction is sitting in the pool with `maxFeePerGas` of 30 gwei and
+`maxPriorityFeePerGas` of 2 gwei. The node is running go-ethereum defaults.
+
+**Subgoal — compute both thresholds before touching anything.** With a bump of 10, the fee-cap
+threshold is 30 times 110, divided by 100, which is 33 gwei. The tip threshold is 2 times 110,
+divided by 100, which is 2.2 gwei.<Cite src="geth-legacypool-list" /> Note that the second number is
+not a rounding artefact you may ignore; it is a gate.
+
+**Attempt one — raise the tip generously, leave the ceiling alone.** Fee cap 30 gwei, tip 10 gwei.
+Gate one fails on the first clause: the incumbent's fee cap is not lower than the
+candidate's.<Cite src="geth-legacypool-list" /> Rejected. This is the single most common wallet bug
+in this area, because "raise the tip" is what a speed-up button intuitively means.
+
+**Attempt two — raise the ceiling past its threshold, leave the tip alone.** Fee cap 40 gwei, tip 2
+gwei. Gate one fails on the second clause: the incumbent's tip cap equals the candidate's, so the
+strict-improvement test rejects it before the percentage test runs.<Cite src="geth-legacypool-list" />
+Rejected.
+
+**Attempt three — clear both thresholds.** Fee cap 33 gwei, tip 2.2 gwei. Both strictly exceed the
+incumbent and both meet their thresholds. Accepted.<Cite src="geth-legacypool-list" />
+
+<Matrix
+  numeric
+  caption="Both failures are decided before the percentage is ever computed, so the threshold everyone argues about had nothing to do with either of them."
+  alt="An incumbent transaction and three replacement attempts at go-ethereum defaults, showing each attempt's fee cap and tip, whether it passes the strict-improvement gate and then the percentage gate, and what the node answers."
+  corner="geth defaults, PriceBump 10"
+  cols={['maxFeePerGas', 'maxPriorityFeePerGas', 'Gate one', 'Gate two', 'Node says']}
+  rows={[
+    { label: 'incumbent', cells: ['30 gwei', '2 gwei', '—', '—', 'already in the pool'] },
+    { label: 'what a candidate must beat', cells: [{ v: '≥ 33 gwei', tone: 'muted' }, { v: '≥ 2.2 gwei', tone: 'muted' }, 'strictly higher on both', 'both thresholds', '—'] },
+    { label: 'attempt one — raise the tip', cells: ['30 gwei', '10 gwei', { v: 'fails', tone: 'danger' }, 'never reached', { v: 'underpriced', tone: 'danger' }] },
+    { label: 'attempt two — raise the ceiling', cells: ['40 gwei', '2 gwei', { v: 'fails', tone: 'danger' }, 'never reached', { v: 'underpriced', tone: 'danger' }] },
+    { label: 'attempt three — raise both', cells: ['33 gwei', '2.2 gwei', { v: 'passes', tone: 'good' }, { v: 'passes', tone: 'good' }, { v: 'accepted', tone: 'good' }] },
+  ]}
+/>
+
+**Subgoal — notice what the arithmetic does to a zero tip.** If the incumbent's tip is 0, the
+threshold is 0 times 110 divided by 100, which is 0 — so gate two is trivially satisfied and gate one
+requires only a strictly positive tip. If the incumbent's tip is 1 wei, integer division makes the
+threshold 1 wei as well, and gate one still forces at least 2 wei. The percentage rule degenerates at
+small values, which is precisely what the strict-improvement gate exists to
+handle.<Cite src="geth-legacypool-list" />
+
+## The bump is enforced per node, and the race is not fair
+
+Two further properties turn a clean rule into a messy operation.
+
+**Every node applies the gates independently, against whatever it happens to hold.** A node that
+already has your incumbent applies both gates to the replacement. A node that never received the
+incumbent — because an announcement did not reach it, or it rejected the original on price, or it
+evicted it — sees your replacement as a first sighting and admits it with no comparison at all. So
+after a replacement, the network's pools hold three different states: some have only the incumbent,
+some have only the replacement, and some have both. The last lesson's point about there being no
+global pool is not an abstraction here; it is the reason a replacement can propagate to eighty
+percent of the network and still lose.
+
+**The winner is chosen by whoever builds the next block, on their own view and their own revenue.**
+This is where the word "race" becomes misleading, because it suggests a fair contest decided by
+timing. It is an auction decided by a profit calculation. Concretely: if the incumbent reached a
+builder inside a searcher's bundle — where it is bound together with the searcher's own transactions
+and the bundle's total payment to the builder is what matters — then your replacement has to beat the
+value of that entire bundle, not the incumbent's own fee fields. Your 10% bump is competing against a
+number you cannot see.
+
+<Figure
+  caption="A replacement removes nothing. It leaves the network holding two candidates at one nonce and hands the decision to whoever builds the block."
+  alt="One incumbent transaction and one replacement share a nonce. Some pools hold only the incumbent, some hold both, some hold only the replacement. A block builder selects on revenue, consuming the nonce once and invalidating the other."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'inc', label: 'the swap', note: 'nonce 42, broadcast first', col: 0 },
+      { id: 'rep', label: 'the cancel', note: 'nonce 42, broadcast second', col: 0, tone: 'accent' },
+      { id: 'p1', label: 'has only the swap', note: 'never heard the cancel', col: 1 },
+      { id: 'p2', label: 'has both', note: 'two candidates, one nonce', col: 1 },
+      { id: 'p3', label: 'has only the cancel', note: 'never heard the swap', col: 1 },
+      { id: 'b', label: 'whoever builds the block', note: 'decides on revenue, not on arrival order', col: 2, tone: 'warn' },
+      { id: 'out', label: 'nonce 42 consumed once', note: 'the loser is permanently nonce too low', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'inc', to: 'p1' },
+      { from: 'inc', to: 'p2' },
+      { from: 'rep', to: 'p2', tone: 'accent' },
+      { from: 'rep', to: 'p3', tone: 'accent' },
+      { from: 'p1', to: 'b' },
+      { from: 'p2', to: 'b' },
+      { from: 'p3', to: 'b' },
+      { from: 'b', to: 'out' },
+    ]}
+  />
+</Figure>
+
+## Cancellation is a construction, not a feature
+
+With the mechanism established, the cancel is easy to specify and its costs are easy to state.
+
+The construction is a transaction from the sender to the sender, value zero, empty `data`, gas limit
+21,000, at the same nonce as the transaction being cancelled, with both fee fields raised past the
+replacement thresholds. It is the cheapest possible transaction that consumes the nonce.
+
+Three properties users are essentially never told:
+
+**It can lose.** If the original is included first, the cancel fails on nonce and the thing the user
+was trying to stop has happened. The green tick was premature by construction: at the moment the
+wallet showed it, the outcome was undetermined.
+
+**It costs money when it wins.** The winning cancel is a transaction. It pays the base fee plus the
+tip you raised in order to win, on 21,000 gas, and — importantly — you bid *higher* than the original
+in order to win the race, so cancelling is systematically more expensive per gas than the transaction
+it replaced.
+
+**It is permanent.** The successful cancel is on-chain forever: a zero-value self-transfer, at that
+nonce, at that timestamp, at that fee. Anyone reading the account's history can see that the user
+changed their mind and roughly what it cost them.
+
+<Misconception
+  belief="A successful cancellation means nothing happened."
+  reality="The cancellation is itself a transaction. It consumed the nonce, spent gas at a rate you raised in order to win, and is recorded on-chain permanently. What did not happen is the original transaction's effect. Everything else happened."
+  why="'Cancel' in software normally means returning to the prior state at no cost. Here the prior state is unreachable — the only way to prevent one transaction is to execute a different one — so the cheapest available undo is still an action with a price and a record."
+  src="eip-1559"
+/>
+
+## The private-endpoint exception, and why it is not a counterexample
+
+There is one place where cancel behaves the way users expect, and understanding why sharpens the
+rule rather than weakening it.
+
+Transactions submitted to Flashbots Protect go to the Flashbots MEV-Share Node, where the
+documentation says they may remain pending for up to six minutes.<Cite src="flashbots-protect-cancellations" />
+Protect exposes a real cancellation: submit a transaction from the same address, at the same nonce,
+with `from` and `to` both set to the original sender's address and an empty `data`
+field.<Cite src="flashbots-protect-cancellations" /> The documentation is explicit that this
+cancellation costs nothing, because it "serves solely for authentication purposes" and is never
+included on-chain.<Cite src="flashbots-protect-cancellations" />
+
+That is a genuinely different operation, and it is available for exactly one reason: **the original
+was never broadcast.** One operator is holding it. Because there is a single holder, there is a party
+who can be asked to discard it, and the request only needs to prove you control the account — hence
+the same-nonce self-transfer shape, used as a signature rather than as a transaction.
+
+Which is to say: cancellation becomes possible precisely when you have given up the property that
+made it impossible. Publishing to thousands of independent caches is what removes the ability to
+recall; sending to one counterparty restores it, and substitutes trust in that counterparty. The next
+lessons are about what else that substitution buys and costs.<Cite src="flashbots-protect-docs" />
+
+<Aside kind="warn">
+Blob-carrying transactions are replaced under a different and much harsher rule: three fee fields
+rather than two, all three strictly greater than the incumbent's, and a default bump of 100 rather
+than 10 — a doubling of every fee.<Cite src="geth-blobpool-config" /> Replacement logic written
+against the ordinary pool fails silently against blob transactions, and there is a whole lesson on
+this later in the module.
+</Aside>
+
+<Check type="predict" concept="price-bump-rule">
+A wallet's speed-up feature reads the stuck transaction, then submits a replacement with
+`maxPriorityFeePerGas` multiplied by 1.5 and `maxFeePerGas` left unchanged, on the reasoning that the
+ceiling was already generous and only the tip needs to be competitive.
+
+The stuck transaction has `maxFeePerGas` 40 gwei, `maxPriorityFeePerGas` 1 gwei. Predict what the
+node returns, then say what a correct implementation does — including what it does when it does not
+know the endpoint's threshold.
+
+<Answer>
+**Prediction: `replacement transaction underpriced`, rejected at gate one.**<Cite src="geth-txpool-errors" />
+The candidate's fee cap is 40 gwei and the incumbent's is 40 gwei, so the incumbent's fee cap is
+greater than or equal to the candidate's and the comparison short-circuits before the percentage
+threshold is evaluated at all.<Cite src="geth-legacypool-list" /> The 1.5× tip is irrelevant; it was
+never reached.
+
+The reasoning behind the bug is the interesting part, because it is *almost* right. The ceiling
+genuinely was generous, and under EIP-1559 semantics a higher ceiling does not cost anything unless
+the base fee rises to meet it.<Cite src="eip-1559" /> But the replacement rule is not asking whether
+the transaction is well priced. It is anti-churn policy: it asks whether the pool is being paid
+enough to justify rewriting an entry and re-propagating it. That question is asked about both fields
+because both are dimensions along which a transaction could otherwise be churned for free.
+
+**A correct implementation raises both fields together and verifies the outcome.** With a bump of 10:
+fee cap to at least 44 gwei, tip to at least 1.1 gwei — and since integer division on wei-denominated
+values can truncate, the safe construction adds a wei or rounds up rather than computing the
+threshold exactly.
+
+**When the threshold is unknown, which is the normal case, escalate and observe.** The rule is client
+configuration exposed as a flag<Cite src="geth-cli-options" />, published figures disagree between 10%
+and 12.5%, and other clients set their own values. So a wallet should not hard-code a constant. It
+should attempt a bump, catch the rejection, raise the multiplier, and retry — with a ceiling on the
+escalation so a mis-parsed error cannot walk the user's fees to the moon. The value that worked
+should be cached per endpoint, because it is a property of that endpoint.
+
+**Two things the implementation must also get right that the question did not ask about.** It must
+poll for a *receipt* rather than for pool state, because a rejection by the node you asked says
+nothing about the nodes you did not ask. And it must tell the user that a speed-up can lose — the
+original may already be in a builder's block — rather than reporting success the moment the node
+accepts the replacement.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The fee fields** are the next lesson, and they explain the second half of gate one: why raising the
+ceiling and raising the tip are genuinely different actions with different effects, and why a
+transaction can be bidding zero without its owner realising.
+
+**Pending is a set** explains why the race is decided by a revenue calculation rather than by arrival
+order, and therefore why "I bumped 10% and still lost" is a normal outcome rather than a bug.
+
+**The blob pool** is where every rule in this lesson changes at once, and where tooling written
+against these rules breaks quietly.
+
+**Product surface.** Two concrete rules fall out and are worth writing down now. A Cancel button
+should be labelled as an attempt and should report its outcome from a receipt, not from an
+acceptance. And any flow with a real-world consequence attached — releasing goods, crediting an
+account — must treat "the user cancelled" as unconfirmed until the account nonce has moved and you
+know which transaction moved it.

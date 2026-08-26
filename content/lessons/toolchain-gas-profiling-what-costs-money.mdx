@@ -1,0 +1,338 @@
+---
+id: toolchain-gas-profiling-what-costs-money
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [measured-forge-1-7-1, measured-gas-profiling-1-7-1, eip-2929, eip-2028, eip-3529, eip-7623, eip-1153, op-docs-transaction-fees, foundry-gas-optimization-guide]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Here are the numbers that decide whether a contract is expensive, measured on forge 1.7.1 with solc
+0.8.36 and the optimizer off:<Cite src="measured-forge-1-7-1" />
+
+<Matrix
+  numeric
+  corner="Operation"
+  cols={['Cold', 'Warm']}
+  rows={[
+    { label: 'SLOAD', cells: [{ v: '2,100', tone: 'warn' }, { v: '100', tone: 'good' }] },
+    { label: 'account access (BALANCE, EXTCODESIZE, the call family)', cells: [{ v: '2,600', tone: 'warn' }, { v: '100', tone: 'good' }] },
+    { label: 'SSTORE, zero → non-zero', cells: [{ v: '20,000 (+2,100 cold)', tone: 'danger' }, { v: '—', tone: 'muted' }] },
+    { label: 'SSTORE, non-zero → non-zero', cells: [{ v: '2,900 (+2,100 cold)', tone: 'warn' }, { v: '—', tone: 'muted' }] },
+    { label: 'SSTORE, same value', cells: [{ v: '—', tone: 'muted' }, { v: '100', tone: 'good' }] },
+    { label: 'TSTORE / TLOAD', cells: [{ v: '—', tone: 'muted' }, { v: '100 each', tone: 'good' }] },
+    { label: 'LOG, per topic', cells: [{ v: '—', tone: 'muted' }, { v: '375', tone: 'good' }] },
+  ]}
+  caption="The three tiers of SSTORE are the whole cost model: a first write, a rewrite and a no-op differ by two orders of magnitude for the same line of Solidity."
+  alt="Measured gas by operation. SLOAD costs 2,100 cold and 100 warm; account access costs 2,600 cold and 100 warm; an SSTORE from zero to non-zero costs 20,000 plus 2,100 when the slot is cold; from non-zero to non-zero 2,900 plus the same cold surcharge; writing the value already there costs 100; TSTORE and TLOAD cost 100 each with no cold tier; a LOG topic costs 375."
+/>
+
+Every figure above was measured with a probe whose result is sunk into storage, under the pricing
+EIP-2929 established.<Cite src="measured-forge-1-7-1" /><Cite src="eip-2929" />
+
+Look at the spread. The most expensive thing on the list is two hundred times the cheapest, and
+every entry above 1,000 gas is a **storage** operation. Nothing else on an EVM comes close:
+arithmetic, comparisons, jumps and stack manipulation are single digits.
+
+That is the whole economics of a contract in one table. **How many distinct [storage
+slots](/c/storage-slot) does this function touch, and in what state does it find them?** Answer that
+and you have predicted the cost to within a few percent. Everything else is rounding.
+
+Notice what the table does *not* have: a column for the operation itself. There is no "cost of a
+write". There is a cost of a write *to a slot in a particular state*, and the spread between the
+cheapest and the most expensive version of the same `SSTORE` is 200×. Any sentence of the form "this
+function costs N gas" is missing its second half.
+
+## Packing is a first-write optimisation, and only that
+
+The standard advice is to pack narrow fields into one slot. It is good advice and it is usually
+justified with the wrong argument, so here is the measurement.
+
+Three contracts, each with a `set(x)` that writes three fields. One uses three `uint256` in three
+slots; one uses three `uint64` deliberately spaced into three slots; one uses three `uint64` that
+share a single slot.<Cite src="measured-gas-profiling-1-7-1" />
+
+<Matrix
+  numeric
+  corner="Layout"
+  cols={['First write (slots zero, cold)', 'Later write (warm, dirty)']}
+  rows={[
+    { label: '3 × uint256, 3 slots', cells: ['71,979', { v: '1,470', tone: 'good' }] },
+    { label: '3 × uint64, 3 slots', cells: [{ v: '72,138', tone: 'warn' }, { v: '1,938', tone: 'warn' }] },
+    { label: '3 × uint64, 1 slot', cells: [{ v: '28,438', tone: 'good' }, { v: '2,038', tone: 'warn' }] },
+  ]}
+  caption="One measurement, two opposite recommendations — which column applies is a property of your workload, not of the layout."
+  alt="Three storage layouts measured on a function that writes three fields. Three uint256 in three slots cost 71,979 on the first write and 1,470 later; three uint64 spread over three slots cost 72,138 and 1,938; three uint64 packed into one slot cost 28,438 and 2,038."
+/>
+
+All six figures from one run of one suite, optimizer off.<Cite src="measured-gas-profiling-1-7-1" />
+
+Read the two columns separately, because they say opposite things.
+
+**On the first write, packing saves 43,541 gas.** That is two avoided zero-to-non-zero writes, each
+20,000 plus the 2,100 cold surcharge — 44,200 nominal<Cite src="measured-forge-1-7-1" /> — and the measurement lands 659 under it
+because the packed version does more masking work in exchange. A 60% reduction. This is the real win
+and it is enormous.
+
+**On every later write, packing costs 568 gas more than three plain `uint256` slots.**<Cite src="measured-gas-profiling-1-7-1" /> Once
+all three slots are warm and already dirty in this transaction, each separate write is 100 gas,
+while the packed write is a read-modify-write with masking on a single slot. The narrow types have
+bought nothing and the masking is pure overhead.
+
+And note the middle row: three `uint64` in three separate slots costs **more** than three `uint256`
+in three slots, in both columns. Narrowing a type without packing it is strictly a loss.
+
+<Misconception
+  belief="uint8 costs less than uint256, because it is a smaller number."
+  reality="The EVM word is 256 bits. A narrow type is stored inside a word and must be masked on every access, so it costs more unless several of them share a slot. Measured: three uint64 in three separate slots cost 72,138 on first write against 71,979 for three uint256 — slightly worse. Packed into one slot they cost 28,438."
+  why="Smaller type, smaller storage, smaller cost is an intuition imported from languages where it is true."
+  src="measured-gas-profiling-1-7-1" />
+
+<Aside kind="note">
+Foundry's own optimisation guide leads with the same conclusion — "storage is the most expensive
+operation", followed immediately by a packed-struct example.<Cite src="foundry-gas-optimization-guide" /> The refinement this measurement
+adds is *when* the packing pays: on the transition into non-zero state. For a contract whose slots
+are written once at initialisation and read forever after, packing is a large, permanent win. For a
+hot counter written repeatedly inside single transactions, it is a small, permanent loss.
+</Aside>
+
+## The one genuinely large modern win
+
+[Transient storage](/c/transient-storage) is the exception to "storage is expensive": `TSTORE` and
+`TLOAD` cost 100 each, with no cold tier at all, because the values never reach the state trie and
+are discarded at the end of the transaction.<Cite src="eip-1153" /><Cite src="measured-forge-1-7-1" />
+
+The canonical application is the reentrancy lock, and the canonical *number* for it is wrong.
+Circulating figures put the storage guard at about 7,100 gas and the transient one at about 200, a
+35× ratio. Measured, the transient guard's overhead is **284** gas and the storage guard's is
+**3,104** with a warm lock slot — about 11×.<Cite src="measured-forge-1-7-1" />
+
+The two numbers disagree because the storage guard does not have a cost, it has a **range**. The
+lock slot is cold on the first guarded call in a transaction and warm on every one after it, so the
+overhead runs from roughly 3,100 to roughly 7,100 depending on where in the transaction the call
+falls.<Cite src="measured-forge-1-7-1" /><Cite src="eip-2929" /> The transient guard is flat, because there is no cold tier to be on the wrong
+side of.
+
+Publish the range and the reason. A single number for the storage guard is how the 35× claim got
+into circulation in the first place.
+
+## Logs are cheap, and that is a design lever
+
+Events are the one write-shaped thing that is not expensive. A topic costs 375, measured as a clean
+increment: `LOG0` 784, `LOG1` 1,162, `LOG2` 1,540 in the same harness.<Cite src="measured-forge-1-7-1" /> The data body is
+charged per byte, and none of it touches the state trie.
+
+Set that against a storage slot at 20,000 for the first write,<Cite src="measured-forge-1-7-1" /> and a rule falls out that a
+great deal of production Solidity gets wrong: **if the only consumer of a value is off-chain, emit
+it, do not store it.** A mapping written purely so an indexer can read it back is paying tens of
+thousands of gas to duplicate information an event carries for hundreds. The constraint is that
+contract code cannot read logs — so the moment any on-chain path needs the value, the slot comes
+back.
+
+The `credit` function in this module's probe writes two slots and emits one indexed event. The event
+is under 4% of the call's cost.
+
+## The cheapest write is the one you skip
+
+Two patterns, both worth more than everything in the next lesson combined.
+
+**Accumulate in memory, write once.** A loop that does `balance += i` a hundred times performs a
+hundred storage reads and a hundred storage writes; hoisting into a local and writing the result
+once performs one of each. Foundry's own guide leads with exactly this example.<Cite src="foundry-gas-optimization-guide" /> With the slot
+warm and dirty each iteration is only 100 gas, so the saving is thousands rather than hundreds of
+thousands — but it is thousands, and it costs nothing in readability.
+
+**Do not write a value that is already there.** An `SSTORE` of the same value a slot already holds
+costs 100, but you paid a cold `SLOAD` of 2,100 to find that out unless the slot was already
+warm.<Cite src="measured-forge-1-7-1" /> The guard is worth it when the no-op case is common and the alternative is a 2,900 or
+20,000 write; it is a loss when writes almost always change the value. That is a workload question
+with a measurable answer, which by now should be a familiar shape.
+
+## Refunds, and the ceiling on them
+
+Clearing a slot back to zero earns a refund. Two constants from EIP-3529 bound what that is worth:
+`SSTORE_CLEARS_SCHEDULE` is set to `SSTORE_RESET_GAS + ACCESS_LIST_STORAGE_KEY_COST`, **4,800 gas**,
+and the maximum refund for a whole transaction is `gas_used // MAX_REFUND_QUOTIENT` where the
+quotient was raised from 2 to **5**.<Cite src="eip-3529" /> The same EIP removed the `SELFDESTRUCT` refund entirely.
+
+You can watch the cap bite. A contract with eight pre-filled slots, measured under isolation so the
+figures are transaction-level:<Cite src="measured-gas-profiling-1-7-1" />
+
+| Transaction | Gas |
+|---|---|
+| clear 1 slot | 21,962 |
+| clear 8 slots | 49,953 |
+| increment 8 slots (no refund) | 64,109 |
+
+Same contract, same fixture, one argument changed.<Cite src="measured-gas-profiling-1-7-1" />
+
+**Subgoal — recover the refund actually paid, because the headline constant is not what you
+receive.**
+
+For the single-slot clear: the transaction consumed 26,762 before refunds, and 26,762 // 5 = 5,352,
+which is above 4,800. So the full 4,800 was paid and the transaction settled at 21,962.<Cite src="eip-3529" /> The
+nominal refund and the received refund agree.
+
+For the eight-slot clear the nominal refund is 8 × 4,800 = **38,400**. But the transaction consumed
+62,441, and 62,441 // 5 = **12,488**. The cap binds. You receive 12,488 — under a third of what you
+earned — and the transaction settles at 49,953, which is exactly gas used minus one fifth of gas
+used.
+
+That is the shape to remember: **a transaction can never cost less than four fifths of what it
+consumed.** Clearing eight slots to reclaim cost buys you a third of the reclaim you would naively
+compute, and clearing eighty buys you no more, proportionally, than clearing eight.
+
+The design consequence is blunt. Any mechanism whose economics depend on clearing state to reclaim
+gas — gas tokens being the historical example, which is precisely what EIP-3529 set out to
+kill<Cite src="eip-3529" /> — does not work. And a "cleanup" function that zeroes a hundred slots is not cheap; it is
+expensive with a discount capped at 20%.
+
+<Aside kind="warn">
+Note also which direction the cap makes you round. `eth_estimateGas` and your gas report both see
+the post-refund number, but the transaction must still be *funded* for the pre-refund number: 62,441
+has to be available even though 49,953 is charged. A gas limit set from the measured 49,953 does not
+run.
+</Aside>
+
+## Calldata: the model changed under you
+
+The classic model is 4 gas per zero byte and 16 per non-zero byte, on top of the 21,000 base — the
+[intrinsic charge](/c/intrinsic-gas) levied before the first opcode runs.<Cite src="eip-2028" /> The previous lesson
+used it to reconcile a measurement to the gas: the 68 calldata bytes of a `credit(address,uint256)`
+call, 8 non-zero and 60 zero, come to 8 × 16 + 60 × 4 = 368, and 21,000 + 368 = 21,368 exactly
+matched the difference isolation introduced.<Cite src="measured-gas-profiling-1-7-1" />
+
+That model is now a floor away from being complete. EIP-7623 defines `tokens_in_calldata =
+zero_bytes + nonzero_bytes × 4`, prices the standard path at `STANDARD_TOKEN_COST = 4` per token,
+and adds a second term at `TOTAL_COST_FLOOR_PER_TOKEN = 10` per token:<Cite src="eip-7623" />
+
+```
+tx.gasUsed = 21000 + max(
+    4 * tokens_in_calldata + execution_gas_used + creation_extra,
+    10 * tokens_in_calldata
+)
+```
+
+Two readings of the same formula:
+
+**The standard path is unchanged.**<Cite src="eip-7623" /> 4 gas per token, and a non-zero byte is 4 tokens, which is
+the familiar 16-and-4. For the `credit` call: 60 + 8 × 4 = 92 tokens, standard cost 368. Identical
+to before.
+
+**The floor is a second bid.** The same 92 tokens have a floor of 920. Execution on that call was
+20,339, so the first branch wins by a mile and the floor never applies — which is why the earlier
+reconciliation came out exact under the old model.
+
+The floor bites on transactions that are **mostly data and do little computation**: a rollup posting
+a batch, a contract storing a blob of bytes, a bridge relaying a proof. For those, the old model
+under-prices the transaction and your local measurement will be low. Read the constants from the EIP
+rather than from any lesson, including this one — that is the parameter table's whole purpose, and
+these are exactly the values that move at a fork.<Cite src="eip-7623" />
+
+<Aside kind="note">
+There is a design lever hiding in `tokens_in_calldata`. A zero byte is 1 token and a non-zero byte
+is 4, under both the standard price and the floor. Left-padded ABI encoding produces a great many
+zero bytes — 60 of the 68 in that `credit` call — which is why ABI-encoded calldata is cheaper per
+byte than its length suggests, and why a tightly packed custom encoding wins less than the byte
+count implies. Count tokens, not bytes.
+</Aside>
+
+## On a rollup, there is a second bill
+
+Everything above prices execution. On [a rollup](/c/rollup), execution is not the whole invoice.
+
+OP Mainnet's fee is documented as the sum of an execution gas fee, an L1 data fee, and — after the
+Isthmus upgrade — an operator fee.<Cite src="op-docs-transaction-fees" /> The execution gas fee is described as exactly the fee you
+would pay for the same transaction on Ethereum; the L1 data fee is named as the only component that
+differs from an Ethereum transaction, and it arises because the transaction's data is published to
+L1.<Cite src="op-docs-transaction-fees" />
+
+What that fee depends on is the interesting part: the estimated size of the transaction **in bytes
+after compression**, plus the current Ethereum gas price and/or blob gas price. For blob-enabled
+chains, the blob data gas price largely determines it.<Cite src="op-docs-transaction-fees" />
+
+So on a rollup you are optimising against **two independent axes**:
+
+- **Execution gas**, priced by the table at the top of this lesson, and visible in your gas report.
+- **Compressed transaction size**, priced by an L1 market you do not control, and completely
+  invisible to every instrument in this module.
+
+<Misconception
+  belief="Gas optimisation is the same job on L1 and on an L2."
+  reality="An L2 transaction carries a second, separately-priced component that scales with its compressed size in bytes and is set by the L1 blob or base-fee market. A change that adds execution steps but shrinks the payload can be a net win there and a net loss on L1."
+  why="Both are denominated in gas and both are reported as one fee, which hides that two different markets produced it."
+  src="op-docs-transaction-fees" />
+
+Resist the urge to attach a ratio to this. How much of an L2 fee is data depends on the L1 blob
+market at the moment of posting, and blob pricing moves; the published splits disagree with each
+other because they were taken at different times under different conditions. What is stable — and
+enough to design with — is that **calldata size is a first-class cost axis on an L2 and a minor one
+on L1**, and that your gas report measures neither.
+
+The practical consequence is that "optimise this contract" is not a well-defined instruction until
+someone names the chain. On L1, cut slots. On a rollup, cut bytes first, and be willing to spend
+execution gas to do it.
+
+<Check type="explain" concept="storage-dominates">
+Two proposals land for the same struct, which is written once per user at registration and then read
+on every interaction and updated on about one interaction in ten.
+
+**Proposal A** packs `uint128 balance`, `uint64 lastSeen`, `uint64 tier` into one slot.
+
+**Proposal B** keeps three `uint256` fields in three slots and argues that packing "costs more on
+every write".
+
+Both authors have measurements. Both measurements are correct. Decide, and say what number would
+change your mind.
+
+<Answer>
+**Both are right about their own case, and the workload picks the winner — Proposal A.**
+
+Author B's measurement is the warm-and-dirty column: three separate slots at 100 gas each beat one
+packed read-modify-write, by around 568 gas on the measurement in this lesson.<Cite src="measured-gas-profiling-1-7-1" /> That is real,
+and it is the wrong column for this workload.
+
+**Count the events, weighted by tier.** Registration is one zero-to-non-zero write per slot: 20,000
+each, plus the 2,100 cold surcharge. Packing turns three of those into one, saving on the order of
+44,000 gas per user, once. Reads are 2,100 cold and 100 warm; the packed layout turns three cold
+reads into one, saving about 4,200 on every interaction that reads all three fields — which is every
+interaction. Updates happen on one interaction in ten and are the only case where packing loses, by
+hundreds.
+
+So packing wins tens of thousands of gas at registration, thousands per read, and loses hundreds on
+a tenth of interactions. It is not close.
+
+**What would change my mind.** Two things, both measurable rather than arguable. First: if `balance`
+were updated many times *inside a single transaction* — a batch settlement looping over the same
+user — the dirty-write path dominates and the packed layout's masking is paid every iteration with
+none of the first-write saving. Second: if the three fields were read independently rather than
+together, so that a typical call touches one field and pays the masking without amortising the
+shared slot.
+
+**The habit worth taking.** "Packing is cheaper" and "packing is more expensive" are both incomplete
+sentences. The complete one names the transition — zero to non-zero, non-zero to non-zero, or
+already dirty — and how often each occurs in the workload. Then it is arithmetic.
+
+</Answer>
+</Check>
+
+## The ranking, once
+
+Sorted by how much a change of that kind is worth, and it is not close between tiers:
+
+1. **Remove a distinct storage slot from the hot path.** Thousands to tens of thousands.
+2. **Move a transaction-scoped value from storage to transient storage.** Thousands, flat.
+3. **Turn a zero-to-non-zero write into a non-zero-to-non-zero one**<Cite src="measured-forge-1-7-1" /> — the 1-and-2 trick used
+   by reentrancy locks. Around 17,000 on every call that would have paid the higher tier.
+4. **Shrink calldata, on an L2.** Priced separately, potentially the largest item on the invoice.
+5. **Avoid a cold account access.** 2,500.
+6. **Drop a log topic.** 375.
+7. **Everything else.** Single digits to low hundreds, and the subject of the next lesson.
+
+## Where this goes
+
+**Next and last**, the folklore: the checklist of micro-optimisations everyone has been handed, run
+through the probe from two lessons ago under three compiler pipelines. Several of the items turn out
+to be worth single digits, one turns out to be backwards, and one is real but only under a setting
+most repositories do not have on.

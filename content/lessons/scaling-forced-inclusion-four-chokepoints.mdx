@@ -1,0 +1,472 @@
+---
+id: scaling-forced-inclusion-four-chokepoints
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [nitro-contracts-rollup-user-logic, nitro-contracts-sequencer-inbox, nitro-contracts-abs-inbox, optimism-portal2-source, optimism-dispute-game-factory, optimism-anchor-state-registry, op-specs-deposits, op-specs-derivation, arbitrum-bold-economics, l2beat-arbitrum-project, l2beat-base-project, l2beat-zksync-era-project, l2beat-linea-project, l2beat-taiko-project, l2beat-stages, l2beat-stages-edge-cases, arxiv-l2-ethical-risk, op-docs-migrating-permissionless]
+stack: {}
+---
+
+Three lessons in, you can drive one mechanism end to end. You know which contract holds the queue,
+which value in the preimage is the L1 sender rather than the L2 one, why the deadline is a view
+function, and why the OP Stack has no such call at all. That is a complete, working command of
+**one** chokepoint.
+
+There are four. Your money is on L1 only after all four have opened, and the previous three lessons
+opened one and a half of them.
+
+This lesson is the map. It is deliberately contract-level rather than diagram-level, because the
+diagram version — *included, posted, proposed, claimed* — is the version that produces confident
+runbooks with a hole in step four. We will read the code that gates each stage on both stacks, find
+who can close it, and end on the constraint that survives all four: getting ordered is not getting
+the outcome you wanted.
+
+## The map, and the first correction to it
+
+Four things must happen between your signature and ETH in an L1 account.
+
+1. **Included** — your transaction enters the canonical L2 ordering.
+2. **Posted** — the data it was derived from is on L1 where anyone can read it.
+3. **Proposed** — a state root covering it is published to an L1 contract.
+4. **Claimed** — the proof or challenge period completes and you execute the withdrawal on L1.
+
+The correction is to step two, and it is good news that sharpens the bad news. On both stacks the
+forced path **collapses steps one and two into a single L1 write**, because forcing is itself a write
+to L1.
+
+On the Arbitrum side, you already read the body of the function: `forceInclusion` builds an empty
+data hash, calls the same internal batch-adding routine the batch poster uses, and emits
+`SequencerBatchDelivered` with a data location of
+`NoData`.<Cite src="nitro-contracts-sequencer-inbox" /> The message bytes were placed on L1 by your
+own submission transaction. There is no separate batcher step for them to wait on.
+
+On the OP Stack side the same thing holds for a different reason. Deposits are drawn from the
+`TransactionDeposited` events of the L1 origin block, not from batcher
+transactions.<Cite src="op-specs-deposits" /> Derivation obliges a block for every epoch, and the
+batch-validity rules only govern *sequencer* batches.<Cite src="op-specs-derivation" /> Your deposit
+never touches the batcher's key.
+
+So the honest scoreboard after three lessons is: steps one and two, closed, on both major stacks, by
+mechanisms you can now name. Steps three and four are untouched, and step three is where the loss
+scenarios live.
+
+<Figure
+  caption="Each gate has its own operator and its own key, and opening one tells you nothing about the next."
+  alt="Four stages between a signature and ETH in an L1 account: included, meaning the transaction enters the canonical L2 ordering; posted, meaning the data it was derived from is on L1 where anyone can read it; proposed, meaning a state root covering it is published to an L1 contract; and claimed, meaning the proof or challenge period completes and the withdrawal executes on L1."
+>
+  <Flow
+    lanes={['ordering', 'data', 'a state root', 'your money']}
+    nodes={[
+      { id: 'inc', label: 'included', note: 'the canonical L2 ordering contains it', col: 0, tone: 'good' },
+      { id: 'post', label: 'posted', note: 'the forced path writes this itself', col: 1, tone: 'good' },
+      { id: 'prop', label: 'proposed', note: 'somebody with a bond publishes a root', col: 2, tone: 'danger' },
+      { id: 'claim', label: 'claimed', note: 'the window completes and you execute on L1', col: 3, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="note">
+Notice which failure this rules out and which it does not. A batcher that stops posting cannot strand
+a forced transaction, because forcing does not go through the batcher. A batcher that stops posting
+*can* strand every non-forced transaction confirmed since it stopped — the transaction-submission
+outage where the unsafe head climbs and the safe head does not. Forcing is the answer to that too,
+but only for transactions you force. Everything already soft-confirmed is still hostage.
+</Aside>
+
+## Chokepoint three: who may publish a state root
+
+A withdrawal is a claim against a state root. If no root covering your transaction exists on L1,
+there is nothing to prove against, and the quality of your inclusion is irrelevant. Read the two
+implementations as an access-control question and the difference between chains stops being a
+vibe.
+
+### Arbitrum: a whitelist with a permissionless off switch
+
+Every assertion-posting entry point in `RollupUserLogic` carries the same modifier, and the modifier
+is two clauses:<Cite src="nitro-contracts-rollup-user-logic" />
+
+```solidity
+modifier onlyValidator(address account) {
+    require(validators.contains(account) || validatorWhitelistDisabled, "NOT_VALIDATOR");
+    _;
+}
+```
+
+`stakeOnNewAssertion` and `confirmAssertion` both carry it, both also carrying
+`whenNotPaused`.<Cite src="nitro-contracts-rollup-user-logic" /> On a chain whose whitelist is
+enabled, proposing is a permissioned role and the second chokepoint is a list of addresses.
+
+The interesting part is the second clause of the `require`, and the function that can set it:
+
+```solidity
+function removeWhitelistAfterValidatorAfk() external {
+    require(!validatorWhitelistDisabled, "WHITELIST_DISABLED");
+    require(_validatorIsAfk(), "VALIDATOR_NOT_AFK");
+    validatorWhitelistDisabled = true;
+}
+```
+
+`external`, no access control, one state flag flipped forever.<Cite src="nitro-contracts-rollup-user-logic" />
+It is the proposer chokepoint's answer to `forceInclusion`, and it has the same shape: a
+permissionless call gated on a delay. There is a sibling, `removeWhitelistAfterFork()`, gated on the
+chain ID having changed since deployment.<Cite src="nitro-contracts-rollup-user-logic" />
+
+**Subgoal: read the delay condition rather than assume it.** `_validatorIsAfk()` is three checks, and
+the first is the one that decides whether the mechanism exists on your chain at
+all:<Cite src="nitro-contracts-rollup-user-logic" />
+
+```solidity
+uint256 _validatorAfkBlocks = validatorAfkBlocks;
+if (_validatorAfkBlocks == 0) return false;
+if (latestConfirmedAssertion.createdAtBlock == 0) return false;
+if (latestConfirmedAssertion.firstChildBlock > 0) {
+    return latestConfirmedAssertion.firstChildBlock + _validatorAfkBlocks < block.number;
+}
+return latestConfirmedAssertion.createdAtBlock + _validatorAfkBlocks < block.number;
+```
+
+**`validatorAfkBlocks == 0` disables the escape entirely.** Not "sets it to zero delay" — returns
+false, permanently, so `removeWhitelistAfterValidatorAfk` always reverts with `VALIDATOR_NOT_AFK`.
+An Arbitrum-family chain configured that way has a proposer whitelist with no permissionless exit
+from it, and looks identical from the outside to one that does not, because the difference is one
+storage slot.
+
+**Subgoal: notice what the clock measures.** It is not "no assertions have been posted". It is the
+age of the **latest confirmed** assertion, or of that assertion's first child if one
+exists.<Cite src="nitro-contracts-rollup-user-logic" /> A whitelisted proposer that keeps posting
+assertions but never lets them confirm — because a challenge is running, or because it simply does
+not call `confirmAssertion` — is not AFK by this definition while the first child keeps the clock
+anchored. The condition is written against absence, not against obstruction.
+
+### OP Stack: no whitelist, and a price
+
+The OP Stack puts the same authority in `DisputeGameFactory.create()`, which has no access-control
+modifier and exactly one gate that can stop you:<Cite src="optimism-dispute-game-factory" />
+
+```solidity
+if (address(impl) == address(0)) revert NoImplementation(_gameType);
+if (msg.value != initBonds[_gameType]) revert IncorrectBondAmount();
+```
+
+Two facts fall straight out. Proposing on a chain with a permissionless respected game type is open
+to any address that sends exactly the right bond. And `setImplementation` is
+`onlyOwner`<Cite src="optimism-dispute-game-factory" /> — an owner who sets a game type's
+implementation to the zero address removes that type's proposing path with one transaction, and the
+factory then reverts `NoImplementation` for everybody, not just for the person the owner dislikes.
+
+### "Anyone can propose" is a sentence about permission, not about cost
+
+Here is the number that makes the point, and it needs both sources to be honest about it.
+
+Arbitrum's own economics documentation recommends, for Arbitrum One, an **assertion bond of 3,600
+ETH** — a one-time bond to start posting assertions, withdrawable once the validator's assertion is
+confirmed — plus challenge bonds of **555 WETH at the big-step level and 79 WETH at the small-step
+level** for each challenge you take part in.<Cite src="arbitrum-bold-economics" /> L2BEAT's live
+discovery for Arbitrum One on 26 August 2026 records an initial bond of 3,600 and marks the system
+as not permissioned.<Cite src="l2beat-arbitrum-project" /> Base's row on the same day records an
+initial bond of **0.05**.<Cite src="l2beat-base-project" />
+
+Both chains earn the same L2BEAT rating for this chokepoint. Arbitrum One: *Self propose* — anyone
+can be a Proposer and propose new roots to the L1 bridge.<Cite src="l2beat-arbitrum-project" /> Base:
+*Self propose*, identical wording.<Cite src="l2beat-base-project" /> The rating is about permission,
+and on permission the two chains are the same. The bonds differ by roughly five orders of magnitude.
+
+That gap is deliberate, not an oversight, and Arbitrum's reasoning is worth taking seriously rather
+than reading as a flaw. A dispute delays *all* pending withdrawals, not just the disputed claim, so
+opening one has to cost the initiator something proportional to the harm it imposes; the docs propose
+a resource ratio of 6.46 for Arbitrum One, meaning about $6.46 spent attacking for every $1 needed to
+defend, computed against a worst case of 500 gwei per gas on the parent
+chain.<Cite src="arbitrum-bold-economics" /> High bonds are the deterrent. The documented mitigation
+for the accessibility cost is trustless bonding pools, which can be deployed permissionlessly so that
+honest parties can pool funds to post an assertion or open a
+challenge.<Cite src="arbitrum-bold-economics" />
+
+Take the operational reading rather than a verdict. If your incident plan's step three is "we propose
+the state root ourselves", the plan needs a line item: which bond, in which token, held where, liquid
+at 3am. If the answer is a pool that has to be assembled during the incident, step three is a
+fundraising exercise with a challenge period attached.
+
+<Misconception
+  belief="Permissionless proposing means my team can propose if the operator stops."
+  reality="It means no address list stands in your way. A bond still does, and on Arbitrum One the documented assertion bond is 3,600 ETH. Permissionless describes the gate, not the toll."
+  why="The L2BEAT row that says 'self propose' is answering an access-control question, and the answer is correct. Cost is a separate row that nothing forces you to read next to it."
+  src="arbitrum-bold-economics"
+/>
+
+### What the other chains do at this chokepoint
+
+The spread is wider than the two-chain comparison suggests, and L2BEAT's rows on 26 August 2026 are
+the live authority. ZKsync Era: *replace proposer* — only whitelisted proposers can publish state
+roots, so on failure withdrawals are frozen, and governance can attempt to change proposers via an
+upgrade.<Cite src="l2beat-zksync-era-project" /> Linea and Taiko Alethia: *cannot withdraw* — only
+whitelisted proposers may publish, so on failure withdrawals
+freeze.<Cite src="l2beat-linea-project" /><Cite src="l2beat-taiko-project" />
+
+Read "governance can attempt to change proposers via an upgrade" carefully. It is a real path and it
+is not yours. It routes through the same upgrade authority that the next lesson will show has an exit
+window of zero on several chains. A chokepoint whose only key is held by the party you are trying to
+escape is not an escape.
+
+<Aside kind="warn">
+A figure circulates that proposer failure freezes withdrawals in roughly half of analysed L2 projects,
+traced to an ethical-risk analysis of L2 rollups.<Cite src="arxiv-l2-ethical-risk" /> This curriculum's
+research pass did not read the paper's methodology, so the sample and date behind that percentage are
+unconfirmed here. Treat it as a reason to check your own chain's row rather than as a statistic you
+can quote. The qualitative claim it stands for — that this failure is common enough to be the default
+assumption rather than the exception — is well supported by the per-chain rows above.
+</Aside>
+
+## The severity ladder is a question about who must act
+
+L2BEAT grades the first chokepoint in three levels, and the levels are easiest to hold if you read
+them as answers to one question: *when the operator stops, how much of the path can you walk alone?*
+
+| Rating | What you can do | Which chokepoints you still need the operator for |
+|---|---|---|
+| **Self sequence** | Submit *and* complete inclusion from L1 | None at this stage |
+| **Enqueue via L1** | Submit to an L1 queue; cannot complete inclusion | Inclusion still needs the operator to process the queue |
+| **No mechanism** | Nothing | Everything |
+
+Arbitrum One and Base both sit at *self sequence*, with a stated delay of 1 day and 12 hours
+respectively.<Cite src="l2beat-arbitrum-project" /><Cite src="l2beat-base-project" /> ZKsync Era sits
+at *enqueue via L1*: users can submit to an L1 queue but cannot force them, and the sequencers cannot
+selectively skip transactions but can stop processing the queue
+entirely.<Cite src="l2beat-zksync-era-project" /> Linea sits at *no mechanism*, with the Operator role
+becoming public only after six months of no finalised
+blocks.<Cite src="l2beat-linea-project" /> Taiko Alethia is *enqueue via L1* with an unusual twist: an
+inclusion becomes due after 9 minutes 36 seconds, after which a whitelisted proposer cannot publish
+another proposal without processing up to ten due
+inclusions.<Cite src="l2beat-taiko-project" />
+
+Three things the ladder does not grade, all of which have bitten teams:
+
+**It does not grade cost.** *Self sequence* is the same rating whether completing inclusion costs you
+one cheap L1 call or a call that advances a cursor over four thousand queued messages.
+
+**It does not grade the bound.** L2BEAT's own edge-cases document raises the upper bound on forced
+transaction delay as an open question, and names Taiko as the awkward case: in the worst case a forced
+transaction is processed every 255 batches, but with a long enough queue the delay for a specific
+transaction can be much longer.<Cite src="l2beat-stages-edge-cases" /> A rating with a headline delay
+next to it can still be describing a queue position rather than a constant.
+
+**It does not grade whether anyone has done it.** The rating is derived from contract code and
+configuration. Whether a user has ever completed the path on that deployment is not an input.
+
+<Misconception
+  belief="A chain rated 'self sequence' has a working escape hatch."
+  reality="It has a code path with no permission check on it. The rating grades possibility. Cost, worst-case delay bound, and whether the path has ever been exercised on that chain are separate questions, and only the first is on the page."
+  why="A green rating in a risk table reads as a verdict about safety rather than as the answer to one narrow, precisely worded question."
+  src="l2beat-stages-edge-cases"
+/>
+
+## Chokepoint four: claiming, and the roles that can reopen it
+
+Suppose everything above went your way. Your transaction is in the ordering, the data is on L1, a
+state root covering it exists. The OP Stack's `checkWithdrawal` is the exact statement of what stands
+between you and your money, and it is longer than "wait for the challenge
+window".<Cite src="optimism-portal2-source" />
+
+- The withdrawal must not already be finalised.
+- It must have been proven — a zero timestamp reverts with `OptimismPortal_Unproven`.
+- Its proof timestamp must be strictly greater than the dispute game's `createdAt`, which blocks
+  proving in the same block the game was created.
+- `block.timestamp - provenWithdrawal.timestamp` must exceed `PROOF_MATURITY_DELAY_SECONDS`.
+- `anchorStateRegistry.isGameClaimValid(disputeGameProxy)` must return true.
+
+That last line is where the authority lives. `isGameClaimValid` is a conjunction of four conditions:
+the game must be *proper*, *respected*, *finalized*, and resolved as
+`DEFENDER_WINS`.<Cite src="optimism-anchor-state-registry" /> Unpack the first and third.
+
+**Proper** means registered in the factory, **not blacklisted**, **not retired**, and the system not
+paused — the registry's own comment notes that pausing temporarily causes a game to be considered
+improper.<Cite src="optimism-anchor-state-registry" /> **Finalized** means resolved *and* past an
+airgap: time since resolution must exceed `DISPUTE_GAME_FINALITY_DELAY_SECONDS`, a constant set at
+construction.<Cite src="optimism-anchor-state-registry" />
+
+So there are two mandatory waits on this chokepoint, not one: the proof maturity delay after you
+prove, and the dispute game finality airgap after the game
+resolves.<Cite src="optimism-portal2-source" /><Cite src="optimism-anchor-state-registry" /> Both are
+immutable constructor values on their contracts, so both are readable and neither is negotiable.
+
+One piece of good news is buried in the storage layout, and it is the free-rider dynamic from the
+first lesson reappearing at the far end of the path. Proven withdrawals are keyed
+`provenWithdrawals[withdrawalHash][proofSubmitter]`, and finalisation comes in two flavours:
+`finalizeWithdrawalTransaction` finalises against `msg.sender`'s own proof, while
+`finalizeWithdrawalTransactionExternalProof` takes a `_proofSubmitter`
+argument.<Cite src="optimism-portal2-source" /> Neither has an access check tying the caller to the
+withdrawal's recipient. So a third party can prove your withdrawal, and a third party can finalise it,
+and the funds still go where the withdrawal says. During a mass exit that is a real service somebody
+can render at scale — and, as in the first lesson, nothing pays them to.
+
+**Subgoal: enumerate who can invalidate a game you were relying on.** Three functions on the registry,
+each asserting only the Guardian:<Cite src="optimism-anchor-state-registry" />
+
+```solidity
+function setRespectedGameType(GameType _gameType) external;   // onlyGuardian
+function updateRetirementTimestamp() external;                // onlyGuardian
+function blacklistDisputeGame(IDisputeGame _disputeGame) external; // onlyGuardian
+```
+
+`blacklistDisputeGame` kills one game. `setRespectedGameType` invalidates every game that is not of
+the new type. `updateRetirementTimestamp` is the widest: `isGameRetired` returns true for any game
+whose `createdAt` is at or before the retirement timestamp, so one call retires **every game that
+currently exists**, including games created in the same block.<Cite src="optimism-anchor-state-registry" />
+
+Read that as a timeline rather than as a list. After a retirement, a withdrawal you had already
+proven is no longer provable against that game. Somebody must create a new game, the game must resolve
+in the defender's favour, the airgap must elapse, you must prove again, and the proof maturity delay
+must elapse again. Your exit clock restarts from a state root that does not exist yet.
+
+This is the mechanism behind the fault-proof migration guidance you have already met: the same
+`setRespectedGameType` call is what makes a chain's fault proofs permissionless, and it is worth
+seeing that the *same lever* also invalidates prior games — it is one switch used constructively in
+one direction and defensively in the other.<Cite src="op-docs-migrating-permissionless" />
+
+### The pause asymmetry, mirrored
+
+In the first lesson of this module you found that on the Arbitrum side the **entrance** is pausable —
+`sendL2Message` carries `whenNotPaused onlyAllowed` — while `forceInclusion` carries no
+modifier.<Cite src="nitro-contracts-abs-inbox" /><Cite src="nitro-contracts-sequencer-inbox" /> The
+OP Stack draws the line in the opposite place, and the contract is unambiguous about
+it.<Cite src="optimism-portal2-source" />
+
+<Matrix
+  corner="Portal entry point"
+  cols={['Asserts not paused']}
+  rows={[
+    { label: <code>depositTransaction</code>, cells: [{ v: 'no', tone: 'good' }] },
+    { label: <code>proveWithdrawalTransaction</code>, cells: [{ v: 'yes', tone: 'danger' }] },
+    { label: <code>finalizeWithdrawalTransactionExternalProof</code>, cells: [{ v: 'yes', tone: 'danger' }] },
+  ]}
+  caption="Three entry points on one contract, and the only unpausable one is the one that puts money in."
+  alt="On OptimismPortal2, depositTransaction does not assert that the system is unpaused, while proveWithdrawalTransaction and finalizeWithdrawalTransactionExternalProof both do."
+/>
+
+`paused()` reads through to `systemConfig.paused()`.<Cite src="optimism-portal2-source" /> So on an
+OP Stack chain a pause cannot stop you entering the queue and can stop you leaving. On an
+Arbitrum-family chain a pause can stop you entering and cannot stop you completing an inclusion you
+already queued.
+
+Neither arrangement is wrong; they protect against different disasters. A portal pause exists so a
+bad state root or a proof-system bug cannot be drained through the bridge, which is exactly a case
+where you want withdrawals frozen. But the operational consequence is the same on both stacks and it
+is the same advice, pointed at different verbs: **the step you can still take under a pause is the
+step you should have taken already.** On Arbitrum, queue early. On the OP Stack, prove early — a
+proven withdrawal past its maturity delay is a much shorter path to finalisation than an unproven one,
+and proving is the half of the exit that a pause can take away from you.
+
+On the Arbitrum side, chokepoint four has its own version of the same story. `confirmAssertion` is
+`onlyValidator` and `whenNotPaused`, and when a challenge has run it additionally requires that
+`challengeGracePeriodBlocks` have elapsed since the winning edge was
+confirmed.<Cite src="nitro-contracts-rollup-user-logic" /> Confirmation, like proposing, is inside the
+validator gate — which means `removeWhitelistAfterValidatorAfk` is doing double duty. It is the
+permissionless key to chokepoints three and four at once, and `validatorAfkBlocks == 0` closes both.
+
+## Back to chokepoint one: inclusion is not the outcome you wanted
+
+The last constraint is the one that survives every mechanism above working perfectly, and it is worth
+stating in its strongest, most specific form rather than as a caution.
+
+**Your transaction executes against the state that exists when it lands.** After a delay measured in
+hours, that state may have moved: the position liquidated, the price gone, the allowance revoked, the
+pool drained. Your transaction can also simply revert, and a reverted forced transaction is a
+completed forced inclusion. The guarantee you bought was ordering. You received it.
+
+The OP Stack makes this concrete in a way that has cost people funds, and the specification states it
+without hedging. When a deposited transaction executes, the balance of the `from` account **must** be
+increased by the amount of `mint`, and the specification says outright that this is unconditional and
+does not revert on deposit failure.<Cite src="op-specs-deposits" />
+
+Follow what that means through the aliasing rule you met in the previous lesson. A contract — a
+multisig, a treasury, a relayer — calls `depositTransaction`. On L2 the sender is the alias, the L1
+address plus `0x1111000000000000000000000000000000001111`, computed as an unchecked
+`uint160`.<Cite src="op-specs-deposits" /> If the call it makes fails, the minted ETH stays with the
+`from` account, which is the alias: an address nobody holds a key for, on a chain whose sequencer you
+were escaping. The deposit succeeded. The forced inclusion worked exactly as specified. The money is
+somewhere you cannot reach.
+
+<Misconception
+  belief="If my forced transaction fails, I get my funds back and can try again."
+  reality="On the OP Stack the mint is unconditional and does not revert on deposit failure, so the ETH lands at the from address whatever the call does. If from is an alias of an L1 contract, it lands at an address that has no key."
+  why="Every other transaction failure people have handled — an L1 revert, an L2 revert on the normal path — is atomic. Deposits split the mint from the call, and that split is invisible until the call fails."
+  src="op-specs-deposits"
+/>
+
+<Check type="spot-bug" concept="proposer-failure">
+A team runs a lending product on an Arbitrum-family Orbit chain. After the previous three lessons they
+rewrite their runbook and ask you to sign it off.
+
+> **Sequencer dark, hour 0.** Queue each user's `withdraw()` through `Inbox.sendL2Message`.
+> **Hour 24.** Call `SequencerInbox.forceInclusion` naming the highest queue position.
+> **Hour 25.** Our transactions are in the canonical ordering. If the whitelisted proposer has not
+> come back, call `removeWhitelistAfterValidatorAfk()` and propose the state root ourselves.
+> **Hour 26 onward.** Prove and claim on L1 through the outbox as normal.
+
+Steps one and two are right. Find what is wrong with steps three and four, and say what has to be
+verified *before* the incident for this runbook to be worth anything.
+
+<Answer>
+**Step three assumes three things the contract does not give you.**
+
+*It assumes the AFK path exists on this chain.* `_validatorIsAfk()` opens with
+`if (_validatorAfkBlocks == 0) return false`, so a chain configured with zero has no permissionless
+whitelist removal at all and the call reverts with
+`VALIDATOR_NOT_AFK` forever.<Cite src="nitro-contracts-rollup-user-logic" /> This is one storage slot
+and it is invisible from the outside. Read it now, not at hour 25.
+
+*It assumes 25 hours is enough time to be AFK.* The condition measures the age of the latest confirmed
+assertion — or of its first child, if one exists — against `validatorAfkBlocks`, not the age of your
+outage.<Cite src="nitro-contracts-rollup-user-logic" /> A proposer that posted an assertion an hour
+before going dark resets nothing but also does not become AFK on your schedule. The runbook needs the
+actual value of `validatorAfkBlocks` in blocks, converted, written down.
+
+*It assumes proposing is free once the whitelist is gone.* It is not. `stakeOnNewAssertion` requires
+`isStaked(msg.sender)` and `amountStaked(msg.sender) >= requiredStake`.<Cite src="nitro-contracts-rollup-user-logic" />
+For Arbitrum One the documented assertion bond is 3,600 ETH, with challenge bonds of 555 and 79 WETH
+per level if anyone disputes you.<Cite src="arbitrum-bold-economics" /> An Orbit chain sets its own
+`baseStake` in its own token; the runbook needs that number and a plan for holding it liquid, or a
+trustless bonding pool that exists before the incident rather than after
+it.<Cite src="arbitrum-bold-economics" />
+
+**Step four skips the confirmation gate and both waits.** "Prove and claim as normal" hides that
+`confirmAssertion` is itself `onlyValidator` and `whenNotPaused`, and that after a challenge it also
+requires `challengeGracePeriodBlocks` since the winning edge was
+confirmed.<Cite src="nitro-contracts-rollup-user-logic" /> Posting an assertion is not confirming it.
+The equivalent gate on the OP Stack side is `isGameClaimValid`, which additionally requires the game
+to be past its finality airgap and the withdrawal to be past its proof maturity
+delay.<Cite src="optimism-anchor-state-registry" /><Cite src="optimism-portal2-source" /> Either way,
+"hour 26 onward" is off by a challenge period plus a grace period.
+
+**And the missing precondition, which is the real answer.** Every number in this runbook is chain
+configuration: `delayBlocks`, `validatorAfkBlocks`, `baseStake`, `challengeGracePeriodBlocks`. Not one
+of them can be read from a documentation page about a different chain, and all four can be read today
+with four `cast call`s. A runbook whose values came from Arbitrum One's docs while the product runs on
+an Orbit chain is not a runbook; it is a description of somebody else's chain.
+
+**What you cannot fix in the runbook.** If `validatorAfkBlocks` is zero and the proposer is
+whitelisted, there is no step three. The honest version of the document says so, in those words, and
+that sentence belongs in your risk register rather than in an incident plan.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The next lesson** closes the module by asking the question all four chokepoints were building
+towards. Not "can I get out" but "can I get out *before the rules change*" — because every delay you
+have just catalogued is time during which an upgrade key can act, and L2BEAT computes an exit window
+by subtracting exactly these delays from the upgrade delay. Arbitrum One's own row does the
+arithmetic in public: an 8-day L2 delay plus a 3-day L1 delay, minus the 1-day force delay, gives
+users 10 days to exit on the regular upgrade path — and **none** on the emergency
+one.<Cite src="l2beat-arbitrum-project" />
+
+**Immediately useful.** Four reads, on your own chain, today. Arbitrum-family:
+`validatorAfkBlocks`, `baseStake`, `validatorWhitelistDisabled`, `challengeGracePeriodBlocks`. OP
+Stack: `proofMaturityDelaySeconds()`, `disputeGameFinalityDelaySeconds()`, `respectedGameType()`, and
+`initBonds` for that type.<Cite src="optimism-portal2-source" /><Cite src="optimism-dispute-game-factory" />
+Eight numbers, one afternoon, and your incident plan stops being a genre exercise.
+
+**The framing to carry forward.** L2BEAT's Stage 1 requirement is one sentence — users are able to
+exit without the help of the permissioned operators — and it is graded per
+chain.<Cite src="l2beat-stages" /><Cite src="l2beat-base-project" /> You now know that the sentence
+has four clauses hiding in it, and which contract holds each one.

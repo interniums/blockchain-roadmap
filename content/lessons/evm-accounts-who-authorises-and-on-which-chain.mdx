@@ -1,0 +1,336 @@
+---
+id: evm-accounts-who-authorises-and-on-which-chain
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-7702, eip-2, eip-155, eip-2929, eip-712, erc-4337-docs, oz-eoa-delegation, nethermind-7702-attack-surfaces, arxiv-7702-phishing, viem-sign-authorization, foundry-cheatcode-sign-delegation]
+stack: {}
+---
+
+A relayer's accounting for one afternoon, reconstructed after the fact.
+
+It received a signed authorization from a user, verified the signature, verified the nonce against
+the chain, built a type-4 transaction around it, and broadcast. The transaction was included four
+blocks later. It reverted. The user was not delegated. The relayer paid.
+
+Nobody attacked anything. No signature was forged, no rule was broken, and the user's wallet did
+nothing a wallet is not supposed to do. The relayer had verified a fact about the world and then
+paid for a transaction that would execute in a *different* world, several seconds later.
+
+This lesson is about the object at the centre of that story — the authorization tuple — and about
+the two of its fields that decide who can be hurt by it: the nonce and the chain id.
+
+## Six fields, one signature
+
+An authorization is a tuple of six values.<Cite src="eip-7702" />
+
+```text
+[chain_id, address, nonce, y_parity, r, s]
+```
+
+The last three are a secp256k1 signature. The first three are what is being signed: which chain
+this is valid on, which address to delegate to, and at which nonce of the signing account.
+
+Notice what is *not* in the tuple. There is no expiry, no spending limit, no list of permitted
+functions, no fee, no recipient, and — crucially — nothing that says who submits it. The tuple
+commits to *what* and *when*. It says nothing about *by whom*, and that omission is the entire
+sponsorship story.
+
+## The digest, and why it cannot be a transaction
+
+The signer is recovered as:<Cite src="eip-7702" />
+
+```text
+authority = ecrecover(keccak256(MAGIC ‖ rlp([chain_id, address, nonce])), y_parity, r, s)
+```
+
+with `MAGIC = 0x05`.<Cite src="eip-7702" />
+
+That one prefix byte is doing the work you already know from
+[EIP-712 typed structured data](/c/eip-712-typed-data): domain separation.<Cite src="eip-712" /> An
+authorization's preimage is
+a three-element RLP list sitting behind the byte `0x05`, which is not the shape of anything a
+wallet signs as a transaction and not the shape of anything it signs as a typed message. The
+authorization gets its own signing domain, so a signature collected in one context cannot be
+presented as authority in another.
+
+This is the same defensive pattern, for the same reason, as every other prefix you have met.
+[Signature recovery](/c/ecrecover) does not know what it is recovering. It returns an address for
+any digest at all. The only thing standing between "a signature over 32 bytes" and "authority to
+act" is that the 32 bytes could not have come from anywhere else.
+
+The signature also has to satisfy the low-`s` rule: `s` must be less than or equal to half the
+curve order, as required by EIP-2.<Cite src="eip-7702" /><Cite src="eip-2" /> If you remember
+[malleability](/c/signature-malleability), you know why — without the rule, every valid
+authorization has a second, equally valid byte encoding, and any system keying deduplication or
+replay protection off the signature bytes has two identities for one authorization.
+
+## What the client checks, step by step
+
+The authorization list is processed after the sender's nonce is incremented and before execution
+begins. For each tuple, in order:<Cite src="eip-7702" />
+
+**Subgoal: confirm this authorization is meant for this chain.** Verify `chain_id` is zero or the
+current chain's id. Anything else, and the tuple is abandoned.
+
+**Subgoal: confirm the nonce is representable.** Verify the nonce is below `2**64 - 1`. The tuple
+must leave room to increment.
+
+**Subgoal: find out who signed.** Recover `authority` from the digest above, enforcing the low-`s`
+rule.
+
+**Subgoal: charge for the state you are about to touch.** Add `authority` to the accessed-addresses
+set, per EIP-2929.<Cite src="eip-2929" /> Subsequent access is at warm prices.
+
+**Subgoal: confirm this account may be delegated at all.** Verify the code of `authority` is empty
+or already a delegation. A contract account fails here.
+
+**Subgoal: confirm the authorization is current.** Verify the nonce of `authority` equals the tuple
+nonce exactly.
+
+**Subgoal: settle the cost.** If `authority` is not empty, credit the difference between
+`PER_EMPTY_ACCOUNT_COST` and `PER_AUTH_BASE_COST` to the global refund counter.
+
+**Subgoal: install, then consume.** Set the code of `authority` to `0xef0100` followed by the
+address — or, when the address is zero, clear the code instead. Then increase the nonce of
+`authority` by one.
+
+Two properties of this loop are worth carrying.
+
+**The nonce increment is last.** Any earlier failure abandons the tuple and moves to the next one,
+so an authorization that fails validation does not consume the authority's nonce.<Cite
+src="eip-7702" /> It does still cost the transaction sender, because the charge was levied upfront.
+
+**Multiple tuples from one authority are allowed, and the last valid one wins.**<Cite
+src="eip-7702" /> Each valid tuple consumes a nonce, so the second must be signed at the
+incremented value. A list is not a set.
+
+## A signed authorization is a live round, not a document
+
+The nonce turns the tuple into something with a short and unpredictable shelf life.
+
+An authorization is valid at exactly one nonce of one account. Anything that moves that account's
+nonce invalidates it: a transaction the user sends themselves, another authorization they signed,
+a contract creation performed by their own delegate. The user does not have to intend it. Sending
+one ordinary transaction while a sponsored authorization is in flight is enough.
+
+That is why an authorization behaves less like a permission slip and more like a single round
+chambered in one specific position. It fires once, in one place, or not at all.
+
+<Aside kind="warn">
+There is a nonce-accounting consequence that has produced real wallet bugs. Since Pectra, a signed
+authorization consumes the authority's nonce, so transactions are no longer the only thing that
+moves it.<Cite src="eip-7702" /> Any component that derives "next nonce" by counting transactions
+sent — rather than by asking the node for the account's nonce, including pending state — will
+compute a value that is too low and produce a stuck transaction behind a
+[nonce gap](/c/nonce-ordering).
+</Aside>
+
+## Signer and payer are different roles
+
+Nothing in the tuple names a submitter. Any party may place a valid authorization into their own
+transaction and pay for it.<Cite src="eip-7702" />
+
+This is the point of the design. Sponsorship — account X paying for account Y — is one of the three
+motivating use cases the EIP names, alongside batching and privilege de-escalation.<Cite
+src="eip-7702" /> A user with zero ETH can be delegated to a smart wallet by an application that
+picks up the gas, which is the on-ramp that plain EOAs never had.
+
+<Figure
+  caption="The tuple travels from one account's key into another account's transaction, and only the second one pays."
+  alt="A user's key signs an authorization tuple carrying chain id, delegate address and nonce; a relayer wraps that tuple into its own type-4 transaction and pays the gas; the result is code written into the user's own account."
+>
+  <Flow
+    nodes={[
+      { id: 'u', label: 'user key', note: 'signs the tuple', col: 0, tone: 'accent' },
+      { id: 't', label: 'authorization', note: 'chain_id, address, nonce', col: 1 },
+      { id: 'r', label: 'relayer', note: 'wraps it, pays gas', col: 2, tone: 'warn' },
+      { id: 'c', label: "user's account", note: 'code field written', col: 3, tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="The account that signs an authorization is the account that pays for it."
+  reality="Signer and payer are separate roles. A relayer, an application, or any stranger can include your authorization in their own transaction and pay the gas for it."
+  why="On Ethereum the signer has always been the payer, because until typed transactions carried authorization lists there was no way to separate the two."
+  src="eip-7702"
+/>
+
+## Chain id: the field with a wildcard
+
+`chain_id` may be the current chain's id, or zero. Zero means the authorization is valid on
+**every** chain.<Cite src="eip-7702" />
+
+That is not an oversight. The EIP's rationale states the trade directly: what code an address holds
+on another chain is a real question, deterministic deployment is possible but "verifying such a
+deployment may not always be desirable", so the chain id exists to narrow the scope — and when
+universal deployment *is* what you want, you set it to zero.<Cite src="eip-7702" />
+
+The practical use is a user delegating one address to the same wallet implementation across every
+chain they will ever touch, with one signature instead of a dozen. The practical risk is the
+mirror image: a zero-chain-id authorization is a commitment to whatever code happens to sit at that
+address on chains the signer has never used, deployed by people they have never heard of.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'chain_id = this chain', note: 'bound' },
+    { title: 'chain_id = 0', note: 'wildcard', tone: 'warn' },
+  ]}
+  rows={[
+    {
+      label: 'Where is the tuple valid?',
+      cells: ['Only on the chain named in it', 'On every chain implementing EIP-7702'],
+    },
+    {
+      label: 'How many signatures cover ten chains?',
+      cells: ['Ten', 'One'],
+    },
+    {
+      label: 'What is the signer committing to?',
+      cells: [
+        'The code at that address on one known chain',
+        'Whatever code sits at that address anywhere, deployed by anyone',
+      ],
+    },
+    {
+      label: 'Who decides the scope?',
+      cells: ['The signer, per chain', 'The signer, once, for chains that do not exist yet'],
+    },
+  ]}
+  caption="The two modes differ in one field, and the convenient value is the one that hands away scope."
+  alt="The chain id field set to the current chain compared with the zero wildcard, across where the tuple is valid, how many signatures ten chains need, what the signer commits to, and who decides the scope."
+/>
+
+This inverts the habit that [EIP-155](/c/eip-155-chain-id-replay) trained into
+everyone.<Cite src="eip-155" /> For a decade, chain binding has been the default for transactions
+and opting out has not been an available mistake. Here, opting out is a field value — and it is the
+value that makes the nicest onboarding flow.
+
+<Misconception
+  belief="An authorization only applies on the chain I signed it on."
+  reality="Only if chain_id is set to that chain. Signed with chain_id = 0, the same tuple authorises the delegation on every chain that implements EIP-7702."
+  why="EIP-155 made chain binding automatic for transactions, so a decade of practice says replay across chains is something the protocol prevents for you."
+  src="eip-7702"
+/>
+
+A December 2025 measurement study of EIP-7702 usage names the chain-agnostic mode as one of two
+extended attack surfaces it identifies, alongside repeated remote activation of delegated code
+through ERC-4337's EntryPoint pipeline.<Cite src="arxiv-7702-phishing" /> The same study reports
+analysing over 150,000 authorization and execution events involving around 26,000 addresses, and
+finds authorizations heavily concentrated in a small number of contract families linked to
+criminal activity.<Cite src="arxiv-7702-phishing" /> Treat that as one team's measurement rather
+than a settled figure — but the direction is the point: the wildcard is used, and not only by
+wallets.
+
+## Griefing the sponsor
+
+Now back to the relayer at the top.
+
+The relayer's problem is structural, not a bug in its code. It verifies a fact — this signature is
+valid, this nonce matches, this account holds a balance I expect to be compensated from — and then
+pays for a transaction that will execute later, in a state the authority controls.
+
+The EIP names both moves. The authorized account can cause a sponsored relayer to spend gas without
+reimbursement by **invalidating the authorization**, which means increasing its own nonce, or by
+**sweeping the relevant assets out of the account**.<Cite src="eip-7702" /> OpenZeppelin repeats
+the warning in its own delegation guidance and points at the same two mitigations the EIP
+suggests: requiring a bond, or running a reputation system.<Cite src="oz-eoa-delegation" />
+
+Neither mitigation is cryptographic, and that is the lesson. There is no signature the user can
+produce that commits them to *not* invalidating their own authorization, because the invalidating
+action is an ordinary transaction they are always entitled to send. A relayer's exposure is priced,
+not proved.
+
+<Misconception
+  belief="Sponsoring a delegation is safe as long as the signature verifies."
+  reality="A valid signature says the tuple was authorised. It says nothing about whether the state it depends on — the nonce, the balance — still holds at inclusion time, and inclusion is seconds away."
+  why="Signature validity feels like the whole check because it is the only part that is cryptographic, and the cryptographic part is the part that is hard."
+  src="nethermind-7702-attack-surfaces"
+/>
+
+## What this does to the mempool
+
+There is a second-order effect the spec spends a whole section on, and it reaches further than
+relayers.
+
+Historically a node could statically determine whether a pending transaction was still valid,
+because an EOA's balance could only fall through a transaction that EOA originated. One
+transaction could invalidate only transactions from the same sender.
+
+Once an account is delegated, **anyone can call it at any point in any transaction**, and that call
+can move its balance. A single transaction from a stranger can therefore invalidate pending
+transactions from other accounts, and no static analysis of the pool can see it coming.<Cite
+src="eip-7702" />
+
+The spec's recommendation to clients is blunt: do not accept more than one pending transaction for
+any account with a non-zero delegation indicator.<Cite src="eip-7702" /> If you have internalised
+that [the mempool is not a queue](/c/mempool-is-not-a-queue), this is one more reason the pool's
+acceptance policy is a node-local decision that your product cannot assume.
+
+<Check type="spot-bug" concept="sponsored-relay-griefing">
+A sponsorship service works like this. A user signs an authorization delegating to the service's
+audited wallet contract, and also signs a token permit letting the service take 5 USDC from the
+user's account as a fee. The service verifies both signatures, checks on-chain that the user's
+nonce matches and their USDC balance is at least 5, and broadcasts a type-4 transaction carrying
+the authorization plus a call that collects the fee.
+
+Name the two independent ways this loses money, and say why adding more verification before
+broadcast does not fix either.
+
+<Answer>
+**Loss one: the nonce moves.** Between the service's check and inclusion, the user sends any
+ordinary transaction. Their nonce increments, the authorization no longer matches, and the tuple is
+abandoned during processing. The service still paid the upfront authorization charge and the
+transaction's gas.
+
+**Loss two: the balance moves.** The user transfers their USDC away in that same window. The fee
+collection reverts, or collects nothing. The delegation may still have been installed — recall that
+processed delegations are not rolled back when execution fails — so the user got the thing they
+wanted and the service got the bill.
+
+**Why more pre-broadcast verification does not help.** Every check the service performs describes
+the chain as of some block. The transaction executes at a later block, and the state it depends on
+is controlled by the counterparty. This is not a race that a faster check wins; it is a check that
+is about the wrong point in time. The gap is not closable by observation.
+
+**What actually addresses it.** Change what is at stake rather than what is known: hold a bond, or
+carry reputation, which are exactly the two mitigations the EIP suggests. Or move the fee inside
+the same call frame so that failing to collect it reverts the work you were paying for — noting
+that this still does not recover the authorization charge, because that was levied before
+execution.
+
+The general form is one you have met on the networking track: a signature proves something about
+the past. Inclusion happens in the future. Any design that treats the two as the same instant has a
+window, and someone will stand in it.
+</Answer>
+</Check>
+
+## Working with tuples in practice
+
+Two toolchain entry points, so the practice exercises are not a scavenger hunt.
+
+In **viem**, `signAuthorization` produces the tuple from a wallet client, and the result is attached
+to a transaction's authorization list.<Cite src="viem-sign-authorization" /> In **Foundry**, three
+cheatcodes cover the flow: `signDelegation` produces a signed delegation for an implementation
+address and a private key, `attachDelegation` attaches one to the next transaction, and
+`signAndAttachDelegation` does both.<Cite src="foundry-cheatcode-sign-delegation" /> The signed
+struct carries the authority's nonce at signing time, which is exactly the field that makes a test
+of the stale-authorization case straightforward to write.<Cite
+src="foundry-cheatcode-sign-delegation" />
+
+## Where this pays off
+
+**Delegation is not an allowance** is the next lesson, and it starts where this one ends: you now
+know that one signature installs the pointer. That lesson is about what the pointer can do, which
+is everything.
+
+**Account abstraction proper** — ERC-4337 and the wallet standards built above it — reuses this
+separation of signer from payer, with a paymaster in the relayer's seat and the same
+you-cannot-prove-the-future problem to solve.<Cite src="erc-4337-docs" />
+
+**Cross-chain replay** joins the chain-id wildcard here to the transaction-level story from
+EIP-155 and the message-level story from typed data.<Cite src="eip-155" /> Three layers, three separate decisions about scope,
+and only one of them defaults to safe.

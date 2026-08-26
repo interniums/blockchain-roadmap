@@ -1,0 +1,131 @@
+import Link from 'next/link';
+import { CARD_DEPS_H, CARD_H, CARD_W, CHECKPOINT_BLEED, CHECKPOINT_TOP, cardBox } from './geometry';
+import type { Lane, TrackKind } from '@/lib/content/types';
+
+export interface TrackNodeData {
+  id: string;
+  number: number;
+  kind: TrackKind;
+  title: string;
+  tagline?: string;
+  lane: Lane;
+  row: number;
+  moduleCount: number;
+  lessonCount: number;
+  /** Lessons read. Zero everywhere until progress is wired — stated, not implied. */
+  lessonsRead: number;
+  needs: string[];
+  opens: string[];
+  /** Plain-English capability earned by finishing this track, shown below it on the spine. */
+  checkpoint?: string;
+}
+
+function stateLabel(read: number, total: number): string {
+  if (total === 0) return 'no lessons yet';
+  if (read === 0) return 'untouched';
+  if (read >= total) return 'complete';
+  return 'in progress';
+}
+
+const nn = (n: number) => String(n).padStart(2, '0');
+
+export function TrackCard({ t }: { t: TrackNodeData }) {
+  const box = cardBox(t.lane, t.row);
+  const pct = t.lessonCount === 0 ? 0 : Math.round((t.lessonsRead / t.lessonCount) * 100);
+  const state = stateLabel(t.lessonsRead, t.lessonCount);
+  const depsId = `t-${t.id}-deps`;
+
+  return (
+    <li className="absolute" style={{ left: box.x, top: box.y, width: CARD_W }}>
+      <Link
+        id={`t-${t.id}`}
+        href={`/t/${t.id}`}
+        aria-describedby={depsId}
+        className="cp-card block rounded-md border border-[var(--color-rule)] bg-[var(--color-surface)] px-4 pt-3.5 no-underline"
+        style={{ height: CARD_H, paddingBottom: CARD_DEPS_H, scrollMarginTop: 132 }}
+      >
+        <span className="flex items-baseline justify-between gap-2">
+          <span className="font-mono text-[11px] tracking-[0.08em] text-[var(--color-ink-3)]">
+            {nn(t.number)}
+          </span>
+          <span
+            className={`rounded-sm px-1.5 py-px text-[10px] uppercase tracking-[0.08em] ${
+              t.kind === 'core'
+                ? 'bg-[var(--color-accent-soft)] text-[var(--color-accent)]'
+                : 'bg-[var(--color-warn-soft)] text-[var(--color-warn)]'
+            }`}
+          >
+            {t.kind}
+          </span>
+        </span>
+
+        <h2 className="mt-1 text-[15.5px] leading-tight font-semibold text-[var(--color-ink)]">
+          {t.title}
+        </h2>
+
+        {t.tagline && (
+          <p className="mt-1.5 line-clamp-2 text-[12.5px] leading-[1.35] text-[var(--color-ink-2)]">
+            {t.tagline}
+          </p>
+        )}
+
+        <p className="mt-2 font-mono text-[11px] text-[var(--color-ink-3)]">
+          {t.moduleCount} modules · {t.lessonCount} lessons
+        </p>
+
+        <span
+          className="mt-2 block h-1.5 rounded-full bg-[var(--color-surface-2)]"
+          aria-hidden="true"
+        >
+          <span
+            className="block h-full rounded-full bg-[var(--color-accent)]"
+            style={{ width: `${pct}%` }}
+          />
+        </span>
+
+        {/* State in words, not only in the bar's colour. */}
+        <p className="mt-1 font-mono text-[11px] text-[var(--color-ink-3)]">
+          {t.lessonsRead} of {t.lessonCount} read · {state}
+        </p>
+      </Link>
+
+      {/*
+        Prerequisites in text. Sits over the foot of the card but outside the <a>, so it is the
+        link's description rather than part of its (already long) accessible name. Clicks fall
+        through to the link beneath.
+      */}
+      <div
+        id={depsId}
+        className="pointer-events-none absolute inset-x-0 px-4"
+        style={{ top: CARD_H - CARD_DEPS_H + 4 }}
+      >
+        <p className="truncate text-[11px] leading-[1.5] text-[var(--color-ink-3)]">
+          <span className="text-[var(--color-ink-2)]">Needs</span>{' '}
+          {t.needs.length ? t.needs.join(', ') : 'nothing — this is the entry point'}
+        </p>
+        <p className="truncate text-[11px] leading-[1.5] text-[var(--color-ink-3)]">
+          <span className="text-[var(--color-ink-2)]">Opens</span>{' '}
+          {t.opens.length ? t.opens.join(', ') : 'nothing further — this is an end of the map'}
+        </p>
+      </div>
+
+      {t.checkpoint && (
+        <div
+          className="absolute rounded-sm border border-[var(--color-rule)] bg-[var(--color-ground)] px-3 py-1.5 text-center"
+          style={{
+            top: CHECKPOINT_TOP,
+            left: -CHECKPOINT_BLEED,
+            right: -CHECKPOINT_BLEED,
+          }}
+        >
+          <p className="font-mono text-[10px] uppercase tracking-[0.1em] text-[var(--color-accent)]">
+            Checkpoint — you can now
+          </p>
+          <p className="mt-0.5 line-clamp-2 text-[11px] leading-[1.4] text-[var(--color-ink-2)]">
+            {t.checkpoint}
+          </p>
+        </div>
+      )}
+    </li>
+  );
+}

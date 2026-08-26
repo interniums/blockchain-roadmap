@@ -1,0 +1,329 @@
+---
+id: infra-event-pipelines-two-regimes
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [ponder-indexing-overview, ponder-config-reference, bilinear-indexing-events, alchemy-eth-getlogs, alchemy-compute-units, execution-apis-getlogs-method, execution-apis-block-tags, eip-7935, envio-reorgs, sentio-obib, geth-pubsub, quicknode-streams-reorgs]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The backfill finished at 04:12 on a Sunday. Eleven hours, 4.1 million blocks, nineteen million rows,
+and a checksum that matched the reference export exactly. The same binary then switched into its
+second job — following the head — and for nineteen days it did that job correctly too.
+
+On day twenty the accounting export was short by 412 rows, all from a four-minute window three weeks
+earlier. Nothing had errored. No alert had fired. The code that wrote those rows was the same code
+that had written the other nineteen million.
+
+That is the shape of this whole module, and it is worth naming before anything else. **A pipeline's
+two regimes share source files and share almost none of their assumptions.** The historical backfill
+is a bounded computation over an input that will never change again. The live tail is an unbounded
+computation over an input whose last few blocks are still being decided. Every property you verified
+during the eleven hours was a property of the first thing. The bug lived in the second.
+
+<Figure
+  caption="One binary, two pipelines — and a seam that every restart crosses again, in the direction nobody designed for."
+  alt="A chunked backfill walks settled history with parallel workers and hands off at a block number to a live tail that follows the head and never ends. A process restart sends the tail back through the backfill code path to catch up, this time above the finalized boundary."
+>
+  <Flow
+    lanes={['bounded', 'the seam', 'unbounded']}
+    nodes={[
+      { id: 'chunks', label: 'chunked backfill', note: 'settled history, workers in parallel', col: 0, tone: 'accent' },
+      { id: 'hand', label: 'handoff', note: 'a block number somebody chose', col: 1 },
+      { id: 'tail', label: 'live tail', note: 'one ordered stream, no end', col: 2, tone: 'accent' },
+    ]}
+    edges={[
+      { from: 'chunks', to: 'hand' },
+      { from: 'hand', to: 'tail' },
+      { from: 'tail', to: 'chunks', label: 'restart: catch up', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+This lesson separates them properly, then does the engineering work for the half you can actually
+finish: chunking a historical range against caps that are not where your 2024 constants think they
+are.
+
+## The two regimes, side by side
+
+Ponder's documentation states the split plainly: internally the indexing engine has two distinct
+modes, backfill and live indexing, which use different approaches for fetching data from the RPC,
+while indexing-function logic works the same way in both.<Cite src="ponder-indexing-overview" /> That
+second half is the useful design goal and the dangerous one. Your handler *should* be
+regime-agnostic. Everything around your handler is not.
+
+<Compare
+  columns={[{ title: 'Backfill' }, { title: 'Live tail' }]}
+  rows={[
+    { label: 'Does it end?', cells: ['Yes, at a known block', 'No'] },
+    { label: 'Is the input stable?', cells: ['Yes — finalized history', 'No — the last blocks can be replaced'] },
+    { label: 'Bound', cells: ['Throughput and provider quota', "Latency, and the tail's own correctness"] },
+    { label: 'Can workers run in parallel?', cells: ['Yes, ranges are independent', 'Not usefully; it is one ordered stream'] },
+    { label: 'Failure signature', cells: ['Slow, expensive, rate-limited', { v: 'Wrong, and quiet', tone: 'danger' }] },
+    { label: 'What a retry costs', cells: ['Time', 'Time, plus a duplicate if you are not idempotent'] },
+    { label: 'Where the risk concentrates', cells: [{ v: 'Your bill', tone: 'warn' }, { v: 'Your data', tone: 'danger' }] },
+  ]}
+  caption="Two regimes, one binary — and not one of these seven answers carries across the seam."
+  alt="Backfill and live tail compared across whether they end, whether the input is stable, what bounds them, whether workers parallelise, their failure signature, the cost of a retry, and where the risk concentrates."
+/>
+
+The asymmetry in the last two rows is the reason this module exists. A backfill that goes wrong tells
+you: requests fail, the job dies, the dashboard shows a red bar, someone looks. A live tail that goes
+wrong hands you rows that are the right shape, the right type, and describing something that did not
+happen.
+
+<Misconception
+  belief="If the same handler runs in both regimes and the backfill checksum matched, the live path is verified too."
+  reality="The backfill exercised a deterministic input with a known end. The live path differs in the three properties that produce corruption — a mutable tail, an unbounded run, and a transport that can silently skip."
+  why="The shared handler is the part you wrote and the part you tested, so it feels like the system. The regime-specific machinery around it is framework code or transport code, and it is invisible in a unit test."
+  src="ponder-indexing-overview"
+/>
+
+### What is genuinely deterministic about backfill
+
+Take a historical range that sits well below the finalized checkpoint. Ask for it a hundred times and
+you get the same logs in the same order, because that history is settled — the execution-layer spec
+defines `finalized` as the most recent crypto-economically secure block, which cannot be re-orged
+outside of manual intervention driven by community
+coordination.<Cite src="execution-apis-block-tags" /> That single property is what makes backfill an
+ordinary distributed batch job. Ranges are independent, so workers are independent. A worker that dies
+mid-range can be restarted on the same range. Two workers that accidentally get the same range produce
+the same rows.
+
+It also means the whole regime is a throughput problem with a cost attached, and both of those have
+knobs. That is the rest of this lesson.
+
+### What is genuinely non-deterministic about the tail
+
+Ask for the last three blocks a hundred times and you can get different answers, because the tip is
+not settled. The spec is direct about it: `latest` is the most recent block in the canonical chain
+observed by the client, and this block may be re-orged out of the canonical chain even under
+healthy/normal conditions.<Cite src="execution-apis-block-tags" /> "Even under healthy/normal
+conditions" is doing a lot of work in that sentence. It is not describing an incident.
+
+Three consequences, all of which get their own lesson later:
+
+- The rows you already wrote can stop being true. That is [what a reorg does](/c/reorg-definition).
+- Your transport can hand you the same event twice, or skip past a gap after a reconnect. Geth's
+  pub-sub interface exposes exactly this shape — you subscribe and receive notifications as blocks
+  arrive<Cite src="geth-pubsub" /> — and a subscription that drops and re-establishes has no
+  obligation to tell you what happened while it was gone.
+- Because the tail never ends, every process restart, deploy and crash happens *inside* it.
+
+### The tail's transport is a choice, and both options are lossy
+
+Backfill has exactly one transport: you ask for a range and it answers. The tail has two, and neither
+is complete on its own.
+
+**Polling.** You ask every *n* seconds whether there is a new block. The cost is a worst-case delay of
+*n*, and the benefit is that a poll is stateless — there is nothing to reconnect, so there is nothing
+to reconnect *past*. Ponder's per-chain `pollingInterval` documents a default of 1,000
+milliseconds.<Cite src="ponder-config-reference" />
+
+**Subscription.** You hold a socket open and the node pushes notifications as blocks
+arrive.<Cite src="geth-pubsub" /> You learn about a block immediately, and you inherit the connection's
+failure modes: the socket can drop, and you can be offline for a stretch without the client raising
+anything you would call an error.
+
+Bilinear's recommendation after building this in production is to run both — subscriptions for
+latency, polling as the backstop — and, regardless of transport, to constantly verify that the next
+block you see is the previous one plus one.<Cite src="bilinear-indexing-events" /> That check is worth
+noticing because it is the same shape as the contiguity invariant in the last lesson of this module:
+the transport will not tell you it skipped, so you assert that it did not.
+
+## The engineering half you can finish today: chunking
+
+A historical range does not arrive in one request. You break it into chunks, and the chunk size is the
+only tuning parameter you get. It is worth being precise about why the cap exists, because there are
+two of them and they behave differently.
+
+**Subgoal: name the two caps, so you can tell which one you are hitting from an error message.** The
+spec's `eth_getLogs` filter takes `fromBlock` and `toBlock` and imposes no limit of its own — the
+method's normative schema is a filter object, not a quota.<Cite src="execution-apis-getlogs-method" />
+The limits are provider policy, and there are two independent ones.
+
+- **A block-span cap.** Alchemy publishes this as a table by plan tier: on Ethereum, Base, Optimism,
+  Arbitrum, Polygon and several others, a free-tier key is capped at 10 blocks per query while paid
+  tiers are unlimited; on "all other chains" the paid ceiling is 10,000, with a footnote that queries
+  wider than 10k on those chains are possible but less likely to
+  succeed.<Cite src="alchemy-eth-getlogs" />
+- **A result-size cap.** The same page states that all responses are capped at
+  150MB.<Cite src="alchemy-eth-getlogs" />
+
+**Subgoal: see why one number cannot satisfy both.** These two caps bind under opposite conditions. A
+quiet range — a contract that emitted nothing for a month — hits the span cap: you are burning
+requests to walk past empty blocks. A busy range — a token during a launch — hits the size cap: a
+single 500-block window returns more than the response can carry, and the request fails or truncates.
+Any fixed chunk size is therefore wrong at one end of your history. Bilinear Labs' practitioner
+write-up lands on the same place from the other direction, recommending something around 1,000 blocks
+as a working default, observing that more than 10,000 is definitely too much, and noting that the
+right size depends entirely on whether the contract you are indexing has tons of events or almost
+none.<Cite src="bilinear-indexing-events" />
+
+**Subgoal: pick the adaptive strategy rather than the constant.** The move that actually works is to
+target a *result count* rather than a block span: if a chunk returned far fewer logs than your target,
+widen the next one; if it returned too many or failed, narrow it. Bilinear describes this as a binary
+search over the range, aiming to fetch a given number of events per
+request.<Cite src="bilinear-indexing-events" /> Ponder ships a version of the same idea as
+configuration: `ethGetLogsBlockRange` sets the maximum block range for `eth_getLogs` requests, and
+its documented default is undefined, in which case Ponder will attempt to determine the block range
+automatically based on error messages.<Cite src="ponder-config-reference" /> Read that last clause
+carefully. The framework is parsing provider error strings, because the caps are not discoverable any
+other way.
+
+<Aside kind="note">
+There is no standard method for asking a provider what its `eth_getLogs` limits are. The spec does not
+define one<Cite src="execution-apis-getlogs-method" />, so every indexer discovers the caps by
+failing. That is why chunk-size code that works against one provider fails against another, and why
+"switching providers is a URL change" is only true if you never issue a wide log query.
+</Aside>
+
+### The constants you inherited are now wrong
+
+Chunk sizes copied from pre-2026 material assume a block that carries fewer logs than a 2026 block
+does. EIP-7935 raises the default block gas limit to 60M, up from the 36M it describes as the mainnet
+value at the time of writing.<Cite src="eip-7935" /> More gas per block means more transactions per
+block means more logs per block, so a chunk size tuned when a block was half the size now returns
+roughly twice the payload for the same span.
+
+The practical effect is not a clean failure. It is a chunk size that worked for two years starting to
+hit the 150MB response ceiling<Cite src="alchemy-eth-getlogs" /> during busy ranges only — so the
+backfill fails at 60% on Tuesday, succeeds on Wednesday when you retry the same range while the target
+contract is quiet, and nobody writes it down. **Re-measure chunk size against a busy historical
+range, not an average one.**
+
+### Chunk size is a bill, not only a setting
+
+Halving the chunk size doubles the request count for the same history. You know from
+[the expensive methods](/c/getlogs-is-the-cost-driver) that log queries are the ones that dominate an
+RPC bill, so this is a direct trade: smaller chunks buy reliability with money, larger chunks buy
+money with failures. There is no free position on that curve — there is only the position you chose
+deliberately and the one you inherited.
+
+Worth being honest about one thing here: the per-request cost of `eth_getLogs` is not something to
+quote confidently. The provider's own documentation table and third-party comparisons of the same
+provider disagree about whether the charge is flat per request or scales with the number of logs
+returned, and this material did not resolve that.<Cite src="alchemy-eth-getlogs" /><Cite src="alchemy-compute-units" />
+Measure your own bill against your own request count; do not budget from a blog post's multiplier.
+
+### The property that makes parallelism safe
+
+Chunks can only run in parallel if each one is independently retryable, and a chunk is only
+independently retryable if re-running it is harmless. That is idempotency, and it is the subject of
+the next lesson — but note where the requirement *comes from*. It is not a nice-to-have bolted on for
+robustness. It is the precondition for the parallelism that makes backfill finish this week instead of
+next month.<Cite src="bilinear-indexing-events" />
+
+Two more things Bilinear's write-up flags that are easy to skip and expensive to skip:
+
+- **Backpressure.** Extraction is usually faster than transform-and-load, so an unbounded in-memory
+  queue between them grows until the process dies. Cap the queue and pause fetching when it
+  fills.<Cite src="bilinear-indexing-events" />
+- **Batch inserts.** Inserting 1,000 events one at a time is dramatically slower than one batch
+  insert of 1,000, with the caveat that if event *n* depends on reading event *n−1*, you need the
+  batch to let you read your own writes or you must commit sooner.<Cite src="bilinear-indexing-events" />
+
+## Where the regimes meet, and why the seam leaks
+
+The handoff is the moment backfill's last chunk lands and the tail takes over. It is a seam, and seams
+leak in one specific way: the tail starts from a block number that backfill has not finished writing,
+or backfill's final chunk overlaps blocks the tail already consumed. Both are invisible until someone
+counts.
+
+The frameworks handle the seam by never really having one. Ponder's engine keeps a trigger-based
+transaction log of every change and, on a restart with identical configuration, rolls back all
+unfinalized changes and resumes from the finalized block — the same machinery it uses for reorg
+reconciliation.<Cite src="ponder-indexing-overview" /> Envio's HyperIndex takes the parallel approach
+of retaining unfinalized entity state so it can roll back, with reorg handling enabled by default via
+`rollback_on_reorg`.<Cite src="envio-reorgs" /> In both cases the boundary that matters is not
+"backfill ended" but "this block is finalized", which is a much better boundary because the chain
+defines it rather than your scheduler.
+
+If you are writing the pipeline yourself, copy that: **make the handoff a block number derived from
+finality, not from whichever job happened to finish.**
+
+There is a second seam that is easier to miss: the one you create yourself every time you restart the
+process. A pipeline that has been tailing for three weeks and is then redeployed has to backfill the
+minutes it was down, using the backfill code path, at a point in history that is *not* below finality.
+So the "backfill only reads settled history" simplification is true for the initial run and false for
+every catch-up after it. Ponder's configuration makes the distinction visible in an unrelated place —
+a contract with an `endBlock` set is not indexed in realtime at all, because a bounded range is a
+different object from an open one.<Cite src="ponder-config-reference" /> Your catch-up path is bounded
+in the same sense but sits in the unsettled zone, which means it needs the tail's guarantees and the
+backfill's chunking at the same time. That combination is the single most common place a
+hand-written pipeline loses rows.
+
+<Misconception
+  belief="Backfill speed is a vendor benchmark question — pick the indexer that wins the benchmark."
+  reality="Rankings invert by workload. Sentio's open benchmark publishes six workloads and different platforms win different ones, with several unable to run some workloads at all."
+  why="Every vendor publishes the single workload it wins, and a single number is easier to compare than a capability matrix."
+  src="sentio-obib"
+/>
+
+That benchmark point is not a digression — it is the same regime split seen from outside. Published
+indexer speed figures measure backfill, because backfill is the part with an end you can put a
+stopwatch on.<Cite src="sentio-obib" /> Nothing in a sync-time benchmark tells you how the tool
+behaves on day twenty of a live tail, which is where the 412 rows went.
+
+<Check type="predict" concept="pipeline-two-regimes">
+You are indexing one contract's `Transfer` events. Your ingester uses a fixed chunk of 2,000 blocks
+and a worker pool of eight. It has one code path: fetch a chunk, write the rows, advance.
+
+You point it at the historical range and it completes cleanly. You then point the same code at the
+head by having it fetch `[head - 2000, head]` every twelve seconds.
+
+Name three distinct failures that this second configuration will produce and the first configuration
+will not, and say which of them would show up in your logs.
+
+<Answer>
+**Failure 1 — duplicate rows from overlapping windows.** Twelve seconds is roughly one slot, so
+consecutive fetches of `[head - 2000, head]` overlap by about 1,999 blocks. Every event is fetched
+about 2,000 times. In backfill the ranges were disjoint, so the same code never had to survive
+re-delivery. Whether this corrupts anything depends entirely on whether your write is idempotent on
+the event's natural key — which is the next lesson, and the reason it is the next lesson.
+**Visibility:** none. The inserts succeed. Aggregates are quietly too large.
+
+**Failure 2 — rows describing blocks that stopped existing.** The spec is explicit that `latest` may
+be re-orged out even under healthy conditions.<Cite src="execution-apis-block-tags" /> Your backfill
+range sat below finality, so this could not happen there. At the head it happens routinely, and the
+row you wrote for a discarded block does not delete itself. **Visibility:** none, unless you compare
+against the canonical chain. QuickNode's Streams documentation describes the detection signal you
+would have to implement yourself — a reorg is identified when a new block's parent hash does not match
+the hash of the previous block that was streamed.<Cite src="quicknode-streams-reorgs" />
+
+**Failure 3 — a permanent gap after any pause longer than the window.** If the process is down for
+five minutes, the head moves about 25 blocks; your fixed window still covers it, so you get lucky. If
+it is down for ninety minutes, or if the chain produces blocks faster than your fetch interval on a
+different network, the next window starts above where you stopped and the blocks in between are never
+requested by anything. **Visibility:** none. This is the failure that produces exactly the 412-row
+shortfall in the opening scene, and it is why the cursor lesson insists the cursor be a persisted
+number rather than an offset from the head.
+
+**The one that would show up in your logs:** none of them, which is the point. Backfill fails loudly
+because it fails against a provider that returns errors. The tail fails silently because everything it
+does returns `200 OK`. If you want a signal you have to assert one — contiguity and lag — and that is
+the last lesson in this module.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You now have the frame the rest of the module hangs on. Each remaining lesson is a specific defect
+that lives on one side of the split:
+
+- The **natural key** and the **idempotent write** are what make a chunk independently retryable, so
+  they are backfill's precondition and the tail's only defence against re-delivery.
+- The **cursor in the same transaction** is what removes the gap between "rows written" and "progress
+  recorded", which is a live-tail failure that a backfill can never show you.
+- **Reorg handling** and **finality** are about the tail exclusively, because backfill by definition
+  reads history that is already settled.
+- **Re-backfill** is about the moment those two regimes collide: a schema change means running the
+  bounded job again while the unbounded one keeps running.
+- **Gap detection** is the instrument you need because, as the answer above says three times, none of
+  this shows up in your logs.
+
+The immediate practical takeaway is smaller and worth doing this week: go and find the chunk size in
+your pipeline, find out when it was last chosen, and re-run one busy historical range with it. If that
+number predates the 60M default gas limit<Cite src="eip-7935" />, it is a number chosen for a
+different chain than the one you are indexing now.

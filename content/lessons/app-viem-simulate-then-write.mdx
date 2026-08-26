@@ -1,0 +1,342 @@
+---
+id: app-viem-simulate-then-write
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [viem-simulate-contract, viem-write-contract, viem-wallet-client-doc, viem-public-client-doc, viem-read-contract-doc, viem-errors-glossary, viem-wait-for-transaction-receipt, viem-send-transaction-doc, viem-clients, viem-contract-errors-source]
+stack: { viem: "2.x" }
+---
+
+viem's documentation puts a warning box directly under the title of `writeContract`. It is one of the
+bluntest sentences in the whole reference:
+
+> `writeContract` internally sends a transaction — it **does not** validate if the contract write will
+> succeed (the contract may throw an error).<Cite src="viem-write-contract" />
+
+The same box recommends simulating first, and the phrase used is "highly
+recommended".<Cite src="viem-write-contract" /> Library documentation does not normally beg.
+
+Here is what the warning is protecting you from. `writeContract` on its own composes a transaction,
+gets it signed, and broadcasts it. If the contract would revert, none of those three steps notice. The
+transaction is mined. It is included in a block, its state changes are discarded, its
+[receipt carries a failure status](/c/tx-receipt-status-zero), and the gas is spent. A person who
+clicked a button, waited, and approved a prompt has paid to be told no.
+
+The fix is two lines and one extra round trip. What makes it worth a full lesson is that the fix has a
+precisely bounded strength, and half of this lesson is about that boundary — because the failure mode
+of *believing* the fix is stronger than it is looks exactly like the failure mode it was supposed to
+remove.
+
+## What simulateContract does
+
+viem describes `simulateContract` as simulating and validating a contract interaction, useful for
+retrieving return data and revert reasons of contract write functions.<Cite src="viem-simulate-contract" />
+It requires no gas and does not change chain state.<Cite src="viem-simulate-contract" /> Internally it
+uses a Public Client to call the `call` action with ABI-encoded
+data.<Cite src="viem-simulate-contract" /> That is [`eth_call`](/c/eth-call-is-the-primitive), the same
+primitive behind every read you have made — pointed at a state-changing function and asked what it
+*would* do.
+
+The return value is the pairing that makes the pattern work: viem documents it as the simulation
+result and the write request, with the type inferred.<Cite src="viem-simulate-contract" />
+
+```ts
+const { result, request } = await publicClient.simulateContract({
+  address: vault,
+  abi: vaultAbi,
+  functionName: 'withdraw',
+  args: [shares],
+  account,
+})
+
+const hash = await walletClient.writeContract(request)
+```
+
+Three distinct things just happened, and they are worth separating.
+
+**`result` is the return value of a write function.** This is not otherwise available to you.
+`writeContract` returns only a transaction hash — viem's docs say so explicitly, and point you at
+`simulateContract` if you want the return data.<Cite src="viem-write-contract" /> A `withdraw` that
+returns the assets received, a `mint` that returns a token id: on-chain that value goes into the
+return buffer of a transaction nobody reads. Simulation is the only way your interface learns it
+before the fact.
+
+**`request` is a prepared argument object.** It carries the address, the ABI, the function, the
+arguments and the account, already assembled and already type-checked. Handing it straight to
+`writeContract` means the transaction you broadcast is the transaction you validated, rather than a
+second hand-assembled object that might differ in a field someone edited six months later. The handoff
+type-checks only because the ABI was declared `as const` — the mechanism from the previous lesson,
+carrying a real guarantee here.<Cite src="viem-simulate-contract" />
+
+**If the call would revert, `simulateContract` throws.** Before the wallet prompt. Before the user is
+asked for anything. The error carries decoded revert data when your ABI contains the error definition,
+which is the subject of the next lesson.<Cite src="viem-simulate-contract" />
+
+<Misconception
+  belief="writeContract fails fast if the contract would revert."
+  reality="It signs and broadcasts. The revert happens on-chain, the transaction is mined, and the gas is charged. viem's own documentation carries a warning saying this in as many words."
+  why="The name reads like an assertion, and the previous generation of libraries estimated gas implicitly inside the write call, which caught many reverts as a side effect. viem does not do that, and the difference is invisible at the call site."
+  src="viem-write-contract"
+/>
+
+### The `account` parameter is not optional in the way it looks
+
+`account` on `simulateContract` is typed `Account | Address | null`, and it is the account to simulate
+the method **from** — that is, the `msg.sender` the EVM will see during the
+simulation.<Cite src="viem-simulate-contract" /> Passing `null` means the transport is assumed to fill
+in the sender.<Cite src="viem-simulate-contract" />
+
+Get this wrong and the simulation answers a question about somebody else. Every balance check, every
+allowance lookup, every `onlyOwner` guard reads `msg.sender`. Simulating an `onlyOwner` function
+without an account, or with the wrong one, produces either a spurious revert or — worse — a spurious
+success, depending on whose address ends up there. The rule is that the account you simulate from must
+be the account that will sign, and with a JSON-RPC account that is whatever the wallet returns from
+`getAddresses`, which can change while your page is open.<Cite src="viem-wallet-client-doc" />
+
+## The block you are simulating against is older than you think
+
+This is the detail most descriptions of the pattern get wrong, and it changes how you reason about the
+guarantee.
+
+`simulateContract` takes a `blockTag` typed `'latest' | 'earliest' | 'pending' | 'safe' | 'finalized'`
+with a **default of `'latest'`**.<Cite src="viem-simulate-contract" /> Not `'pending'`. By default, the
+simulation runs against the most recent *sealed* block — state that already excludes everything sitting
+in the node's mempool.
+
+So the default configuration is one step *further* from the world your transaction will land in than
+people assume. You can opt into `blockTag: 'pending'`, and doing so is often right, but it buys less
+than the name promises. A node's pending view is that node's own mempool, and you already know that
+[the mempool is not global](/c/mempool-is-not-global) and that
+[pending is not an ordered queue of what happens next](/c/mempool-pending-is-not-a-queue). Simulating
+at `pending` swaps "one node's view of the last sealed block" for "one node's view of an unordered set
+it happens to be holding". Both are snapshots. Neither is the block.
+
+<Aside kind="note">
+Two other parameters change what you are simulating and are worth knowing exist. `stateOverride` lets
+you ephemerally rewrite state before the call — the documented use case is simulating a transfer that
+needs an approval that has not happened yet.<Cite src="viem-simulate-contract" /> viem attaches a
+warning to it that says the quiet part: with state overrides you are simulating against a fake state,
+which is useful for testing, but a transaction made from the returned `request` might fail regardless
+of the simulation result.<Cite src="viem-simulate-contract" /> And `authorizationList` accepts a signed
+[EIP-7702 authorization](/c/tx-type-4-setcode), so you can simulate against an EOA that will be
+carrying delegated code by the time the transaction executes but is not carrying it
+now.<Cite src="viem-simulate-contract" />
+</Aside>
+
+## Simulation is not estimation
+
+These two get used interchangeably and they answer different questions. You have already met the
+distinction from the estimation side; here it is from the client side.
+
+`estimateContractGas` returns a number or throws. Estimation is
+[a search for the smallest working gas limit](/c/estimategas-is-a-search), so when it fails, what you
+get is a message about the search, which may not contain the revert data at all. `simulateContract`
+executes the call and returns the return value, or throws carrying the revert
+bytes.<Cite src="viem-simulate-contract" /> Both appear on viem's list of ABI-inferring
+actions.<Cite src="viem-simulate-contract" />
+
+Use estimation to size a limit. Use simulation to explain a failure.
+[Confusing the two](/c/estimategas-is-not-simulation) is the reason so many products display
+"execution reverted" to users: the explanation was available from a call they never made. And note
+that even a correct estimate can be an insufficient gas limit once
+[the 63/64 rule](/c/estimategas-63-64) takes its cut at each nested frame — a separate problem that
+simulation does not solve either.
+
+## What can change between the simulation and the block
+
+Here is the boundary. A successful simulation says: *against one node's view of one block, executed
+from this account with these arguments, this call did not revert.* Enumerate everything in that
+sentence that can be false by the time your transaction executes.
+
+<Figure
+  caption="Everything simulation removed happened before the prompt; everything it cannot touch happens after it."
+  alt="simulateContract runs an eth_call against the latest sealed block. Between that call and the broadcast sits a gap in which a human decides at the wallet prompt and other parties build blocks. writeContract then broadcasts the validated request, and the receipt can still come back reverted, mined and charged."
+>
+  <Flow
+    lanes={['the read', 'the gap', 'the write', 'the receipt']}
+    nodes={[
+      { id: 'sim', label: 'simulateContract', note: 'eth_call at the latest sealed block', col: 0, tone: 'accent' },
+      { id: 'gap', label: 'the wallet prompt', note: 'open as long as a human takes', col: 1, tone: 'warn' },
+      { id: 'blk', label: 'blocks are built', note: 'by someone else, in their order', col: 1, tone: 'warn' },
+      { id: 'w', label: 'writeContract(request)', note: 'the request you validated', col: 2 },
+      { id: 'ok', label: 'status success', col: 3, tone: 'good' },
+      { id: 'bad', label: 'status reverted', note: 'mined, and charged', col: 3, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'sim', to: 'gap' },
+      { from: 'sim', to: 'blk' },
+      { from: 'gap', to: 'w' },
+      { from: 'blk', to: 'w' },
+      { from: 'w', to: 'ok' },
+      { from: 'w', to: 'bad' },
+    ]}
+  />
+</Figure>
+
+**Someone else's transaction lands first.** Another user takes the last of a fixed supply, moves a
+pool's reserves, or claims the position you were about to liquidate. Nothing about your call changed;
+the state it reads did.
+
+**A price updates.** [A push oracle updates on deviation or heartbeat](/c/orac-deviation-and-heartbeat),
+and a health check or a slippage bound that passed at simulation time fails at execution time. This is
+not an edge case — it is the normal behaviour of the system.
+
+**The block is not built in the order you imagine.** [Searchers and builders](/c/mev-searcher) assemble
+blocks to maximise value, and your transaction's position within the block is theirs to choose. A
+[sandwich](/c/mev-sandwich) is precisely the case where two transactions are inserted around yours
+specifically so that the state you simulated against is not the state you execute against.
+
+**Your own earlier transaction lands, or does not.** If you have a pending transaction at a lower
+nonce, the state your simulation assumed may depend on it — and
+[nonce ordering](/c/account-nonce-eoa) means it executes first or yours does not execute at all.
+
+**Time moved.** Deadline parameters, epoch boundaries, unlock timestamps and vesting cliffs all read
+`block.timestamp`, which is different in the block that includes you.
+
+**A different node built the block.** You simulated against your provider. The block was assembled by
+a builder with a different view.
+
+**And the user thought about it.** This one dominates the others in practice, and it is the one nobody
+puts on the list. The wallet prompt sits open for as long as a human takes. Every second of that is
+simulation staleness accumulating, and it is measured in blocks. A confirmation flow with three screens
+is a flow whose simulation is three screens old.
+
+<Misconception
+  belief="A successful simulateContract means the transaction will succeed."
+  reality="It means the call did not revert against one node's view of one block — by default the latest sealed block, which is already behind the mempool. Everything between that instant and inclusion is unconstrained."
+  why="The word 'simulate' implies determinism, and in a single-writer system it would be deterministic. Here the state is written by everyone, concurrently, with an ordering you do not control."
+  src="viem-simulate-contract"
+/>
+
+## Therefore: the UI still has to handle a reverted receipt
+
+This is the concrete obligation that follows. `waitForTransactionReceipt` resolves with a receipt, and
+that receipt has a `status` — the documented example shows `status: 'success'`, and the failing case is
+the one your code must also
+handle.<Cite src="viem-wait-for-transaction-receipt" /><Cite src="viem-errors-glossary" /> A mined
+transaction is not a successful transaction. Simulation moves most failures earlier; it does not make
+the late ones impossible, and a product that treats "we got a receipt" as "it worked" will show users
+a success screen for a transaction that did nothing and cost them money.
+
+Note also that this is where you meet a second class of failure that simulation never touches at all:
+the transaction that is never included. It can sit below the fee market, be dropped, or be replaced by
+the user from inside their wallet — which
+[produces a different hash for the same nonce](/c/tx-replacement-changes-the-hash) and orphans anything
+keyed on the original. `waitForTransactionReceipt` has an `onReplaced` callback for exactly that, with
+reasons `replaced`, `repriced` and `cancelled`.<Cite src="viem-wait-for-transaction-receipt" /> The
+transaction-UX module takes that state machine apart properly.
+
+## The multi-step flow, where the pattern fights you
+
+There is one shape where simulate-before-write is awkward for a structural reason, and it is extremely
+common: two transactions where the second only succeeds after the first has landed. Approve then
+transfer. Deposit then stake. Permit then swap.
+
+Simulating step two before step one is confirmed will revert, correctly, every time — because at the
+block being simulated the allowance is still zero.<Cite src="viem-simulate-contract" /> You have three
+options, and they are not equally good.
+
+**Simulate step two only after step one's receipt.** Honest, and it costs the user a full inclusion
+wait sitting between two prompts. This is the default and it is fine.
+
+**Fake it with `stateOverride`.** viem supports it and documents the approval case as the motivating
+example — but it also warns that you are simulating a fake state and the real transaction may fail
+regardless.<Cite src="viem-simulate-contract" /> Use it to answer "would the swap logic work", never to
+gate the send.
+
+**Stop making it two transactions.** The batched-call standards exist for this, and viem exposes them.
+That is the wallet-capabilities module's subject; the relevant point here is that "simulate the second
+step" is often the wrong question, and "why are there two steps" is the right one.
+
+Notice that all three are decisions about product flow rather than about the library. That is the
+recurring shape of this whole module: viem gives you a sharp primitive and hands the sequencing problem
+back to you.
+
+## Worked example: costing the pattern honestly
+
+Before you make simulation mandatory on every write, price it.
+
+**Subgoal 1 — count the added latency and put it where the user feels it.** One extra `eth_call` on the
+Public Client's transport, on the critical path between the click and the wallet
+prompt.<Cite src="viem-simulate-contract" /><Cite src="viem-public-client-doc" /> Against a distant
+provider that is a visible pause before anything appears. The fix is not to skip the simulation; it is
+to render a pending state on the click and let the prompt arrive when it arrives.
+
+**Subgoal 2 — count the added request volume.** One additional request per write attempt, including
+every attempt a user abandons. Writes are rare compared to reads, so this is usually noise in a request
+bill — but it is not noise if you simulate on every keystroke of an amount field. Simulate on submit,
+or debounce hard.
+
+**Subgoal 3 — name what you get for it that has no substitute.** The revert, decoded, before the
+signature. The return value of a write function. A prepared, type-checked
+request.<Cite src="viem-simulate-contract" /> The first of those is the one that changes your support
+load, because it converts "your transaction failed" into a sentence naming a cause.
+
+**Subgoal 4 — identify where the pattern does not fit.** Anything with an intentionally competitive
+outcome. If you are racing for a mint, a liquidation, or an arbitrage, the simulation is stale by
+construction and the extra round trip is a handicap. There, the correct design is to accept reverts and
+budget for them — which is the opposite decision, made deliberately, for a reason you can state.
+
+**Subgoal 5 — decide what happens when simulation throws for a non-revert reason.** The simulation is
+an RPC call and can fail as a network operation: `HttpRequestError`, `TimeoutError`, a rate
+limit.<Cite src="viem-errors-glossary" /> Blocking the write on it means a provider hiccup blocks a
+user who could have transacted fine. Decide explicitly whether a transport failure during simulation
+blocks the flow or degrades to an unvalidated write with a warning. Not deciding means you have chosen
+"block", silently.
+
+<Check type="predict" concept="viem-simulation-is-not-a-guarantee">
+A team adds simulate-before-write to a swap interface. Reverted transactions drop by roughly 90%. Then
+they see three reports. Say for each whether simulation was supposed to prevent it, and what the actual
+fix is.
+
+1. A user's swap reverted with a slippage error. The interface had simulated successfully eleven
+   seconds earlier.
+2. A user's transaction never appeared at all. The interface still shows "confirming" forty minutes
+   later.
+3. An internal tool that simulates with `stateOverride` to fake an approval reports success, and the
+   real transaction reverts every time.
+
+<Answer>
+**1. Not preventable, and it is the pattern working as designed.** Eleven seconds is roughly a block
+on Ethereum L1, and simulation runs against a snapshot — by default the latest *sealed*
+block.<Cite src="viem-simulate-contract" /> Another trade moved the pool, or the same trade was
+[sandwiched](/c/mev-sandwich). The fix is not more simulation. It is a slippage bound the user chose,
+a deadline, and a UI that explains a slippage revert as a market event rather than as a bug. If this
+is happening constantly, the fix is private order flow, not client-side validation.
+
+**2. Not preventable, and it is a different failure class entirely.** Simulation says whether a call
+would revert *if executed*. It says nothing about inclusion. This transaction is under-priced, dropped,
+or replaced. The fix is on the receipt side: `waitForTransactionReceipt` with a timeout and an
+`onReplaced` handler, plus a UI state for "not included yet" that is distinct from
+"pending".<Cite src="viem-wait-for-transaction-receipt" /> Forty minutes of "confirming" is a missing
+state machine, not a missing simulation.
+
+**3. Preventable, and it is the documented trap.** viem warns that state overrides simulate against a
+fake state and that a transaction built from the returned `request` may fail regardless of the
+result.<Cite src="viem-simulate-contract" /> The tool asserted an approval that does not exist on
+chain. The fix is to make the approval real — send it, or use a batched flow that performs approval and
+swap together — rather than to simulate as if it were. A simulation with overrides answers a
+hypothetical, and shipping on a hypothetical is how you get a 100% failure rate with a green check
+mark.
+
+**The through-line:** simulation converts one specific class of failure — "this call reverts against
+current state" — into a pre-signature error. It has nothing to say about ordering, inclusion, or
+states you invented. Knowing which of the three you are looking at is the skill.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** picks up the error `simulateContract` throws and takes it apart. The revert reason
+is not in `error.message` in any form you should depend on; it is in a `cause` chain, and getting the
+custom error's name and arguments out of it is a five-line function you write once.
+
+**The transaction-UX module** owns everything after `writeContract` returns: the states between
+broadcast and finality, replacement detection, and why a hash is a poor primary
+key.<Cite src="viem-wait-for-transaction-receipt" />
+
+**The wagmi module** wraps this exact pair as `useSimulateContract` and `useWriteContract`, with the
+simulation cached as a query. That introduces a question you now have the vocabulary for: a cached
+simulation is a snapshot of a snapshot, and its staleness is under your control only if you configure
+it to be.

@@ -1,0 +1,291 @@
+---
+id: evm-opcodes-memory-an-array-you-can-only-grow
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    yellow-paper,
+    execution-specs,
+    eip-3336,
+    eip-5656,
+    eip-1153,
+    solidity-layout-memory,
+    learnevm-memory,
+  ]
+stack: {}
+---
+
+A batch function processes a list of orders. For each order it builds a small `bytes memory` payload,
+hashes it, and moves on. The payload is dead the instant the hash is taken.
+
+At 300 orders it works. At 900 it runs out of gas. Someone profiles it and finds that the hashing is
+not the problem and the loop body is not the problem — the transaction is spending most of its gas on
+something that does not appear anywhere in the source.
+
+The missing line item is memory that was allocated 900 times and released zero times, because the EVM
+has no instruction that releases memory and Solidity's allocator has no code path that would use one.
+
+This lesson is about the shape of that location: what memory actually is at the machine level, what
+"reading a byte" costs you in instructions, and why the meter that prices it only ever goes up.
+
+## What the machine actually provides
+
+A call frame's memory is a byte array. That is the whole of it.
+
+It is indexed from zero. It is initially all zeroes. It grows whenever an instruction addresses a
+byte beyond its current extent.<Cite src="yellow-paper" /> It is private to the frame: a fresh frame
+gets fresh zeroed memory, and nothing is inherited from the caller except the calldata region that
+was explicitly copied in.<Cite src="execution-specs" /> When the frame returns or reverts, its memory
+is gone.
+
+What it does *not* have is the interesting part. There are no objects. There are no types. There is
+no allocator, no header before each block, no free list, no garbage collector, and no `free`. The
+machine has no notion of an "array in memory" or a "struct in memory" — those are conventions the
+compiler imposes on top of raw byte offsets, and if you write your own assembly you can break them,
+which is the subject of the fourth lesson in this module.
+
+<Aside kind="note">
+This is worth contrasting with [storage](/c/per-account-storage-trie), which is also a dumb key-value
+map but a *global, persistent* one addressed in 32-byte slots rather than bytes. The two locations
+are not the same data structure with different lifetimes. They are different machines: one is a
+linear byte array scoped to a frame, the other is a trie-backed map scoped to an account and to
+forever.
+</Aside>
+
+## Everything moves 32 bytes at a time
+
+`MLOAD` reads 32 bytes starting at a byte offset. `MSTORE` writes 32 bytes at a byte offset. Neither
+requires the offset to be word-aligned — you can load from offset 5 — but the *quantity* moved is
+always a word.<Cite src="yellow-paper" /> The single exception in the whole instruction set is
+`MSTORE8`, which writes exactly one byte.
+
+Two consequences follow, and both explain code you have probably read without understanding.
+
+**"The byte at offset 5" is not an operation the machine has.** Getting it means loading the word at
+some offset and then shifting and masking to isolate the byte you wanted. That is three instructions
+where a byte-addressable CPU would use one, and it is why byte-level manipulation in Yul is full of
+shift-and-mask sequences that look like obfuscation and are actually the shortest available spelling.
+
+**`MSTORE` clobbers the 31 bytes after your value.** If you have a 20-byte address and you `MSTORE`
+it at offset 100, you have written 32 bytes at offset 100: the address is right-aligned in that word,
+preceded by twelve zero bytes, and whatever used to live at offsets 112 through 131 is now gone.
+
+<Misconception
+  belief="MSTORE writes only the bytes of the value you gave it."
+  reality="It writes a full 32 bytes at the target offset, overwriting whatever followed. Writing a narrow value into the middle of an existing buffer is a read-modify-write, not a store."
+  why="Every higher-level language writes exactly the width of the type, because every higher-level language runs on a byte-addressable machine. The EVM's single-byte store instruction exists precisely because single-byte stores are the exception here rather than the default."
+  src="solidity-layout-memory"
+/>
+
+The practical version of that rule: to place a short value inside a buffer without damaging its
+neighbours you must either use `MSTORE8` per byte, or load the surrounding word, mask out the target
+bytes, OR in your value, and store the word back. Solidity does this for you. Assembly does not.
+
+Since Cancun there is one more memory-moving instruction worth knowing about. `MCOPY`, opcode `0x5E`,
+copies a range of memory to another range, and it behaves as if an intermediate buffer were used, so
+the source and destination may overlap safely.<Cite src="eip-5656" /> Before it existed, compilers
+and hand-written assembly emitted `MLOAD`/`MSTORE` loops for the same job; the EIP's own worked
+example puts a 256-byte copy at 27 gas with `MCOPY` against at least 96 gas with unrolled load-store
+pairs.<Cite src="eip-5656" /> Its pricing belongs to the next lesson.
+
+## The meter that only goes up
+
+Here is the mechanism that produced the failing batch job.
+
+Memory expansion is charged against the highest offset the frame has ever addressed. EIP-3336 states
+the rule exactly while proposing to replace it: the quantity being charged for is the number of words
+required to cover the range from memory address 0 to the last word that has been read or written by
+the EVM.<Cite src="eip-3336" />
+
+Read that clause twice, because three separate surprises are packed into it.
+
+**It says *read or written*.** A read past the current extent expands memory and is charged for it,
+exactly as a write would be. There is no cheap way to peek at a high offset.
+
+**It says *has been*.** Past tense, for the whole frame. If you write a single word at offset one
+million and then do all your real work near offset zero, you are charged as though you were using a
+megabyte the entire time. Nothing gives that back.
+
+**It says *from address 0*.** The charge covers a contiguous span, not the bytes you actually
+touched. Memory that you skipped over is memory you paid for.
+
+And there is no deallocation instruction anywhere in the EVM. Not "deallocation is discouraged", not
+"deallocation is expensive" — the opcode does not exist. Correspondingly, Solidity places every new
+object at the free-memory pointer and never frees memory.<Cite src="solidity-layout-memory" />
+
+<Misconception
+  belief="You can free memory when you are done with it, or at least stop paying for it."
+  reality="There is no deallocation instruction, and Solidity's allocator only ever moves its pointer forward. The charge is against the high-water mark for the life of the frame."
+  why="Every mainstream runtime an engineer has used has either a garbage collector or an explicit free, so 'this object is dead' and 'this memory is available again' feel like the same statement. On the EVM the first is true and the second is not."
+  src="solidity-layout-memory"
+/>
+
+<Figure
+  caption="One buffer is alive and nine hundred were allocated; the meter covers the whole span from offset zero regardless."
+  alt="Frame memory after nine hundred loop iterations. Payload buffers one through eight hundred and ninety-nine are dead but still occupy their offsets, and only the nine hundredth is in use. Memory expansion is charged across all of them."
+>
+  <ByteLayout
+    caption="frame memory at the 900th iteration"
+    fields={[
+      { label: 'payload 1', tone: 'muted', note: 'dead' },
+      { label: 'payload 2', tone: 'muted', note: 'dead' },
+      { label: '…', variable: true, tone: 'muted', note: '896 more, all dead' },
+      { label: 'payload 899', tone: 'muted', note: 'dead' },
+      { label: 'payload 900', tone: 'accent', note: 'the only one alive' },
+    ]}
+  />
+</Figure>
+
+### The batch job, walked through
+
+**Subgoal — find where the allocation happens.** Each iteration builds a `bytes memory` payload.
+Building it means reading the free-memory pointer, using the bytes it names, and writing the advanced
+pointer back. That is an allocation, whether or not the source contains the word.
+
+**Subgoal — find where the deallocation happens.** It does not. The payload is dead after the hash,
+but the free-memory pointer has already moved past it and will never move back.
+
+**Subgoal — total it up.** After *n* iterations the high-water mark is roughly *n* payload lengths
+above where it started. Memory grows monotonically for the whole frame even though at no instant is
+more than one payload alive.
+
+**Subgoal — notice which term bites.** For the first few hundred iterations the cost of that growth
+is nearly linear and looks like noise in the profile. Past a certain size a second term takes over
+and the curve turns sharply upward, which is why the function worked at 300 orders and died at 900
+rather than degrading smoothly. Putting numbers on that turn is the next lesson.
+
+**Subgoal — apply the only available fix.** You cannot free the buffer, so reuse it. Allocate one
+payload buffer before the loop and overwrite it each iteration. The high-water mark then reflects one
+payload rather than *n*, and the quadratic term never engages. The remedy for memory pressure on this
+machine is always reuse, never release.
+
+## Two things that are zero, and one that is not
+
+The machine zero-initialises memory. Every byte you have not written reads as zero, which is why
+reading past what you have used is safe rather than undefined.<Cite src="yellow-paper" />
+
+Solidity's *free* memory is a different claim, and the documentation is explicit that it does not
+hold. Some operations need a temporary area larger than the reserved scratch space; they use the
+region the free-memory pointer points at without advancing the pointer, and that region may or may
+not be zeroed afterwards. You should not expect free memory to point at zeroed
+memory.<Cite src="solidity-layout-memory" />
+
+So: freshly *expanded* memory is zero, because the machine guarantees it. Memory *above the
+free-memory pointer* is not reliably zero, because the compiler may have scribbled on it. Assembly
+that assumes the second because it knows the first is a real and quiet class of bug. The same
+documentation warns against reaching for `MSIZE` to find a definitely-zeroed region and then using
+that pointer non-temporarily without updating the free-memory pointer.<Cite src="solidity-layout-memory" />
+
+## The one thing that does reset the meter
+
+Memory is per frame, and so is the high-water mark. A sub-call starts with a fresh, empty, zeroed
+memory of its own, and when it returns, everything it expanded is discarded along with the frame.
+
+EIP-1153's security considerations turn this into an arithmetic observation while analysing how much
+memory a transaction can force a node to allocate. Spending the whole of a 30-million-gas budget
+expanding memory in one context reaches roughly 3.75 MB; spending it a million gas at a time across
+many contexts, each of which resets the expansion cost, reaches roughly 20 MB for the same
+budget.<Cite src="eip-1153" />
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'One context', note: 'the whole budget in a single frame', tone: 'warn' },
+    { title: 'Many contexts', note: 'a million gas at a time', tone: 'good' },
+  ]}
+  rows={[
+    {
+      label: 'What is the expansion charged against?',
+      cells: [
+        'One high-water mark, rising for the life of the frame',
+        'A fresh high-water mark in every frame, starting at zero',
+      ],
+    },
+    {
+      label: 'How much memory does 30 million gas reach?',
+      cells: ['Roughly 3.75 MB', 'Roughly 20 MB'],
+    },
+    {
+      label: 'What happens to the expansion on return?',
+      cells: ['Nothing — the frame is still paying for it', 'Discarded along with the frame'],
+    },
+  ]}
+  caption="The same gas budget reaches over five times more memory when it is spent across frames, because the meter restarts at every call boundary."
+  alt="EIP-1153's arithmetic: thirty million gas spent expanding memory inside one context reaches about 3.75 MB, while the same budget spent a million gas at a time across many contexts reaches about 20 MB, because each new frame resets the memory expansion charge."
+/>
+
+Two lessons come out of that.
+
+For an attacker, it says the per-frame charge is not a global bound, which is part of why the
+protocol has since acquired other ceilings.
+
+For you, it says something more immediately useful: **a sub-call is the only garbage collector the
+EVM has.** If a piece of work needs a large scratch buffer and nothing that follows needs the
+contents, doing that work in a separate frame — even a self-call — releases the expansion when the
+frame returns. This is a real technique with a real cost, since the call itself is not free and the
+result has to be copied back through return data, and it is worth reaching for exactly when the
+buffer is large enough that the quadratic term is visible.
+
+<Check type="predict" concept="memory-highwater-never-shrinks">
+A function does the following, in this order, inside a single frame:
+
+1. Writes one 32-byte word at memory offset `0x100000` (roughly one megabyte in).
+2. Reads it back and checks it.
+3. Runs a loop that does all of its remaining work between offsets `0x80` and `0x200`.
+4. Returns 32 bytes from offset `0x80`.
+
+A colleague argues that steps 3 and 4 are cheap because they work in the first few hundred bytes of
+memory, and that step 1 is "one `MSTORE`, three gas".
+
+What does this actually cost, roughly, and what would you change?
+
+<Answer>
+**Step 1 is not one `MSTORE` at three gas.** The `MSTORE` itself is a cheap opcode, but addressing a
+byte at roughly one megabyte raises the high-water mark to cover the whole span from address 0 to
+that word.<Cite src="eip-3336" /> The frame is now charged as though it is using a megabyte of memory,
+and the charge is dominated by a term that grows with the square of the size — the next lesson puts
+the figure at over two million gas for a megabyte, which is a large fraction of what a single
+transaction is even allowed to spend.
+
+**Steps 3 and 4 are indeed cheap in themselves, and that changes nothing.** Working near offset
+`0x80` does not lower the high-water mark, because the mark records the highest offset ever
+addressed, not the current working set.<Cite src="eip-3336" /> There is no instruction that would
+lower it and Solidity's allocator would not call one.<Cite src="solidity-layout-memory" />
+
+**Step 2 is worth noticing separately.** A read past the current extent expands memory exactly like a
+write does, so if step 2 had come first it would have been the expensive instruction and step 1 would
+have looked free.<Cite src="eip-3336" /> Which line the profiler blames depends on ordering, not on
+which operation is inherently costly. This is a good reason to distrust a per-line gas attribution
+around memory.
+
+**What to change.** The offset is almost certainly a bug rather than a design — a scaled index, a
+hash used directly as an offset, or an unchecked arithmetic result. Bound it. If a genuinely large
+scratch region is required, do that work in a sub-call so the expansion is released when the frame
+returns,<Cite src="eip-1153" /> and if the same buffer is needed repeatedly, allocate it once and
+reuse it rather than allocating per iteration.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The cost curve**, next lesson, replaces "a term that grows with the square of the size" with the
+actual formula and the actual numbers, including the size at which the quadratic term overtakes the
+linear one and the hard ceiling that a per-transaction gas cap now puts on the whole question.
+
+**Solidity's memory map** is the convention layered on this raw array: which offsets are reserved,
+where the free-memory pointer lives, and exactly which assembly mistakes corrupt data belonging to
+code you never touched.
+
+**Copy costs** are where word granularity becomes a pricing rule rather than an inconvenience. Once
+every bulk operation is charged per 32-byte word, "just hash the whole struct" stops being free and
+becomes a number you can predict before you write it.<Cite src="eip-5656" />
+
+**Choosing a location** is the payoff for the whole module. Memory is the cheap-but-dying one;
+knowing that its charge is monotonic within a frame is what stops "put it in memory" from being an
+automatic answer.
+
+**Memory-safe assembly**, in the Yul module, depends on this lesson's mental model completely: the
+four regions a memory-safe block may touch are defined relative to a pointer that only moves one way,
+and the annotation is a promise you make about a machine with no allocator to check it.<Cite src="learnevm-memory" />

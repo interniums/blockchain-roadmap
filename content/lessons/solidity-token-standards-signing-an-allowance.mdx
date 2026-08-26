@@ -1,0 +1,343 @@
+---
+id: solidity-token-standards-signing-an-allowance
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-2612, eip-712, weird-erc20, permit2-repo, permit2-allowance-transfer-source, uniswap-permit2-docs, measured-gas-constants]
+stack: { solidity: "0.8.36" }
+---
+
+The two-transaction dance has a cost that is easy to state and hard to shake: the first transaction
+does nothing the user wanted. It writes a number so that a second transaction can read it. The user
+pays gas twice, waits twice, and confirms twice, for one swap.
+
+EIP-2612 removes the first transaction by letting the holder *sign* the allowance instead of
+sending it, so that whoever submits the real operation can install the approval in the same
+call.<Cite src="eip-2612" /> Permit2 does the same trick for the large majority of tokens that never
+implemented it.<Cite src="permit2-repo" />
+
+You already know [EIP-712 typed data](/c/eip-712-typed-data) and
+[domain separation](/c/domain-separated-hashing). This lesson is not about how the digest is built.
+It is about what changes when authorisation stops being a transaction, and what breaks when the
+token on the other side is not the token the code assumed.
+
+## What permit adds to a token
+
+Three functions, on top of ERC-20:<Cite src="eip-2612" />
+
+```solidity
+function permit(address owner, address spender, uint value, uint deadline,
+                uint8 v, bytes32 r, bytes32 s) external;
+function nonces(address owner) external view returns (uint);
+function DOMAIN_SEPARATOR() external view returns (bytes32);
+```
+
+A call to `permit` sets `allowance[owner][spender]` to `value`, increments `nonces[owner]` by one,
+and emits `Approval` — if and only if four conditions hold.<Cite src="eip-2612" /> Take them one at
+a time, because each is a distinct attack being closed.
+
+**Subgoal: bind the authorisation to a deadline.** The current block time must be less than or
+equal to `deadline`. Without it a signature is a bearer instrument with no expiry, and the
+specification's rationale is explicit about who that hurts: a relayer given a permit holds a free
+option to submit it or withhold it, and setting `deadline` to a near-future value is the
+mitigation.<Cite src="eip-2612" /> Setting it to the maximum `uint` creates permits that
+effectively never expire — which the standard permits and which you should treat as a red flag in
+review.<Cite src="eip-2612" />
+
+**Subgoal: reject the recovery failure that looks like success.** `owner` must not be the zero
+address. You know why: [`ecrecover`](/c/ecrecover) fails silently and returns the zero address for
+malformed input, so without this check a garbage signature would create an approval to spend the
+zero address's holdings — the specification calls them "zombie funds".<Cite src="eip-2612" /> This
+is the same defect the EVM hands every signature-checking contract, showing up in a standard.
+
+**Subgoal: make each signature usable once.** `nonces[owner]` before the state update must equal
+the `nonce` inside the signed message, and a successful `permit` increments it. The nonce is
+per-owner and sequential, which has a consequence people meet in production: two permits signed for
+the same owner cannot be submitted out of order, and if one is used the other is dead.
+
+**Subgoal: bind the message to this token, on this chain.** The digest is
+`keccak256(0x1901 . DOMAIN_SEPARATOR . keccak256(abi.encode(PERMIT_TYPEHASH, owner, spender, value,
+nonce, deadline)))`, with the type hash over
+`Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)` —
+which is `0x6e71edae12b1b97f4d1f60370fef10105fa2faae0126114a169c64845d6126c9`.<Cite src="eip-2612" /><Cite src="eip-712" />
+The common domain separator binds `name`, `version`, `chainId` and `verifyingContract`, so the
+signature is worthless at a different token and worthless on a different chain.<Cite src="eip-2612" />
+
+<Figure
+  caption="The nonce and the deadline sit inside the signed bytes, so whoever submits the permit can change neither."
+  alt="The six 32-byte words hashed to form the permit struct hash: the Permit type hash, then owner, spender, value, nonce and deadline."
+>
+  <ByteLayout
+    offsets
+    caption="abi.encode(PERMIT_TYPEHASH, owner, spender, value, nonce, deadline)"
+    fields={[
+      { label: 'typehash', size: 32, tone: 'accent', note: '0x6e71ed…6126c9' },
+      { label: 'owner', size: 32 },
+      { label: 'spender', size: 32 },
+      { label: 'value', size: 32 },
+      { label: 'nonce', size: 32, tone: 'warn', note: 'usable once' },
+      { label: 'deadline', size: 32, tone: 'warn', note: 'or never' },
+    ]}
+  />
+</Figure>
+
+That last one carries a caveat the specification states itself: if `DOMAIN_SEPARATOR` embeds the
+chain id and is computed **once at deployment** rather than reconstructed per call, a future chain
+split leaves the contract advertising a chain id that is no longer unique, and cross-chain replay
+becomes possible.<Cite src="eip-2612" /> A cached domain separator is a gas optimisation with a
+fork-shaped tail risk.
+
+### What the specification says permit does *not* fix
+
+Its security considerations are short and worth reading against your instincts.<Cite src="eip-2612" />
+
+- **Anyone can front-run your permit.** Another party can call `permit` before the intended
+  submitter. The spec's judgement: the end result is the same for the signer. The approval lands;
+  who paid for it is not something the signer was promised.
+- **Permits are censorable.** A relayer can simply not submit. The mitigations are a short deadline
+  and, if the signer holds ETH, submitting it themselves — which invalidates the outstanding one by
+  consuming the nonce.
+- **The ERC-20 approve race applies to `permit` as well.** It writes an absolute value into the same
+  word, so everything from the previous lesson still holds.
+
+<Misconception
+  belief="permit is the safe version of approve."
+  reality="It is the cheap version. It writes the same absolute value into the same allowance word, inherits the same race, and adds a signature that is valid until its deadline whether or not the user still wants it to be."
+  why="The two-transaction flow feels like the risky part because it is the visible part. Moving work off-chain removes gas and confirmations, not authority."
+  src="eip-2612"
+/>
+
+## The failure everyone meets: the token does not have it
+
+`permit` is an extension. The token either implements it or does not, and most deployed supply does
+not. Two shapes of failure follow, and only one of them is loud.
+
+**The token has no `permit` and reverts.** Your integration breaks visibly and you fix it. Fine.
+
+**The token has no `permit` and does not revert.** This is the one that costs money. A token with a
+permissive fallback function can absorb an unknown selector and return successfully, so a `permit`
+call appears to succeed, no allowance is written, and execution continues into the lines that assumed
+one. The weird-ERC-20 catalogue records exactly this: tokens that do not support `permit` may not
+revert, which "could lead to the execution of later lines of code in unexpected
+scenarios".<Cite src="weird-erc20" />
+
+**The token has a `permit` with different semantics.** Several well-known tokens implement a permit
+that is not EIP-2612 — DAI, RAI, GLM, STAKE, CHAI, HAKKA, USDFL and HNY are the catalogued
+ones.<Cite src="weird-erc20" /> The EIP itself documents the DAI variant in its backwards-compatibility
+section: instead of a `value` argument it takes a `bool allowed`, setting the approval to zero or to
+the maximum, and its `deadline` is called `expiry` — and that is not a cosmetic
+difference, because the parameter names are part of the EIP-712 type string and therefore part of
+the signed message.<Cite src="eip-2612" /><Cite src="eip-712" /> A signature produced for one type
+string does not verify against the other. There is also a token with DAI's ABI and different
+semantics again: expiring approvals, where `transferFrom` only works while the expiry has not
+passed.<Cite src="eip-2612" />
+
+The practical rule: **`permit` support is a per-token fact you verify against the deployed
+contract**, in the same way and for the same reason as everything else in this module. A
+`try/catch` around `permit` with a fallback to a conventional approval is the defensive shape, and
+it is not optional if your product lets a merchant configure the token.
+
+### The front-run that is harmless to the signer and fatal to your transaction
+
+Re-read the specification's first security note with an integrator's eyes rather than a user's:
+another party can always call `permit` before the intended one, and the end result is the same for
+the signer.<Cite src="eip-2612" />
+
+The same for the signer. Not the same for you.
+
+If your function is `permit(...)` followed by `transferFrom(...)` in one call, and somebody else
+submits that permit first, the nonce has already advanced when your `permit` runs. The signature no
+longer matches the expected nonce, `permit` reverts, and your entire transaction reverts with it —
+even though the allowance you needed is sitting right there, already granted.<Cite src="eip-2612" />
+Anyone can do this to any permit-using integration for the cost of one transaction, and there is no
+profit motive required; it is pure griefing.
+
+The defensive shape is to treat the permit as best-effort and the allowance as the thing you
+actually check:
+
+```solidity
+try IERC20Permit(token).permit(owner, address(this), value, deadline, v, r, s) {} catch {}
+require(IERC20(token).allowance(owner, address(this)) >= value, "no allowance");
+```
+
+Swallowing the revert is uncomfortable to write and correct here: the permit is a *means*, the
+allowance is the *requirement*, and the second line is the one that must hold. It also happens to
+absorb the silent-success tokens from the previous section, because those never wrote an allowance
+and the check catches them.
+
+## Permit2: signature approvals for tokens that never got the memo
+
+Permit2 is one deployed contract that layers signature-based authorisation over any ERC-20. The
+user grants the token allowance to Permit2 once; from then on they sign messages that Permit2
+verifies and acts on.<Cite src="permit2-repo" /><Cite src="uniswap-permit2-docs" />
+
+It is really two contracts in one, and the distinction is the thing to learn:<Cite src="permit2-repo" />
+
+**`SignatureTransfer`** handles signature-based transfers with **no allowance at all**. Permission
+to the spender lasts only for the duration of the transaction in which the one-time signature is
+spent. Its nonces are unordered and non-monotonic, so signed permits do not have to be transacted in
+any particular order — which is the direct fix for EIP-2612's sequential-nonce problem.
+
+**`AllowanceTransfer`** handles allowances with an amount, a spender and an expiry. Look at the
+storage shape, because it is a nice piece of design and you know how to read it:<Cite src="permit2-allowance-transfer-source" />
+
+```solidity
+struct PackedAllowance {
+    uint160 amount;      // type(uint160).max means unlimited
+    uint48  expiration;
+    uint48  nonce;
+}
+```
+
+160 plus 48 plus 48 is 256. The amount, the expiry and the replay counter occupy exactly one storage
+slot, so reading or writing the whole authorisation is one `SLOAD` or one `SSTORE` rather than
+three.<Cite src="measured-gas-constants" /> `uint160` is chosen because it is wide enough for any
+plausible token amount and leaves room for the two timestamps; the design is the packing lesson
+applied to a permission.
+
+The rest of the surface follows from that struct: `approve(token, spender, amount, expiration)` for
+the on-chain path, `permit(owner, PermitSingle, signature)` and a `PermitBatch` variant for the
+signed path, `lockdown(TokenSpenderPair[])` to revoke many approvals in one transaction, and
+`invalidateNonces(token, spender, newNonce)` to kill outstanding signatures.<Cite src="permit2-allowance-transfer-source" />
+Signature verification supports ERC-1271, so contract accounts can authorise the same
+way.<Cite src="permit2-repo" />
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'EIP-2612 permit', note: 'at the token' },
+    { title: 'SignatureTransfer', note: 'Permit2', tone: 'accent' },
+    { title: 'AllowanceTransfer', note: 'Permit2' },
+  ]}
+  rows={[
+    {
+      label: 'Where does the authorisation end up?',
+      cells: [
+        "In the token's own allowance word, as an absolute value.",
+        'Nowhere. It lasts only for the transaction that spends the signature.',
+        'In Permit2, as amount, expiration and nonce packed into one slot.',
+      ],
+    },
+    {
+      label: 'Must signatures be spent in order?',
+      cells: [
+        'Yes. nonces[owner] is sequential, so one unused permit kills the next.',
+        'No. Nonces are unordered and non-monotonic.',
+        'Each token and spender pair carries its own nonce, retired by invalidateNonces.',
+      ],
+    },
+    {
+      label: 'Which tokens does it cover?',
+      cells: [
+        'Only tokens that implemented it, and only where the semantics match.',
+        'Any ERC-20, once the user has approved Permit2 on it.',
+        'Any ERC-20, once the user has approved Permit2 on it.',
+      ],
+    },
+    {
+      label: 'What can it express that ERC-20 cannot?',
+      cells: [
+        'Nothing new — the same absolute value, obtained without a transaction.',
+        'A one-shot authorisation that leaves nothing behind.',
+        'A bounded, expiring permission, revocable in batch through lockdown.',
+      ],
+    },
+  ]}
+  caption="Only SignatureTransfer removes the standing value entirely; the other two relocate it."
+  alt="EIP-2612 permit, Permit2 SignatureTransfer and Permit2 AllowanceTransfer compared on where the authorisation is stored, nonce ordering, token coverage, and what each can express."
+/>
+
+### The trade, stated honestly
+
+**What you gain.** Expiring approvals, which ERC-20 cannot express. Batch revocation, which ERC-20
+cannot express. One signature covering several tokens and several spenders. A one-time transfer
+authorisation that leaves nothing behind. And an approval surface that is one audited contract
+instead of N application contracts of unknown quality.
+
+**What you pay.** The user still grants a standing token allowance — to Permit2, usually unlimited,
+because a bounded one would defeat the purpose. That allowance is subject to everything in the
+previous lesson. It is now concentrated in a single contract that a very large amount of value
+routes through, which changes the shape of the risk rather than removing it: fewer places to get it
+wrong, larger consequence if that one place is wrong.
+
+**And the authorisation surface moves to signing.** A user who has granted Permit2 an unlimited
+allowance on a token can be drained by one signature over a `PermitSingle` naming an attacker's
+address as spender. No transaction from them, no gas, no pending-transaction feedback — the same
+shift the previous lesson named, now with better ergonomics on both sides.
+
+<Misconception
+  belief="Permit2 replaces token approvals."
+  reality="It replaces per-application approvals with one approval to Permit2, plus signatures. The standing ERC-20 allowance still exists; it just points at a single contract."
+  why="The pitch is 'no more infinite approvals', and at the application layer that is true. At the token layer there is exactly one, and it is usually infinite."
+  src="permit2-repo"
+/>
+
+## Choosing, as a product decision
+
+- **The token implements EIP-2612 and you control the flow.** Use `permit`. One transaction, no
+  standing allowance, no extra contract in the trust path.
+- **The token does not, or you must support arbitrary tokens.** Permit2, with `SignatureTransfer`
+  when the operation is one-shot and `AllowanceTransfer` when the user genuinely wants a recurring,
+  bounded, expiring permission.
+- **Either way, bound the deadline.** A deadline measured in minutes turns a stolen signature into a
+  narrow window. A deadline of `type(uint256).max` turns it into a standing approval that the user
+  cannot see in any approvals dashboard, because no `Approval` event has fired yet.
+- **Never call `permit` without a fallback.** The silent-success case above is the reason.
+
+That third point deserves emphasis, because it is where the two lessons meet. An unspent permit
+signature is an approval that has not happened yet and therefore does not appear anywhere on chain.
+Revoking it is not possible directly; the only mechanism is to consume or invalidate the nonce,
+which costs a transaction — `permit` submitted by the signer for EIP-2612, or `invalidateNonces` for
+Permit2.<Cite src="eip-2612" /><Cite src="permit2-allowance-transfer-source" />
+
+<Check type="explain" concept="permit2">
+A user is phished into signing an EIP-712 message. Their wallet shows a structured view with named
+fields; they approve it. The message is a Permit2 `PermitSingle` with `amount` set to
+`type(uint160).max`, `expiration` set 30 days out, and `spender` set to an address the attacker
+controls. The user had previously granted Permit2 an unlimited USDC allowance while using a
+legitimate exchange.
+
+Say what the attacker can do, when they can do it, and what the user's options are the moment they
+realise.
+
+<Answer>
+**They can move the user's USDC, up to the whole balance, at any time in the next 30 days.** The
+chain of authority is: USDC's allowance mapping authorises Permit2 for an unlimited amount; the
+signed `PermitSingle` authorises the attacker's address as a spender inside Permit2 for
+`type(uint160).max` until the expiry. The attacker submits the permit and the transfer whenever they
+choose — including a month from now, after the user has forgotten, and including repeatedly, since
+an unlimited amount is not consumed.<Cite src="permit2-allowance-transfer-source" />
+
+**Nothing has happened on chain yet, so nothing shows up.** Until the attacker submits the permit
+there is no `Approval` event and no allowance visible inside Permit2. An approvals dashboard that
+lists what the user has granted shows one entry — the legitimate Permit2 allowance on USDC — and
+that entry is exactly what the user granted deliberately.
+
+**Their options, in order of effect.** Move the tokens: a balance the attacker cannot reach is the
+only defence that does not depend on winning a race. Then `invalidateNonces(USDC, attackerSpender,
+newNonce)` on Permit2, which retires the outstanding signature — but that is a transaction the
+attacker can front-run with the permit itself, so it is not a substitute for moving funds. Then
+`lockdown` and/or setting the USDC allowance to Permit2 back to zero, which closes the underlying
+route for everything.<Cite src="permit2-allowance-transfer-source" />
+
+**The lesson to carry into product work.** Permit2 gives the user tools that ERC-20 does not —
+expiry, batch revoke, nonce invalidation — and every one of them is a transaction the user has to
+send, in a race, after they already realise. The defence that scales is on the signing side: an
+interface that shows the spender and the amount in terms the user can act on, and a habit of short
+deadlines, so that a stolen signature ages out before it is used.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** goes back to the plain `transfer` call and asks why a correct-looking one
+reverts against USDT — the same class of problem as a token that "has" `permit` and does not.
+
+**The account-abstraction material** on the app track picks up the other end of this: session keys,
+scoped permissions and expiring authority are what Permit2 gestures at within the constraints of
+being a token-layer contract.
+
+**Signature phishing** is the security track's version of this lesson. The mechanics here — what a
+signature authorises, how long for, and what it costs to retract — are the things an incident
+runbook needs stated precisely.

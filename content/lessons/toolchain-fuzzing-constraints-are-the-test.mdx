@@ -1,0 +1,303 @@
+---
+id: toolchain-fuzzing-constraints-are-the-test
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [forge-std-repo, forge-std-stdutils-source, foundry-cheatcode-assume, foundry-testing-config, foundry-forge-testing, measured-fuzz-probe-1-7-1, measured-forge-1-7-1]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Three ways to keep a fuzzed value between 0 and 100. All three compile, all three do what their
+author intended, and all three produce a green test.
+
+```solidity
+if (x > 100) x = 100;          // clamp
+x = bound(x, 0, 100);          // forge-std
+x = x % 101;                   // modulo
+```
+
+Log every value each one actually produces over 256 runs on forge 1.7.1 with `--fuzz-seed 42`, and
+count:<Cite src="measured-fuzz-probe-1-7-1" /><Cite src="measured-forge-1-7-1" />
+
+<Matrix
+  numeric
+  corner="strategy"
+  cols={['runs', 'landed on exactly 100', 'landed on exactly 0', 'distinct values out of 101']}
+  rows={[
+    { label: 'if (x > 100) x = 100;', cells: ['256', { v: '217', tone: 'danger' }, '8', { v: '8', tone: 'danger' }] },
+    { label: 'bound(x, 0, 100)', cells: ['256', '14', '25', { v: '88', tone: 'good' }] },
+    { label: 'x % 101', cells: ['256', '13', '25', { v: '88', tone: 'good' }] },
+  ]}
+  caption="Three lines that all keep x in range, and one of them turns a 101-value sweep into eight values."
+  alt="Measured over 256 runs on forge 1.7.1 with fuzz seed 42. The clamp lands on 100 in 217 runs, on 0 in 8 runs, and sees 8 distinct values out of 101. bound lands on 100 in 14 runs, on 0 in 25, and sees 88 distinct values. Modulo lands on 100 in 13 runs, on 0 in 25, and sees 88 distinct values."
+/>
+
+The clamped test spent 217 of its 256 runs on a single value and saw eight distinct inputs in total.
+It is, to a very good approximation, `test_BoundaryIsHandled()` written in 256 copies. The other two
+swept most of the range.
+
+This lesson is about the general form of that: **your constraints are part of the specification the
+test checks, and nothing in the output tells you what they excluded.**
+
+## Clamping is not bounding
+
+The arithmetic is immediate once you look at it. `if (x > 100) x = 100;` maps every value above 100
+onto 100. Over a `uint256` domain that is all but 101 of 2^256 values — a share of the domain
+indistinguishable from all of it. If the generator were uniform, essentially 100% of runs would test
+`x == 100`.
+
+The measured figure is 217 of 256 rather than 256 of 256 only because the generator is not
+uniform: `dictionary_weight` defaults to 40 and the dictionary supplies small values, which pass
+through the clamp unchanged.<Cite src="foundry-testing-config" /><Cite src="measured-forge-1-7-1" />
+The bias you measure is therefore a *floor*. Change nothing about the test, refactor a constant out
+of the contract so the dictionary stops scraping it, and the clamped version gets
+worse.<Cite src="measured-fuzz-probe-1-7-1" />
+
+Notice also the second column of the table. Eight runs landed on zero under clamping, against 25
+under `bound`. Clamping does not only over-sample the maximum; it under-samples the *other*
+boundary, because nothing in it moves values toward `min`. On a range whose lower end is where the
+interesting behaviour lives — a fee that behaves differently at zero, a share calculation that
+divides by a supply that can be empty — the clamp is simultaneously spending almost everything on one
+end and starving the other.<Cite src="measured-fuzz-probe-1-7-1" />
+
+`bound` avoids both by wrapping rather than saturating, and its two special-case branches are what
+keep the endpoints reachable without making them dominant — `0, 1, 2, 3` map to
+`min, min+1, min+2, min+3`, with the source comment stating the intent as ensuring coverage of the
+min and max values.<Cite src="forge-std-stdutils-source" /><Cite src="forge-std-repo" /> Hence the 14
+hits on 100 and 25 on 0: the boundaries are over-represented relative to the interior, deliberately
+and by a factor of about ten, rather than by a factor of about
+thirty.<Cite src="measured-fuzz-probe-1-7-1" />
+
+Modulo measured indistinguishably from `bound` here — 88 distinct values, 13 hits on the
+maximum.<Cite src="measured-fuzz-probe-1-7-1" /> It is cheaper and it is not biased in the way
+clamping is. Two things keep it from being the default recommendation. It discards the boundary
+structure `bound` preserves, so `x % 101` maps `type(uint256).max` to an arbitrary interior value
+rather than to the maximum. And `min + x % (max - min + 1)` written by hand overflows when the range
+is the full type, which `bound` handles by construction and which its `require(min <= max, ...)`
+guard makes loud rather than silent.<Cite src="forge-std-stdutils-source" />
+
+<Misconception
+  belief="`if (x > max) x = max;` is equivalent to bound — both keep x in range."
+  reality="Clamping concentrates almost the entire input domain on a single value. Measured over 256 runs on a 0-to-100 range, it produced 8 distinct inputs against bound's 88, with 217 runs landing on the maximum."
+  why="Both descriptions really are 'keep x in range', and the clamped version reads as more obvious code with fewer dependencies."
+  src="forge-std-repo"
+/>
+
+<Aside kind="note">
+The same failure appears with `assume` in place of the clamp, for a different reason: a broad
+`vm.assume` range collapses onto the endpoints because the dictionary is what survives the filter.
+Three different mechanisms — saturating, filtering, and the dictionary — converge on the same
+outcome, which is a test that reports 256 runs and examines a handful of values. Whenever a fuzz test
+looks suspiciously fast or its `μ` and `~` are identical, this is the first thing to check.
+</Aside>
+
+## Every constraint is a claim about scope
+
+Now the general problem, which survives writing all your constraints correctly.
+
+A constraint does not make the test safer. It makes the test *smaller*. `bound(amount, 1, 1e18)` is a
+statement that this property is being checked for amounts up to one token and for no larger amount.
+That statement may be exactly right — perhaps the contract reverts above that, and there is a
+separate test for the revert. It may also be the reason the overflow at `type(uint256).max` has been
+sitting there for a year.
+
+Three constraints that are individually reasonable and jointly hide a real class of bug:
+
+- `amount = bound(amount, 1, 1e18)` — never sees the arithmetic edge of the type.
+- `vm.assume(to != address(0))` — never sees the burn path, which in many tokens is a genuinely
+  different code path with a genuinely different accounting rule.
+- `vm.assume(recipient != sender)` — never sees self-transfer, which is where balance updates written
+  as `balances[from] -= a; balances[to] += a;` behave differently from
+  `balances[from] = balances[from] - a;` and where several real token bugs have lived.
+
+None of those lines is wrong. Each of them is a decision about what is out of scope, taken silently,
+usually to make a failing test pass. And the documentation's own framing pushes in the same
+direction: `bound` is recommended because it is efficient, which is a statement about the search and
+not about whether the range you chose is the right one.<Cite src="foundry-cheatcode-assume" /> The
+tool has no opinion on your bounds and no way to form one.
+
+<Misconception
+  belief="Using bound instead of assume makes a fuzz test rigorous."
+  reality="It makes the search efficient. Both cheatcodes narrow the domain, and a bound that excludes the region where the bug lives hides it exactly as thoroughly as an assume would — while producing a full 256 runs and no warning."
+  why="The efficiency argument for bound is the one that gets taught, so 'used bound' reads as 'did fuzzing properly' rather than as 'chose a range'."
+  src="foundry-cheatcode-assume"
+/>
+
+<Aside kind="stop">
+The structural problem is that **the constraints are written by the person who wrote the code**,
+usually in the same sitting, and usually in response to a failure they judged uninteresting. That is
+the same mind, in the same mood, drawing the boundary of the search and the boundary of the
+implementation. When they disagree, the test does not tell you; it goes green.
+
+This is not a hypothetical style complaint. It is the reason a fuzz test's constraints deserve at
+least as much review attention as its assertion, and the reason "we fuzz that" is a much weaker claim
+than it sounds when the person saying it also chose the domain.
+</Aside>
+
+### Reading constraints as a reviewer
+
+Four questions, in order. They take about ninety seconds on a test you have never seen.
+
+1. **What is the declared domain?** Read the parameter types. `uint256` claims everything;
+   `uint16` has already narrowed to 65,536 values before a single constraint runs.
+2. **What does each constraint remove?** Write the surviving interval down. Do it literally — the
+   act of writing `[1, 1e18]` next to a `uint256` parameter is what makes the exclusion visible.
+3. **Where would the bug you fear live?** If the answer is outside the surviving interval, the test
+   cannot find it and the green result means nothing about it.
+4. **Is the assertion still non-trivial inside the surviving interval?** Constraints and assertions
+   interact. Narrow the domain enough and many assertions become tautologies.
+
+That fourth question is the one people skip, and it is the one that catches the worst tests.
+
+## Fixtures: enumerate instead of hoping
+
+Everything so far has been about sampling. The fix for "the value I care about might not get tried"
+is to stop sampling for that value and enumerate it.
+
+A **fixture** is a dataset attached to a parameter *by name*. It is a storage array prefixed with
+`fixture` followed by the dataset name, or a function named the same way, and the fuzzed parameter
+whose name matches it draws from it.<Cite src="foundry-forge-testing" /> A test whose name begins
+with `table` is then executed once per entry rather than
+sampled.<Cite src="foundry-forge-testing" /><Cite src="foundry-testing-config" />
+
+```solidity
+contract TableTest is Test {
+    Fees f;
+    uint256[] public fixtureAmount = [0, 1, 9_999, 10_000, 10_001, type(uint128).max];
+
+    function setUp() public { f = new Fees(); }
+
+    function tableFeeConserved(uint256 amount) public view {
+        assertEq(f.net(amount) + f.feeOn(amount), amount);
+    }
+}
+```
+
+The parameter is `amount`; the fixture is `fixtureAmount`. On forge 1.7.1 that runs six times, once
+per entry, in order:<Cite src="measured-fuzz-probe-1-7-1" />
+
+```text
+[PASS] tableFeeConserved(uint256) (runs: 6, μ: 12200, ~: 12200)
+```
+
+`runs: 6` — the run count is now the size of your dataset, not a sampling budget. This is
+deterministic enumeration. Nothing about it depends on a seed, a dictionary, or luck.
+
+That makes it the right home for the values a domain expert knows matter: zero, one wei, the exact
+threshold in a fee table, the value one below and one above a tier boundary, the maximum of the type
+the contract will actually receive. Those get tried by construction.
+
+### The part that is easy to miss
+
+A fixture is not confined to `table` tests. On forge 1.7.1, an ordinary `testFuzz_` function whose
+parameter name matches a fixture draws from it too — measured over 256 runs against
+`fixtureAmount = [11, 22, 33]`, the three fixture values accounted for 72 runs, roughly 28% of the
+campaign, with the remaining runs drawn normally and 146 distinct values seen
+overall.<Cite src="measured-fuzz-probe-1-7-1" />
+
+So the two mechanisms compose, and the practical pattern is:
+
+- **`table` test** when you want exactly your list and nothing else — a specification table, a set of
+  known-bad inputs from a past incident, a compatibility matrix.
+- **`testFuzz_` plus a fixture** when you want the random sweep *and* a guarantee that the nasty
+  values are in it.
+
+The second is usually what you want for a property, and it directly repairs the failure mode from
+lesson two: you are no longer relying on the dictionary to have scraped the constant that matters,
+because you have named it yourself.
+
+<Figure
+  caption="One named array serves both engines — as the whole dataset of a table test, and as a guaranteed share of a fuzz campaign."
+  alt="A fixtureAmount array is matched by name to a parameter called amount; a table test then runs once per entry, while an ordinary fuzz test mixes the same entries into its 256 sampled runs."
+>
+  <Flow
+    nodes={[
+      { id: 'fx', label: 'fixtureAmount', note: 'a named array', col: 0, tone: 'accent' },
+      { id: 'p', label: 'parameter amount', note: 'matched by name', col: 1 },
+      { id: 'tbl', label: 'table test', note: 'runs: 6, once per entry', col: 2, tone: 'good' },
+      { id: 'fz', label: 'testFuzz test', note: 'about 28% of 256 runs', col: 2 },
+    ]}
+  />
+</Figure>
+
+<Check type="explain" concept="overconstraining-hazard">
+Take the reflection prompt for this module seriously for one test. Here is an ERC-4626-style vault
+property from a real-looking suite:
+
+```solidity
+function testFuzz_DepositThenRedeemNeverProfits(uint256 assets) public {
+    assets = bound(assets, 1e6, 1_000_000e18);
+    vm.startPrank(alice);
+    uint256 shares = vault.deposit(assets, alice);
+    uint256 back   = vault.redeem(shares, alice, alice);
+    vm.stopPrank();
+    assertLe(back, assets);
+}
+```
+
+Draw the domain, shade what is tested, and say what fraction of the parameter's declared domain is
+left untested — and whether the bug you would most fear in this contract lives in it.
+
+<Answer>
+**Shaded region: `[1e6, 1e24]` out of `[0, 2^256 - 1]`. Untested fraction: about
+1 − 10^24 / 1.16 × 10^77, which is 1 to within about fifty decimal places.** That figure is not the
+useful part, though, because most of the excluded domain is amounts no token will ever have. The
+useful part is *which specific excluded values matter*.
+
+**Three regions are excluded and each one is a known bug class.**
+
+*Below `1e6`.* You already know the ERC-4626 inflation case: the danger is a deposit that rounds down
+to zero shares against a manipulated `totalAssets`. That is a small-numerator problem, and the lower
+bound of `1e6` is precisely the region where it lives. Whoever wrote `1e6` almost certainly wrote it
+because small amounts were producing failures — which is to say, the constraint was added to silence
+the bug it was meant to find.
+
+*Zero itself.* `deposit(0)` is a distinct code path in most vaults: it may revert, may mint zero
+shares, may emit an event with a zero amount that a downstream indexer chokes on. The bound excludes
+it entirely.
+
+*Above `1e24`.* The overflow edge of `assets * totalSupply / totalAssets`. Whether it is reachable
+depends on the real supply cap, but the test is not the place that decision gets recorded.
+
+**The assertion is also weaker than it looks inside the shaded region.** `assertLe(back, assets)`
+permits `back == 0`. A vault that returns nothing at all passes this property for every input. The
+property that would have caught the rounding attack is not "never profits" but "loses at most one
+wei", or better, "loses at most one wei and `shares > 0`" — and once you write the second clause you
+have a test that fails on the excluded region and forces the bound to be justified rather than
+assumed.
+
+**What to actually change.**
+
+1. Split into two properties. `bound(assets, 1, type(uint96).max)` for the round-trip loss bound, and
+   a separate test for `deposit(0)` with an explicit expectation.
+2. Tighten the assertion to `assertLe(assets - back, 1)` plus `assertGt(shares, 0)`. Now the
+   constraint cannot hide the bug by making the assertion vacuous.
+3. Add `uint256[] public fixtureAssets = [0, 1, 2, 1e6 - 1, 1e6, type(uint96).max];` so those points
+   are tried by construction rather than by whether the dictionary scraped
+   them.<Cite src="foundry-forge-testing" /><Cite src="measured-fuzz-probe-1-7-1" />
+4. Write down, in a comment above the bound, *why* the lower bound is where it is. If you cannot,
+   that is the finding.
+
+**The general lesson.** The most dangerous constraint in a fuzz test is the one that was added to
+make a failing test pass. It is indistinguishable in the source from one that was added because the
+domain genuinely stops there, and it is the reason step four is not optional.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Immediately, in review.** You now have a ninety-second procedure for a fuzz test you have never
+seen, and a measured reason to run it: the difference between eight distinct inputs and eighty-eight
+is one line of constraint, and no output distinguishes them.
+
+**In the next lesson.** Everything so far has assumed the test either passes or fails. It does
+neither reliably: without a pinned seed the same commit can go red today and green tomorrow, and both
+results are correct. Lesson five is about the counterexample that appears, where forge writes it, and
+how to turn a probabilistic finding into a permanent one.
+
+**When you write the constraints on an invariant handler.** The same reasoning applies with much
+higher stakes, because a handler's constraints shape not one call but every sequence the campaign can
+construct. A handler that bounds a deposit to a comfortable range prevents the campaign from ever
+reaching the accounting state where the bug lives, over hundreds of thousands of
+calls.<Cite src="foundry-testing-config" />

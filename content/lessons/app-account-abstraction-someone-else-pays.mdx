@@ -1,0 +1,422 @@
+---
+id: app-account-abstraction-someone-else-pays
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-4337, erc-4337-docs, ottersec-paymasters, erc-7562, measured-gas-constants]
+stack: {}
+---
+
+A user installs your app, connects nothing, funds nothing, and completes their first on-chain action
+forty seconds later. They have never held ETH. They do not know what ETH is.
+
+Somebody paid for that. In ERC-4337 the somebody is a contract you deployed, holding a deposit you
+funded, running validation logic you wrote. The user's experience is "gasless". Your experience is a
+contract that spends real money according to rules you specified, at a rate an adversary chooses.
+
+This lesson is that contract: the mechanism first, then the three ways it gets emptied, then the
+arithmetic that tells you whether your rules are actually rules.
+
+## The mechanism
+
+A paymaster is named inside the UserOperation's `paymasterAndData` field. The documentation's summary
+of the role is two lines: paymasters sponsor gas for accounts under programmable conditions, and must
+stake and deposit ETH into the EntryPoint.<Cite src="erc-4337-docs" />
+
+During the verification loop, the EntryPoint asks it a question:
+
+```solidity
+function validatePaymasterUserOp(
+    PackedUserOperation calldata userOp,
+    bytes32 userOpHash,
+    uint256 maxCost
+) external returns (bytes memory context, uint256 validationData);
+```
+
+<Cite src="eip-4337" />
+
+`maxCost` is the number to stare at. It is the most this operation can cost, computed from the gas
+limits and fee fields in the UserOperation. Returning without reverting is a commitment to cover it.
+`validationData` carries the same packed authoriser-plus-time-window word an account
+returns.<Cite src="eip-4337" /> `context` is an optional blob handed back to you after execution.
+
+If you returned a context, the EntryPoint calls you again after the main execution call:
+
+```solidity
+function postOp(
+    PostOpMode mode,
+    bytes calldata context,
+    uint256 actualGasCost,
+    uint256 actualUserOpFeePerGas
+) external;
+
+enum PostOpMode {
+    opSucceeded, // UserOperation succeeded
+    opReverted   // UserOperation reverted. paymaster still has to pay for gas.
+}
+```
+
+<Cite src="eip-4337" />
+
+That comment in the enum is the specification telling you the deal in its own words, and it is the
+single most important sentence in this lesson. **Paymasters are charged even when UserOperations
+revert.**<Cite src="eip-4337" />
+
+You are not sponsoring successful actions. You are sponsoring *attempts*.
+
+<Figure
+  caption="The commitment is made in the verification loop, before anything runs — so both branches end at the same debit."
+  alt="A paymaster's validatePaymasterUserOp accepts maxCost, the operation then either succeeds or reverts, postOp is called with the corresponding mode, and the paymaster's deposit is debited on both paths."
+>
+  <Flow
+    nodes={[
+      { id: 'v', label: 'validatePaymasterUserOp', note: 'returning at all accepts maxCost', col: 0, tone: 'accent' },
+      { id: 'ok', label: 'the call succeeds', col: 1, tone: 'good' },
+      { id: 'rev', label: 'the call reverts', col: 1, tone: 'danger' },
+      { id: 'po', label: 'postOp(mode)', note: 'opSucceeded / opReverted', col: 2 },
+      { id: 'debit', label: 'deposit debited', note: 'the bundler is paid', col: 3, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'v', to: 'ok' },
+      { from: 'v', to: 'rev' },
+      { from: 'ok', to: 'po' },
+      { from: 'rev', to: 'po' },
+      { from: 'po', to: 'debit' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="A paymaster is a UX feature — a toggle that makes onboarding smoother."
+  reality="It is a contract that spends ETH on every attempt its validation function accepts, including attempts that revert. The validation function is the entire security model, and it is written by you."
+  why="It arrives in product conversations as 'gasless onboarding', which sounds like a setting rather than a spending endpoint with attacker-controlled call patterns."
+  src="ottersec-paymasters"
+/>
+
+## Two gas budgets of its own
+
+The paymaster has its own metered slices, separate from the account's:
+`paymasterVerificationGasLimit` for its validation and `paymasterPostOpGasLimit` for its post-operation
+hook.<Cite src="eip-4337" /> Both are fields in the UserOperation — which is to say, both are numbers
+chosen by the party submitting the operation, not by you.
+
+Hold that next to what you know about
+[a transaction's gas limit versus what it uses](/c/tx-gas-limit-vs-used). In ordinary transactions the
+person choosing the limit is the person paying, so a bad choice punishes only them. Here those are
+different people. Someone else picks the ceiling; your deposit absorbs the consequences.
+
+## Drain one: sponsoring anything
+
+The simplest failure needs no cleverness at all.
+
+A paymaster whose `validatePaymasterUserOp` returns success unconditionally — or on a condition an
+attacker satisfies trivially, like "the sender is a smart account" or "the call is to our contract" —
+will pay for every operation that names it. An attacker does not need a bug. They submit valid,
+expensive, sponsored operations in a loop until the deposit reaches zero.
+
+Nothing in the trace looks like an attack. Every operation is well-formed, correctly signed by an
+account the attacker controls, and accepted by your rules. Your deposit goes to bundlers, who did
+nothing wrong either.
+
+The rate is calculable, which is what makes this a design question rather than a fear:
+
+```text
+loss per hour  =  maxCost you accept
+                × operations per block a bundler will carry for one sender
+                × blocks per hour
+```
+
+The middle term is not zero and not unbounded — ERC-7562 caps a single sender at
+`SAME_SENDER_MEMPOOL_COUNT` = 4 operations in the mempool, and an unstaked entity at
+`SAME_UNSTAKED_ENTITY_MEMPOOL_COUNT` = 10.<Cite src="erc-7562" /> Those are mempool quotas per
+bundler, not a global rate limit, and an attacker with many sender addresses multiplies straight
+through the first one. Treat the quotas as friction, never as your control.
+
+<Aside kind="warn">
+The reflection prompt for this module asks you to compute the maximum your paymaster can lose in one
+hour assuming every rule you wrote is respected and every sponsored user is an attacker. If your
+scoping rules do not let you compute that number, you have written preferences, not rules. The
+formula above is the whole exercise; the only hard part is knowing your own `maxCost` ceiling, and if
+you do not cap `callGasLimit` yourself, you do not have one.
+</Aside>
+
+## Drain two: the penalty you did not know you were paying
+
+This one is a genuinely non-obvious mechanic, and it is the first attack OtterSec documents.
+
+Recall the rule from the first lesson: a penalty of 10% (`UNUSED_GAS_PENALTY_PERCENT`) applies to the
+amounts of `callGasLimit` and `paymasterPostOpGasLimit` left **unused**, when the unused remainder is
+at least 40,000 (`PENALTY_GAS_THRESHOLD`).<Cite src="eip-4337" />
+
+OtterSec's finding is that paymaster implementations frequently do not model it. In their words, the
+code does not account for gas penalties: the actual gas charged to the paymaster includes not just the
+gas used, but also any penalties incurred from differences between the execution gas limit and actual
+execution gas.<Cite src="ottersec-paymasters" /> The exploitation is direct — a malicious actor sets
+an artificially high gas limit to trigger the penalty.<Cite src="ottersec-paymasters" />
+
+### Worked example: where the shortfall comes from
+
+An ERC-20 paymaster charges the user tokens equal to the gas the operation consumed, and pays the
+EntryPoint in ETH. Trace one operation.
+
+**Subgoal 1 — write down what the paymaster believes it owes.** Its accounting is built on
+`actualGasCost`, the figure handed to `postOp`.<Cite src="eip-4337" /> It converts that to tokens at
+its own rate and takes them from the user. In its ledger, revenue equals cost.
+
+**Subgoal 2 — write down what the EntryPoint actually debits.** The debit is the gas consumed *plus*
+the penalty on unused `callGasLimit` and `paymasterPostOpGasLimit` above the
+threshold.<Cite src="eip-4337" /> The penalty is not a separate invoice; it is part of what the
+paymaster's deposit funds.
+
+**Subgoal 3 — identify who controls the gap.** The gap is 10% of (limit − used) whenever that
+difference is at least 40,000. `callGasLimit` is a UserOperation field. The submitter picks it. A
+sponsored operation that genuinely needs 30,000 gas can declare a limit of 1,030,000 and leave
+1,000,000 unused, of which 100,000 gas is penalty.
+
+**Subgoal 4 — price it.** At a modest 1 gwei effective fee, 100,000 penalty gas is 0.0001 ETH per
+operation that the paymaster pays and does not recover. The user was charged for 30,000. Repeat.
+
+**Subgoal 5 — name the fix and its cost.** Either cap the gas limits your validation will accept —
+read `callGasLimit` and `paymasterPostOpGasLimit` out of the operation and reject anything above a
+ceiling you chose — or include the worst-case penalty in the amount you collect up front. The first
+is better: it makes the exposure a number you set, and a rejected operation costs you nothing at all.
+
+<Misconception
+  belief="Over-estimating gas is harmless — unused gas is refunded."
+  reality="That is true for ordinary transactions and false inside a UserOperation. A tenth of the unused callGasLimit above a 40,000 threshold is charged, by design, to stop operations from squatting on bundle space."
+  why="'Unused gas is not charged' is one of the first solid facts you learn about Ethereum, and it holds everywhere except here."
+  src="eip-4337"
+/>
+
+## Drain three: charging after execution
+
+The third failure is the most severe of the three, and it is structural rather than arithmetic.
+
+Two patterns exist for an ERC-20 paymaster. **Pre-payment with refund**: the user pre-approves and
+prepays the maximum cost, and gets the difference back. **Post-execution charging**: the user bundles
+the token approval into the same UserOperation, which removes the need for a separate pre-approval —
+better UX, and the reason the pattern is popular.<Cite src="ottersec-paymasters" />
+
+The second pattern is exploitable. An attacker can approve the required token allowance during
+simulation to pass validation, then revoke the allowance just before the UserOperation is
+submitted.<Cite src="ottersec-paymasters" /> By the time `postOp` runs and tries to pull tokens, there
+is nothing to pull.
+
+Now apply what the previous lesson established about the two loops. The payment guarantee the bundler
+relies on was settled in the verification loop. So: even when `postOp()` fails, the EntryPoint will
+still complete the execution and pay the bundler who submitted it — and that payment comes from the
+paymaster's deposit.<Cite src="ottersec-paymasters" /> The paymaster has paid ETH and collected
+nothing.
+
+OtterSec's recommendation is blunt, and it is the one to internalise: always collect full payment
+during validation, not after execution; the most secure approach is to require upfront pre-funding,
+even though it may temporarily lock more user funds.<Cite src="ottersec-paymasters" />
+
+Note what that costs. The safe pattern is the one with the worse onboarding story — a separate
+approval, more locked funds, an extra step. The insecure pattern exists because it is the nicer
+product. That tension is the actual decision, and it should be made deliberately rather than by
+copying whichever example you found first.
+
+<Matrix
+  corner="Drain"
+  cols={['What the attacker does', 'What closes it']}
+  rows={[
+    {
+      label: 'Sponsoring anything',
+      cells: [
+        'Submits well-formed, expensive, sponsored operations in a loop',
+        'Scope sender, target and selector — and know the maxCost you accept',
+      ],
+    },
+    {
+      label: 'The unused-gas penalty',
+      cells: [
+        'Sets an artificially high gas limit to trigger the penalty',
+        'Reject callGasLimit and paymasterPostOpGasLimit above a ceiling you set',
+      ],
+    },
+    {
+      label: 'Charging after execution',
+      cells: [
+        'Approves the tokens during simulation, revokes before submission',
+        'Collect full payment during validation, never after execution',
+      ],
+    },
+  ]}
+  caption="None of the three needs a bug: each one is your own validation function saying yes."
+  alt="Three ways a paymaster's deposit leaves — sponsoring anything, the unused-gas penalty, and charging after execution — each with the attacker's move and the constraint that closes it."
+/>
+
+## Why validation cannot check what you want it to check
+
+At this point the obvious instinct is to write better rules. "Sponsor at most three operations per
+account per hour." "Only sponsor if this user's on-chain reputation score is above X."
+
+Neither is expressible in the validation phase as written, and the reason is the ERC-7562 fence from
+the first lesson.
+
+**You cannot read the clock.** `TIMESTAMP` is on the OP-011 banned opcode list, along with `NUMBER`,
+`BASEFEE`, `GASPRICE`, `ORIGIN`, `COINBASE` and the rest.<Cite src="erc-7562" /> "Per hour" has no
+in-validation expression. What you have instead is the `validAfter`/`validUntil` window in the
+returned `validationData`, which the EntryPoint checks for you.<Cite src="eip-4337" />
+
+**You cannot freely read other contracts.** A staked paymaster may access its own storage, associated
+storage in non-entity contracts, and read-only storage of any non-entity contract; an unstaked one may
+not.<Cite src="erc-7562" /> Reputation-score lookups against a third-party registry are exactly the
+shape the rules restrict.
+
+**You cannot call an address without code.** `EXTCODE*` and `*CALL` against a codeless address are
+forbidden during validation by OP-041.<Cite src="erc-7562" />
+
+**And counting costs storage.** A per-account counter is an `SSTORE` in the validation phase. On the
+measurements taken for this course, a non-zero to non-zero `SSTORE` is 2,900 gas plus 2,100 when the
+slot is cold, and a cold `SLOAD` is 2,100.<Cite src="measured-gas-constants" /> Every sponsored
+operation pays that, on top of everything else, out of the deposit you are trying to protect.
+
+So real paymasters take one of two roads, and both have a cost worth naming.
+
+**Sign off-chain.** A backend service decides whether to sponsor, signs an approval over the
+operation's hash, and the paymaster's validation reduces to a signature check against a known key.
+This is expressive — your backend can apply any policy at all, including rate limits and reputation —
+and it moves the spending decision into a web service. Your signing endpoint is now the thing that
+authorises spending, so it inherits every property of a spending endpoint: it needs authentication,
+rate limiting, monitoring, and a key that is not in an environment variable on a laptop. You have not
+removed the risk; you have moved it somewhere your existing tooling can see it, which is usually the
+right trade as long as you say so out loud.
+
+**Stake and use on-chain state.** Accept the stake requirement and the storage rules and enforce what
+you can enforce inside them. Narrower, cheaper to reason about, and constrained by what ERC-7562
+permits.
+
+<Misconception
+  belief="Our paymaster is safe because a backend signature is required."
+  reality="It relocates the policy rather than enforcing one. The paymaster now pays for anything your signer signs, so the signing service is the spending endpoint — and a signer that stamps requests without checking sender, target, selector and gas ceiling reproduces the permissive paymaster with more steps."
+  why="A signature feels like a security control. It is an authentication mechanism; the authorisation still has to be a rule somebody wrote."
+  src="ottersec-paymasters"
+/>
+
+## The failure that is not a drain
+
+There is a fourth outcome worth naming, because it takes the paymaster off the air without costing a
+single wei.
+
+Bundlers score the entities a UserOperation names. The specification's stated policy is that an entity
+causing invalidation of a large number of UserOperations in the mempool is throttled down, or
+completely banned for a period.<Cite src="eip-4337" /> A throttled entity is limited to
+`THROTTLED_ENTITY_MEMPOOL_COUNT` = 4 operations in the mempool, and an unstaked entity to
+`SAME_UNSTAKED_ENTITY_MEMPOOL_COUNT` = 10.<Cite src="erc-7562" /> The rules are careful about
+attribution — EREP-015 says a paymaster should not have its `opsSeen` incremented because of a failure
+of the factory or the account<Cite src="erc-7562" /> — but careful attribution is not the same as no
+attribution.
+
+So a paymaster whose validation reverts often, for any reason, degrades its own standing with each
+bundler independently. There is no on-chain record of this, no event, no balance change. Sponsorship
+simply starts working less often, for some users, on some bundlers. Build the observability for it
+before you need it: track your accepted-versus-submitted ratio per bundler endpoint, because that
+ratio is the only view you get of a score you cannot query.
+
+## The scoping list
+
+Every dimension below is one you can constrain, and each one you leave open is a term in the loss
+formula. This is the same discipline as
+[naming a capability rather than a role](/c/capability-not-role) — the question is not who the user is
+but what your money is allowed to do.
+
+- **Sender.** An allowlist, a proof of prior interaction, or a signature from your backend. "Any
+  address" means "any number of addresses".
+- **Target and selector.** The most valuable single constraint, and the cheapest to check: the target
+  contract must be yours and the first four bytes of the inner calldata must be a selector you chose.
+- **Calldata shape beyond the selector.** A sponsored `mint(to)` where `to` is unconstrained sponsors
+  minting to anyone.
+- **Gas ceilings.** Reject `callGasLimit` and `paymasterPostOpGasLimit` above a value you set. Without
+  this, drain two is open and your `maxCost` is whatever the submitter felt like.
+- **Value.** Sponsor gas, not value transfer, unless value transfer is the product.
+- **Rate per account per period.** Expressible as an on-chain counter (with the storage costs above)
+  or as backend policy behind a signature.
+- **Expiry.** Use the `validUntil` half of `validationData`; it is free and it is enforced by the
+  EntryPoint.<Cite src="eip-4337" />
+- **Chain.** The `userOpHash` binds to `chainid` already, but your backend's policy should too.
+
+<Check type="spot-bug" concept="paymaster-risk">
+Review this paymaster. It is meant to sponsor the first action of new users of one game contract, and
+it is currently deployed with 4 ETH of deposit at the EntryPoint. Name every way its deposit leaves,
+ranked by how fast.
+
+```solidity
+contract GamePaymaster {
+    address public constant GAME = 0x00000000000000000000000000000000000000A1;
+    address public immutable entryPoint;
+    mapping(address => bool) public sponsored;
+
+    function validatePaymasterUserOp(
+        PackedUserOperation calldata userOp,
+        bytes32,
+        uint256
+    ) external returns (bytes memory context, uint256 validationData) {
+        require(msg.sender == entryPoint, "not entrypoint");
+        address target = address(bytes20(userOp.callData[16:36]));
+        require(target == GAME, "wrong target");
+        require(!sponsored[userOp.sender], "already sponsored");
+        sponsored[userOp.sender] = true;
+        return ("", 0);
+    }
+}
+```
+
+<Answer>
+**Fastest: unbounded gas limits, so `maxCost` is whatever the attacker declares.** The third parameter
+of `validatePaymasterUserOp` is `maxCost` and this implementation does not even name it, let alone cap
+it.<Cite src="eip-4337" /> Nothing reads `callGasLimit`. An attacker generates fresh sender addresses
+— each one passes the `sponsored` check exactly once, which is the entire intended defence — and
+declares an enormous `callGasLimit`. Each operation costs the deposit its real gas *plus* 10% of the
+unused remainder above the 40,000 threshold.<Cite src="eip-4337" /><Cite src="ottersec-paymasters" />
+Address generation is free. The one-sponsorship-per-address rule bounds nothing.
+
+**Second: the selector is never checked, only the target.** The code extracts a target from a fixed
+calldata offset and compares it to `GAME`. Any function on the game contract is sponsored, including
+whichever one is most expensive, and including any function added by a future upgrade. Constrain the
+selector, not just the address.
+
+**Third: the calldata offset is an assumption, not a parse.** `userOp.callData[16:36]` assumes one
+specific account implementation's encoding of an `execute` call. A different account implementation
+lays those bytes out differently, so the value read as "target" may be an argument, a length prefix,
+or padding — and an attacker who wants `target == GAME` to be true while calling something else only
+has to pick an account whose encoding puts the right twenty bytes at offset 16. Decode the call
+properly or restrict which account implementations you sponsor.
+
+**Fourth: no expiry.** `validationData` is returned as `0`, meaning valid forever. A campaign that was
+supposed to run for a launch weekend is still sponsoring in two years. `validUntil` costs
+nothing.<Cite src="eip-4337" />
+
+**Fifth, and structural: the `sponsored` write happens during validation.** That is an `SSTORE` on the
+paymaster's own storage, which is an access a **staked** paymaster is permitted — a staked paymaster or
+factory may access its own storage, an unstaked one may not.<Cite src="erc-7562" /> It also means every
+sponsored operation pays roughly 2,900 to 5,000 gas for the bookkeeping, depending on whether the slot
+is cold.<Cite src="measured-gas-constants" /> That is a cost, not a bug, but it belongs in the loss
+arithmetic — and if this paymaster is unstaked, it is not a cost but a rejection.
+
+**What is right about it.** The EntryPoint check on the first line is correct and non-negotiable, and
+scoping to a single target contract is the right instinct — it is simply implemented against an
+assumption rather than a parse, and left without the other four constraints.
+
+**The number the author could not compute.** With unbounded gas limits there is no finite answer to
+"what can this lose in an hour". That is the tell. A scoped paymaster's worst hour is arithmetic; an
+unscoped one's is a function of how bored the attacker is.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The practice exercises for this module** are the two halves of what you just read: build a paymaster
+scoped to a single contract method and prove sponsorship is refused for anything else, then deploy a
+permissive one on Anvil and drain it from an unrelated account. Do the second one first. The drain
+takes about ten lines and it changes how the first one feels.
+
+**The next lesson** puts the paymaster in the other architecture. A 7702-delegated EOA can be
+sponsored by the same paymaster through the same EntryPoint — the economics you just learned do not
+change when the account's address stops changing.
+
+**The session-key module** is the same problem with a different budget. A session key is a scoped
+authority over the user's funds; a paymaster is a scoped authority over yours. Both are secured by the
+same act: writing down what the rule permits, then computing the worst case it allows.

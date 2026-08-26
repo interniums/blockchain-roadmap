@@ -1,0 +1,405 @@
+---
+id: protocol-client-architecture-a-slot-second-by-second
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [consensus-specs-mainnet-config-v161, consensus-specs-beacon-chain-v161, consensus-specs-validator-v161, consensus-specs-mainnet-preset-phase0-v161, consensus-specs-mainnet-preset-altair-v161, fork-choice-spec, engine-api-paris, ethereum-org-attestations, rig-attestation-timings, eip-7773, eip-7782, lighthouse-book, lighthouse-slashing-protection, lighthouse-doppelganger, prysm-docs, eip-3076]
+stack: {}
+---
+
+A validator's dashboard shows a missed **head vote** for slot 12,884,301. Not a missed attestation — the
+attestation went out, on time, and got included. The source and target votes were correct and paid. Only
+the head vote was wrong.
+
+Pull up the block explorer for that slot and there is a block. It exists, it is canonical, it has been
+finalised for hours. The validator voted for its parent instead.
+
+Nothing malfunctioned. The block arrived at 4.6 seconds into the slot, and the deadline for deciding what
+the head was had passed at 3.999. This lesson is about the deadlines inside a slot, where they come from
+in the specification, and why "twelve seconds" is the least important number in the structure.
+
+## The slot is a schedule, not a duration
+
+The mainnet configuration sets `SLOT_DURATION_MS` to 12,000 — twelve seconds — and the phase0 preset sets
+`SLOTS_PER_EPOCH` to 32, making an epoch 384 seconds, about six and a half
+minutes.<Cite src="consensus-specs-mainnet-config-v161" /><Cite src="consensus-specs-mainnet-preset-phase0-v161" />
+
+Both of those are true and neither tells you how the slot behaves. What governs behaviour is a set of
+deadlines *inside* the slot, and the way the specification expresses them has changed in a way worth
+noticing.
+
+The current scheme is basis points. `BASIS_POINTS` is 10,000, and a helper converts a basis-point figure
+into milliseconds:<Cite src="fork-choice-spec" />
+
+```python
+def get_slot_component_duration_ms(basis_points: uint64) -> uint64:
+    """
+    Calculate the duration of a slot component in milliseconds.
+    """
+    return basis_points * SLOT_DURATION_MS // BASIS_POINTS
+```
+
+The mainnet config then sets three of them:<Cite src="consensus-specs-mainnet-config-v161" />
+
+- `PROPOSER_REORG_CUTOFF_BPS: 1667` — about 17% of the slot.
+- `ATTESTATION_DUE_BPS: 3333` — about 33%.
+- `AGGREGATE_DUE_BPS: 6667` — about 67%.
+
+Do the arithmetic at the mainnet slot duration and the familiar numbers fall out, slightly bent:
+
+- Proposer reorg cutoff: 1667 × 12,000 ÷ 10,000 = **2,000 ms**.
+- Attestation due: 3333 × 12,000 ÷ 10,000 = **3,999 ms**.
+- Aggregate due: 6667 × 12,000 ÷ 10,000 = **8,000 ms**.
+
+Not four seconds. Three thousand nine hundred and ninety-nine milliseconds, because 3,333 basis points is
+not exactly a third. The millisecond does not matter operationally. What matters is what the encoding
+tells you: **these are fractions of a slot, not absolute times.** Change `SLOT_DURATION_MS` and every
+deadline moves with it, without anyone editing a deadline.
+
+That is a recent refactor and it left fossils behind. `SECONDS_PER_SLOT`, value 12, is still in the phase0
+spec and marked *deprecated*.<Cite src="consensus-specs-beacon-chain-v161" /> `INTERVALS_PER_SLOT`, value
+3, is still in the fork-choice spec and marked *deprecated*
+too.<Cite src="fork-choice-spec" /> That second one is where the folklore comes from: for years the slot
+was described as three four-second intervals, and material written in that era will tell you the
+attestation deadline is "one third of the way in" as though the third were the definition rather than the
+current value of a configurable fraction.
+
+<Figure
+  caption="Two thousand milliseconds to build and publish, two more to reach attesters, four to aggregate, four to deliver — there is no slack anywhere in the slot."
+  alt="A 12,000 millisecond slot with the proposer reorg cutoff at 2,000 ms, the attestation deadline at 3,999 ms and the aggregate deadline at 8,000 ms, dividing the slot into a build window, a propagation window, an aggregation window and a delivery window."
+>
+  <Timeline
+    from={0}
+    to={12000}
+    unit="ms"
+    caption="one slot · SLOT_DURATION_MS = 12,000"
+    ticks={[0, 2000, 3999, 8000, 12000]}
+    marks={[
+      { at: 2000, label: 'proposer reorg cutoff', tone: 'warn' },
+      { at: 3999, label: 'attestation due', tone: 'danger' },
+      { at: 8000, label: 'aggregate due', tone: 'warn' },
+    ]}
+    spans={[
+      { label: 'build and publish', start: 0, end: 2000, tone: 'accent', note: 'later is more valuable' },
+      { label: 'block reaches attesters', start: 2000, end: 3999, note: 'or they vote for its parent' },
+      { label: 'aggregates form', start: 3999, end: 8000 },
+      { label: 'aggregates propagate', start: 8000, end: 12000, tone: 'muted', note: 'for the next proposer to include' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="note">
+The same file carries `SYNC_MESSAGE_DUE_BPS: 3333` and `CONTRIBUTION_DUE_BPS: 6667` for sync-committee
+duty — the same two fractions, applied to a different job.<Cite src="consensus-specs-mainnet-config-v161" />
+The deadline structure of the slot is one shape reused, not four independent decisions.
+</Aside>
+
+## t = 0 — the proposer publishes
+
+One validator is selected to propose per slot. Its job started before the slot did: it has already called
+`engine_forkchoiceUpdated` with payload attributes to begin a build, and it collects the result with
+`engine_getPayload` — which returns the most recent version of that build at the time of the
+call.<Cite src="engine-api-paris" /> Later means fuller. Later also means the block reaches attesters
+later.
+
+The specification names the point where "later" turns expensive. `PROPOSER_REORG_CUTOFF_BPS` is 1,667
+basis points — 2,000 ms on mainnet — and the fork-choice spec uses it in a helper called
+`is_proposing_on_time`.<Cite src="fork-choice-spec" /><Cite src="consensus-specs-mainnet-config-v161" />
+A proposer that publishes after that point is, by the protocol's own definition, not on time, and one of
+the consequences is that the *next* proposer is permitted to consider reorging it out.
+
+So the proposer's twelve seconds are really two: build value until about two seconds in, then get out.
+
+## t ≈ 4 s — the attestation deadline, and how a late block loses
+
+Every active validator attests once per epoch, in an assigned slot, on an assigned
+[committee](/c/committee).<Cite src="ethereum-org-attestations" /> The rule for *when* is one sentence in
+the validator spec, and it is the sentence behind the missed head vote at the top of this lesson.
+
+A validator should create and broadcast its attestation when either the validator has received a valid
+block from the expected proposer for the assigned slot, **or** `get_attestation_due_ms(epoch)`
+milliseconds have elapsed since the start of the slot — **whichever comes
+first**.<Cite src="consensus-specs-validator-v161" />
+
+Read the disjunction carefully. The deadline is not a wait; it is a ceiling. A validator that sees the
+block at 900 ms attests at 900 ms. A validator that has seen nothing by 3,999 ms attests at 3,999 ms
+anyway, because an attestation withheld is worth nothing.
+
+And what does it attest *to*? The spec says: let `head_block` be the result of running fork choice during
+the assigned slot.<Cite src="consensus-specs-validator-v161" /> Fork choice over the blocks it has
+actually seen. If this slot's block is not among them, the heaviest thing it knows is the previous slot's
+block — so that is the head vote.
+
+That is how a late block loses. Not through a rule that punishes lateness, but through the ordinary
+operation of a deadline against a proposer who missed it. The attesters were not wrong; they voted for the
+head as of the moment they were required to decide. By the time the block arrived, the votes that would
+have supported it had already been cast for its parent.
+
+<Misconception
+  belief="Ethereum has moved to six-second slots."
+  reality="Mainnet slots are 12 seconds. EIP-7782, which proposed reducing slot time, is listed as Declined for Inclusion in the Glamsterdam meta EIP."
+  why="The proposal was covered widely and enthusiastically enough that inclusion read as settled, and 'reduce block latency' is a headline that travels further than a scheduling decision that reversed it."
+  src="eip-7773"
+/>
+
+The declination is worth stating precisely, because half-remembered versions of it circulate. EIP-7782 is
+titled "Reduce Block Latency" and proposes cutting the slot from 12s to 6s.<Cite src="eip-7782" /> The
+Glamsterdam hardfork meta EIP lists it under **Declined for Inclusion**, alongside EIP-7805
+(FOCIL).<Cite src="eip-7773" /> Twelve seconds, with the deadline at 3,999 ms, is what mainnet does. A
+declined EIP is not a dead one — it can be picked up by a later upgrade — but it is not scheduled, and
+nothing about its future has a date.
+
+### The counterweight: proposer boost
+
+If attesters vote for the parent when a block is late, an adversary who can delay a block by a second has
+a cheap reorg. The fork choice compensates.
+
+`PROPOSER_SCORE_BOOST` is 40, and the spec explains the unit: the boost and the reorg weight thresholds
+are percentage values measured with respect to the weight of a single
+committee.<Cite src="fork-choice-spec" /><Cite src="consensus-specs-mainnet-config-v161" /> A timely
+block gets a temporary weight bonus worth 40% of one committee's weight, applied during its own slot.
+Three related constants sit beside it — `REORG_HEAD_WEIGHT_THRESHOLD` 20,
+`REORG_PARENT_WEIGHT_THRESHOLD` 160, and `REORG_MAX_EPOCHS_SINCE_FINALIZATION` 2 — which gate when a
+proposer may deliberately reorg a late head.<Cite src="consensus-specs-mainnet-config-v161" />
+
+[Proposer boost](/c/proposer-boost) and its trade-offs belong to the fork-choice module; what matters here
+is that the boost exists *because* of the deadline. The deadline creates the attack, the boost prices it,
+and the value of the boost is a dial with a failure mode at each end.
+
+## t ≈ 8 s — aggregation
+
+Individual attestations are too numerous to put in blocks one by one, so a subset of each committee
+aggregates them. `TARGET_AGGREGATORS_PER_COMMITTEE` is 16.<Cite src="consensus-specs-validator-v161" />
+Selected validators collect matching attestations from their subnet, combine the signatures, and publish
+the aggregate by `AGGREGATE_DUE_BPS` — 8,000 ms into the
+slot.<Cite src="consensus-specs-mainnet-config-v161" />
+
+The last four seconds of the slot are, in effect, the propagation budget for aggregates so that the next
+proposer has something to include. `MIN_ATTESTATION_INCLUSION_DELAY` is 1 slot, so the earliest an
+attestation can appear on chain is the slot after the one it
+attests to.<Cite src="consensus-specs-mainnet-preset-phase0-v161" />
+
+Stack the whole schedule and the twelve seconds are fully spoken for: two seconds for the proposer to
+build and publish, two more for the block to reach attesters, four for aggregates to form, four to deliver
+them. Everything else the protocol wants to do in a slot — block propagation, execution validation, data
+availability sampling — competes inside the same budget. That is why measured attestation timings are a
+live research subject rather than a solved one.<Cite src="rig-attestation-timings" />
+
+### Where the Engine API calls land on this clock
+
+The previous lesson gave you three methods with no timing attached. Put them on the schedule and the
+pressure on each becomes obvious.
+
+**For a proposer**, `forkchoiceUpdated` with payload attributes fires as early as the consensus client can
+commit to a parent — typically as soon as it has processed the previous slot's block. `getPayload` fires
+at the last tolerable moment before publishing, and the specification's 1-second timeout on that method is
+not a generous allowance when the whole publish window is about two
+seconds.<Cite src="engine-api-paris" /><Cite src="consensus-specs-mainnet-config-v161" />
+
+**For everyone else**, `newPayload` fires the moment a beacon block arrives, and it is on the critical
+path to the head vote. The attester cannot vote for a block it has not validated, so execution time for
+that payload is spent out of the same budget that ends at 3,999 ms. The specification's 8-second timeout
+on `newPayload` is a protocol-level upper bound, not a target — a payload that took eight seconds to
+validate has already cost you the head vote and most of the next
+slot.<Cite src="engine-api-paris" /><Cite src="consensus-specs-mainnet-config-v161" />
+
+Then `forkchoiceUpdated` follows to move the head. That one is not on the attestation critical path, which
+is why a node under load will often show head updates trailing payload validation without any effect on
+voting.
+
+There is one recurring exception to the rhythm. The beacon state transition decomposes into per-slot
+processing, block processing, and epoch processing — and epoch processing runs only at epoch boundaries,
+where it does the expensive accounting: justification, finalisation, rewards and
+penalties.<Cite src="consensus-specs-beacon-chain-v161" /> Every 32nd slot therefore carries work the
+other 31 do not, inside the same twelve seconds and against the same 3,999 ms deadline. If you are
+sampling timings, sample enough slots to see epoch boundaries as their own population rather than as
+outliers.
+
+## What a validator actually does all day
+
+The schedule above makes the job sound dramatic. It is not.
+
+**Attesting is the constant duty.** One attestation per epoch, every epoch, forever. An epoch is 384
+seconds, so that is 225 attestations per day, per
+validator.<Cite src="consensus-specs-mainnet-config-v161" /><Cite src="consensus-specs-mainnet-preset-phase0-v161" />
+Each carries three votes: source, target and head.<Cite src="ethereum-org-attestations" />
+
+**Aggregating comes round occasionally** — 16 aggregators per committee per
+slot.<Cite src="consensus-specs-validator-v161" />
+
+**Sync-committee duty applies only if selected.** `SYNC_COMMITTEE_SIZE` is 512 and
+`EPOCHS_PER_SYNC_COMMITTEE_PERIOD` is 256, so a selected validator serves a fixed stretch of 256 epochs —
+a little over 27 hours.<Cite src="consensus-specs-mainnet-preset-altair-v161" /><Cite src="consensus-specs-mainnet-config-v161" />
+
+**Proposing is rare.** There is exactly one proposal per slot — 7,200 per day, shared across the entire
+active validator set — while every validator in that set attests 225 times a day. Whatever the size of the
+set, that ratio is the whole story: proposals are a scarce resource divided among everyone, attestations
+are a duty each of them performs.
+
+<Matrix
+  corner="Duty"
+  cols={['How often, per validator', 'The constants that fix it']}
+  rows={[
+    {
+      label: 'Attesting',
+      cells: [
+        { v: '225 times a day, every day, forever', tone: 'accent' },
+        'One per epoch; SLOTS_PER_EPOCH 32 at SLOT_DURATION_MS 12,000 makes an epoch 384 s',
+      ],
+    },
+    {
+      label: 'Aggregating',
+      cells: ['Occasionally, when selected', 'TARGET_AGGREGATORS_PER_COMMITTEE = 16 per committee'],
+    },
+    {
+      label: 'Sync-committee duty',
+      cells: [
+        'Only if selected, then for a little over 27 hours straight',
+        'SYNC_COMMITTEE_SIZE 512, EPOCHS_PER_SYNC_COMMITTEE_PERIOD 256',
+      ],
+    },
+    {
+      label: 'Proposing',
+      cells: [
+        { v: 'Rare — 7,200 slots a day shared across the whole active set', tone: 'muted' },
+        'Exactly one proposer per slot',
+      ],
+    },
+  ]}
+  caption="Three of the four duties are occasional or conditional. The one that is constant is the one nobody watches."
+  alt="Validator duties compared by frequency and the consensus-spec constants that fix them: attesting once per epoch, aggregating when selected, sync-committee duty for a 256-epoch period, and proposing once per slot across the whole set."
+/>
+
+<Misconception
+  belief="A validator's main job is proposing blocks."
+  reality="Proposing is rare. The constant duty is attesting once per epoch, and attestation rewards dominate validator income."
+  why="Block production is the visible, dramatic part of the job — it is what block explorers show and what MEV discussions are about — while attesting is invisible when it works."
+  src="ethereum-org-attestations"
+/>
+
+The operational consequence is the whole point. Because income is dominated by attestations, and
+attestations are graded on being **on time, every epoch**, the important property of a staking setup is
+not how well it builds blocks. It is uptime and latency, sustained indefinitely. A setup that produces
+brilliant blocks and misses attestations during every restart is a worse setup than a dull one that never
+misses.
+
+## The second split: beacon node and validator client
+
+Everything above is the consensus client's work — but "the consensus client" is usually two processes as
+well.
+
+The **beacon node** handles peer-to-peer networking, keeps the beacon state, runs fork choice, drives the
+Engine API, and exposes an HTTP API. The **validator client** holds the signing keys, asks the beacon node
+what duties it has, and signs.<Cite src="lighthouse-book" /><Cite src="prysm-docs" />
+
+Three things follow, and each is a real operational lever.
+
+**The process holding the keys is not the process exposed to the public network.** The beacon node talks
+to strangers. The validator client talks to the beacon node. That is a meaningful reduction in what an
+attacker who compromises the networked process gets.
+
+**One validator client can be pointed at more than one beacon node.** If one beacon node is resyncing,
+restarting, or simply wrong, duties can still be fetched and signed against another.
+
+**Slashing protection lives with the validator client.** It is a local database recording what these keys
+have already signed, and it is what stops a restarted or duplicated process from producing a second
+conflicting signature. There is an interchange format specified for moving it between
+clients — EIP-3076 — precisely because moving keys without moving that history is how operators
+[slash](/c/slashing) themselves.<Cite src="eip-3076" /><Cite src="lighthouse-slashing-protection" />
+
+<Aside kind="warn">
+"I copied the keystores to the new machine and started it up" is the sentence that precedes most
+self-inflicted slashings. The keystores are not the state that matters; the slashing-protection database
+is.<Cite src="lighthouse-slashing-protection" /> Clients ship a detection mechanism for the specific case
+of the same keys running twice — doppelganger protection, which waits and listens for your own validators
+attesting before it signs anything — and it costs a couple of epochs of downtime on every
+start.<Cite src="lighthouse-doppelganger" /> That trade is almost always worth taking.
+</Aside>
+
+## What is proposed, and what is not scheduled
+
+The mainnet configuration file contains constants for deadlines that are not in force. `ATTESTATION_DUE_BPS_GLOAS`
+is 2,500 — 25% of the slot — with `AGGREGATE_DUE_BPS_GLOAS` at 5,000 and `PAYLOAD_ATTESTATION_DUE_BPS` at
+7,500.<Cite src="consensus-specs-mainnet-config-v161" /> A restructured slot, with the attestation
+deadline pulled earlier to make room for a payload-attestation phase, is written down.
+
+And in the same file, three lines above: `GLOAS_FORK_EPOCH: 18446744073709551615`.<Cite src="consensus-specs-mainnet-config-v161" />
+That is 2⁶⁴ − 1, the maximum value of a `uint64`, and the file's own comment explains the convention —
+forks that are disabled are temporarily set to the max uint64 value.<Cite src="consensus-specs-mainnet-config-v161" />
+
+This is the cleanest answer available to "when does Glamsterdam ship". The specification carries the
+constants and encodes the activation as *never, for now*. Anyone quoting a date is quoting something other
+than the config, and the config is what clients read.
+
+<Check type="predict" concept="slot-phases">
+Your team runs validators. An engineer proposes moving them to a datacentre with better hardware but
+roughly 400 ms more network latency to most beacon-chain peers. They argue: "The attestation deadline is
+four seconds. Four hundred milliseconds is a tenth of that. It is well within budget."
+
+Predict the effect, and say what you would measure before deciding.
+
+<Answer>
+**The budget framing is wrong, and the error is that 400 ms is not being spent against a four-second
+allowance.**
+
+**What the deadline actually is.** A validator attests when it has seen a valid block from the expected
+proposer, *or* at `get_attestation_due_ms` — 3,999 ms on mainnet — whichever comes
+first.<Cite src="consensus-specs-validator-v161" /><Cite src="consensus-specs-mainnet-config-v161" /> The
+attestation goes out on time in either case. The deadline is not what you are at risk of missing.
+
+**What you are at risk of missing is the block.** The quantity that matters is whether the block arrives
+before your deadline, and blocks do not arrive at a fixed time. They arrive in a distribution, and the
+proposer is allowed to publish as late as roughly 2,000 ms and still be "on
+time".<Cite src="fork-choice-spec" /><Cite src="consensus-specs-mainnet-config-v161" /> Adding 400 ms
+shifts your view of that entire distribution 400 ms later against a fixed cut-off.
+
+**So the effect is on head votes specifically.** Source and target votes are about checkpoints and are
+unaffected by whether you saw this slot's block. The head vote is the one that requires having seen it. If
+you were previously seeing 1% of blocks after the deadline, and 400 ms of the arrival distribution sits
+between the old and new positions, you now miss the head vote on every block in that band. Source and
+target keep paying; head-vote rewards degrade. That is a small, permanent revenue loss that will not show
+up as an error anywhere.
+
+**The second-order effect nobody predicts.** Your validators voting for the parent is exactly the
+mechanism that reorgs a late block.<Cite src="consensus-specs-validator-v161" /> At small scale that is
+your problem alone. At large scale, a systematically late-viewing operator becomes a participant in
+reorging honest proposers, which is a network externality rather than a private cost.
+
+**What to measure before deciding, not after.**
+
+*Block arrival time relative to slot start, as a distribution.* From the candidate location, over
+thousands of slots. One number is useless; you need the tail, because the tail is what crosses 3,999 ms.
+
+*The fraction already past 3,599 ms today.* That is the population that the extra 400 ms moves across the
+line. If it is negligible, the move is cheap; if the distribution has a fat shoulder there, it is not.
+
+*Your current head-vote inclusion rate as a baseline.* You cannot detect a regression in a number you were
+not tracking, and this one will not alarm on its own.
+
+*Aggregate publication timing.* If any of your validators aggregate, they are working against the 8,000 ms
+deadline with the same shift applied.<Cite src="consensus-specs-mainnet-config-v161" />
+
+**The reframe for your engineer.** The deadline is fixed and the block arrival is a random variable. You
+are not spending 400 ms out of 4,000; you are moving a distribution against a cut-off, and the only thing
+that matters is how much probability mass crosses it.
+</Answer>
+</Check>
+
+## What this unlocks
+
+- **The next lesson** takes the same clock somewhere uncomfortable. Everything here assumed clients behave
+  correctly. What happens when a third of them, or two thirds, behave incorrectly in the same way at the
+  same moment is a quantitative question with two named
+  breakpoints.<Cite src="consensus-specs-mainnet-config-v161" />
+- **The module's practice** asks you to sample a hundred consecutive slots and plot block arrival times
+  with the 3,999 ms line drawn on the chart. The shape of that histogram explains more about validator
+  economics than any amount of prose.<Cite src="rig-attestation-timings" />
+- **The consensus-specs module** shows you where every constant in this lesson lives, and how to change
+  one and watch the specification behave differently — including running epochs at a shrunken parameter
+  set so that finalisation happens inside a REPL session rather than
+  overnight.<Cite src="consensus-specs-mainnet-preset-phase0-v161" />
+
+The habit worth forming: when a system quotes you a period, ask what the deadlines *inside* the period
+are. Twelve seconds is a scheduling unit. 2,000, 3,999 and 8,000 milliseconds are what your infrastructure
+is actually being graded against.

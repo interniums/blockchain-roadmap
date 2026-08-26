@@ -1,0 +1,429 @@
+---
+id: infra-simulation-upgrade-rehearsal
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [measured-simulation-2026-08-26, foundry-fork-testing, forge-inspect-reference, execution-apis-execute-schemas, geth-ns-eth, eth-simulatev1-spec]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Here is a real proxy upgrade, executed against real mainnet state, on forge 1.7.1 at a fork pinned to
+block 25,839,000. The transaction succeeded. Read what it did.<Cite src="measured-simulation-2026-08-26" />
+
+```text
+[PASS] test_UpgradeSucceedsAndBreaksEverything()
+Logs:
+  totalSupply before: 50573966556660742
+  totalSupply after : 417223780715013227085836490829281552150151464294
+  holder before: 50828467320
+  holder after : 0
+  name after: Dai Stablecoin
+```
+
+The proxy is USDC. The upgrade pointed its implementation slot at DAI's contract — a perfectly valid
+contract, deployed, verified, holding billions. The `upgradeTo` call returned `status 1`. Nothing
+reverted. Nothing warned.
+
+And afterwards, every balance in the token is zero, and the total supply is
+`417223780715013227085836490829281552150151464294`, which is not a quantity of anything. Converted
+back to hex it is `0x4914f61d25e5c567143774b76edbf4d5109a8566`, and that address is USDC's `pauser`,
+which lives in storage slot 1 — the slot DAI's code reads as `totalSupply`.<Cite src="measured-simulation-2026-08-26" />
+
+That is the whole argument for this lesson in one screen. **The failure mode of an upgrade is not a
+revert. It is a success that returns wrong numbers.** No monitor fires on a successful transaction.
+No test that did not run against live storage could have seen it.
+
+## Why the new implementation's own tests cannot find this
+
+The new implementation compiles. Its unit tests pass. They pass against a freshly deployed contract
+with empty storage — which is the one configuration the upgrade will never encounter, because the
+thing you are upgrading is a proxy that has been accumulating state for years.
+
+Everything that goes wrong in an upgrade lives in the gap between those two situations:
+
+- Slot **N** means one thing to the old code and something else to the new code.
+- A value that was written by an old initializer and is never written again.
+- A mapping whose base slot moved, so every entry in it is now unreachable and reads as zero.
+- A [namespaced-storage layout](/c/erc-7201-namespaced-storage) whose namespace string changed.
+- A value written by a constructor in the old implementation, which a new implementation expects to
+  find in storage and which was never there.
+- A packed slot where a `uint128` became a `uint256` and shoved its neighbour into the next word.
+
+You know all of these as [storage collision](/c/storage-collision) hazards from the Solidity track.
+What is new here is the *procedure* for finding out whether one is about to happen to you, and it has
+four steps that must be done in order.
+
+<Figure
+  caption="The order matters: you cannot execute the real calldata until you know who is allowed to send it."
+  alt="A four-step procedure. First, find the admin by reading the chain and proving the address by using it. Second, execute the production calldata at a recent block while impersonating that admin. Third, run the existing suite against the upgraded proxy, comparing values captured before. Fourth, diff the new storage layout against the implementation that is currently behind the proxy."
+>
+  <Flow
+    dir="down"
+    lanes={['step 1', 'step 2', 'step 3', 'step 4']}
+    nodes={[
+      { id: 's1', label: 'find the admin', note: 'read the slots, then prove it by using it', col: 0, tone: 'accent' },
+      { id: 's2', label: 'execute real calldata', note: 'at a recent block, as that admin', col: 1 },
+      { id: 's3', label: 'run the suite', note: 'against the upgraded proxy, before against after', col: 2 },
+      { id: 's4', label: 'diff the layout', note: 'against the implementation now behind the proxy', col: 3 },
+    ]}
+  />
+</Figure>
+
+## Step 1: find out who the admin is, from the chain
+
+The rehearsal begins by impersonating the admin. So you need the admin, and the surprising part is
+how many different places it can be.
+
+Three real proxies, read at the same pinned block:<Cite src="measured-simulation-2026-08-26" />
+
+<Matrix
+  corner="Slot"
+  cols={['USDC (FiatTokenProxy)', 'Aave v3 Pool']}
+  rows={[
+    {
+      label: <>EIP-1967 admin <code>0xb531…6103</code></>,
+      cells: [
+        { v: '0x0000000000000000000000000000000000000000', tone: 'danger' },
+        { v: '0x0000000000000000000000000000000000000000', tone: 'danger' },
+      ],
+    },
+    {
+      label: <>EIP-1967 impl <code>0x3608…2bbc</code></>,
+      cells: [{ v: '—', tone: 'muted' }, '0x728a138a4823392C2Efa55E028d434f526Fe03cF'],
+    },
+    {
+      label: <>zeppelinos admin <code>0x10d6…390b</code></>,
+      cells: [{ v: '0x807a96288A1A408dBC13DE2b1d087d10356395d2', tone: 'good' }, { v: '—', tone: 'muted' }],
+    },
+    {
+      label: <>zeppelinos impl <code>0x7050…f8c3</code></>,
+      cells: ['0x43506849D7C04F9138D1A2050bbF3A0c054402dd', { v: '—', tone: 'muted' }],
+    },
+  ]}
+  caption="The standard admin slot answers zero on both proxies, and on neither is zero the answer."
+  alt="Storage slots read at one pinned block. The EIP-1967 admin slot returns the zero address on both USDC and the Aave v3 Pool. USDC returns its real admin 0x807a96288A1A408dBC13DE2b1d087d10356395d2 from the zeppelinos admin slot and its implementation 0x43506849D7C04F9138D1A2050bbF3A0c054402dd from the zeppelinos implementation slot. The Aave v3 Pool returns its implementation 0x728a138a4823392C2Efa55E028d434f526Fe03cF from the EIP-1967 implementation slot. A dash marks a slot the measurement did not report for that proxy."
+/>
+
+Read that table slowly, because there are three separate traps in it.
+
+**USDC does not use EIP-1967.** Its slots are `keccak256("org.zeppelinos.proxy.implementation")` and
+`keccak256("org.zeppelinos.proxy.admin")` — the convention that predates the standard. The largest
+regulated stablecoin on Ethereum returns `address(0)` from the slot every modern tool checks first.
+
+**Aave's Pool uses EIP-1967 for the implementation and returns zero for the admin**, because that
+proxy holds its admin as an immutable in code rather than in storage. There is nothing wrong with
+this. It just means the answer is not in the state, and a script that reads slots will conclude there
+is no admin.
+
+**A zero read is indistinguishable from "no such slot".** `eth_getStorageAt` on an unused slot returns
+32 zero bytes; so does a slot that genuinely holds `address(0)`. Your script cannot tell them apart,
+so it will happily go on to impersonate `address(0)`, fail with a revert, and hand you a misleading
+error to debug.
+
+The correct procedure is to **prove** you found the admin rather than infer it: read the candidate
+slots, then execute the actual upgrade call from the candidate address on the fork. If it succeeds,
+that is the admin. In the measured run, `upgradeTo` from `0x807a…95d2` succeeded, which is what
+established the identification.<Cite src="measured-simulation-2026-08-26" />
+
+<Aside kind="note">
+That address has no code at all — `eth_getCode` returns `0x` and its nonce is
+3.<Cite src="measured-simulation-2026-08-26" /> So the admin of that proxy is not a multisig contract
+whose threshold logic you can rehearse; it is an ordinary account, however its key is actually held.
+Two consequences. Your rehearsal cannot exercise the approval process, because there is no on-chain
+approval process to exercise. And any assumption in your runbook of the form "the upgrade requires
+three signatures, so we have time to react" is an assumption about that specific proxy, not a
+property of proxies. Read the admin before you write the incident plan.
+</Aside>
+
+## Step 2: execute the real calldata, at a recent block
+
+Now the rehearsal proper. Fork at a *recent* block, not a convenient old one — the point is that the
+proxy holds current state and current users. Impersonate the admin with `vm.prank`, which the fork
+guide documents as executing a single call as another address, with `vm.startPrank` for a
+sequence.<Cite src="foundry-fork-testing" /> Send exactly the bytes you intend to send in
+production.
+
+```solidity
+function setUp() public {
+    vm.createSelectFork(vm.envString("RPC"), 25_839_000);
+}
+
+function test_HoldersKeepTheirBalance() public {
+    uint256 before_ = IERC20(USDC).balanceOf(HOLDER);
+
+    address admin = address(uint160(uint256(vm.load(USDC, ZOS_ADMIN))));
+    vm.prank(admin);
+    IProxy(USDC).upgradeTo(NEW_IMPL);
+
+    assertEq(IERC20(USDC).balanceOf(HOLDER), before_, "live balance changed across the upgrade");
+}
+```
+
+Two disciplines make this a rehearsal rather than a demo.
+
+**The implementation address and the calldata are the production ones.** Not a fixture, not a
+freshly deployed copy compiled by the test. If the upgrade in production will be
+`upgradeToAndCall(impl, initData)`, the rehearsal calls `upgradeToAndCall` with that exact
+`initData` — the migration function you forgot to call is a failure the rehearsal is supposed to
+catch, and it cannot catch it if the test calls a different function.
+
+**The admin is read from the chain, not hard-coded.** A hard-coded admin that was correct last
+quarter is a rehearsal that passes for a system nobody operates any more.
+
+<Aside kind="warn">
+Some proxies guard the implementation address and some do not. Attempting `upgradeTo` with an
+address holding no code reverted on the measured proxy with `Cannot set a proxy implementation to a
+non-contract address`.<Cite src="measured-simulation-2026-08-26" /> That check is a property of that
+implementation of the proxy, not of proxies in general — and
+[a delegatecall into an address with no code succeeds, returning success and no data](/c/delegatecall-no-code-succeeds).
+A proxy without the guard, pointed at an empty address, becomes a contract where every call succeeds
+and every read returns nothing. Find out which kind yours is, on a fork, before you find out in
+production.
+</Aside>
+
+## Step 3: run the suite you already have against the upgraded proxy
+
+This is the step that produces the finding, and it is the step teams skip because it feels like
+duplicated work. It is not: the assertions are the same, the *state they run against* is the thing
+that changed.
+
+The measured run, with one integration-style assertion:<Cite src="measured-simulation-2026-08-26" />
+
+```text
+[FAIL: live balance changed across the upgrade: 0 != 50828467320]
+  test_HoldersKeepTheirBalance()
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; finished in 115.80ms
+```
+
+One hundred and sixteen milliseconds to turn a silent catastrophe into a red build. Note what made
+that possible: the assertion compares against a value **read from live state before the upgrade**,
+not against a constant. That pattern — capture before, upgrade, compare after — is the whole
+technique, and it generalises to everything the proxy is supposed to preserve.
+
+A short list of before-and-after captures worth asserting on, in roughly the order they catch things — all of them read from the fork in `setUp`, before anything is executed:<Cite src="foundry-fork-testing" />
+
+- The balances of the largest handful of real holders, read from the chain in `setUp`.
+- Total supply, and any accounting aggregate the protocol maintains.
+- Every role and owner: does the same address still hold the same authority afterwards?
+- Any configuration value a user could be harmed by: fee rates, caps, oracle addresses, pause flags.
+- One full user journey end to end — deposit, wait, withdraw — executed by an impersonated real
+  holder, not by a fresh address you funded, because a fresh address has no history to be corrupted.
+
+## Step 4: diff the storage layout statically
+
+The fork rehearsal is a dynamic check: it catches what your assertions happen to touch. The static
+check catches what you did not think to assert on. Run both.
+
+`forge inspect` prints a contract's storage layout.<Cite src="forge-inspect-reference" /> Measured on
+forge 1.7.1 with solc 0.8.36, for a vault that gained one address field in the wrong
+place:<Cite src="measured-simulation-2026-08-26" />
+
+<Matrix
+  corner="Name"
+  cols={['Type', 'Bytes', 'V1 slot', 'V2 slot']}
+  rows={[
+    { label: 'owner', cells: ['address', '20', '0', '0'] },
+    { label: 'treasury', cells: ['address', '20', { v: '—', tone: 'muted' }, { v: '1  ← inserted', tone: 'warn' }] },
+    { label: 'totalShares', cells: ['uint256', '32', '1', { v: '2', tone: 'danger' }] },
+    { label: 'shares', cells: ['mapping(address => uint256)', '32', '2', { v: '3', tone: 'danger' }] },
+  ]}
+  caption="The slot column is the only place this change is visible."
+  alt="Two storage layouts from forge inspect. In V1, owner is at slot 0, totalShares at slot 1 and the shares mapping at slot 2. In V2 a treasury address is inserted at slot 1, so totalShares moves to slot 2 and the shares mapping to slot 3. Every field after owner has shifted down one slot."
+/>
+
+Everything after `owner` moved down one slot. After that upgrade, `totalShares` reads whatever was in
+slot 2 — the base slot of the old `shares` mapping, which is zero — and every user's share balance
+lives at a key derived from slot 2 while the new code looks under slot 3. Same failure as the opening
+example, arrived at by a one-line edit that looks entirely reasonable in review.
+
+Three things make this check actually work in practice:
+
+**Diff against the deployed implementation, not against `main`.** Fetch the layout of the
+implementation currently in the proxy's slot<Cite src="forge-inspect-reference" /> — you read that address in step one — and compare the
+new one against *that*. What is on the chain and what is on the branch are different artifacts and
+the difference is exactly what you are looking for.
+
+**Store the layout as an artifact.** A committed layout file that a job diffs is a check; a table
+somebody eyeballed in a terminal is a memory.
+
+**Remember what a layout cannot tell you.** It shows where variables live. It does not show whether
+the *values* in them still mean the same thing — a `uint256 rate` that changes from basis points to
+ray precision occupies the same slot and breaks everything downstream. That one only a fork rehearsal
+with real assertions will catch, which is why step three and step four are not substitutes.
+
+<Misconception
+  belief="The new implementation's unit tests passing means the upgrade is safe."
+  reality="Unit tests run against a fresh deployment with empty storage. Upgrades fail on live storage layout and live values, and the failure presents as a successful transaction returning wrong numbers — measured, a real proxy upgrade returned status 1 while sending every holder's balance to zero."
+  why="A green suite is the strongest signal most engineers have, and nothing in it is aware that the contract it tested will be executed against somebody else's storage."
+  src="measured-simulation-2026-08-26"
+/>
+
+## The same rehearsal without a fork, in one request
+
+There is a lighter version of steps two and three that is worth having, because it costs one HTTP
+call and can run from anywhere — including from a monitoring job, or from a reviewer's laptop with no
+repository checked out.
+
+This is the `code`-override trick generalised. Geth's own documentation demonstrates the pattern in
+miniature: replace a live contract's bytecode with a version that keeps the same storage layout and
+adds an accessor, then call the accessor — the storage is untouched, only the code reading it
+changed.<Cite src="geth-ns-eth" /> An upgrade is that manoeuvre performed for real.
+
+You do not need the admin's permission to *see* an upgraded proxy. You need the proxy's storage to
+say the implementation slot holds the new address, and `eth_simulateV1` will say that for you.
+
+**Subgoal — put the new implementation behind the proxy without executing an upgrade.** Apply a
+`stateDiff` override on the proxy address that writes the new implementation address into its
+implementation slot.<Cite src="execution-apis-execute-schemas" /> Use `stateDiff`, never `state` — the
+proxy's storage *is* the protocol's state, and replacing it wholesale is the mistake from lesson two
+at maximum blast radius.
+
+**Subgoal — read the things that must not change, in the same request.** Add calls for
+`totalSupply`, for two or three real holders' balances, for the owner and for the critical
+parameters. They execute against the overridden state, in order, in one
+block.<Cite src="eth-simulatev1-spec" />
+
+**Subgoal — get the baseline from the same block, un-overridden.** Send the identical call list a
+second time with no overrides at all. Now you have two arrays of `returnData` from the same parent
+block, differing only in which implementation interpreted the storage.
+
+**Subgoal — diff the arrays and look at the shape of the differences.** Every entry that changed is a
+value the upgrade would alter. Some changes are intended; that is what the upgrade is for. What you
+are hunting is the change nobody proposed — a supply that moved, a balance that vanished, an owner
+that became `0x0`.
+
+Two honest limits. This rehearses the *post-upgrade world*, not the *upgrade transaction*, so it will
+not exercise an initializer, a migration function, or the admin's permission to perform the upgrade
+at all — for those you need step two properly. And it depends on you knowing which slot the
+implementation lives in, which is exactly the question step one showed is harder than it looks.
+
+## Diffing storage you cannot name
+
+Steps three and four both depend on knowing what to look at. Sometimes you do not: the contract is
+somebody else's, the source is partially verified, or the layout is generated by a framework nobody
+on the team can read.
+
+The fallback is crude, mechanical and surprisingly effective: **diff the raw slots.**
+
+Read a window of storage slots before the upgrade and the same window after, and print every slot
+whose value changed. `vm.load` on a fork does this in a loop; `eth_getStorageAt` does it over RPC.
+For mapping entries you cannot enumerate, compute the keys for a handful of known real holders
+— the same `keccak256(key . slot)` derivation you already use — and include those.
+
+Three rules make the output readable rather than a wall of hex.
+
+**Take the baseline at the same block as the rehearsal.** Otherwise you are diffing the upgrade
+against the passage of time.
+
+**Expect a small number of changed slots and treat a large number as the finding.** A well-behaved
+upgrade touches almost nothing: the implementation slot, and whatever the migration deliberately
+writes. If forty slots moved, the layout shifted, and you have your answer without ever knowing what
+the variables were called.
+
+**Print the slot numbers, not just the count.** Slot 1 changing when your diff predicted slot 12 is
+the difference between "the migration ran" and "everything moved down by one".
+
+This is the technique that produced the opening example's diagnosis. Nobody needed USDC's source to
+work out what `417223780715013227085836490829281552150151464294` was: converting it to hex and
+recognising an address is a thirty-second exercise, and the address was sitting in slot
+1.<Cite src="measured-simulation-2026-08-26" /> Wrong numbers on a chain are rarely random. They are
+almost always some other field, read through the wrong lens.
+
+## What the rehearsal still will not catch
+
+Being precise here is what keeps a passing rehearsal from becoming overconfidence.
+
+**Whether the initializer situation is right.** A rehearsal that calls `upgradeToAndCall` with your
+`initData` proves the call executes. It does not prove that the initializer's guard is correct, that
+it cannot be called again later by someone else, or that a *future* upgrade will remember to call it.
+
+**Whether the admin will actually sign.** You impersonated. That is a substitution, and the real
+approval process — signers, thresholds, hardware wallets, someone on holiday — is untouched by it.
+
+**What happens in the window.** The upgrade lands in a block, and the state it meets is the state at
+that block, not the state at your pinned block. Anything a user or an attacker can do in between is
+outside the rehearsal, and an upgrade is a uniquely attractive moment to act next to.
+
+**Third-party code that changes under you.** If the new implementation calls into a protocol that is
+itself upgradeable, your rehearsal exercised their current implementation. Their governance can
+replace it without telling you.
+
+**Whether anyone can undo it.** Rehearse the rollback as its own exercise<Cite src="foundry-fork-testing" />: fork at the upgraded state
+and put the old implementation back. If the new implementation moved a role, consumed a one-shot
+initializer, or is UUPS and removed its own `upgradeTo`, you will find out here rather than during the
+incident.
+
+<Check type="predict" concept="upgrade-rehearsal">
+You are asked to review an upgrade runbook before a treasury signs it. The runbook contains:
+
+1. `forge test` on the new implementation repository — 214 tests, all green.
+2. A storage-layout diff of the new implementation against the previous release tag — no changes.
+3. A fork test that forks at block 25,000,000 (chosen because it is cached from a previous project),
+   pranks a hard-coded admin address, calls `upgradeTo`, and asserts the call does not revert.
+
+The production transaction will be `upgradeToAndCall(newImpl, initData)` where `initData` calls
+`migrateV3()`.
+
+State what this runbook does and does not establish, and give the smallest set of changes that would
+make you comfortable.
+
+<Answer>
+**It establishes that the new implementation's own logic works, and almost nothing about the
+upgrade.** Four defects, in descending order of how badly they would hurt.
+
+**The rehearsal executes different calldata than production.** Production sends
+`upgradeToAndCall(newImpl, initData)`; the rehearsal sends `upgradeTo(newImpl)`. So `migrateV3()` —
+the part that touches live state and is therefore the riskiest thing in the whole change — was never
+executed at all. This is the finding that would stop the review on its own. The rehearsal must send
+the production bytes.
+
+**The assertion is "did not revert", which is precisely the wrong assertion.** The measured opening
+example of this lesson is an upgrade that returned status 1 and zeroed every balance in the
+contract.<Cite src="measured-simulation-2026-08-26" /> A non-reverting upgrade is the null result.
+The rehearsal has to capture live values before — real holders' balances, total supply, roles,
+critical configuration — and compare after.
+
+**The fork block is wrong, and the reason it was chosen is the tell.** Block 25,000,000 was picked
+because it was already cached. That is a convenience, and it means the rehearsal ran against a proxy
+holding state from a different era, with a different set of users and possibly a different admin,
+different roles and different parameters. Pin to a *recent* block, accept the cache miss, and re-pin
+before the actual send.
+
+**The admin is hard-coded.** Read it from the chain, from the slot convention the proxy actually
+uses. Measured, a real proxy returns `address(0)` from the EIP-1967 admin slot and its true admin
+from the zeppelinos slot, while another returns `address(0)` because its admin is immutable in
+code.<Cite src="measured-simulation-2026-08-26" /> A hard-coded admin can be stale, and a wrong one
+produces a revert you will misread as a permissions bug.
+
+**The storage-layout diff is comparing the wrong pair.** New implementation versus previous *release
+tag* answers "did we change the layout since we last tagged". The question is "does the layout match
+what is behind the proxy right now" — so diff against the implementation address read from the
+proxy's slot at the fork block. These are the same artifact only if nothing was ever deployed out of
+band, which is exactly the assumption an upgrade rehearsal exists to stop making.
+
+**The smallest sufficient change set.**
+
+Re-pin the fork to a recent block. Read the admin and the current implementation from the proxy's
+actual slots. Prank that admin, send `upgradeToAndCall(newImpl, initData)` — the production bytes.
+Assert on before/after captures of real holders' balances, total supply and every role. Diff the
+layout against the implementation address you read from the proxy. And add one more test that
+forks the upgraded state and puts the old implementation back, so the runbook's rollback step is
+something we have done rather than something we have written down.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now rehearse the single most dangerous routine action a protocol takes, against the state it
+will actually meet, and produce a red build in about a tenth of a second when it would have gone
+wrong.
+
+The technique generalises immediately: **capture live values, execute the real calldata as the real
+authority, assert the things that must not change.** That triple is the shape of every rehearsal for
+the rest of this module.
+
+**Next**: the same technique applied to an action that is slower, more public, and even harder to
+undo — a governance proposal, where the failures cluster not in the substance but in the encoding of
+the payload and the permissions of the executor, and where the failure arrives at `execute`, days
+after the vote, in front of everyone.

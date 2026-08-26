@@ -1,0 +1,407 @@
+---
+id: altvm-pinocchio-p-token
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [simd-0266-proposal, solana-upgrades-p-token, spl-token-repo, p-token-program-manifest, p-token-entrypoint-source, solana-docs-account-runtime, pinocchio-entrypoint-source, pinocchio-crate-versions, anza-security-audits-spl, helius-p-token, solana-docs-compute-budget, eip-20]
+stack: {}
+---
+
+Clone the SPL Token repository and open two manifests.
+
+`program/Cargo.toml` declares a crate called `spl-token`, version 9.0.0, built on the ordinary
+`solana-program-entrypoint`, with
+`program-id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`.<Cite src="spl-token-repo" />
+
+`pinocchio/program/Cargo.toml` declares a crate called `pinocchio-token-program`, described as "a
+pinocchio-based Token (aka 'p-token') program", depending on `pinocchio` rather than the SDK — with
+`program-id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`.<Cite src="p-token-program-manifest" /><Cite src="spl-token-repo" />
+
+Two independent implementations, in one repository, claiming the same address. That is the whole story
+in two lines of TOML, and there is no equivalent of it on Ethereum.
+
+## The numbers, from the proposal
+
+SIMD-0266 publishes the full before-and-after table, and the upgrade page reproduces
+it.<Cite src="simd-0266-proposal" /><Cite src="solana-upgrades-p-token" /> A representative slice:
+
+<Matrix
+  numeric
+  corner="Instruction"
+  cols={['SPL Token', 'p-token', '% of original']}
+  rows={[
+    { label: <code>Transfer</code>, cells: ['4,645', '76', { v: '1.6%', tone: 'good' }] },
+    { label: <code>TransferChecked</code>, cells: ['6,200', '105', { v: '1.6%', tone: 'good' }] },
+    { label: <code>SyncNative</code>, cells: ['3,045', '61', '2.0%'] },
+    { label: <code>MintTo</code>, cells: ['4,538', '119', '2.6%'] },
+    { label: <code>Burn</code>, cells: ['4,753', '126', '2.6%'] },
+    { label: <code>InitializeImmutableOwner</code>, cells: ['1,404', '38', '2.7%'] },
+    { label: <code>CloseAccount</code>, cells: ['2,916', '120', '4.1%'] },
+    { label: <code>InitializeMint2</code>, cells: ['2,827', '228', '8.0%'] },
+    { label: <code>InitializeMultisig2</code>, cells: ['2,826', '318', { v: '11.2%', tone: 'warn' }] },
+  ]}
+  caption="SIMD-0266's own before-and-after figures, in compute units: the instruction that does the most real work is the one that kept the most of its cost."
+  alt="Compute unit costs before and after the p-token rewrite, from SIMD-0266: Transfer 4,645 to 76, TransferChecked 6,200 to 105, SyncNative 3,045 to 61, MintTo 4,538 to 119, Burn 4,753 to 126, InitializeImmutableOwner 1,404 to 38, CloseAccount 2,916 to 120, InitializeMint2 2,827 to 228, and InitializeMultisig2 2,826 to 318."
+/>
+
+<Cite src="simd-0266-proposal" />
+
+The proposal also publishes something more useful than the table, and almost nobody quotes it: the
+instruction usage distribution on mainnet. `TransferChecked` is 36.33% of token instructions,
+`Transfer` 13.22%, `CloseAccount` 12.23%, `InitializeAccount3` 9.98%, `InitializeImmutableOwner`
+9.78%, `SyncNative` 4.53%, `InitializeAccount` 2.58%, with everything else under one per cent
+each.<Cite src="simd-0266-proposal" />
+
+That distribution is why the optimisation work went where it did. The two `transfer` variants are half
+of all traffic, so they got a fast path of their own. It is also the correct way to read any
+optimisation table: a 90% saving on an instruction that is 0.1% of calls is a rounding error, and a 60%
+saving on the one that is a third of them is the entire project.
+
+<Aside kind="note">
+Compute units, not gas. The figures above measure work on the SBF virtual machine and are charged
+against Solana's compute budget — a default of 200,000 CU per instruction and a hard ceiling of
+1,400,000 CU per transaction.<Cite src="solana-docs-compute-budget" /> There is no conversion to EVM
+gas, and no EVM gas constant you have learned transfers here.
+</Aside>
+
+## The fast path, and the arithmetic from lesson one
+
+p-token does not use `entrypoint!`. It declares a raw `extern "C"` entrypoint by hand, with a fast path
+for `transfer` and `transfer_checked` that reads fields out of the input buffer at **hard-coded byte
+offsets** and skips general parsing entirely.<Cite src="p-token-entrypoint-source" />
+
+Here are three of those constants, exactly as the source declares
+them:<Cite src="p-token-entrypoint-source" />
+
+```rust
+const ACCOUNT1_DATA_LEN: usize = 0x0058;
+const ACCOUNT2_HEADER_OFFSET: usize = 0x2910;
+const IX3_ACCOUNT3_HEADER_OFFSET: usize = 0x5218;
+```
+
+You already know how to derive every one of them.
+
+**Subgoal 1 — locate the first account.** The buffer opens with an 8-byte account count, so account 1's
+header begins at offset 8.<Cite src="solana-docs-account-runtime" /> Within a header, `data_len` sits at
+offset 80.<Cite src="solana-docs-account-runtime" /> So account 1's data length lives at 8 + 80 = 88 =
+**`0x0058`**. That is `ACCOUNT1_DATA_LEN`.
+
+**Subgoal 2 — step over one 165-byte token account.** Header 88, data 165, realloc reservation 10,240,
+padding up to an 8-byte boundary, then 8 bytes of `rent_epoch`.<Cite src="solana-docs-account-runtime" /><Cite src="pinocchio-entrypoint-source" />
+8 + 88 + 165 + 10,240 = 10,501; align to 10,504; add 8 for `rent_epoch`; **10,512 = `0x2910`**. That is
+`ACCOUNT2_HEADER_OFFSET`.
+
+**Subgoal 3 — step over a second one.** 10,512 + 88 + 165 + 10,240 = 21,005; align to 21,008; add 8;
+**21,016 = `0x5218`**. That is `IX3_ACCOUNT3_HEADER_OFFSET`, the authority's header in a plain
+`transfer`.
+
+**Subgoal 4 — handle the field that cannot be assumed.** The authority is an arbitrary account of
+unknown data length, so its size cannot be baked in. The code reads its `data_len`, aligns it with
+`(input + 7) & !7`, and adds the result to a base offset to find the instruction
+data.<Cite src="p-token-entrypoint-source" /> Constants where the layout is fixed; arithmetic where it
+is not.
+
+**Subgoal 5 — notice that the guards and the assumptions are the same code.** Before any of those
+offsets is used, the fast path checks that the account count is 3, that account 1's `data_len` equals
+`Account::LEN`, that account 2's duplicate marker is `NON_DUP_MARKER`, that account 2's `data_len`
+equals `Account::LEN`, and that account 3's marker is `NON_DUP_MARKER`.<Cite src="p-token-entrypoint-source" />
+Every assumption behind the arithmetic is a condition that must hold for the fast path to be taken.
+Then it checks the instruction data length and the discriminator, and only then does it construct
+account values by transmuting raw pointers.<Cite src="p-token-entrypoint-source" />
+
+**Subgoal 6 — see what happens when the guards fail.** Nothing dramatic: control falls through to a
+general path that allocates an uninitialised array of `MAX_TX_ACCOUNTS` entries on the stack, calls the
+library's `deserialize`, and dispatches normally.<Cite src="p-token-entrypoint-source" /> The fast path
+is an optimisation with a correct fallback, not a replacement.
+
+That structure is the reason this is defensible engineering rather than recklessness, and it is worth
+naming as a pattern: **hard-code the offset, but derive it from a documented layout, and make every
+assumption behind it an explicit runtime guard on the same code path.** A layout change does not
+silently corrupt anything; it makes the guards fail and the slow path run.
+
+## Removing the logs
+
+One more source of savings, and the only one with a real cost attached.
+
+SIMD-0266 proposes omitting the instruction-name logs the token program used to emit. Its reasoning is
+twofold: logging the name consumes more than 100 compute units — in some cases almost the whole cost of
+executing the instruction — and the logs were never a reliable interface, because they can be truncated
+and an attacker can inject matching messages to confuse parsers.<Cite src="simd-0266-proposal" />
+
+The proposal quantifies it. p-token's `Transfer` is 76 CU without logs and 186 CU with
+them.<Cite src="simd-0266-proposal" /> Nearly sixty per cent of the post-optimisation cost of a transfer
+was the log line. In the shipped program, logging sits behind a Cargo feature that is not on by
+default.<Cite src="p-token-entrypoint-source" />
+
+This is the module's honesty test. Observability was spent to buy compute. The proposal's argument that
+nobody should have depended on those logs is correct and beside the point; plenty of pipelines did, and
+the upgrade page answers "Indexing Changes Required?" with Yes.<Cite src="solana-upgrades-p-token" />
+When you make this trade in your own program, make it explicitly and tell your consumers, rather than
+discovering afterwards that a log line was load-bearing.
+
+## Three instructions that were not there before
+
+A "like-for-like re-implementation" that adds instructions sounds contradictory, so it is worth being
+precise about what was added and why, because each one is a different kind of opportunity that only
+appears when you are already rewriting.
+
+**`withdraw_excess_lamports`, discriminator 38.** Accounts on Solana must hold a rent-exempt balance,
+and over the years people have sent SOL to mint and multisig accounts that has no way back out. The
+proposal gives the example that the USDC mint holds roughly 323 SOL in excess, and notes that the total
+amount of SOL that could be freed this way has yet to be
+calculated.<Cite src="simd-0266-proposal" /><Cite src="solana-upgrades-p-token" /> The instruction lets
+the mint authority — or, for a mint with no mint authority, a signature from the mint key itself —
+recover it. The proposal flags that this may have economic consequences depending on how much SOL is
+unbricked.<Cite src="simd-0266-proposal" />
+
+**`batch`, discriminator 255.** Executes a variable number of token instructions in one invocation.
+Covered below; it is the answer to a cost that only became dominant *after* the optimisation
+landed.<Cite src="simd-0266-proposal" />
+
+**`unwrap_lamports`, discriminator 45.** Transfers lamports out of a native SOL token account directly
+to any destination, removing the need to create a temporary native token account for the
+recipient.<Cite src="simd-0266-proposal" />
+
+Two discriminator details are worth noticing, because they are the kind of thing that decides whether a
+"drop-in replacement" really is one. `withdraw_excess_lamports` reuses the value Token-2022 already
+assigned to the same operation, so the two programs agree; `batch` and `unwrap_lamports` use values
+unused in both SPL Token and Token-2022, so nothing that decoded old traffic can mistake
+them.<Cite src="simd-0266-proposal" /> Backwards compatibility here is not a slogan — it is a
+constraint satisfied one byte at a time.
+
+## Swapped in behind the same address
+
+Here is the mechanism, from the proposal.
+
+p-token is loaded into an account at `ptok6rngomXrDbWf5v5Mkmu5CEbB51hzSCPDoj9DrvF` **before** the change
+takes effect. A feature gate, `ptokFjwyJtrwCa9Kgo9xoDS59V4QccBGEaRFnRPnSdP`, controls activation. When
+the gate is enabled, the runtime replaces the program at
+`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` with the one at the staging address, using the Upgradable
+Loader v3.<Cite src="simd-0266-proposal" />
+
+The proposal is candid about what that is: replacing the program requires **breaking consensus on a
+non-native program**, and it notes this has been done before for SPL Token to fix bugs and add
+features.<Cite src="simd-0266-proposal" /> Because of the potential economic consequences, the feature
+was put to a validator vote.<Cite src="simd-0266-proposal" />
+
+The proposal also records the alternative that was rejected, and it is the more interesting half.
+p-token could have been deployed to a *new* address with people encouraged to migrate — and the
+proposal's stated reason for not doing that is that it would hinder adoption, since people would be very
+slow to adopt the new program, if they adopted it at all.<Cite src="simd-0266-proposal" />
+
+That sentence is the whole contrast this track exists to draw.
+
+### Why Ethereum cannot do this
+
+An ERC-20 is not an implementation at a known address. It is
+[a ledger inside each token's own contract](/c/erc20-is-a-ledger), deployed once per token, with the
+standard specifying only the interface those contracts expose.<Cite src="eip-20" /> There are millions of
+them, each holding its own copy of transfer logic, each immutable unless its author built an upgrade
+path.
+
+So the Ethereum analogue of SIMD-0266 does not exist. You can write a better ERC-20 implementation, and
+it will be used by tokens deployed after you publish it — never by the ones already out there. The only
+comparable levers are protocol-level: reprice an opcode, add a precompile, or change what an account can
+delegate to. None of them can replace *the code inside* a million already-deployed contracts.
+
+Solana can do it because the token program is one program at one address that everything CPIs into. That
+centralisation is a real cost — it is a single point of consensus-breaking change, which is precisely why
+it required a validator vote — and it bought a network-wide efficiency upgrade that reached every wallet,
+every DEX and every token without a single line of their code changing.
+
+<Misconception
+  belief="To get p-token's savings, our program has to migrate to Pinocchio."
+  reality="The implementation was swapped behind the existing token program address. Every CPI your program already makes to the token program got cheaper on activation, with no change on your side."
+  why="Software upgrades normally require the caller to adopt something; a runtime-level implementation swap has no counterpart in ordinary dependency management."
+  src="simd-0266-proposal"
+/>
+
+## What the sources disagree about
+
+Two things in this story are reported inconsistently, and both are worth stating as ranges rather than
+facts.
+
+**When it activated.** The upgrade page is bylined "April 2026, by Solana Foundation" and marks mainnet
+activation Completed.<Cite src="solana-upgrades-p-token" /> Other reporting places activation at epoch
+971 and in the spring of 2026, with one wire report naming 13 May 2026. These are consistent in the
+sense of describing the same event, but they are not the same claim, and no primary artifact fixes a
+calendar date. Compounding it: SIMD-0266's own front matter still records `status: Review`, even though
+the program is live.<Cite src="simd-0266-proposal" /> Treat "spring 2026, epoch 971, feature gate
+`ptokFjwyJtrwCa9Kgo9xoDS59V4QccBGEaRFnRPnSdP`" as the durable form, and get the exact slot from an
+epoch-to-date calculation if you ever need one.
+
+**How much blockspace it freed.** Two figures circulate and they are not the same measurement.
+
+The upgrade page states a roughly 10% reduction in total block space usage, and headlines "10% More
+Total Block Space".<Cite src="solana-upgrades-p-token" /> That is consistent with the proposal's own
+motivating estimate, which reasons that token instructions consume about 10% of block compute units and
+that reducing them to a twentieth would turn 10% into 0.5%, a 9.5% gain.<Cite src="simd-0266-proposal" />
+
+The second figure comes from Firedancer's differential equivalence testing, which replayed mainnet
+transactions twice — once under each implementation. Over the window 3–11 August 2025 it reported 8.9
+trillion CU saved with logging enabled and 9.14 trillion with logging disabled, described as 12.0% and
+12.3% of total blockspace usage respectively.<Cite src="helius-p-token" />
+
+<Compare
+  columns={[
+    { title: 'The upgrade page', note: 'Solana Foundation' },
+    { title: 'Differential replay', note: "Firedancer's equivalence testing" },
+  ]}
+  rows={[
+    {
+      label: 'What figure is reported?',
+      cells: [
+        { v: <>~10% reduction in total block space usage<Cite src="solana-upgrades-p-token" /></>, tone: 'warn' },
+        { v: <>12.0% of total blockspace usage with logging, 12.3% without<Cite src="helius-p-token" /></>, tone: 'warn' },
+      ],
+    },
+    {
+      label: 'What was measured?',
+      cells: [
+        <>Block space freed, consistent with the proposal's own estimate that token instructions are about 10% of block compute and would fall to about 0.5%<Cite src="simd-0266-proposal" /></>,
+        <>Mainnet transactions replayed twice, once under each implementation: 8.9 trillion CU saved with logging enabled, 9.14 trillion with it disabled<Cite src="helius-p-token" /></>,
+      ],
+    },
+    {
+      label: 'Over what window?',
+      cells: [
+        <>Stated as an outcome of the upgrade, with no sampling window<Cite src="solana-upgrades-p-token" /></>,
+        <>3–11 August 2025<Cite src="helius-p-token" /></>,
+      ],
+    },
+  ]}
+  caption="Two measurements of different quantities over different windows. They are carried side by side because averaging them would produce a number neither source reports."
+  alt="The two circulating blockspace-impact figures for p-token, kept separate: the Solana Foundation upgrade page reports about a 10% reduction in total block space usage, while Firedancer's differential replay of mainnet transactions between 3 and 11 August 2025 reports 8.9 trillion compute units saved with logging enabled and 9.14 trillion without, described as 12.0% and 12.3% of total blockspace usage."
+/>
+
+Do not average these. They measure different things over different windows, and at least one of them
+counts vote transactions in the denominator while the other's framing does not obviously do so — a
+material difference, given that `MAX_VOTE_UNITS` is 36,000,000 CU of a block's
+budget.<Cite src="solana-docs-compute-budget" /> The defensible statement is: **somewhere in the region
+of a tenth of Solana's compute was being spent on token-program overhead, and most of it is now gone.**
+
+## Maturity: read the deployment record, not the version number
+
+Pinocchio has never published a 1.0. The current line is 0.11.x, with 0.11.2 released on 9 June 2026 on
+a crate first published in July 2024.<Cite src="pinocchio-crate-versions" /> The satellite crates version
+independently and are all also pre-1.0 — `pinocchio-system` at 0.6.1, `pinocchio-token` at 0.7.0,
+`pinocchio-token-2022` at 0.4.0, `pinocchio-associated-token-account` at
+0.4.0.<Cite src="pinocchio-crate-versions" />
+
+Against that, the evidence that actually bears on whether it is safe to depend on:
+
+- It is maintained under the Anza organisation, and the token repository's workspace lists Anza
+  maintainers as its authors.<Cite src="spl-token-repo" /><Cite src="p-token-program-manifest" />
+- The program built on it passed the existing SPL Token test fixtures and differential fuzzing that
+  replayed millions of past mainnet instructions, verifying that both the result and the resulting
+  account state matched the original implementation.<Cite src="simd-0266-proposal" />
+- Four external audit reports and a formal-verification report are published in Anza's security-audits
+  repository — Neodyme dated 12 June 2025, Zellic dated 30 June 2025, 13 October 2025 and 26 March 2026,
+  and Certora dated 11 May 2026.<Cite src="anza-security-audits-spl" />
+- It executes the highest-volume program on the network.<Cite src="solana-upgrades-p-token" />
+
+And one detail that cuts the other way, which you would only find by opening the manifest: the token
+repository pins `pinocchio = "0.9.3"` in its workspace dependencies, not
+0.11.x.<Cite src="spl-token-repo" /> The program running at the busiest address on Solana is two minor
+versions behind the library's latest release. That is not a criticism of either — it is what a
+conservative dependency policy looks like on a program that requires a validator vote to change — but it
+does mean "p-token uses Pinocchio, so Pinocchio 0.11 is battle-tested" is an inference nobody has earned.
+
+<Misconception
+  belief="Pinocchio is pre-1.0, so it is experimental and unproven."
+  reality="It is Anza-maintained, and code built on it has passed four external audits, a formal-verification effort and differential fuzzing against replayed mainnet traffic, and now runs the network's most-invoked program. Version numbers are a poor maturity signal here; audit history and deployment footprint are better ones."
+  why="0.x reads as alpha by convention, and the convention is usually right."
+  src="pinocchio-crate-versions"
+/>
+
+## The cost that moved
+
+One last number, because it is where this story goes next.
+
+Once `Transfer` costs 76 CU, look at what surrounds it. A cross-program invocation costs a flat
+`DEFAULT_INVOCATION_COST` of 1,000 CU before the callee executes
+anything.<Cite src="solana-docs-compute-budget" /> Most token transfers happen by CPI, inside somebody
+else's instruction. So the call now costs **more than thirteen times** what the callee does.
+
+<Figure
+  caption="Both bars are compute units against the same budget. One is metered work; the other is a flat charge for making the call at all."
+  alt="A cross-program invocation costs a flat 1,000 compute units before the callee runs, against p-token's Transfer at 76 compute units."
+>
+  <Bars
+    unit="CU"
+    axisLabel="compute units for one token transfer by CPI"
+    items={[
+      { label: 'DEFAULT_INVOCATION_COST', value: 1000, tone: 'warn', note: 'charged before the callee runs' },
+      { label: 'p-token Transfer', value: 76, tone: 'good', note: 'the callee itself' },
+    ]}
+  />
+</Figure>
+
+The proposal saw this coming and shipped an answer: a `batch` instruction, discriminator 255, which
+executes a variable number of token instructions in a single invocation, so the base CPI cost is paid
+once instead of per instruction.<Cite src="simd-0266-proposal" /> Its stated motivation is that almost
+every DeFi protocol on Solana performs multiple token CPIs in one instruction — an AMM doing two
+transfers per swap, or transferring and minting during an LP deposit.<Cite src="simd-0266-proposal" />
+
+That is the general law of this kind of work, and it is worth carrying out of this module: **when you
+remove the dominant cost, you do not end up with no cost. You end up with a new dominant cost, in a place
+nobody was looking.**
+
+<Check type="predict" concept="protocol-level-swap">
+You run engineering at a wallet. A director forwards the p-token announcement and asks: "What is our
+migration plan and how long will it take?"
+
+Give the answer, including the parts that are genuinely work.
+
+<Answer>
+**The core answer: there is no migration, because there is nothing to migrate to.** The runtime replaced
+the implementation behind `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` itself, so every instruction the
+wallet already builds against that address executes the new code.<Cite src="simd-0266-proposal" /> The
+instruction set and account layouts are unchanged, and the upgrade page answers "Breaking Change?" with
+No.<Cite src="solana-upgrades-p-token" /> Signing flows, address derivation and account parsing are all
+untouched.
+
+**But there are three pieces of real work, and two of them are on the read path.**
+
+*First, indexing.* The upgrade page answers "Indexing Changes Required?" with
+Yes.<Cite src="solana-upgrades-p-token" /> Three instructions were added — `withdraw_excess_lamports`
+(38), `batch` (255) and `unwrap_lamports` (45) — and anything decoding token instruction data must
+handle them or it will misparse.<Cite src="simd-0266-proposal" /> `batch` is the dangerous one for a
+wallet's activity feed: a single token-program instruction may now contain several logical operations,
+so any code that assumes one instruction is one transfer will under-report. The page points at the IDL
+in the repository and a client-library version bump as the
+path.<Cite src="solana-upgrades-p-token" /><Cite src="spl-token-repo" />
+
+*Second, logs.* The instruction-name logs are gone.<Cite src="simd-0266-proposal" /> If anything in the
+stack — transaction history, notifications, support tooling — matched on
+`Program log: Instruction: Transfer`, it now matches nothing and fails silently rather than loudly. Grep
+for that string across every repository, including the ones nobody has touched in two years.
+
+*Third, compute-limit assumptions.* Any hard-coded `SetComputeUnitLimit` values tuned against the old
+costs are now generous. That is not a bug, but the priority fee is computed from the requested limit
+rather than actual usage, so leaving them alone means overpaying on every
+transaction.<Cite src="solana-docs-compute-budget" /> Re-simulate and re-derive them.
+
+**What to say to the director.** "No migration, because it happened underneath us. Our transactions got
+roughly ninety-five per cent cheaper in compute terms at the token-program layer without us shipping
+anything.<Cite src="simd-0266-proposal" /> The work is on the read side: three new instructions to decode,
+one log line we can no longer rely on, and a set of stale compute-limit constants to re-tune. Two weeks,
+mostly in the indexer."
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now describe, mechanically and with sources, the largest compute optimisation shipped on Solana:
+what it changed, how it reached every user without their participation, what it cost in observability,
+and which of its widely quoted figures are firm and which are ranges the sources disagree on.
+
+You have also seen the pattern that makes it more than a Solana story. The dominant cost in the hot path
+was fixed per-invocation overhead nobody had measured; the fix was deployable underneath the callers
+rather than in front of them; and the moment it landed, the bottleneck moved to the cost of *calling*
+the thing that had just been optimised.
+
+The last lesson of this module turns that into a decision procedure for your own program. It is mostly
+an argument for not doing this — and for understanding precisely why the right answer for almost every
+team is to benefit from Pinocchio without ever writing it.

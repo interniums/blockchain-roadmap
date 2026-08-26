@@ -1,0 +1,423 @@
+---
+id: toolchain-deploy-verify-where-addresses-come-from
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-1014, eip-161, yellow-paper, foundry-create2-guide, foundry-cast-create2, foundry-cast-compute-address, foundry-forge-inspect, foundry-cast-abi-encoding, solady-create3, solidity-docs-metadata, sourcify-exact-vs-match, foundry-solc-config, foundry-deploying]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+The same script. The same commit. Two chains. Two different addresses.
+
+You published the address in a blog post before the second deployment ran, because the whole point of
+the salt was that you could. The support channel has already started. You have about twenty minutes
+to work out which of four inputs moved, and "run it again" is not available, because the wrong address
+is now occupied.
+
+This lesson is the debugging procedure, and the reason the failure is so common: all four inputs are
+things a normal engineering change touches.
+
+## The two derivations, restated as deployment questions
+
+You know both address derivations from Track 03. What matters here is what each one promises a
+*deployment*, which is a different question from what it promises a contract.
+
+### CREATE: an address is a receipt for a counter
+
+An ordinary deployment derives its address from the deployer and that deployer's nonce: the rightmost
+160 bits of the hash of the RLP encoding of the pair.<Cite src="yellow-paper" /> EIP-1014 refers to
+the same thing as "the usual sender-and-nonce-hash".<Cite src="eip-1014" />
+
+```text
+address = keccak256( rlp([ sender, nonce ]) )[12:]
+```
+
+`cast compute-address` computes it directly — the reference describes the command as computing "the
+contract address from a given nonce and deployer address":<Cite src="foundry-cast-compute-address" />
+
+```bash
+cast compute-address $DEPLOYER --nonce 7
+```
+
+The nonce is a counter that advances with every transaction the account sends. That is the entire
+problem. An EOA that has done *anything* on chain B — a test transfer, a faucet claim, an approval
+someone made a year ago — is at a different nonce than the same EOA on chain A, and every contract it
+deploys lands somewhere else. "Deploy the same thing to five chains from the same key and get the same
+address" works exactly until one chain saw one extra transaction, and there is no way to go back.
+
+<Aside kind="note">
+Contract accounts count too, and their nonce starts at 1 rather than 0 under EIP-161's account
+rules.<Cite src="eip-161" /> That detail is not trivia here — it is the number that makes the CREATE3
+pattern at the end of this lesson work.
+</Aside>
+
+### CREATE2: an address is a commitment to four things
+
+EIP-1014's specification is one line, and every byte in it is an input you control:<Cite src="eip-1014" />
+
+<Figure
+  caption="Eighty-five bytes go into that hash. Move any one of them and the contract lands somewhere else."
+  alt="The CREATE2 preimage laid out as bytes: a one-byte 0xff prefix, the twenty-byte deployer address, a thirty-two-byte salt, and the thirty-two-byte keccak of the init code."
+>
+  <ByteLayout
+    caption="keccak256( 0xff ++ deployer ++ salt ++ keccak256(init_code) )[12:]"
+    fields={[
+      { label: '0xff', size: 1, tone: 'muted', note: 'fixed prefix' },
+      { label: 'deployer', size: 20, note: 'the factory, not you' },
+      { label: 'salt', size: 32, note: 'yours to choose' },
+      { label: 'keccak256(init_code)', size: 32, tone: 'warn', note: 'the input that moves' },
+    ]}
+  />
+</Figure>
+
+Foundry's own guide states the same formula and names the components: a fixed `0xff` prefix, the
+deployer address, your chosen salt, and the hash of the contract's creation
+bytecode.<Cite src="foundry-create2-guide" />
+
+No nonce. Which is what people hear, and then they stop listening — because the fourth input is the
+one that moves.
+
+### The property you are actually buying
+
+Before treating the initcode hash as a nuisance, be clear about what including it buys, because you
+are about to see a pattern that removes it.
+
+EIP-1014's own motivation is the sharpest statement of it: the derivation "allows interactions to
+(actually or counterfactually in channels) be made with addresses that do not exist yet on-chain but
+can be relied on to only possibly eventually contain code that has been created by a particular piece
+of init code".<Cite src="eip-1014" />
+
+Read that as a guarantee about the future. If the address is `keccak256(0xff ++ deployer ++ salt ++
+keccak256(init_code))[12:]`, then the only contract that can ever exist there is the one that
+particular initcode produces. Nothing else can occupy it — not a different version, not an attacker's
+contract, not your own later mistake. The address *is* a commitment to the code.
+
+That is what makes counterfactual deployment safe. You can tell a user their vault address and let
+them fund it before it exists, because whatever eventually appears there is the code you promised.
+You can hardcode an address into a contract on another chain before the target is deployed. You can
+audit code and then point at an address and say the audit covers whatever runs there.
+
+Three practical uses, all resting on the same fourth input:
+
+- **Pre-funding.** Send assets to an address that has no code yet.
+- **Cross-references.** Contract A on chain X refers to contract B's address on chain Y before B
+  exists.
+- **Provenance.** Two chains showing the same address is evidence — under CREATE2 — of the same
+  initcode, and therefore the same constructor arguments and the same compiler settings.
+
+Hold on to the third one. It is true under `CREATE2`, it is the reason people believe "same address
+means same contract", and by the end of this module you will know exactly which deployment patterns
+make it false.
+
+## The initcode hash is the fragile input
+
+EIP-1014 defines `init_code` precisely: "the code that, when executed, produces the runtime bytecode
+that will be placed into the state, and which typically is used by high level languages to implement a
+'constructor'".<Cite src="eip-1014" />
+
+Read that definition against how Solidity actually builds a deployment and three separate things fall
+inside the hash.
+
+### Worked example: deriving the address by hand
+
+Each step named by what it is for, because the point is to see where each input enters.
+
+**Subgoal 1 — get the creation bytecode, which is the compiler's output for the deployment, not for
+the deployed contract.**
+
+```bash
+forge inspect src/Token.sol:Token bytecode > /tmp/creation.hex
+```
+
+`forge inspect` is the command that prints a compiled contract's fields — bytecode, ABI, storage
+layout — straight out of the build artifact.<Cite src="foundry-forge-inspect" />
+
+**Subgoal 2 — append the ABI-encoded constructor arguments, because the constructor's inputs are part
+of what gets executed.**
+
+```bash
+cast abi-encode "constructor(address,uint16)" $TREASURY 250
+# concatenate: initcode = creation bytecode ++ encoded args
+```
+
+This is the step that surprises people. The arguments are not passed alongside the initcode; they are
+appended to it. They are *in* the hash. `cast abi-encode` produces exactly the encoding the ABI
+specification defines, which is the same encoding the compiler expects the constructor to find after
+the creation code.<Cite src="foundry-cast-abi-encoding" />
+
+**Subgoal 3 — hash it, producing the single value the derivation consumes.**
+
+```bash
+cast keccak $INITCODE
+```
+
+**Subgoal 4 — derive the address, from all four inputs at once.**
+
+```bash
+cast create2 --deployer $DEPLOYER --salt $SALT --init-code $INITCODE
+# or, if you already have the hash:
+cast compute-address $DEPLOYER --salt $SALT --init-code-hash $INITCODE_HASH
+```
+
+`cast create2` defaults `--deployer` to `0x4e59b44847b379578588920ca78fbf26c0b4956c`,<Cite src="foundry-cast-create2" />
+which is the community factory the next lesson is entirely about. If you did not pass a deployer, you
+computed an address relative to that one.
+
+### The three things that move the hash
+
+**Constructor arguments.** Subgoal 2 is where the multi-chain bug usually lives. The treasury address
+differs per chain. The bridge endpoint id differs per chain. The initial owner is a different multisig
+per chain. Each of those is a legitimate, deliberate, correct difference — and each one changes the
+initcode, the hash, and the address.
+
+**Optimizer settings.** `optimizer` and `optimizer_runs` change the generated code, and they are
+project configuration you can change without touching a contract.<Cite src="foundry-solc-config" />
+Bumping runs to shrink a hot path is a normal Tuesday. It moves every predicted address.
+
+**The compiler version — through the metadata tail.** The compiler appends the IPFS hash of the
+canonical metadata file, plus the compiler version, to the end of the runtime
+bytecode.<Cite src="solidity-docs-metadata" /> Because the runtime bytecode is the payload the
+creation code returns, that tail sits inside the initcode too. And the metadata covers the compiler
+settings and the source files themselves, so the chain is short and total: change a byte of source,
+the source hash changes, the metadata changes, the metadata hash changes, the deployed bytecode
+changes.<Cite src="sourcify-exact-vs-match" /> A comment. A renamed file. A different absolute path in
+a CI container.
+
+<Misconception
+  belief="CREATE2 guarantees the same address on every chain."
+  reality="It guarantees the same address for the same deployer, salt and initcode hash. The initcode includes ABI-encoded constructor arguments, and the compiled bytecode reflects optimizer settings, compiler version and even source file paths through the appended metadata hash."
+  why="The pitch is deterministic addresses, which is a true statement about the opcode and not about your deployment process."
+  src="foundry-create2-guide"
+/>
+
+<Aside kind="warn">
+The escape hatch exists and has a price. `--no-cbor-metadata`, or `settings.metadata.appendCBOR` set
+to false in Standard JSON, skips appending the metadata to the deployed
+bytecode.<Cite src="solidity-docs-metadata" /> That removes one source of drift — and removes the
+fingerprint that lets a verification service prove which exact sources produced this code. You are
+trading a reproducibility problem for a provenance problem. Decide which you would rather explain.
+</Aside>
+
+## Salts are an interface, so design them
+
+A salt is 32 bytes of your choosing, and most teams choose `keccak256("MyToken")` and move on. Two
+better habits.
+
+**Put a version in it.** `keccak256("MyToken.v2")` means a redeploy is a deliberate act with a
+different address, rather than a `CREATE2` that reverts because something already occupies the slot.
+Two contracts cannot share an address; a salt that never changes turns every redeploy into a wall.
+
+**Consider who else can use your salt.** `cast create2` has a `--caller` option described as the
+"address of the caller", used for the first 20 bytes of the salt.<Cite src="foundry-cast-create2" />
+That convention — encoding the permitted deployer into the salt's high bytes, so a factory can check
+it — exists because a shared public factory otherwise lets anyone deploy *their* initcode at *your*
+salt first. If your deployment depends on a specific address being free at broadcast time, that is a
+front-running surface, and the salt is where the mitigation goes.
+
+Salt mining is the same tool: `--starts-with`, `--ends-with` and `--matching` search for a salt whose
+resulting address has a chosen prefix.<Cite src="foundry-cast-create2" /> Useful for a recognisable
+address; irrelevant to security.
+
+## CREATE3: buying address stability with an extra contract
+
+Now the pattern that exists because of everything above. If the initcode hash is the input that keeps
+moving, remove it from the derivation.
+
+The trick is a composition of both opcodes. `CREATE2`-deploy a tiny intermediate contract whose own
+initcode is a fixed constant, then have *that* contract `CREATE` the real one at its own nonce 1. The
+final address depends on the salt and the deployer, and not at all on the code being deployed.
+
+Solady's implementation is small enough to read completely, and it is worth reading because every
+byte has a job.<Cite src="solady-create3" />
+
+**Subgoal 1 — the intermediate proxy's initcode is a constant, so its CREATE2 address depends on
+nothing but deployer and salt.**
+
+```text
+_PROXY_INITCODE   = 0x67363d3d37363d34f03d5260086018f3          (16 bytes)
+PROXY_INITCODE_HASH = 0x21c35dbe1b344a2488cf3321d6ce542f8e9f305544ff09e4993a62319a497c1f
+```
+
+<Cite src="solady-create3" />
+
+**Subgoal 2 — those 16 bytes do nothing but return 8 bytes of runtime code.**
+
+<Figure
+  caption="Sixteen bytes with no parameters in them: this is why the proxy's own CREATE2 address depends on nothing but the deployer and the salt."
+  alt="The sixteen-byte CREATE3 proxy initcode broken into opcodes: PUSH8 of the eight-byte runtime, RETURNDATASIZE supplying a zero, MSTORE, PUSH1 0x08 as the return size, PUSH1 0x18 as the return offset, and RETURN."
+>
+  <Anatomy
+    value="0x67363d3d37363d34f03d5260086018f3"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 4, label: 'PUSH8' },
+      { from: 4, to: 20, label: 'the 8-byte runtime', tone: 'accent' },
+      { from: 20, to: 22, label: 'RETURNDATASIZE', note: 'a zero without a PUSH' },
+      { from: 22, to: 24, label: 'MSTORE' },
+      { from: 24, to: 28, label: 'PUSH1 0x08', note: 'return size' },
+      { from: 28, to: 32, label: 'PUSH1 0x18', note: 'return offset' },
+      { from: 32, to: 34, label: 'RETURN' },
+    ]}
+  />
+</Figure>
+
+**Subgoal 3 — the 8-byte runtime is a one-shot deployer: copy my calldata, CREATE it.**
+
+<Figure
+  caption="The proxy never learns what it is deploying — it copies whatever calldata it was handed and creates that, which is exactly why its own address is stable."
+  alt="Eight opcodes of the CREATE3 proxy runtime. CALLDATASIZE and two RETURNDATASIZE pushes set up a CALLDATACOPY of the whole calldata into memory at zero, then CALLDATASIZE, RETURNDATASIZE and CALLVALUE set up CREATE with the call value, offset zero and the calldata size."
+>
+  <StackTrace
+    steps={[
+      { op: 'CALLDATASIZE', stack: ['cds'], changed: [0] },
+      { op: 'RETURNDATASIZE', stack: ['0', 'cds'], changed: [0] },
+      { op: 'RETURNDATASIZE', stack: ['0', '0', 'cds'], changed: [0] },
+      { op: 'CALLDATACOPY', stack: [], note: 'calldata → memory[0..cds)' },
+      { op: 'CALLDATASIZE', stack: ['cds'], changed: [0] },
+      { op: 'RETURNDATASIZE', stack: ['0', 'cds'], changed: [0] },
+      { op: 'CALLVALUE', stack: ['value', '0', 'cds'], changed: [0] },
+      { op: 'CREATE', stack: ['new address'], changed: [0], tone: 'accent', note: 'value, offset 0, size cds' },
+    ]}
+  />
+</Figure>
+
+<Cite src="solady-create3" />
+
+Whatever initcode you send it, it deploys. The proxy carries no knowledge of what it is deploying,
+which is exactly why its own address is stable.
+
+**Subgoal 4 — predict the final address, which is a plain CREATE derivation from the proxy at nonce
+1.**
+
+Solady computes it inline, and the constants in the comments are a direct payoff for
+[RLP](/c/rlp):<Cite src="solady-create3" />
+
+```text
+rlp([ proxy, 1 ])  =  0xd6  0x94  <20-byte proxy address>  0x01
+
+  0x94 = 0x80 + 0x14   (a 20-byte string; 0x14 is 20)
+  0x16 = 1 + 20 + 1    (the payload: the 0x94 marker, the address, the nonce)
+  0xd6 = 0xc0 + 0x16   (a short list whose payload is 22 bytes)
+
+address = keccak256( 0xd694 ++ proxy ++ 0x01 )[12:]
+```
+
+That is 23 bytes hashed, and Solady's `keccak256(0x1e, 0x17)` hashes exactly `0x17` = 23 of
+them.<Cite src="solady-create3" />
+
+The library's own documentation of the guarantee is one sentence: it "returns the deterministic address
+of the deployed contract, which solely depends on `salt`".<Cite src="solady-create3" />
+
+### What CREATE3 actually costs
+
+**An extra deployment, every time.** Two contracts land instead of one, and the proxy is dead weight
+afterwards.
+
+**A second contract in the trust path.** The address is now relative to a specific CREATE3 deployer
+contract, which must itself exist at the same address on every chain — which is the *original* problem,
+pushed one level down. Solady's prediction helper takes the deployer explicitly, precisely because the
+answer is meaningless without it.<Cite src="solady-create3" />
+
+**It is not an EIP.** Implementations differ between libraries, so "the CREATE3 address" is only
+defined relative to one implementation. Record which library and which version you used, in the same
+place you record the salt.
+
+**And the property you gave up.** With `CREATE2`, the address commits to the code at it: identical
+address implies identical initcode. With `CREATE3` it does not, by design. Same address, different
+bytecode, on two chains, is now a legal and expected state. If anything downstream — a monitoring
+script, an integration partner, a user — was treating "same address" as "same contract", CREATE3 is
+the moment that assumption becomes false.
+
+That last consequence is the thread the final lesson in this module picks up.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'CREATE', note: 'sender and nonce' },
+    { title: 'CREATE2', note: 'EIP-1014', tone: 'accent' },
+    { title: 'CREATE3', note: 'a library pattern, not an EIP', tone: 'warn' },
+  ]}
+  rows={[
+    { label: 'What decides the address?', cells: ['the deployer and its nonce', 'the deployer, the salt and the initcode hash', 'the deployer and the salt'] },
+    { label: 'Does the deployed code affect it?', cells: ['No', 'Yes — the initcode hash is one of the four inputs', 'No, by design'] },
+    { label: 'What moves it between chains?', cells: ['one extra transaction ever sent from that account', 'a constructor argument, an optimizer setting, a source path', 'the CREATE3 deployer not being at the same address'] },
+    { label: 'What can you promise before it exists?', cells: ['nothing you should rely on', 'that only this initcode can ever occupy the address', 'the address, but nothing about the code at it'] },
+  ]}
+  caption="CREATE2 is the only one of the three where an address is a commitment to the code; CREATE3 buys address stability by spending exactly that."
+  alt="The three derivations compared: what decides the address, whether the deployed code affects it, what moves it between chains, and what each lets you promise before the contract exists."
+/>
+
+<Check type="predict" concept="initcode-hash-fragility">
+Your token deploys to `0xA11CE…` on Ethereum via the shared CREATE2 factory. You run the identical
+script against Base and get a different address. Three things differ between the runs:
+
+1. The constructor takes `(address treasury, uint16 feeBps)`. On Ethereum you passed the mainnet
+   treasury; on Base a different one.
+2. Between the two runs, someone merged a PR that raised `optimizer_runs` from 200 to 1,000.
+3. Base's deployment ran in CI, where the repository is checked out at `/home/runner/work/proto/proto`
+   rather than `/Users/you/src/proto`.
+
+For each, say whether it can change the address, and by what mechanism. Then say what you would do
+differently so this class of failure cannot happen again.
+
+<Answer>
+**All three can change it, by three different routes into the same hash.**
+
+**1. Constructor arguments — yes, directly.** Constructor arguments are ABI-encoded and appended to the
+creation bytecode; the result is the `init_code` whose keccak256 the derivation
+consumes.<Cite src="eip-1014" /> A different treasury address is 32 different bytes in the initcode, so
+a different hash, so a different address. This one is not a mistake — the treasury *should* differ — it
+is a design conflict between "chain-specific configuration" and "identical address".
+
+**2. Optimizer runs — yes, through the generated code.** Optimizer settings are compiler input and
+change the emitted bytecode.<Cite src="foundry-solc-config" /> Different creation bytecode is a
+different initcode hash. Note the timing: the change is in a merged PR, not in the deployment command,
+so nothing about the two invocations looks different.
+
+**3. The checkout path — yes, through the metadata tail.** The compiler appends the IPFS hash of the
+canonical metadata file to the end of the runtime bytecode,<Cite src="solidity-docs-metadata" /> and
+the metadata covers the source files and their paths. Change the paths and the metadata changes, so
+its hash changes, so the deployed bytecode changes.<Cite src="sourcify-exact-vs-match" /> The runtime
+code is what the creation code returns, so the change propagates into the initcode as well. This is the
+one that reads as impossible and is not.
+
+**What to do differently — pick one of two coherent designs, not a mixture.**
+
+*If the address must be identical across chains:* make the initcode identical. That means no
+chain-specific constructor arguments — deploy with a uniform constructor and set the per-chain
+configuration in a follow-up transaction — plus a pinned compiler version and pinned optimizer settings
+committed in `foundry.toml`, and a fixed build path (a container with a fixed working directory).
+Alternatively use CREATE3, which removes the initcode from the derivation entirely and lets the
+constructor arguments differ.<Cite src="solady-create3" />
+
+*If the configuration must be chain-specific:* accept different addresses, and stop publishing a single
+address as if it were a property of the protocol. Publish a per-chain table instead.
+
+**And make the check mechanical either way.** Compute the expected address in the script before
+broadcasting and `require` that the deployment matches:
+
+```solidity
+address predicted = computeCreate2Address(salt, keccak256(initCode), factory);
+require(predicted == EXPECTED, "initcode drift");
+```
+
+A build that changed the initcode hash then fails during the dry run, on someone's laptop, instead of
+being discovered by a user who followed a blog post to an empty
+address.<Cite src="foundry-deploying" />
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Immediately next:** every CREATE2 address in this lesson was computed relative to a deployer, and
+most of them relative to the same one — a factory that is at the same address on most chains, for a
+reason worth understanding, and absent on others, for the same reason.
+
+**In verification:** the metadata tail that made your address move is the same tail that decides how
+strong a verification match you get. It is one mechanism with two consequences, and the last lesson in
+this module handles the second.
+
+**In your runbook:** the address strategy is a decision, made once, written down. Which derivation,
+which factory, which salt scheme, and what happens when the compiler is bumped. Teams that never make
+this decision explicitly make it implicitly, and find out during an incident.

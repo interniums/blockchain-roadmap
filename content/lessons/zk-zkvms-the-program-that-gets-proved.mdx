@@ -1,0 +1,397 @@
+---
+id: zk-zkvms-the-program-that-gets-proved
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    sp1-example-fibonacci-guest,
+    sp1-example-fibonacci-host,
+    sp1-releases,
+    succinct-sp1-docs,
+    sp1-docs-what-is-a-zkvm,
+    sp1-docs-proof-types,
+    sp1-docs-hardware-requirements,
+    sp1-docs-solidity-verifier,
+    risc0-zkvm-docs,
+    risc0-docs-guest-code,
+    risc0-docs-receipts,
+    theblock-risc-zero-production,
+    noir-docs-unconstrained,
+    chainpath-conflict-register,
+  ]
+stack: { sp1: "v6.5.0" }
+---
+
+This is the entire guest program from SP1's `fibonacci` example, read from the repository at tag
+**v6.5.0** on 26 August 2026 — comments trimmed, nothing else
+changed:<Cite src="sp1-example-fibonacci-guest" /><Cite src="sp1-releases" />
+
+```rust
+#![no_main]
+sp1_zkvm::entrypoint!(main);
+
+pub fn main() {
+    let n = sp1_zkvm::io::read::<u32>();
+    sp1_zkvm::io::commit(&n);
+
+    let mut a = 0;
+    let mut b = 1;
+    for _ in 0..n {
+        let mut c = a + b;
+        c %= 7919; // Modulus to prevent overflow.
+        a = b;
+        b = c;
+    }
+
+    sp1_zkvm::io::commit(&a);
+    sp1_zkvm::io::commit(&b);
+}
+```
+
+Count what is unusual. The loop is Rust. The arithmetic is Rust. Four things are not: the two
+attribute lines that replace the normal entry point, one `read`, and three `commit`s. That is the
+whole surface area of "writing a program for a zkVM" — and it is a surface about **input and output**,
+not about mathematics.
+
+Which is exactly why the first real bug in this field is an I/O bug. This lesson is about the
+boundary those four lines draw, what falls on each side of it, and what the proof does and does not
+say about either side.
+
+## The boundary is the input stream, not the language
+
+Take the two calls one at a time.
+
+`sp1_zkvm::io::read` does not read from `argv`, from a file, or from a socket. It reads from **the
+zkVM's input stream** — a sequence of values the host wrote before proving began. The host side of
+the same example makes the pairing visible:<Cite src="sp1-example-fibonacci-host" />
+
+```rust
+let n = 700_000u32;
+let mut stdin = SP1Stdin::new();
+stdin.write(&n);
+```
+
+`sp1_zkvm::io::commit` is the other half. It appends to the proof's **public values** — the outputs
+that travel with the proof and that a verifier gets to see. The host reads them back off the finished
+proof in the order they were committed:<Cite src="sp1-example-fibonacci-host" />
+
+```rust
+let _ = proof.public_values.read::<u32>();
+let a = proof.public_values.read::<u32>();
+let b = proof.public_values.read::<u32>();
+```
+
+Three commits in the guest, three reads on the host, same order, same types. There is no schema here
+and no function selector to catch a mismatch. If the guest commits a `u64` and the host reads a
+`u32`, nothing about the proof is invalid — the proof is a true statement about a computation, and
+you have simply misread its output. You have met this failure before as
+[ABI](/c/abi-encoding) decoding against the wrong signature; the difference is that here the
+mismatch does not even have four bytes of selector standing in its way.
+
+<Aside kind="warn">
+**A commit is a publication decision, and it is irreversible.** Everything you commit is visible to
+anyone holding the proof, forever. Committing a value "for debugging" is the same act as posting it
+on-chain. Committing too *little* is the more common bug and the more dangerous one, for the reason
+the next section is about.
+</Aside>
+
+RISC Zero draws the same boundary but names it in three parts rather than two, which is worth
+borrowing as vocabulary even if you only ever use SP1. Its guest can:<Cite src="risc0-docs-guest-code" />
+
+- **read inputs** — `env::read`, `env::read_slice`, `env::stdin`
+- **write private outputs to the host** — `env::write`, `env::write_slice`, `env::stdout`, `env::stderr`
+- **commit public outputs to the journal** — `env::commit`, `env::commit_slice`
+
+That middle row is the one people miss. A guest can hand something back to the host *without*
+putting it in the proof. Output is not one channel; it is two, and only one of them is a claim.
+
+<Figure
+  caption="One way in, three ways out — and the boundary is drawn by which call you used, not by which language you wrote."
+  alt="A flow from host to guest: the host writes values into the zkVM's input stream, which is the only way anything enters the guest program. From the guest, three exits: committed public values that travel with the proof, a private output channel that reaches only the host, and everything read but never committed, which stays a private witness."
+>
+  <Flow
+    lanes={['host', 'the only way in', 'guest', 'three ways out']}
+    nodes={[
+      { id: 'host', label: 'host', note: 'writes values before proving', col: 0 },
+      { id: 'stream', label: 'input stream', note: 'no network, disk or clock', col: 1, tone: 'accent' },
+      { id: 'guest', label: 'guest program', note: 'reads, computes, commits', col: 2 },
+      { id: 'pub', label: 'public values', note: 'committed: travels with the proof', col: 3, tone: 'good' },
+      { id: 'out', label: 'private output', note: 'reaches the host, not the proof', col: 3, tone: 'muted' },
+      { id: 'wit', label: 'private witness', note: 'read, used, never committed', col: 3, tone: 'muted', dashed: true },
+    ]}
+    edges={[
+      { from: 'host', to: 'stream' },
+      { from: 'stream', to: 'guest' },
+      { from: 'guest', to: 'pub', tone: 'good' },
+      { from: 'guest', to: 'out' },
+      { from: 'guest', to: 'wit' },
+    ]}
+  />
+</Figure>
+
+Everything the guest reads that it does not commit is a **private witness**. It existed, the prover
+had it, the computation used it, and the verifier never sees it. That is not a privacy feature
+bolted on — it is simply what "not committed" means.
+
+## The host is where the money is spent
+
+The host program is ordinary code on your machine. Here is the shape of the whole
+run:<Cite src="sp1-example-fibonacci-host" />
+
+```rust
+let client = ProverClient::from_env().await;
+
+// Run it WITHOUT proving, and get a report back.
+let (_, report) = client.execute(ELF, stdin.clone()).await.unwrap();
+println!("executed program with {} cycles", report.total_instruction_count());
+
+// Then pay.
+let pk = client.setup(ELF).await.unwrap();
+let mut proof = client.prove(&pk, stdin.clone()).core().await.unwrap();
+
+client.verify(&proof, pk.verifying_key(), None).expect("verification failed");
+```
+
+The line that matters most for your budget is `execute`. It runs the guest and returns a report with
+a **cycle count**, without generating a proof.<Cite src="sp1-example-fibonacci-host" /> RISC Zero
+exposes the same idea from inside the guest with `env::cycle_count`, alongside `env::log` for
+debugging.<Cite src="risc0-docs-guest-code" />
+
+Cycles are the currency of this whole discipline. Proving cost tracks the length of the execution
+trace, so a cycle count is the number you optimise against and the number you can get for free,
+in a fraction of a second, before you have provisioned a single GPU. The correct first move on any
+new guest program is: execute it, read the cycle count, and only then decide whether proving is a
+conversation worth having.
+
+<Misconception
+  belief="You find out what a zkVM workload costs by proving it."
+  reality="You find out by executing it and reading the cycle count, which costs a normal program run. Proving is what you do after the cycle count says the answer is plausible."
+  why="The prover is the visible, dramatic step, and tutorials go straight to it because their examples are small enough that the distinction never bites."
+  src="sp1-example-fibonacci-host"
+/>
+
+And note what `execute` also gives you: a way to know your guest is *correct* without paying to prove
+it. Debugging inside a prover is miserable and slow. Debugging inside an executor is a normal Rust
+debugging session.
+
+### A guest can verify another proof
+
+One capability deserves flagging now even though its machinery belongs to the next module, because it
+changes what "a program" can mean here. SP1's compressed proofs are constant-size STARK proofs, and
+the documentation gives the reason they exist in that form: they can be cheaply **recursively
+verified within SP1 itself**, which is what its proof-aggregation support is built
+on.<Cite src="sp1-docs-proof-types" />
+
+So a guest program is allowed to take proofs as input and check them. Sixteen proofs of sixteen
+batches go in; one proof goes out, saying "sixteen valid proofs existed and their public values chain
+together". The on-chain verifier's work does not change — it still checks one proof at
+around the cost you priced in the previous lesson — while the computation behind it grows without
+limit.
+
+This is the mechanism that turns the asymmetry from a fixed discount into an unbounded one, and it is
+also why "how many parties stop redoing the work" was the right question rather than "how big is the
+computation". Hold the capability; the *why* — a verifier expressed as a program, and what that costs
+— is the next module's subject.
+
+## Why the guest cannot phone out, and what to do instead
+
+No network. No filesystem. No system clock. No randomness that did not come in through the input
+stream. The guest is written in ordinary Rust, so the standard library's *shape* suggests the
+standard library's *capabilities* — and RISC Zero's guest boilerplate quietly tells you otherwise: the
+guest is `#![no_std]` and `#![no_main]`, because it is never launched as a standalone
+executable.<Cite src="risc0-docs-guest-code" />
+
+The reason is not a missing feature. It is that a proof is a statement about a **deterministic**
+trace. If the guest could read the wall clock, "this program executed correctly" would depend on a
+fact the verifier has no way to recheck, and the proof would be attesting to the prover's word about
+its own environment. There would be nothing to verify.
+
+<Misconception
+  belief="A guest program can call out to the network, read files, or use system time."
+  reality="Anything not fed in through the input stream cannot be part of a proved statement. Non-determinism has to be passed in as a witness and then constrained inside the guest."
+  why="The guest is written in ordinary Rust, so the language's affordances suggest the runtime's. The compile error arrives later than the mental model does."
+  src="risc0-docs-guest-code"
+/>
+
+The fix is a pattern, and it is the single most useful idea in this lesson.
+
+**Subgoal — turn "fetch it" into "supply it and check it".** You want a guest that reasons about the
+current ETH price. It cannot fetch one. So the host passes in a *signed price report* — the payload
+and a signature — and the guest verifies the signature inside the proof boundary. The proved
+statement changes from the unprovable "the price is 4,200" to the checkable "a report signed by key
+`K` said 4,200, and `K` was committed as a public value". A verifier who trusts `K` now has something
+to act on, and the trust assumption is named rather than smuggled.
+
+**Subgoal — generalise it.** Anything expensive to compute and cheap to check should be computed
+*outside* and checked *inside*. Do not factor a number in the guest; pass the factors in and multiply.
+Do not search a list for the matching entry; pass the index in and read it. Do not compute a square
+root; pass the root in and square it. The guest's job is verification, and verification is almost
+always the cheaper half.
+
+This pattern has a name in circuit languages, where it is explicit rather than idiomatic: Noir calls
+them **unconstrained functions**, and its documentation is direct that their results are hints which
+your constrained code must then check.<Cite src="noir-docs-unconstrained" /> A zkVM does not force you
+to mark the boundary, which makes the discipline yours to keep.
+
+<Aside kind="stop">
+**An unchecked hint is a hole in the proof, not an optimisation.** If the guest reads a value and
+branches on it without constraining it, the prover chooses that value freely — and a prover choosing
+freely is an adversary. The proof will still verify. It will simply be proving a different statement
+from the one you thought you wrote, and the verifier has no way to tell. Every "pass it in" in the
+list above is only safe because of the "and check it" that follows.
+</Aside>
+
+## RISC Zero, and what a receipt actually contains
+
+The other production zkVM proving arbitrary Rust is RISC Zero, which reached a production-ready
+release in 2024.<Cite src="theblock-risc-zero-production" /> Its pipeline is spelled out in four
+steps, and the vocabulary differs enough to be worth mapping deliberately:<Cite src="risc0-zkvm-docs" />
+
+1. The guest program is compiled to an **ELF binary**.
+2. The **executor** runs the ELF and records the **session**.
+3. The **prover** checks and proves the validity of the session, outputting a **receipt**.
+4. Anyone with the receipt can **verify** it — and the verification algorithm takes an **ImageID** as
+   a parameter, which is a cryptographic identifier for the expected binary.
+
+A receipt is two pieces: a **journal**, which holds the program's public outputs, and a **seal**, the
+opaque blob that cryptographically attests to the receipt's validity.<Cite src="risc0-docs-receipts" />
+Journal is to seal as public values are to proof.
+
+Now read step 4 again, because it carries the whole security argument. The docs work the example
+through two parties: Alice and Bob agree on a guest program, and they each have the source and the
+ImageID — and in practice Bob gets that ImageID either by constructing it himself or by retrieving
+it from a trusted channel.<Cite src="risc0-docs-receipts" /> Verifying then tells Bob two things at
+once: the execution was valid, *and* the program that executed was the one with the expected
+ImageID.<Cite src="risc0-docs-receipts" />
+
+That second clause is where deployments go wrong. A receipt with no ImageID pinned is a proof that
+*some* program ran. It is the same fact as SP1's verification key, which is derived from the compiled
+ELF and which the Solidity SDK tells you to keep upgradeable inside your
+contract.<Cite src="sp1-docs-what-is-a-zkvm" /><Cite src="sp1-docs-solidity-verifier" /> Whichever
+system you use, the identifier of the binary is a value your system must hold and defend, and how it
+gets updated is a governance question dressed as a constant.
+
+<Aside kind="note">
+**The hardware question is also a purchasing question.** RISC Zero recommends at least 16 GB of RAM
+for local proof generation, and offers the alternative of not owning the machine at all: proofs can
+be requested from **Boundless**, where provers generate them on your behalf, and the docs note that
+in that mode you do not write host code at all.<Cite src="risc0-zkvm-docs" /> SP1's local-proving
+table sets its own floors — 16 or more CPU cores for core and compressed proving, and 16 GB or more
+of memory rising to 64 GB or more for PLONK wrapping — and it too recommends its network for
+non-trivial programs.<Cite src="sp1-docs-hardware-requirements" /> "Which zkVM" and "whose GPUs" are
+two decisions, and the second one is often the one with the invoice attached.
+</Aside>
+
+### One interface, two dialects
+
+<Compare
+  axis="The same idea, two names"
+  columns={[{ title: 'SP1' }, { title: 'RISC Zero' }]}
+  rows={[
+    { label: 'Code being proved', cells: ['guest program', 'guest code'] },
+    { label: 'Compiled artifact', cells: ['ELF', 'ELF binary'] },
+    { label: 'Public outputs', cells: [<>public values (<code>io::commit</code>)</>, <>journal (<code>env::commit</code>)</>] },
+    { label: 'Private output to host', cells: [{ v: '—', tone: 'muted' }, <><code>env::write</code> / <code>env::stdout</code></>] },
+    { label: 'The proof object', cells: ['proof', 'receipt (journal + seal)'] },
+    { label: 'Binary identity', cells: [<>verification key <code>vk</code>, derived at <code>setup</code></>, 'ImageID'] },
+    { label: 'Dry run, no proof', cells: [<><code>client.execute</code> → cycle report</>, <>executor session, <code>env::cycle_count</code></>] },
+    { label: 'Not-your-hardware option', cells: ['Succinct Prover Network', 'Boundless'] },
+  ]}
+  caption="Every row is one idea under two names — the only genuine asymmetry is the private channel back to the host."
+  alt="SP1 and RISC Zero side by side. Guest program versus guest code; ELF versus ELF binary; public values committed with io::commit versus a journal committed with env::commit; no SP1 equivalent of RISC Zero's env::write private output to the host; a proof versus a receipt made of a journal and a seal; a verification key derived at setup versus an ImageID; client.execute returning a cycle report versus an executor session and env::cycle_count; the Succinct Prover Network versus Boundless."
+/>
+
+Sources, left to right: SP1's own docs and example, and RISC Zero's zkVM overview, receipts and guest
+pages.<Cite src="sp1-example-fibonacci-guest" /><Cite src="sp1-example-fibonacci-host" /><Cite src="risc0-zkvm-docs" /><Cite src="risc0-docs-receipts" /><Cite src="risc0-docs-guest-code" />
+
+Treat the pair as two implementations of one interface. They differ in proof system, in memory
+behaviour on large programs, and in what hardware they expect — and those differences are real. They
+do not differ in the model you have just learned, which is why porting a guest program between them
+is a mechanical exercise and porting a hand-written circuit is not.
+
+Which one to pick is the next lesson's problem, and the short version of its answer is that the
+published comparisons will not settle it: circulating cost figures for these systems are stated in
+mismatched units and circulating latency figures span different years, hardware and
+scopes.<Cite src="chainpath-conflict-register" />
+
+## Three things a valid proof does not say
+
+Before the module moves on, fix the negative space. A proof that verifies tells you the program ran
+and produced these public values. It does not tell you:
+
+**1. That the inputs were the right inputs.** The prover chose them. Unless a public value binds an
+input to something the verifier independently knows — a state root, a signature over a known key, a
+commitment posted earlier — "correct computation over data I selected" is all you have bought.
+
+**2. That the program is correct.** The proof attests faithfully to whatever the guest actually does,
+bugs included. A guest that returns `true` unconditionally produces valid proofs all day. Auditing
+the guest is a normal software audit and it does not go away.
+
+**3. That the private inputs were private in any operational sense.** They were on the prover's
+machine, in the prover's memory, possibly in the prover's logs, and if you outsourced proving they
+were on somebody else's machine entirely. "Not committed" means "not in the proof". It does not mean
+"nobody saw it".
+
+<Check type="spot-bug" concept="guest-program">
+A team ships a guest program for an airdrop claim. Cleaned up, it is:
+
+```rust
+pub fn main() {
+    let root: [u8; 32] = sp1_zkvm::io::read();
+    let address: [u8; 20] = sp1_zkvm::io::read();
+    let amount: u64 = sp1_zkvm::io::read();
+    let path: Vec<[u8; 32]> = sp1_zkvm::io::read();
+
+    assert!(verify_merkle_path(root, leaf(address, amount), &path));
+
+    sp1_zkvm::io::commit(&amount);
+}
+```
+
+The on-chain claim contract verifies the proof, reads `amount` from the public values, and transfers
+that many tokens to `msg.sender`. Name every way a prover drains this, and give the minimal fix.
+
+<Answer>
+**The bug is not in the Merkle check. The Merkle check is fine.** Everything wrong here is about what
+was committed.
+
+**1. The root is a private input.** `root` is read and never committed, so the proof says "there
+exists *some* root under which this leaf is valid". A prover invents their own tree containing a leaf
+worth ten million tokens, proves membership in it, and the statement is entirely true. The contract
+compares nothing, because it was given nothing to compare. **Commit the root**, and have the contract
+require that it equals the airdrop root it stores.
+
+**2. The address is a private input.** Even with the root fixed, the proof never says *whose* leaf
+this was. Any prover who obtains any valid leaf — they are in a public tree — proves it and claims to
+`msg.sender`. **Commit the address**, and have the contract require it equals `msg.sender`.
+
+**3. Nothing prevents replay.** With root and address both committed and checked, the same proof is
+still a bearer instrument: it verifies every time it is submitted. **The contract must record that
+this claim has been consumed** — a `claimed[address]` flag is enough here, and the general form is a
+nullifier. This is contract work, not guest work, and it is the most commonly skipped step.
+
+**4. The private inputs are not secret.** `address` and `amount` are in a public Merkle tree.
+Not committing them hid them from the proof, not from anybody. If the goal were a *private* airdrop,
+this design does not deliver one and the leak is in the tree, not the zkVM.
+
+**The minimal fix, stated as a rule.** Every value the verifier must agree on has to be a public
+value, and the contract has to check each one against something it already knows. Committing less is
+not a privacy win — it is a deletion of the very clauses that make the proof mean anything. The
+useful reflex when reading any guest program is to write out the sentence the proof proves, filling
+in "there exists" for every uncommitted input, and then ask whether that sentence is one you would
+pay out on.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now read a guest program and say precisely what its proof asserts: the committed values are
+the claim, the uncommitted inputs are existential quantifiers, and anything the program could not
+reach — network, disk, clock — had to arrive through the input stream and be checked on the way in.
+
+That is enough to write one. It is not enough to choose which system to run it on, and the next
+lesson is about why that choice resists the benchmarks published to settle it — the hardware
+requirement usually dominates the algorithmic difference, and the vendors say as much in their own
+documentation.<Cite src="succinct-sp1-docs" /><Cite src="risc0-zkvm-docs" />

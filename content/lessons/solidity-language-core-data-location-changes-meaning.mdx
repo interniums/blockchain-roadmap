@@ -1,0 +1,394 @@
+---
+id: solidity-language-core-data-location-changes-meaning
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solidity-docs-types, solidity-docs-contracts, solidity-docs-storage-layout, solidity-050-breaking, solidity-changelog, eip-1153]
+stack: { solidity: "0.8.36" }
+---
+
+Here is a pull request whose entire diff is one word.
+
+```solidity
+struct Position { uint128 collateral; uint128 debt; }
+mapping(address => Position) private positions;
+
+function topUp(address who, uint128 amount) internal {
+-   Position memory  p = positions[who];
++   Position storage p = positions[who];
+    p.collateral += amount;
+}
+```
+
+Both versions compile. Neither produces an error. They do completely different things: the second
+credits the account, and the first computes a number and throws it away when the call frame ends.
+
+You already know the machine underneath. You know [storage is the expensive, persistent
+map](/c/storage-is-the-expensive-one), that [memory is scratch space scoped to one
+frame](/c/memory-is-per-frame), and that [calldata is a read-only region you were handed by the
+caller](/c/calldata-is-read-only). None of that tells you what the diff above does, because the
+question is not where the bytes sit. The question is whether `p` **is** the struct or is a **copy
+of** the struct — and in Solidity that is decided by a keyword most people read as a performance
+hint.
+
+This lesson is the four rules that decide it, and the shape of the mistakes they produce.
+
+<Figure
+  caption="Each part of this module repairs one place where familiar syntax carries an unfamiliar meaning."
+  alt="The module's four themes in order: data location decides aliasing, visibility and mutability constrain contracts rather than people, a modifier is a textual splice, and multiple inheritance is resolved by C3 linearisation."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'loc', label: 'data location', note: 'aliasing, not performance', col: 0, tone: 'accent' },
+      { id: 'vis', label: 'visibility, view, pure', note: 'constrains contracts, not people', col: 1 },
+      { id: 'mod', label: 'modifiers', note: 'a splice, not a check', col: 2 },
+      { id: 'inh', label: 'inheritance', note: 'C3, and not Python’s order', col: 3 },
+    ]}
+  />
+</Figure>
+
+## The split is about aliasing, not size
+
+Solidity divides every type into two families, and the dividing line is stated in the docs as a
+property of assignment rather than of representation.
+
+**Value types** are "always copied when they are used as function arguments or in
+assignments."<Cite src="solidity-docs-types" /> The family is closed and short: `bool`, the integer
+types, `address` and `address payable`, the fixed-width `bytesN` types, enums, contract types,
+user-defined value types, and function types.<Cite src="solidity-docs-types" />
+
+**Reference types** are the ones where "values of reference type can be modified through multiple
+different names."<Cite src="solidity-docs-types" /> That family is also closed, and shorter:
+structs, arrays — which includes `bytes` and `string` — and mappings.<Cite src="solidity-docs-types" />
+
+Read those two sentences next to each other and the design falls out. A value-typed name can never
+alias another value-typed name, so there is nothing to decide about it and nothing to annotate. The
+docs say exactly that: value type declarations "do not specify a data location since they are small
+enough to be stored on the stack", with state variables as the sole exception, since those live in
+storage by default and may instead be marked `transient`, `constant` or
+`immutable`.<Cite src="solidity-docs-types" />
+
+A reference-typed name is a handle. Two handles can point at one thing. So every reference-typed
+variable has to say which region its referent lives in — and the compiler has refused to guess
+since 0.5.0, when explicit data location became mandatory for every variable of struct, array or
+mapping type, including parameters and return variables.<Cite src="solidity-050-breaking" /><Cite src="solidity-docs-types" />
+
+<Aside kind="note">
+The annotation is grammatically attached to the *variable*, not to the type. `uint256[] storage a`
+and `uint256[] memory b` have the same element type and the same length semantics; what differs is
+what the name `a` or `b` denotes. This is why "change `memory` to `storage` to make it faster" is
+not a well-formed sentence — you have changed what the identifier refers to.
+</Aside>
+
+## Three locations, and the four rules that connect them
+
+The three locations are the ones you already know from the machine, restated in the language's
+terms: `storage` is where the state variables live and lasts as long as the contract; `memory` has a
+lifetime limited to one external function call; and `calldata` is "a non-modifiable, non-persistent
+area where function arguments are stored, and behaves mostly like memory."<Cite src="solidity-docs-types" />
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'storage', note: 'the contract’s own state' },
+    { title: 'memory', note: 'scratch for one call' },
+    { title: 'calldata', note: 'what the caller handed you' },
+  ]}
+  rows={[
+    {
+      label: 'How long does the data live?',
+      cells: [
+        'As long as the contract',
+        'One external function call',
+        'The call that supplied it',
+      ],
+    },
+    {
+      label: 'Can your code write to it?',
+      cells: [
+        'Yes, and only these writes persist',
+        'Yes, and the writes vanish with the frame',
+        'No — non-modifiable by definition',
+      ],
+    },
+    {
+      label: 'Where may a local variable of this location point?',
+      cells: [
+        'Only at an existing storage object',
+        'At a fresh allocation or a copy',
+        'Only at a parameter it was handed',
+      ],
+    },
+    {
+      label: 'What does assigning out of it cost?',
+      cells: [
+        'A read per slot the copy touches',
+        'A memory copy of runtime length',
+        'A copy, unless the target is calldata too',
+      ],
+    },
+  ]}
+  caption="The locations differ in lifetime and in write permission, which is why one keyword can decide whether a function has any effect."
+  alt="Storage, memory and calldata compared on lifetime, writability, what a local variable of that location may point at, and the cost of assigning out of it."
+/>
+
+What is not obvious from the machine is what happens when you assign across them. The docs give
+four rules, and they are worth having verbatim because every one of the bugs in this lesson is a
+misremembering of one of them:<Cite src="solidity-docs-types" />
+
+1. **Assignments between storage and memory (or from calldata) always create an independent copy.**
+2. **Assignments from memory to memory only create references.** Changes through one memory variable
+   are visible in every other memory variable referring to the same data.
+3. **Assignments from storage to a local storage variable also only assign a reference.**
+4. **All other assignments to storage always copy.** That includes assignments to state variables,
+   and assignments to members of a local variable of storage struct type — even when the local
+   variable is itself just a reference.
+
+Two of those four alias. The other two copy. Here is the arrangement in one table, because the
+asymmetry is the thing to memorise:
+
+<Matrix
+  corner="assign from ↓"
+  cols={['storage (state)', 'storage (local var)', 'memory', 'calldata']}
+  rows={[
+    {
+      label: 'storage',
+      cells: ['copy', { v: 'alias', tone: 'accent' }, 'copy', { v: 'n/a', tone: 'muted' }],
+    },
+    {
+      label: 'memory',
+      cells: ['copy', { v: 'not allowed', tone: 'muted' }, { v: 'alias', tone: 'accent' }, { v: 'n/a', tone: 'muted' }],
+    },
+    {
+      label: 'calldata',
+      cells: ['copy', { v: 'not allowed', tone: 'muted' }, 'copy', { v: 'alias (parameter)', tone: 'accent' }],
+    },
+  ]}
+  caption="Crossing a location boundary always copies; only an assignment that stays inside one region can alias."
+  alt="A grid of assignment source location against destination. Storage into a local storage variable, memory into memory, and calldata into a calldata parameter alias. Every other legal combination copies, and memory and calldata cannot be assigned into a local storage variable at all."
+/>
+
+The trap is not that the rules are complicated. It is that **the two aliasing cases are the two that
+look most like ordinary local-variable declarations.** `Position storage p = positions[who];` and
+`uint256[] memory tmp = other;` both read like "make a local named after this thing", and both are
+in fact "make a second name for this thing". Everything else in the table announces itself by
+crossing a location boundary.
+
+### Worked example: the compiler's own five lines
+
+The Solidity documentation ships a short contract that exercises all four rules. Walk it one
+statement at a time, naming what each line is *for* rather than what it does.<Cite src="solidity-docs-types" />
+
+```solidity
+contract C {
+    uint[] x;                                   // data location of x is storage
+
+    function f(uint[] memory memoryArray) public {
+        x = memoryArray;      // 1
+        uint[] storage y = x; // 2
+        y[7];                 // 3
+        y.pop();              // 4
+        delete x;             // 5
+        // y = memoryArray;   // 6 — does not compile
+        // delete y;          // 7 — does not compile
+        g(x);                 // 8
+        h(x);                 // 9
+    }
+
+    function g(uint[] storage) internal pure {}
+    function h(uint[] memory) public pure {}
+}
+```
+
+**Subgoal 1 — establish that crossing a boundary always duplicates.** `x = memoryArray` is memory
+into a state variable. That is rule 1, so it "copies the whole array to storage."<Cite src="solidity-docs-types" />
+This one statement can be arbitrarily expensive: it is a loop of `SSTORE`s whose length is a runtime
+value, priced by the schedule you already know, and none of that appears in the source.
+
+**Subgoal 2 — establish that a local storage variable is a second name, not a copy.**
+`uint[] storage y = x` "assigns a pointer, data location of y is storage."<Cite src="solidity-docs-types" />
+Rule 3. `y` now denotes the same array as `x`.
+
+**Subgoal 3 — confirm reads go through the pointer.** `y[7]` "returns the 8th element" —
+of `x`, because there is only one array.<Cite src="solidity-docs-types" />
+
+**Subgoal 4 — confirm writes go through the pointer, in both directions.** `y.pop()` "modifies x
+through y", and then `delete x` "clears the array, also modifies y."<Cite src="solidity-docs-types" />
+The aliasing is symmetric. This is the whole content of rule 3, and it is the reason the opening
+diff changed the program's meaning rather than its cost.
+
+**Subgoal 5 — see the two things you are not allowed to do, and why the refusals differ.**
+`y = memoryArray` is rejected because it "would need to create a new temporary / unnamed array in
+storage, but storage is 'statically' allocated."<Cite src="solidity-docs-types" /> There is nowhere
+to put it. `delete y` is rejected for a different reason: assignments to a local storage reference
+"can only be made from existing storage objects", and resetting the pointer would leave it aimed at
+no sensible location.<Cite src="solidity-docs-types" /> Note carefully what *is* allowed:
+`delete x` clears the array; `delete y` would try to clear the pointer. The compiler distinguishes
+those, and so must you.
+
+**Subgoal 6 — see the same split applied to arguments.** `g(x)` "calls g, handing over a reference
+to x"; `h(x)` "calls h and creates an independent, temporary copy in memory."<Cite src="solidity-docs-types" />
+Two calls, same argument, same syntax at the call site. The callee's parameter annotation decides
+whether the callee can mutate your state. Whether a function can write your storage is visible only
+in *its* signature, never at the call.
+
+<Aside kind="warn">
+Subgoal 6 is the one worth carrying into code review. When you read `doThing(orders)` you have
+learned nothing about whether `orders` survives the call unchanged. You have to go read the
+signature of `doThing`. An `internal` function taking `Order[] storage` is a function with write
+access to your state, and it looks identical at the call site to one that takes a copy.
+</Aside>
+
+## The rule people get wrong is the fourth one
+
+Rules 1 through 3 tend to stick because they have memorable shapes: crossing copies, memory aliases,
+local storage aliases. Rule 4 is the one that catches experienced readers, because it contradicts
+the intuition rule 3 just installed.
+
+> All other assignments to storage always copy. Examples for this case are assignments to state
+> variables or to members of local variables of storage struct type, even if the local variable
+> itself is just a reference.<Cite src="solidity-docs-types" />
+
+Read the second half slowly. `p` is a storage reference. `p.inner = someMemoryStruct` is an
+assignment *into* storage through that reference, so it copies — field by field, one `SSTORE`
+sequence, right now. The reference-ness of `p` does not propagate to the assignment. `p` being a
+pointer means writes through it land in state; it does not mean writes through it are cheap or lazy.
+
+That is the correct mental model to keep: **a storage reference decides *where* a write lands, never
+*whether* a write happens.** Assigning to `p` itself is not a write at all. Assigning to `p.field`
+is a write to the contract's state. The next lesson is entirely about that pair, because the two
+statements differ by four characters.
+
+<Misconception
+  belief="Choosing memory over storage is a performance decision, like stack versus heap in C."
+  reality="It changes assignment semantics. A storage-to-local-storage assignment aliases; a storage-to-memory assignment copies. Two programs that differ only in that keyword compute different results, not the same result at different speeds."
+  why="Every language an engineer arrives with has a lifetime-and-cost distinction in roughly this position — stack versus heap, value versus boxed — and in those languages the choice never changes what a mutation is visible to. Solidity puts the aliasing decision in the same syntactic slot, so the habit transfers cleanly and silently produces the wrong reading."
+  src="solidity-docs-types"
+/>
+
+### The check that would have caught the opening diff
+
+Go back to `topUp`. There is a mechanical way to make the compiler tell you which version you wrote,
+and it costs one keyword.
+
+Writing to a state variable is one of the operations the compiler counts as modifying
+state.<Cite src="solidity-docs-contracts" /> So if you declare `topUp` as `view`, the `storage`
+version fails to compile — it writes — and the `memory` version compiles cleanly, because it does
+not. That is a one-line, compile-time discriminator between "this function updates the ledger" and
+"this function computes a number". If your intent was to write state and the function accepts
+`view`, the write went nowhere.
+
+Lesson 4 takes mutability apart properly, including the one place where that promise is not backed
+by the EVM. For now it is a tool: mutability annotations are the cheapest available assertion about
+whether a reference-typed local is doing what you meant.
+
+## What `transient` is, and is not
+
+You met [transient storage](/c/transient-storage) at the opcode level: `TSTORE` and `TLOAD` from
+EIP-1153, a key-value region scoped to the transaction and cleared afterwards.<Cite src="eip-1153" />
+Since Solidity's default EVM target moved to `osaka` in 0.8.31, those opcodes are assumed present
+unless you deliberately lower the target for an older chain.<Cite src="solidity-changelog" />
+
+It is tempting to file transient storage as a fourth data location. The language does not, and the
+docs say so in one line: "`transient` is not yet supported as a data location for reference
+types."<Cite src="solidity-docs-types" />
+
+Two consequences follow. First, `transient` appears as a *state variable* modifier, alongside
+`constant` and `immutable`, not as an annotation you can write on a local
+variable.<Cite src="solidity-docs-types" /> Second, only value types are supported there at
+all — the storage-layout rules say so directly, and note that the storage and transient layouts are
+"completely independent and don't interfere with each other's variable locations", so the two kinds
+of state variable can be interleaved safely.<Cite src="solidity-docs-storage-layout" /> You cannot
+declare a transient mapping, a transient struct or a transient dynamic array.
+
+<Misconception
+  belief="transient is a fourth data location, so you can write `MyStruct transient s` or keep a transient mapping."
+  reality="It is a modifier on value-typed state variables only. The documentation states plainly that transient is not yet supported as a data location for reference types, and the layout rules confirm only value types are supported there."
+  why="TSTORE and TLOAD get taught as 'storage, but cheap and per-transaction', which frames transient as a peer of storage rather than as a restricted modifier. The natural next thought is that anything storage can hold, transient can hold."
+  src="solidity-docs-types"
+/>
+
+<Check type="predict" concept="sol-assignment-copy-rules">
+A vault keeps positions in a mapping and a running list of active accounts.
+
+```solidity
+struct Position { uint128 collateral; uint128 debt; }
+
+mapping(address => Position) private positions;
+address[] private active;
+
+function settle(address who, Position memory fresh) internal {
+    Position storage p = positions[who];   // A
+    p = fresh;                             // B
+    positions[who].debt = fresh.debt;      // C
+
+    address[] memory snapshot = active;    // D
+    address[] memory alias_ = snapshot;    // E
+    alias_[0] = address(0);                // F
+}
+```
+
+For each of the six lines, say whether it copies, aliases, or touches no state at all. Then say what
+`positions[who].collateral` and `active[0]` hold when `settle` returns.
+
+<Answer>
+**A — aliases, and touches nothing.** Rule 3: storage to a local storage variable assigns a
+reference.<Cite src="solidity-docs-types" /> `p` is now a second name for `positions[who]`. No
+`SSTORE` has happened.
+
+**B — touches no state at all, and this is the bug.** `p = fresh` assigns *to the pointer*, not
+through it. It is not one of the four rules operating on storage contents; it is a local variable
+being pointed somewhere else. In this exact shape the compiler rejects it, for the reason from
+subgoal 5 — a memory array or struct has no storage location to point at, so `p = fresh` is not a
+legal retarget.<Cite src="solidity-docs-types" /> The version that *does* compile is
+`p = positions[somebodyElse]`, which silently changes which account the rest of the function writes
+to. Either way, line B has not updated any collateral.
+
+**C — copies.** This is rule 4: an assignment into storage, through a mapping access, copies the
+value now.<Cite src="solidity-docs-types" /> One `uint128` field is written. Note that C works
+whether or not A and B exist; it does not read `p`.
+
+**D — copies.** Storage to memory crosses a boundary, so rule 1: an independent copy of the whole
+`active` array is materialised in memory.<Cite src="solidity-docs-types" /> The cost is linear in
+the array's length and does not appear anywhere in the syntax.
+
+**E — aliases.** Memory to memory creates a reference, and changes through one are visible through
+the other.<Cite src="solidity-docs-types" /> `snapshot` and `alias_` are two names for one array.
+
+**F — writes to memory only.** It mutates the array that D copied. The copy is discarded when the
+frame ends.
+
+**On return:** `positions[who].collateral` is **unchanged** — nothing in the function ever wrote it.
+`positions[who].debt` is `fresh.debt`, from line C. `active[0]` is **unchanged**, because D copied
+before F mutated.
+
+The instructive part is the pairing of B and F. Both look like assignments that should stick. B
+fails to write state because it retargets a pointer instead of writing through it; F fails to write
+state because it writes through a copy instead of the original. They are the two halves of the same
+confusion — one where you expected a copy's semantics and got a pointer's, one the reverse — and no
+amount of reading either line in isolation tells you which you have.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** takes the two survivors from this one — `calldata` parameters and local storage
+pointers — and treats each as a hazard in its own right: the copy you did not ask for, and the
+pointer that looks like data.
+
+**Storage layout** stops being an abstraction the moment you accept that these are references into a
+concrete slot map. State variables are laid out contiguously from slot 0, packed where the sizes
+permit, and dynamic arrays and mappings deliberately break that pattern.<Cite src="solidity-docs-storage-layout" />
+A `T storage` reference is, at the bytecode level, a slot number that the compiler has been tracking
+for you.
+
+**Delegatecall and proxies** are this lesson at cross-contract scale. When one contract runs another
+contract's code against its own storage, the two compilations agree about slot numbers and about
+nothing else — no names, no types. Every proxy storage-collision bug is a data-location bug where
+the two sides of the alias were compiled separately.
+
+**Gas review** gets a rule of thumb you can apply without a profiler: look for boundary crossings.
+An assignment that crosses between storage, memory and calldata is a copy whose length is often a
+runtime value, and it is usually the largest number in a function you thought was cheap.

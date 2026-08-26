@@ -1,0 +1,382 @@
+---
+id: evm-yul-assembly-memory-map-is-a-contract
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    solidity-layout-memory,
+    solidity-layout-storage,
+    solidity-inline-assembly,
+    solidity-yul,
+    solidity-custom-storage-layout,
+    ottersec-memory-safety,
+    eip-5656,
+    eip-2929,
+    eip-1153,
+    measured-gas-constants,
+  ]
+stack:
+  solc: "0.8.36"
+---
+
+A bug report from someone else's pull request.
+
+A function builds a `bytes memory` payload, calls a small assembly helper to hash part of it, then
+appends a second array and returns. The helper was reviewed and is four lines long. The test that
+fails is not a test of the helper — it asserts the length of the second array, and it reports a
+length in the tens of billions.
+
+Nobody wrote to that array's length. Nobody wrote near it. The helper touched sixty-four bytes at
+the bottom of memory and returned a `bytes32`.
+
+That is the shape of every memory bug in assembly: **the symptom appears in code that is correct**.
+Solidity's memory conventions are not a style guide the compiler recommends. They are an interface
+the compiler's own generated code is on the other side of, and an assembly block that violates them
+corrupts statements it never mentions.
+
+## The four reserved slots
+
+Solidity reserves four 32-byte slots at the bottom of memory, with these byte ranges inclusive of
+endpoints:<Cite src="solidity-layout-memory" />
+
+| Range | Size | Purpose |
+|---|---|---|
+| `0x00` – `0x3f` | 64 bytes | scratch space for hashing methods |
+| `0x40` – `0x5f` | 32 bytes | currently allocated memory size — the free memory pointer |
+| `0x60` – `0x7f` | 32 bytes | the zero slot |
+
+Everything above `0x80` is allocation. Solidity always places new objects at the free memory
+pointer, and memory is never freed.<Cite src="solidity-layout-memory" />
+
+<Figure
+  caption="Three of these four regions belong to the compiler, and only the first is yours without ceremony."
+  alt="Solidity memory from offset zero upward: 64 bytes of scratch space, the 32-byte free memory pointer at 0x40, the 32-byte zero slot at 0x60, and allocations from 0x80 upward."
+>
+  <ByteLayout
+    caption="Solidity memory, from 0x00 up"
+    fields={[
+      { label: 'scratch space', size: 64, tone: 'good', note: '0x00-0x3f, yours to use' },
+      { label: 'free memory pointer', size: 32, tone: 'accent', note: '0x40, a value not a place' },
+      { label: 'zero slot', size: 32, tone: 'danger', note: '0x60, never write here' },
+      { label: 'allocations', variable: true, note: '0x80 up, never freed' },
+    ]}
+  />
+</Figure>
+
+Three of these have consequences sharper than the table suggests.
+
+**Scratch space is explicitly yours to use.** The documentation says scratch space can be used
+between statements, which is to say within inline assembly.<Cite src="solidity-layout-memory" /> This
+is the one region you may write without ceremony — which is why `keccak256` over two words in
+assembly is idiomatic rather than reckless.
+
+**The free memory pointer is a value, not an address to write over.** `0x40` holds a number: the
+offset of the next free byte. Allocating means reading it, using the region it names, and storing
+the advanced value back. `mstore(0x40, x)` where `x` is data rather than a new frontier does not
+corrupt one array; it corrupts every allocation the function makes afterwards, because the allocator
+now believes free memory starts inside live data.
+
+**The zero slot has a job, and the job is being zero.** It is used as the initial value for dynamic
+memory arrays and should never be written to.<Cite src="solidity-layout-memory" /> An uninitialised
+`bytes memory` or `uint256[] memory` points at `0x60`, and the length it reports is the word stored
+there. Write a non-zero value at `0x60` and every default-initialised dynamic array in that call
+frame simultaneously acquires a length of whatever you wrote — which is the bug in the opening
+scene, and why the reported length was a nonsense number rather than a plausible one.
+
+<Aside kind="warn">
+There is one more rule that catches people who reason carefully and still get it wrong. Some
+operations need a temporary area larger than the 64-byte scratch space. They are placed *at* the free
+memory pointer without updating it, and the memory may or may not be zeroed. The documentation states
+the conclusion directly: one should not expect the free memory to point to zeroed-out
+memory.<Cite src="solidity-layout-memory" /> So an assembly block that allocates a buffer and writes
+only part of it cannot assume the rest is zero — even though memory in a fresh call frame is
+zero-initialised. Reaching for `msize` to find a definitely-zeroed region is called out in the same
+place as a bad idea, because using such a pointer non-temporarily without updating the free memory
+pointer has unexpected results.<Cite src="solidity-layout-memory" />
+</Aside>
+
+## The three ways to break it
+
+**Clobber the pointer.** Write data at `0x40`. Every subsequent allocation in the frame lands
+somewhere arbitrary, usually overlapping something live. The failure is loud and immediate, which
+makes this the least dangerous of the three.
+
+**Allocate without advancing.** Read `0x40`, write your data at the address it names, and forget to
+store the advanced pointer back. Nothing is wrong yet. Then the next Solidity statement allocates —
+a `new bytes(n)`, an `abi.encode`, a string concatenation, a memory struct — receives the same
+region, and overwrites you. Your data is gone and theirs is fine, or the reverse, depending on
+ordering the source does not show.
+
+**Write to `0x60`.** Covered above. The distinguishing feature is that the damage is not to a
+neighbour but to a type-wide default.
+
+The second is the one that ships. It has no local symptom at all, and whether it manifests depends
+on what the compiler chose to allocate next, which depends on the optimizer, which depends on the
+rest of the function. This is the mechanism behind the next lesson, and the reason a "works on my
+machine" defence is meaningless here.
+
+<Matrix
+  corner="Violation"
+  cols={['What the block did', 'What breaks', 'When you find out']}
+  rows={[
+    {
+      label: 'Clobber the pointer',
+      cells: [
+        'Wrote data at 0x40',
+        'Every later allocation in the frame lands on top of something live',
+        { v: 'Immediately, and loudly', tone: 'good' },
+      ],
+    },
+    {
+      label: 'Allocate without advancing',
+      cells: [
+        'Read 0x40, wrote above it, never stored the new frontier',
+        'The next Solidity allocation is handed the same region',
+        { v: 'Whenever the compiler next allocates, which the source does not show', tone: 'danger' },
+      ],
+    },
+    {
+      label: 'Write to the zero slot',
+      cells: [
+        'Wrote a non-zero word at 0x60',
+        'Every default-initialised dynamic array in the frame reports that word as its length',
+        { v: 'At the first read of an array nobody touched', tone: 'warn' },
+      ],
+    },
+  ]}
+  caption="The violation you can debug is the one that breaks immediately; the one that ships is the one whose symptom belongs to somebody else's statement."
+  alt="Three ways to violate Solidity's memory conventions from assembly, each with what the block did, what breaks, and when the failure becomes visible."
+/>
+
+<Misconception
+  belief="If my assembly block works and the tests pass, it respects the memory model."
+  reality="Whether a violation manifests depends on what the compiler allocates after your block and where the optimizer decides to put things. Both change when unrelated code changes. A green suite is evidence about one compilation, and the bug is a property of a different one."
+  why="Passing tests is how we establish that code works everywhere else, and the feedback loop is normally reliable enough that we stop asking what the tests are actually evidence for. Here the compiler is a variable in the experiment and it is not held constant."
+  src="ottersec-memory-safety"
+/>
+
+### Worked: hashing versus building
+
+Two assembly tasks, one trivially safe and one not, and the difference is exactly the allocator.
+
+**Subgoal: hash two words without allocating anything.** Both words fit in the 64-byte scratch space,
+which is documented as usable from inline assembly.<Cite src="solidity-layout-memory" />
+
+```solidity
+assembly ("memory-safe") {
+    mstore(0x00, account)          // scratch word 0
+    mstore(0x20, slotIndex)        // scratch word 1
+    key := keccak256(0x00, 0x40)   // hash exactly those 64 bytes
+}
+```
+
+No allocation happened, no pointer moved, and the region used is reserved for precisely this. The
+annotation is discussed next lesson; the point here is that this block owes the allocator nothing.
+
+**Subgoal: build a byte array, which means becoming the allocator for a moment.** Now you must read
+the pointer, lay out a length word followed by the data, round the total up to a multiple of 32, and
+write the new frontier back. The documentation's own `GetCode` example does exactly
+this:<Cite src="solidity-inline-assembly" />
+
+```solidity
+assembly {
+    let size := extcodesize(addr)
+    code := mload(0x40)                                            // 1. current frontier
+    mstore(0x40, add(code, and(add(add(size, 0x20), 0x1f), not(0x1f))))  // 2. advance it, rounded up
+    mstore(code, size)                                             // 3. length word first
+    extcodecopy(addr, add(code, 0x20), 0, size)                    // 4. data after the length
+}
+```
+
+Read step 2 as arithmetic rather than as an incantation: `size + 0x20` is the data plus its length
+word, `+ 0x1f` then `and` with `not(0x1f)` rounds up to the next multiple of 32, because memory array
+elements always occupy multiples of 32 bytes.<Cite src="solidity-layout-memory" /> Drop the rounding
+and the next allocation starts mid-word. Drop step 2 entirely and you have written the second failure
+above.
+
+<Aside kind="note">
+Since Cancun, `mcopy` moves memory to memory directly, so hand-written `mload`/`mstore` copy loops in
+new assembly are a legacy pattern rather than a necessity.<Cite src="eip-5656" /> This does not change
+the allocator's rules — you still read `0x40`, still round, still write back. It changes only the
+inner loop, which was the part that was already easy to review.
+</Aside>
+
+## Storage does not work like that at all
+
+Memory locals resolve inside an assembly block. Storage variables do not, and the inconsistency is
+where most people's first assembly block fails to compile.
+
+A local variable of value type is directly usable and assignable. A local referring to memory
+evaluates to the *address* of the variable in memory, not the value — and assigning to it changes
+the pointer, not the data.<Cite src="solidity-inline-assembly" /> So `x` means three different things
+depending on where `x` lives, and none of them is "the value in storage".
+
+Storage variables need a slot and a byte offset, because a variable does not necessarily occupy a
+full slot:<Cite src="solidity-inline-assembly" />
+
+- `x.slot` — the slot number the compiler assigned.
+- `x.offset` — the byte offset within that slot.
+- Using `x` on its own is an error.<Cite src="solidity-inline-assembly" />
+
+You may assign to the `.slot` of a local storage pointer — for structs, arrays and mappings, where
+`.offset` is always zero — but not to `.slot` or `.offset` of a state
+variable.<Cite src="solidity-inline-assembly" /> That single permission is what makes namespaced
+storage patterns expressible at all.
+
+Calldata is a third convention again. A dynamic calldata array exposes `x.offset` and `x.length`,
+both assignable, **with no validation that the resulting region lies within `calldatasize()`** — the
+documentation says so explicitly, for both the dynamic and the statically-sized
+case.<Cite src="solidity-inline-assembly" /> External function pointers expose `.address` and
+`.selector`, where the selector is four right-aligned bytes.<Cite src="solidity-inline-assembly" />
+
+<Misconception
+  belief="You can read a storage variable in assembly by naming it, the way you can a local."
+  reality="A state variable has no single Yul identifier. You need x.slot, plus x.offset when it is packed, and you do the shifting and masking yourself. Naming it directly is an error."
+  why="Memory and value locals genuinely do resolve by name inside the block, so the block looks like it shares the enclosing scope. It shares part of it, and the part it does not share is the part that costs 2,100 gas to read."
+  src="solidity-inline-assembly"
+/>
+
+### Reading a packed variable, step by step
+
+The layout rules are compact enough to hold: data is stored contiguously starting with the first
+state variable in slot 0; the first item in a slot is stored lower-order aligned; a value type that
+does not fit the remaining space starts the next slot; structs and array data always begin a new
+slot.<Cite src="solidity-layout-storage" />
+
+So a `uint64 fee` packed at offset 20 of a slot is reached in three moves:
+
+```solidity
+assembly {
+    let word := sload(fee.slot)                 // 1. the whole 32 bytes, neighbours included
+    let shifted := shr(mul(8, fee.offset), word) // 2. offset is in BYTES; shr counts BITS
+    fee := and(shifted, sub(shl(64, 1), 1))     // 3. mask to the declared width, derived
+}
+```
+
+<Figure
+  caption="The word arrives whole: every step after SLOAD exists only to get the neighbours back out of it."
+  alt="A stack trace of reading a packed uint64: SLOAD returns the entire 32-byte slot for 2,100 gas when cold, a shift of 160 bits moves the field down, and a mask of two to the sixty-fourth minus one trims what is left above it."
+>
+  <StackTrace
+    steps={[
+      {
+        op: 'SLOAD',
+        stack: ['owner|fee|pad'],
+        gas: 2100,
+        changed: [0],
+        tone: 'warn',
+        note: 'cold slot: the whole 32 bytes',
+      },
+      {
+        op: 'PUSH 160',
+        stack: ['160', 'owner|fee|pad'],
+        changed: [0],
+        note: '8 x fee.offset: bits, not bytes',
+      },
+      { op: 'SHR', stack: ['fee|high bits'], changed: [0], note: 'anything above fee survives' },
+      {
+        op: 'PUSH mask',
+        stack: ['2**64 - 1', 'fee|high bits'],
+        changed: [0],
+        note: 'sub(shl(64, 1), 1)',
+      },
+      { op: 'AND', stack: ['fee'], changed: [0], tone: 'good', note: 'now the declared width' },
+    ]}
+  />
+</Figure>
+
+Step 2 is where hand-written code goes wrong, because `.offset` is a byte offset while `shr` is
+documented as a logical shift right by a number of *bits*.<Cite src="solidity-yul" /> Step 3 is the
+masking discipline from the previous lesson, with `64` readable against the
+declared type. Writing the value back is worse: you must clear the old bits, shift the new value in,
+and store the whole word, and forgetting to clear silently ORs the new value into the old one.
+
+The gas is unchanged by any of this. On this project's toolchain a cold `SLOAD` measures 2,100 and a
+warm one 100; `SSTORE` is 20,000 for a zero-to-non-zero write, 2,900 for non-zero to non-zero and 100
+for a warm no-op, each with 2,100 added when the slot is
+cold.<Cite src="measured-gas-constants" /><Cite src="eip-2929" /> Assembly buys you the arithmetic
+around the access, never the access. If the reason you dropped down here was storage cost,
+[the price is set by the trie](/c/storage-is-the-expensive-one) and you have optimised the wrong
+term. The same `.slot` mechanism reaches transient storage through `tload` and `tstore`, whose layout
+is entirely independent of the storage layout and never interferes with
+it.<Cite src="solidity-layout-storage" /><Cite src="eip-1153" />
+
+<Aside kind="note">
+The compiler can now also move where the whole layout starts. A contract may declare a base slot with
+a `layout at` specifier, and the slots assigned to static storage variables shift
+accordingly.<Cite src="solidity-custom-storage-layout" /> It is specified on the most derived
+contract and shifts the entire inheritance tree.<Cite src="solidity-layout-storage" /> That narrows
+one of the classic reasons to reach for assembly, and lesson five works out by how much.
+</Aside>
+
+<Check type="predict" concept="solidity-memory-model-is-a-contract">
+A library function packs two values into a scratch area and returns their hash. To avoid "wasting"
+an allocation, the author writes into the region starting at the free memory pointer and does not
+update it.
+
+```solidity
+function pairHash(bytes32 a, bytes32 b, bytes memory tail)
+    internal pure returns (bytes32 h)
+{
+    assembly {
+        let p := mload(0x40)
+        mstore(p, a)
+        mstore(add(p, 0x20), b)
+        h := keccak256(p, 0x40)
+    }
+    bytes memory out = new bytes(tail.length);   // (A)
+    // ... copy tail into out, return h
+}
+```
+
+Predict what happens at line (A), then predict what happens if a later refactor moves line (A) to
+*before* the assembly block. Then say which of the two versions you would rather review.
+
+<Answer>
+**As written, line (A) is fine, and that is the trap.** The block reads the free memory pointer,
+writes 64 bytes above it, and never advances it. `new bytes(...)` then allocates from the same
+pointer and overwrites those 64 bytes — but the hash was already computed inside the block, so
+nothing live is lost. This is exactly the fourth permitted region under the memory-safe rules: memory
+after the free memory pointer that you do not leave anything depending on.<Cite src="solidity-inline-assembly" />
+
+**Move (A) before the block and it is still fine, for a different reason.** `out` is allocated first
+and lives at the frontier; the pointer advances past it. The block then reads the *new* pointer, so
+it writes above `out` rather than over it. The version that breaks is the one where the block
+writes at a pointer captured earlier, or where `out` is allocated *between* the two `mstore`s by a
+statement the author did not think of as an allocation. String concatenation, `abi.encode`, a memory
+struct literal and an internal call that returns memory are all allocations.
+
+**Which is easier to review:** neither, and that is the finding. Correctness here is a property of
+statement ordering across the whole function, not of the four lines inside the braces. A reviewer
+cannot approve the block; they can only approve the function, and only until someone edits it. The
+version that survives review is the one where the block allocates properly — read `0x40`, write, put
+the advanced value back — because then the four lines are correct on their own terms and stay correct
+when the function around them changes.
+
+**A cheaper answer for this particular case:** two 32-byte words fit exactly in the reserved scratch
+space at `0x00`–`0x3f`, which is documented as usable from inline assembly and belongs to nobody
+between statements.<Cite src="solidity-layout-memory" /> `mstore(0x00, a); mstore(0x20, b);
+keccak256(0x00, 0x40)` needs no pointer at all, and the question of ordering never arises.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The memory-safe annotation** is next, and it is now statable precisely: it is a promise about
+which of these regions your block touches, made to an optimizer that will act on it. Everything in
+this lesson is the vocabulary that promise is written in.
+
+**Namespaced storage** — ERC-1967's fixed slots and ERC-7201's derived ones — exists because `.slot`
+can be assigned on a local storage pointer. That single capability is the entire mechanism behind
+upgradeable-contract storage layouts, and it is on the short list of things assembly is genuinely
+for.
+
+**Proxy fallbacks** copy calldata to memory, `delegatecall`, copy return data back, and return or
+revert. Every step is an allocator decision, and the reason those functions are written in assembly
+is that the operation has no type — not that the copy loop is faster.
+
+**Gas profiling** on the toolchain track will keep showing you that memory is cheap and storage is
+not. The numbers above are the reason a micro-optimised memory routine rarely repays its review cost,
+while a removed `SSTORE` always does.

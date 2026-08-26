@@ -1,0 +1,433 @@
+---
+id: toolchain-unit-testing-controlling-the-world
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    foundry-cheatcode-prank,
+    foundry-cheatcodes-overview,
+    forge-std-vm-1-16-2,
+    forge-std-stdcheats-1-16-2,
+    forge-std-repo,
+    eip-7702,
+    eip-7782,
+    measured-forge-cli-1-7-1,
+    measured-forge-1-7-1,
+  ]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+A vesting contract has a ninety-day cliff. The test for it:
+
+```solidity
+function test_NothingClaimableBeforeCliff() public {
+    vesting.grant(alice, 1_000e18);
+    vm.roll(block.number + 216_000);          // "30 days of blocks"
+    assertEq(vesting.claimable(alice), 0);
+}
+```
+
+It passes. It passed through the audit. It passed through the version where someone changed the
+cliff comparison from `<` to `<=`, and through the version where the cliff was accidentally
+initialised to zero for grants created in the same block as the deployment.
+
+`claimable` is computed from `block.timestamp`. `vm.roll` does not move `block.timestamp`. The test
+asserted that nothing had vested at the *same instant* the grant was created, which is true of every
+implementation anyone could write, including one that vests everything a second later.
+
+Every cheatcode in this lesson has a version of that story. They are the tools that make a test able
+to say anything at all — you cannot test a ninety-day cliff by waiting ninety days — and each one
+has a specific way of producing an assertion that is technically correct and worthless.
+
+<Matrix
+  corner="Cheatcode"
+  cols={['What it rewrites', 'The catch']}
+  rows={[
+    { label: 'vm.prank(x)', cells: ['msg.sender', 'Expires on the next external call'] },
+    { label: 'vm.startPrank(x)', cells: ['msg.sender', { v: 'Runs until vm.stopPrank(), across the setUp boundary', tone: 'danger' }] },
+    { label: 'vm.prank(x, origin)', cells: ['msg.sender and tx.origin', 'The one-argument form leaves tx.origin alone'] },
+    { label: 'vm.deal(a, n)', cells: ['An account’s ETH balance', { v: 'An assignment, not a top-up', tone: 'warn' }] },
+    { label: 'deal(token, a, n)', cells: ['The token’s balance slot for a', { v: 'totalSupply is not adjusted by default', tone: 'warn' }] },
+    { label: 'vm.warp(t)', cells: ['block.timestamp', 'block.number does not move'] },
+    { label: 'vm.roll(n)', cells: ['block.number', { v: 'block.timestamp does not move', tone: 'danger' }] },
+  ]}
+  caption="Grouped by what each one rewrites, the lesson is one question: what did this cheatcode leave untouched?"
+  alt="The Environment cheatcodes grouped by what they rewrite — msg.sender, tx.origin, an ETH balance, a token balance slot, the block timestamp and the block number — each with the behaviour that catches people."
+/>
+
+## `prank` and `startPrank`: one call versus a span
+
+`vm.prank(x)` sets the **next** call's `msg.sender` to `x`. `vm.startPrank(x)` sets **all
+subsequent** calls' `msg.sender` to `x` until `stopPrank` is called. Those are the doc comments
+verbatim from forge-std v1.16.2's `Vm.sol`.<Cite src="forge-std-vm-1-16-2" /> The reference page adds
+the operational form: the prank only applies to the next call, and if you need to prank multiple
+calls, use `startPrank`.<Cite src="foundry-cheatcode-prank" />
+
+The failure modes are asymmetric, and that asymmetry is the whole lesson here.
+
+**Getting `prank` wrong fails loudly.** You pranked one call and the second call went out as the test
+contract. Some assertion about ownership or balance is now wrong, and it is wrong on the line after
+the one you were thinking about. You find it in a minute.
+
+**Getting `startPrank` wrong fails silently.** A forgotten `vm.stopPrank()` does not error. There is
+no unclosed-scope diagnostic, because there is no scope — there is a flag that is set. Every later
+call in that test goes out as the pranked address, and if the omission is in `setUp`, every later
+call in *every* test does.<Cite src="foundry-cheatcode-prank" /> That is the fixture-poisoning case
+from the previous lesson, and it is the reason to reach for single-shot `vm.prank` by default and
+`startPrank` only when a genuine multi-call sequence needs one identity.
+
+<Misconception
+  belief="vm.prank and vm.startPrank differ only in style — one saves you from repeating yourself."
+  reality="prank covers exactly one external call and then expires. startPrank covers everything until stopPrank, including calls in later tests when the omission is in setUp."
+  why="Both are described as 'set msg.sender', and in the three-line example where you first meet them the two are interchangeable."
+  src="foundry-cheatcode-prank"
+/>
+
+### What "the next call" counts
+
+This is the detail that decides whether your prank lands, and the reference does not spell it out:
+the cheatcode documentation says "next call" and does not address internal function calls at
+all.<Cite src="foundry-cheatcode-prank" /><Cite src="forge-std-vm-1-16-2" /> The wording implies
+external calls only. It is worth knowing what that means in practice, so here is the behaviour
+observed on forge 1.7.1 — an observation about one version, not a documented guarantee:
+
+**Probe one — a purely internal call between the prank and the target.**
+
+```solidity
+vm.prank(address(0xBEEF));
+uint256 v = _pureHelper(1);   // internal, makes no external call
+t.record();                   // <- who is msg.sender here?
+```
+
+`t.record()` sees `0xBEEF`. The internal call did not consume the
+prank.<Cite src="measured-forge-cli-1-7-1" /> That matches the mental model: an internal call is a
+jump, not a message call, and there is no `msg.sender` for it to set.
+
+**Probe two — an internal helper that itself makes an external call.**
+
+```solidity
+vm.prank(address(0xBEEF));
+_internalHelper();            // internal, but calls t.value() inside
+t.record();                   // <- who is msg.sender here?
+```
+
+`t.record()` sees the **test contract**, not `0xBEEF`. The prank was consumed by `t.value()`, three
+lines away from where anyone was looking.<Cite src="measured-forge-cli-1-7-1" />
+
+<Figure
+  caption="An internal call is invisible to the prank; an external call made from inside one is not."
+  alt="vm.prank arms the next external call; the internal helper does not consume it, but the external call the helper makes does, so the call the test cared about sees the test contract as msg.sender."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'p', label: 'vm.prank(0xBEEF)', note: 'arms the next external call', col: 0, tone: 'accent' },
+      { id: 'h', label: '_internalHelper()', note: 'a jump, so no msg.sender to set', col: 1, tone: 'muted' },
+      { id: 'v', label: 't.value()', note: 'external, inside the helper — consumes it', col: 2, tone: 'danger' },
+      { id: 'r', label: 't.record()', note: 'sees the test contract', col: 3, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+The rule this gives you is not "keep the prank next to the call in the source". It is stronger:
+**keep the prank next to the call, with nothing in between that could reach outside the current
+frame.** A logging helper, a balance snapshot, a getter that reads through an interface — any of
+them can silently eat the prank. When you cannot guarantee that, use `startPrank`/`stopPrank` around
+the exact span and accept the bookkeeping.
+
+### Walking a sequence
+
+The reliable way to reason about this is to write the caller down next to each external call, the way
+you would annotate a stack. Take a fixture that left no prank active, so calls start from the test
+contract:
+
+```solidity
+1  token.mint(alice, 100e18);          // caller: the test contract
+2  vm.prank(alice);
+3  token.approve(address(vault), 100e18);   // caller: alice   <- prank consumed here
+4  vault.deposit(100e18);              // caller: the test contract
+5  vm.startPrank(alice);
+6  vault.deposit(0);                   // caller: alice
+7  vault.withdraw(0);                  // caller: alice
+8  vm.stopPrank();
+9  vault.pause();                      // caller: the test contract
+```
+
+**Subgoal — locate the single line the one-shot prank covers.** Line 3, and only line 3. Line 4 is
+the line people expect to be covered, because it is the line the test is actually about; the approve
+on line 3 was written as a setup detail and quietly ate the prank.
+
+**Subgoal — check what line 4 then does.** It succeeds, because the test contract has an approval it
+does not need and a balance of zero — so it deposits nothing, or reverts with a message about
+balance, depending on the vault. Either way the assertion that follows is about the wrong account.
+
+**Subgoal — notice that the fix is not "add another prank".** Two pranks in a row works and is
+fragile: insert one logging call between them and the second prank moves to the wrong line. Lines 5-8
+are the shape that survives editing, because the span is explicit.
+
+**Subgoal — confirm line 9 rather than assuming it.** After `stopPrank`, `msg.sender` is
+`address(this)` again.<Cite src="forge-std-vm-1-16-2" /> If you are not certain a prank is inactive
+at a given point, `vm.readCallers()` answers it in one call — it reports the current `msg.sender` and
+`tx.origin` and whether any caller modification is active, distinguishing a one-shot `Prank` from a
+`RecurrentPrank`.<Cite src="forge-std-vm-1-16-2" />
+
+## The four overloads, and the one that quietly matters
+
+`prank` and `startPrank` each have four overloads in forge-std v1.16.2:<Cite src="forge-std-vm-1-16-2" />
+
+```solidity
+function prank(address msgSender) external;
+function prank(address msgSender, address txOrigin) external;
+function prank(address msgSender, bool delegateCall) external;
+function prank(address msgSender, address txOrigin, bool delegateCall) external;
+```
+
+### The `txOrigin` form
+
+Under a single-argument prank, `tx.origin` is left at the default test origin. Measured on forge
+1.7.1: after `vm.prank(alice)`, a contract recording both values sees `msg.sender == alice` and
+`tx.origin` at a different, fixed address — the two are **not** equal. After
+`vm.prank(alice, alice)`, they are.<Cite src="measured-forge-cli-1-7-1" />
+
+So if the code under test compares `msg.sender` to `tx.origin`, the single-argument prank does not
+exercise the branch you think it does. The two-argument overload is the only way to reach it.
+
+Now the part that matters more than the mechanics. Notice what code comparing those two values is
+almost always trying to do: establish that the caller is not a contract. That inference has been
+unsound since EIP-7702, because a delegated EOA carries a code entry pointing at a delegate and can
+be `msg.sender` while also being `tx.origin`.<Cite src="eip-7702" /> You have met this as
+[tx.origin does not mean EOA](/c/tx-origin-not-eoa) and
+[the broken check itself](/c/tx-origin-check-broken).
+
+The testing consequence is uncomfortable and worth sitting with: `vm.prank(alice, alice)` will make
+that guard behave exactly as its author intended, and the test will pass. Your test is a faithful
+reproduction of a broken invariant. Reproducing it does not repair it — and a green test next to the
+guard is precisely what stops anyone from looking at the guard again.
+
+<Misconception
+  belief="vm.prank changes tx.origin as well as msg.sender."
+  reality="Only the overloads that take a txOrigin argument do. Under a one-argument prank the two differ, which is observable on forge 1.7.1."
+  why="On a real chain an externally-owned account sets both at once, so they feel like one thing."
+  src="foundry-cheatcode-prank"
+/>
+
+### The `delegateCall` form
+
+The boolean overload makes the prank apply when the next call is a `DELEGATECALL` — the doc comment
+reads "Sets the *next* delegate call's `msg.sender` to be the input
+address".<Cite src="forge-std-vm-1-16-2" /> There is one documented restriction and it is not
+obvious: delegate calls cannot be pranked from an EOA, and you must use a contract as the prank
+source when pranking delegate calls.<Cite src="foundry-cheatcode-prank" />
+
+That constraint stops being arbitrary once you remember what
+[delegatecall actually is](/c/delegatecall-is-the-proxy-primitive): the callee runs in the caller's
+storage and keeps the caller's `msg.sender`. There is no storage belonging to an EOA for borrowed
+code to execute against. If you are testing an upgrade path, a
+[delegatecall proxy](/c/delegatecall-proxy), or a module system, the prank source has to be a
+contract you deployed for the purpose.
+
+## `deal`: two functions, one name, and a broken invariant
+
+`deal` is where the word betrays the behaviour. It sounds additive, like dealing another card. It is
+an assignment.
+
+**The ETH one.** `vm.deal(address account, uint256 newBalance)`, documented as "Sets an address'
+balance" — and note that the parameter is literally named
+`newBalance`.<Cite src="forge-std-vm-1-16-2" /> Two calls in a row on forge 1.7.1,
+`vm.deal(alice, 5 ether)` then `vm.deal(alice, 1 ether)`, leave alice holding exactly one
+ether.<Cite src="measured-forge-cli-1-7-1" /> Not six.
+
+<Misconception
+  belief="vm.deal(alice, 1 ether) tops Alice up by one ether."
+  reality="It sets her balance to exactly one ether, discarding whatever was there — including anything a previous line in the same test gave her."
+  why="'Deal' reads as additive. The signature does not: the parameter is named newBalance."
+  src="foundry-cheatcodes-overview"
+/>
+
+**The token one, which is a different function entirely.** forge-std's `StdCheats` provides
+`deal(address token, address to, uint256 give)` — no `vm.` prefix — which locates the token's balance
+storage and overwrites it.<Cite src="forge-std-stdcheats-1-16-2" /> It is not a cheatcode call; it is
+a library helper that probes for the slot backing `balanceOf(to)` and writes there. Two things follow
+from that implementation, and both are load-bearing:
+
+**It depends on the token storing balances in a shape the helper can find.** A token whose balances
+live behind a proxy in a namespaced layout, or that computes balances from shares and a rebasing
+index, is not guaranteed to end up with the balance you asked for. When a `deal`-ed balance does not
+match what `balanceOf` then returns, this is why.
+
+**By default it does not touch `totalSupply`.** The three-argument form delegates to
+`deal(token, to, give, false)`, and the four-argument form is documented as setting the balance
+"optionally adjusting the total supply".<Cite src="forge-std-stdcheats-1-16-2" /> Measured on forge
+1.7.1: a token deployed with a supply of 1000 all held by the deployer, then
+`deal(address(tok), alice, 500)`, reports alice holding 500 and `totalSupply` still
+1000.<Cite src="measured-forge-cli-1-7-1" /> The sum of balances is now 1500 against a supply of
+1000. Passing `true` as the fourth argument moves the supply to match.<Cite src="measured-forge-cli-1-7-1" />
+
+Sit with what that does to a test suite. Every conservation property you might assert — sum of
+balances equals total supply, the vault's accounting matches its holdings, no value was created — is
+false in the fixture *before your contract does anything*. An invariant campaign against that fixture
+either fails immediately for a reason that is not a bug, or, worse, was written to accommodate the
+discrepancy and can no longer detect real inflation.
+
+<Aside kind="warn">
+The habit worth building: after any `deal` on a token, decide explicitly whether the supply should
+have moved, and say so with the fourth argument.<Cite src="forge-std-stdcheats-1-16-2" /> "I did not
+think about it" and "the supply should not move" produce identical code, which means the next reader
+cannot tell them apart.
+</Aside>
+
+## `warp` and `roll` are independent
+
+`vm.warp(uint256 newTimestamp)` sets `block.timestamp`. `vm.roll(uint256 newHeight)` sets
+`block.height` — the block number.<Cite src="forge-std-vm-1-16-2" /> They share nothing. Measured on
+forge 1.7.1: after `vm.roll(n + 100)` the timestamp is unchanged, and after a subsequent
+`vm.warp(ts + 3600)` the block number is unchanged.<Cite src="measured-forge-cli-1-7-1" />
+
+On a real chain the two advance together at a fixed rate: Ethereum's slot time is twelve seconds, and
+the proposal to halve it to six is a Draft rather than shipped behaviour.<Cite src="eip-7782" /> That
+coupling is the intuition you have imported. Inside a test the coupling does not exist, and nothing
+reconciles them: you can produce a test in which a thousand blocks pass in zero seconds, or a decade
+passes at block number one.
+
+<Misconception
+  belief="vm.roll(block.number + 100) also moves time forward, because a hundred blocks is about twenty minutes."
+  reality="warp and roll are independent. Rolling leaves block.timestamp exactly where it was, so any accrual computed from timestamps accrues nothing."
+  why="On a real chain blocks imply the passage of about twelve seconds each, and the two numbers are printed side by side in every block explorer."
+  src="foundry-cheatcodes-overview"
+/>
+
+**Subgoal — decide which clock the contract reads, before you write the test.** Open the contract and
+find the variable. Interest accrual, cliffs, deadlines, TWAP windows and streaming payments are
+almost always `block.timestamp`. Block-count schedules survive mostly in older staking contracts and
+in code ported from chains with different block times.
+
+**Subgoal — move the clock the contract reads, and move it relative to a value you read from the
+contract.** `vm.warp(vesting.cliff() + 1)` states an intent that survives a change to the cliff
+constant. `vm.warp(1_000_000 + 90 days)` states an arithmetic coincidence that does not.
+
+**Subgoal — assert on both sides of the boundary.** A single assertion after the boundary cannot
+distinguish "the cliff released the funds" from "the funds were never locked". Assert zero at
+`cliff() - 1` and non-zero at `cliff() + 1`, in the same test or in an adjacent pair, and the
+opening example of this lesson becomes impossible to write.
+
+**Subgoal — move both clocks when the contract reads both.** If a contract uses timestamps for
+accrual and block numbers for a governance delay, a test that warps but does not roll is testing half
+of it. There is no cheatcode that advances them together in a coupled way; you write two lines.
+
+<Check type="predict" concept="warp-and-roll">
+A lending market accrues interest from `block.timestamp` and enforces a governance timelock measured
+in `block.number`. A test does this:
+
+```solidity
+vm.warp(block.timestamp + 14 days);
+market.executeProposal(id);
+```
+
+What are the two possible outcomes, and what does each one tell you?
+
+<Answer>
+**Outcome one: the call reverts with a timelock error.** `vm.warp` moved the timestamp and left the
+block number exactly where it was.<Cite src="measured-forge-cli-1-7-1" /> The timelock counts blocks,
+no blocks passed, so the proposal is not executable. This is the good outcome — the test fails, you
+add `vm.roll(block.number + N)`, and you have learned which clock the timelock reads.
+
+**Outcome two: the call succeeds.** This is the outcome to be suspicious of, because there are two
+very different reasons for it. Either the timelock is timestamp-based after all and the code comment
+that said "blocks" is stale — worth knowing — or the timelock is not being enforced on this path at
+all. A single green assertion cannot distinguish those, and the test as written will report the same
+green in both worlds.
+
+**What settles it.** Read `block.number` before and after the warp and assert it did not move, then
+assert the proposal is *not* executable at that point, then roll and assert that it is. Three
+assertions instead of one, and the difference between them is the entire content of the timelock.
+
+**The general form.** When a contract reads two clocks, a test that moves one of them is not a weaker
+test — it is a test of a state that cannot occur on chain. Fourteen days at a twelve-second slot is
+about a hundred thousand blocks, not zero.<Cite src="eip-7782" /> Whatever the test proves is a fact
+about an impossible world.
+</Answer>
+</Check>
+
+<Check type="spot-bug" concept="prank-scope">
+A staking test, reviewed and approved:
+
+```solidity
+function setUp() public {
+    pool = new Pool(address(token));
+    deal(address(token), alice, 1_000e18);
+    vm.startPrank(alice);
+    token.approve(address(pool), type(uint256).max);
+    pool.stake(1_000e18);
+    vm.stopPrank();
+}
+
+function test_RewardsAccrueOverAWeek() public {
+    uint256 before = pool.earned(alice);
+    vm.roll(block.number + 50_400);
+    vm.prank(alice);
+    uint256 gained = pool.earned(alice) - before;
+    assertGt(gained, 0);
+}
+```
+
+The test fails with an arithmetic panic. The author's fix is to change `assertGt(gained, 0)` to
+`assertGe(gained, 0)`. Find every defect, and say which one the "fix" hides.
+
+<Answer>
+**Defect one — the clock is wrong, and it is the reason the test fails.** `vm.roll` moves the block
+number and leaves `block.timestamp` untouched.<Cite src="measured-forge-cli-1-7-1" /> If `earned` is
+timestamp-based, no time has passed, `gained` is zero, and `assertGt(gained, 0)` fails correctly. The
+repair is `vm.warp(block.timestamp + 7 days)`, or both lines if the pool reads both clocks.
+
+**Defect two — the "fix" converts a working test into a permanently green one.** `assertGe(x, 0)` on
+an unsigned value is true for every possible value of `x`. The assertion is now unfalsifiable: it
+will pass against a pool that accrues correctly, a pool that accrues nothing, and a pool that has
+been deleted and replaced with a stub. This is the single most common way a real suite loses a test —
+not deletion, but the loosening of an assertion until it stops being one.
+
+**Defect three — the arithmetic panic is a second, separate bug.** `pool.earned(alice) - before`
+underflows if `earned` ever decreases — which it does the moment anyone claims. In this test it
+cannot, but the pattern is fragile, and the panic it produces looks nothing like a staking bug in the
+output. Snapshot both values and compare, or assert on the absolute figure.
+
+**Defect four — the `vm.prank(alice)` does nothing, and hides a real question.** The next external
+call after it is `pool.earned(alice)`, a view whose result does not depend on the
+caller.<Cite src="foundry-cheatcode-prank" /> The prank is consumed by a call that ignores it. Worse,
+it is a signal that the author believed the caller mattered here; if `earned` were ever changed to
+read `msg.sender` instead of its argument, this test would keep passing while every other caller
+broke.
+
+**What is actually right, and worth saying.** `vm.startPrank`/`vm.stopPrank` in `setUp` is correctly
+paired, so the fixture does not leak alice into the test. That is the discipline from the previous
+lesson, applied. The bugs here are all inside one test, which is where you want them.
+
+**Which one the fix hides:** defect two hides defect one. After the change, the test is green, the
+clock is still wrong, and there is no longer any signal that the pool's accrual is untested. Six
+months later the accrual formula gets rewritten and nothing objects.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next lesson:** asserting on failure. Everything here manipulated the world *before* a call;
+`expectRevert` and `expectEmit` make claims *about* a call, and they introduce a new failure mode —
+an assertion that binds to the wrong call and then reports success. The prank-consumption rule you
+learned above is the same rule in a different costume: something registers, the next external call
+consumes it, and "next" is counted by the EVM rather than by your eyes.
+
+**In the fuzzing module:** `deal` and `warp` become the inputs a fuzzer varies. A fuzzed timestamp
+finds off-by-one cliff bugs that no hand-picked `+ 90 days` ever will, and a fuzzed balance finds the
+rounding that only appears at 1 wei.
+
+**In the fork-testing module:** these cheatcodes meet real state, and two of them acquire dangerous
+twins. `vm.roll` sets a local block number; `vm.rollFork` moves a fork to a different block and
+therefore changes the real state underneath it. The names differ by four
+characters.<Cite src="forge-std-repo" />
+
+**And the habit to carry out of this lesson:** every cheatcode is a lie you are telling the EVM so
+that a test can finish in milliseconds. A lie that is written down — `vm.warp(vesting.cliff() + 1)`,
+`deal(token, alice, amount, true)` — is a premise a reviewer can check. A lie that is implied by a
+magic number is a premise nobody will ever audit, pinned here to forge 1.7.1 and forge-std
+v1.16.2.<Cite src="measured-forge-1-7-1" /><Cite src="forge-std-vm-1-16-2" />

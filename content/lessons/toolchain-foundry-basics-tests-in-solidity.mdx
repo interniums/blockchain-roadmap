@@ -1,0 +1,264 @@
+---
+id: toolchain-foundry-basics-tests-in-solidity
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [foundry-writing-tests, foundry-layout-docs, foundry-deploying, foundry-cheatcodes-overview, forge-std-repo, foundry-project-config-reference, measured-foundry-basics-1-7-1, eip-170, eip-3860]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Here is the test file `forge init` writes, unedited:
+
+```solidity
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+import {Test} from "forge-std/Test.sol";
+import {Counter} from "../src/Counter.sol";
+
+contract CounterTest is Test {
+    Counter public counter;
+
+    function setUp() public {
+        counter = new Counter();
+        counter.setNumber(0);
+    }
+
+    function test_Increment() public {
+        counter.increment();
+        assertEq(counter.number(), 1);
+    }
+}
+```
+
+Read the first line of the body again. `contract CounterTest is Test`. The test is not a script that
+drives a contract; it is a contract, deployed into an EVM, that calls another contract. `counter` is
+a state variable holding an address. `new Counter()` is a `CREATE`. `assertEq` is a function call
+inside the same execution.
+
+Everything you know about a [contract account](/c/contract-account) applies to the thing running your
+assertions. It has an address. It has storage. It has a balance. When it calls `counter.increment()`
+that is a real `CALL` into a real [call frame](/c/call-frame), with `msg.sender` set to the test
+contract's own address, and if the callee reverts, the revert propagates by the ordinary rules.
+
+Two consequences fall out of that immediately, and both catch people. The default caller in every
+test is a contract, not an externally owned account — so any code path guarded by a
+[`msg.sender == tx.origin` check](/c/tx-origin-not-eoa) behaves differently under test than it would
+for a wallet user, unless you say otherwise. And the test contract can receive ETH, hold tokens and
+implement callbacks, which means it is a participant in the system you are testing rather than an
+observer of it. A reentrancy test works by making the test contract itself the reentrant caller.
+
+## What the missing boundary buys
+
+The design claim is narrow and worth stating precisely: there is no serialisation step between the
+assertion and the code under test.<Cite src="foundry-writing-tests" /> A harness written in another
+language has to ABI-encode arguments, hand them to a node over a socket, wait, receive a hex string,
+and decode it. Every one of those steps costs time, and — more importantly — every one of them is a
+place where information is lost.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Solidity test', note: 'runs inside forge’s EVM', tone: 'accent' },
+    { title: 'Harness in another language', note: 'talks to a node' },
+  ]}
+  rows={[
+    { label: 'Where does the assertion run?', cells: ['In the same EVM, on the same call stack', 'In another process, across a socket'] },
+    { label: 'What crosses a boundary?', cells: ['Nothing', 'Arguments out as ABI-encoded hex, a hex string back'] },
+    { label: 'How does it read a slot with no getter?', cells: ['Directly, with forge-std’s stdstore helpers', 'Only what an RPC response happens to carry'] },
+    { label: 'What does a revert look like?', cells: ['The selector plus its ABI-encoded arguments', 'A provider-shaped error object'] },
+    { label: 'Can it measure gas mid-call?', cells: ['Yes — gasleft() deltas inside the execution', 'Only what the RPC response reports'] },
+  ]}
+  caption="Everything the Solidity test observes directly, an out-of-process harness has to reconstruct from a transcript."
+  alt="A Solidity test and an out-of-process harness compared on where the assertion runs, what crosses a boundary, raw slot access, revert data and mid-call gas measurement."
+/>
+
+The time cost is measurable. On this machine, that generated project's two tests, one of them fuzzed
+over 256 inputs, finish in 5.79 ms of suite time.<Cite src="measured-foundry-basics-1-7-1" /> Raise
+the fuzz budget to 10,000 runs and the suite takes 30.17 ms.<Cite src="measured-foundry-basics-1-7-1" />
+Forty times the work for five times the wall clock. That ratio is the whole reason property-based
+testing is the default expectation for contracts rather than an exotic practice: when a run costs
+microseconds, running ten thousand of them is not a decision anybody has to justify.
+
+The information cost is subtler and matters more. Because the test executes inside the EVM, it can
+observe things that never appear in an RPC response:
+
+- **Raw storage.** Not "call the getter" — the slot itself, including slots with no getter, using
+  forge-std's `stdstore` helpers.<Cite src="forge-std-repo" />
+- **Exact revert data.** The four-byte selector plus its ABI-encoded arguments, matched precisely,
+  rather than a string scraped out of a provider's error object whose shape differs per provider.
+- **Gas accounting** at the granularity of an individual call, which the test can read with
+  `gasleft()` deltas mid-execution.
+- **Environment rewrites** — block number, timestamp, `msg.sender`, an account's balance or code —
+  performed by the runner rather than negotiated with a node.
+
+That last group is the cheatcodes, and their implementation is worth knowing now even though the
+unit-testing module covers them properly: a cheatcode is an ordinary `CALL` to a fixed magic address
+that Foundry's EVM intercepts, and `vm` is a typed Solidity interface to that
+address.<Cite src="foundry-cheatcodes-overview" /> They are not compiler magic. They are a call
+convention, which is why they are available to any contract in the test EVM and why they leave a
+frame in the trace.
+
+<Misconception
+  belief="Writing tests in Solidity is a stylistic preference — it saves you a context switch between languages."
+  reality="It removes a process boundary. The test and the code under test share one EVM, one call stack and one gas meter, which is what makes raw-slot access, precise revert matching and mid-call gas measurement possible at all."
+  why="The visible difference is the language, so the language looks like the point. The language is a consequence: to run inside the EVM, the test has to be EVM code."
+  src="foundry-writing-tests"
+/>
+
+## The layout, and which half you commit
+
+`forge` identifies file roles by directory and by suffix, and the defaults are all configurable
+keys.<Cite src="foundry-layout-docs" /><Cite src="foundry-project-config-reference" />
+
+<Figure
+  caption="A file's role comes from the directory it sits in, and every one of those directories is a key you can move."
+  alt="The seven default project directories — src, test, script, lib, out, cache and broadcast — each labelled with what it holds and the foundry.toml key that names it."
+>
+  <Tree
+    root={{
+      label: 'project root',
+      tone: 'accent',
+      children: [
+        { label: 'src/', note: 'contracts · src' },
+        { label: 'test/', note: '*.t.sol · test' },
+        { label: 'script/', note: '*.s.sol · script' },
+        { label: 'lib/', note: 'dependencies · libs' },
+        { label: 'out/', note: 'artifacts · out', tone: 'muted' },
+        { label: 'cache/', note: 'build cache · cache_path', tone: 'muted' },
+        { label: 'broadcast/', note: 'sent txs · broadcast' },
+      ],
+    }}
+  />
+</Figure>
+
+The suffix is not decoration. A test file is `.t.sol` and its contract inherits `Test`; a script is
+`.s.sol` and inherits `Script`.<Cite src="foundry-layout-docs" /> Discovery inside those files is by
+function-name prefix, not by annotation — which the unit-testing module makes precise.
+
+The first four are committed. `out/` and `cache/` are not: they are derived, and rebuilding them is
+one command. `broadcast/` is the interesting one, and the generated `.gitignore` says something more
+specific than most summaries do:
+
+```gitignore
+# Compiler files
+cache/
+out/
+
+# Ignores development broadcast logs
+!/broadcast
+/broadcast/*/31337/
+/broadcast/**/dry-run/
+```
+
+Read the negation. `!/broadcast` un-ignores the directory; the two lines after it re-ignore chain
+`31337` — anvil's chain ID — and every dry run.<Cite src="measured-foundry-basics-1-7-1" /> The rule
+being expressed is *keep the record of transactions you actually broadcast to a real chain, discard
+the rehearsals*. Those records carry deployed addresses and transaction hashes, and later scripts
+read them back.<Cite src="foundry-deploying" />
+
+<Aside kind="warn">
+The project-layout documentation says to add `out/`, `cache/` **and** `broadcast/` to `.gitignore`,
+and states that the default template does this automatically.<Cite src="foundry-layout-docs" /> The
+template shipped with forge 1.7.1 does not: it explicitly un-ignores `/broadcast` and excludes only
+the local-chain and dry-run subtrees.<Cite src="measured-foundry-basics-1-7-1" /> The two disagree.
+Trust the file your own `forge init` wrote, and decide deliberately — if your deploy story depends on
+reading past broadcasts, ignoring the directory silently breaks it.
+</Aside>
+
+## What is in `out/`, and why it is not disposable in the way you think
+
+`out/` is regenerable, but its contents are the input to two things that happen much later:
+verification, and any tool that needs your ABI. One artifact from the generated project:
+
+```console
+$ python3 -c "import json; d=json.load(open('out/Counter.sol/Counter.json')); print(sorted(d))"
+['abi', 'bytecode', 'deployedBytecode', 'id', 'metadata', 'methodIdentifiers', 'rawMetadata']
+```
+
+Inside `metadata` sit the settings that produced those bytes:
+
+```json
+{
+  "compiler": { "version": "0.8.36+commit.8a079791" },
+  "settings": {
+    "evmVersion": "osaka",
+    "optimizer": { "enabled": false, "runs": 200 },
+    "metadata": { "bytecodeHash": "ipfs" },
+    "remappings": [ "forge-std/=lib/forge-std/src/" ]
+  }
+}
+```
+
+Those are the real values on this machine.<Cite src="measured-foundry-basics-1-7-1" /> Note what the
+artifact is recording: the exact compiler build, the EVM ruleset, the optimizer configuration, and
+the remapping set. Those four are precisely the four levers this module spends its remaining three
+lessons on, and the artifact records them because reproducing the bytecode requires all four to
+match.
+
+`cache/` is the other half of the pair, and it is keyed on more than file contents. It holds
+`solidity-files-cache.json`, whose `profiles` map records the exact solc settings each named
+configuration compiled under — optimizer, `evmVersion`, `viaIR`, metadata options — while every
+file's entry indexes its artifacts by compiler version, then by profile name, then by a build
+id.<Cite src="measured-foundry-basics-1-7-1" /> Change a compiler setting and the lookup misses, so
+the artifacts are rebuilt rather than silently reused. That is the mechanism behind a thing that
+confuses people the first time: flip one optimizer key and a build you expected to be incremental
+recompiles everything. It is not a bug, and the alternative — an `out/` holding a mixture of bytecode
+built under two different settings — is much worse.
+
+One more command worth running on day one:
+
+```console
+$ forge build --sizes
+| Contract | Runtime Size (B) | Initcode Size (B) | Runtime Margin (B) | Initcode Margin (B) |
+| Counter  | 481              | 509               | 24,095             | 48,643              |
+```
+
+Add each size to its margin and you recover the two limits you already know: 481 + 24,095 = 24,576,
+the [runtime code size cap](/c/code-deposit-and-size-limits) from EIP-170, and 509 + 48,643 = 49,152,
+the initcode cap from EIP-3860.<Cite src="measured-foundry-basics-1-7-1" /><Cite src="eip-170" /><Cite src="eip-3860" />
+`forge` is not computing a percentage for you; it is telling you how much room you have left before a
+deployment stops being possible.
+
+<Check type="explain" concept="tests-in-solidity">
+A colleague argues that Foundry's Solidity tests are a worse deal than a TypeScript suite, because
+"the tests run against a fake EVM, so passing tests prove less than tests run against a real node."
+
+Where is that right, where is it wrong, and what is the actual limitation you should warn them about?
+
+<Answer>
+**Wrong about the EVM.** The EVM inside `forge` is an implementation of the same specification a node
+runs; it is not a mock. What differs is what surrounds it — no P2P layer, no mempool, no other users'
+transactions, no consensus.
+
+**Right about the surroundings, and that is the real limitation.** A passing suite proves your
+contract behaves correctly for the sequences your tests generate, against the state your `setUp`
+constructed. It says nothing about how it behaves against six months of accumulated mainnet state, or
+when another transaction lands between two of yours. Fork testing addresses the first of those and
+arrives later in this track; the second is a property nobody's test runner gives you.
+
+**Also right about one specific number, for a reason worth knowing now.** Gas figures printed by a
+test are a function of the harness as much as the contract, because `setUp` leaves accounts and slots
+[warm](/c/cold-vs-warm-access) that would be cold in a fresh transaction. The gas-profiling module
+takes this apart properly. Treat a test-suite gas number as a comparison against yesterday's number,
+not as a prediction of what a user will pay.
+
+**The trade they are missing.** The boundary they want to keep is the thing that costs them
+`stdstore`, exact revert-data matching and mid-call `gasleft()` deltas. A TypeScript suite can assert
+on what an RPC response contains. A Solidity test can assert on what the machine did.
+</Answer>
+</Check>
+
+## Where this pays off
+
+Everything in this track that looks like a testing technique — fuzzing, invariant campaigns, fork
+tests, gas snapshots — is downstream of the fact that a run costs microseconds and the assertions
+live inside the machine. Keep that causal direction straight and the rest of the track stops looking
+like a list of features.
+
+The layout half of this lesson sets up the next one directly. You now know that dependencies live
+under `lib/` and that `lib/` is committed as something other than plain files. What you do not yet
+know is how an import string like `forge-std/Test.sol` — which is not a path, and does not begin with
+`./` — turns into a file on disk. That resolution has four independent sources, they merge rather
+than replace, and the merged result is written down nowhere.

@@ -1,0 +1,382 @@
+---
+id: solidity-errors-events-name-is-a-claim
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [solidity-abi-spec, solidity-docs-contracts, solidity-docs-control-structures, solidity-blog-custom-errors, viem-contract-errors, sourcify-4byte, measured-forge-1-7-1]
+stack: { solidity: "0.8.36", foundry: "1.7.1" }
+---
+
+Three in the morning. The support dashboard says a batch of withdrawals is failing, and every one
+of them shows the same tidy line:
+
+```text
+VaultPaused(1234)
+```
+
+Somebody pages the vault team. The vault team, eventually, establishes two things: the vault is not
+paused, and the vault was not called in any of those transactions.
+
+Nothing malfunctioned. The frontend did exactly what it was built to do, and what it produced was
+not a lie so much as a category error — it read four bytes, found a matching entry in an ABI it
+happened to hold, and rendered the entry's name as though the name were a fact about the world.
+
+This lesson is about the size of the gap between those four bytes and the sentence a user reads, and
+about the two places engineers habitually assume a guarantee that is not there.
+
+## Revert data has no return address
+
+You already know that [an exception in a sub-call bubbles up](/c/revert-bubbling): the payload is
+re-thrown by each frame until something catches it or the transaction ends. What is worth pausing on
+is what the payload gains as it travels.
+
+Nothing. Not a frame counter, not a contract address, not a marker that it was forwarded rather than
+originated. The bytes that arrive at the top are, byte for byte, the bytes the innermost frame
+produced.
+
+Compiled and run on solc 0.8.36, with `Outer` holding an `IInner` and calling
+`inner.work()`, where only `Inner` declares `error VaultPaused(uint256 since)` and only `Inner` ever
+raises it:<Cite src="measured-forge-1-7-1" />
+
+```text
+call Outer.go()  →  reverts with 36 bytes
+
+0x555b7f28                                                          VaultPaused(uint256)
+  00000000000000000000000000000000000000000000000000000000000004d2  since = 1234
+```
+
+`Outer` is where the call was made. `Inner` is where it failed. The payload names neither. A caller
+of `Outer` receives the same 36 bytes it would have received if `Outer` had raised the error itself,
+if a contract three frames deeper had, or if a token `Outer` calls happened to define an error whose
+signature collides.
+
+The ABI specification does not leave this to inference. It attaches a warning to the errors section
+with the heading **Never trust error data**:
+
+> The error data by default bubbles up through the chain of external calls, which means that a
+> contract may receive an error not defined in any of the contracts it calls directly. Furthermore,
+> any contract can fake any error by returning data that matches an error signature, even if the
+> error is not defined anywhere.<Cite src="solidity-abi-spec" />
+
+Two distinct failures of provenance in two sentences. The first is *accidental*: your caller sees an
+error nobody in the paths it knows about declares, because it came from further down. The second is
+*deliberate*: a hostile contract in the path can produce any payload it likes.
+
+## Forging is one line of Solidity
+
+The second failure needs no cleverness and no vulnerability. An error is a name and a list of types
+that anybody may declare. Nothing binds a selector to a contract, because the selector is a hash of
+a string — and everyone can hash a string.
+
+```solidity
+error VaultPaused(uint256 since);   // declared here, owned by nobody
+
+contract Impostor {
+    function work() external pure {
+        revert VaultPaused(1234);
+    }
+}
+```
+
+Route a call through `Impostor` and the payload is identical to the genuine one at every byte. There
+is no field to check and no registry to consult. The ABI specification makes the same point from the
+compiler's side: multiple errors with the same name, and even with identical signature, may
+legitimately coexist in one ABI array, because "only the name of the error itself is relevant and not
+where it is defined".<Cite src="solidity-abi-spec" /> The compiler documentation adds that such
+errors are "indistinguishable by the caller".<Cite src="solidity-docs-contracts" />
+
+<Figure
+  caption="A revert payload is evidence about content and never about origin — all three of these arrive at the client identically."
+  alt="Three origins produce the same revert payload: the contract that genuinely declares VaultPaused, a contract one frame deeper that it calls, and a hostile impostor that declares the same error. Every frame above re-throws the bytes unchanged, so the client receives the same thirty-six bytes in all three cases."
+>
+  <Flow
+    lanes={['where it originated', 'on the way up', 'what arrives', 'what is shown']}
+    nodes={[
+      { id: 'genuine', label: 'Inner reverts', note: 'declares VaultPaused', col: 0, tone: 'good' },
+      { id: 'deeper', label: 'a frame deeper', note: 'a token Inner calls', col: 0, tone: 'warn' },
+      { id: 'fake', label: 'Impostor reverts', note: 'declares it too', col: 0, tone: 'danger' },
+      { id: 'fwd', label: 'every frame above', note: 'adds nothing', col: 1 },
+      { id: 'bytes', label: '36 identical bytes', note: '0x555b7f28 … 04d2', col: 2, tone: 'accent' },
+      { id: 'cli', label: 'the client', note: 'names it VaultPaused', col: 3 },
+    ]}
+    edges={[
+      { from: 'genuine', to: 'fwd', tone: 'good' },
+      { from: 'deeper', to: 'fwd', tone: 'warn' },
+      { from: 'fake', to: 'fwd', tone: 'danger' },
+      { from: 'fwd', to: 'bytes' },
+      { from: 'bytes', to: 'cli' },
+    ]}
+  />
+</Figure>
+
+Which produces the rule that matters more than anything else in this module:
+
+> Error data should only be used to give an indication of failure, but not as a means for
+> control-flow. The reason is that the revert data of inner calls is propagated back through the
+> chain of external calls by default. This means that an inner call can "forge" revert data that
+> looks like it could have come from the contract that called
+> it.<Cite src="solidity-docs-contracts" />
+
+**Display, yes. Debugging, yes. Branching, no.** A contract that reads a selector out of a failed
+call and acts differently depending on which error it "was" has handed that decision to whoever
+controls the callee — whether it is treating one error as retryable and another as fatal, skipping a
+participant on a specific error, or unwinding one way for `InsufficientBalance` and another for
+`Paused`.
+
+<Misconception
+  belief="Decoding an error name tells me which contract reverted."
+  reality="It tells you what the bytes say. The payload carries no address and no proof of origin, it is forwarded unchanged through every intermediate frame, and any contract can emit bytes matching any error signature."
+  why="The client renders MyError(1, 2) with no address attached, which reads like a stack frame from a language where exceptions carry a stack. Here there is no stack — just the last thing anyone wrote into the return buffer."
+  src="solidity-abi-spec"
+/>
+
+<Aside kind="warn">
+There is a third source of confusion the documentation names separately: a revert you are looking at
+may not be a deliberate error condition at all. "It could be due to an out-of-gas situation and not
+a deliberate error condition: The caller always retains at least 1/64th of the gas in a call and
+thus even if the called contract goes out of gas, the caller still has some gas
+left."<Cite src="solidity-docs-control-structures" /> An out-of-gas sub-call returns *empty* revert
+data, which is the same shape a bare `require` produces — so
+[the 63/64 rule](/c/63-64-rule) is why "no data" has at least two completely different meanings and
+why guessing between them from the payload alone is impossible.
+</Aside>
+
+## What a client can actually do
+
+The path from `REVERT` to a rendered sentence is short, and every decision point in it is one where
+information is invented rather than recovered.
+
+**Step 1 — the bytes reach the client** in the `data` field of a JSON-RPC error, as a hex string.
+That is the entire input.
+
+**Step 2 — the client matches four bytes against an ABI it holds.** Not against the chain: there is
+no on-chain registry of error selectors and no way to ask a contract what errors it can produce.
+
+**Step 3 — the two built-ins are special-cased.** viem hard-codes the `Error(string)` and
+`Panic(uint256)` ABI fragments and handles them before consulting your ABI, mapping a panic code
+through a fixed lookup table.<Cite src="viem-contract-errors" />
+
+**Step 4 — a match produces a decoded object.** viem raises `ContractFunctionRevertedError` carrying
+`data` (the decoded name and arguments), `raw` (the original hex), `reason` and
+`signature`.<Cite src="viem-contract-errors" /> The `raw` field is the one that is actually evidence;
+everything else is interpretation.
+
+**Step 5 — a miss produces a guess.** When the selector is not in the ABI, viem's message reads:
+"Unable to decode signature ... as it was not found on the provided ABI", and points the developer at
+`4byte.sourcify.dev` to look the value up.<Cite src="viem-contract-errors" /> That service is a
+community signature database — the Sourcify project took over the openchain signature
+API — and it maps four bytes to *candidate* strings that people have submitted.<Cite src="sourcify-4byte" />
+It is genuinely useful for debugging and it is not authority: four bytes is a truncated hash, several
+signatures can map to the same value, and nothing stops anyone submitting a plausible-looking one.
+
+The honest summary of the pipeline: a name on a screen means "these four bytes matched an entry in a
+file we shipped". Every stronger reading is added by the reader.
+
+## The ABI you have is not the ABI you need
+
+Now the accident that produced the three-in-the-morning page, and it is a compiler behaviour rather
+than anyone's mistake.
+
+The custom-errors announcement states it in one sentence: "The compiler includes all errors that a
+contract can emit in the contract's ABI-JSON. Note that this will **not** include errors forwarded
+through external calls."<Cite src="solidity-blog-custom-errors" />
+
+That sounds mild. Compiled, it is stark. Here are three artifacts from one solc 0.8.36 build, with
+the error entries of each ABI listed:<Cite src="measured-forge-1-7-1" />
+
+```solidity
+interface IVault {
+    error VaultPaused(uint256 since);
+    error NotDepositor(address who);
+    function dep() external;
+}
+
+contract Vault is IVault {
+    function dep() external pure { revert VaultPaused(1); }
+}
+
+contract Consumer {
+    IVault v;
+    function go() external { v.dep(); }
+}
+```
+
+<Matrix
+  corner="Artifact"
+  cols={['VaultPaused', 'NotDepositor', 'Why']}
+  rows={[
+    {
+      label: 'IVault',
+      cells: ['declared', 'declared', 'the interface is where the vocabulary lives'],
+    },
+    {
+      label: 'Vault',
+      cells: [
+        { v: 'in its ABI', tone: 'good' },
+        { v: 'in its ABI', tone: 'good' },
+        'inherited, including the one it never raises',
+      ],
+    },
+    {
+      label: 'Consumer',
+      cells: [
+        { v: 'absent', tone: 'danger' },
+        { v: 'absent', tone: 'danger' },
+        'it can forward both and declares neither',
+      ],
+    },
+  ]}
+  caption="The contract your frontend talks to is the one whose artifact lists none of the errors it will hand back."
+  alt="Three artifacts from one solc build. IVault declares VaultPaused and NotDepositor. Vault inherits both into its ABI, including the one it never raises. Consumer's ABI contains neither, although it calls IVault and forwards both."
+/>
+
+`Consumer` holds a variable of type `IVault`. It calls a method declared on `IVault`. The compiler
+knows, at compile time, every error `IVault` declares. And `Consumer`'s ABI contains **none of
+them**, because they are not errors `Consumer` can emit — they are errors it can *forward*, and the
+ABI is a description of a contract's own surface, not of its dependency graph.
+
+Point a frontend at `Consumer`, hand it `Consumer`'s artifact, and every failure originating one
+frame deeper arrives as an unrecognised four-byte value. This is why single-contract tutorials never
+surface the problem and why every real system has it.
+
+<Misconception
+  belief="If I define good custom errors, my frontend will be able to decode any failure my system produces."
+  reality="A contract's ABI JSON lists only its own errors. Errors thrown by contracts it calls and forwards are absent, even when the callee's interface is imported and known to the compiler."
+  why="Tutorials have one contract, where 'the ABI' and 'every error reachable through this entry point' are the same set. In a router, proxy or vault-plus-strategy system they are different sets, and the difference is invisible until an incident."
+  src="solidity-blog-custom-errors"
+/>
+
+### The fix is a client-side artifact, assembled on purpose
+
+There is no compiler flag for this. The frontend needs a **merged error ABI**: the union of the error
+entries from every contract reachable through the entry points it calls. Clients accept a plain
+array of ABI items, so this is a build step, not a library.
+
+Three things to get right when you build it.
+
+**Enumerate deliberately, not from one artifact.** The list is every contract that can be in a call
+stack under your entry points — implementations behind proxies, strategies, tokens, oracles, and the
+libraries all of them use. Deriving it from the entry point's artifact is the step that does not
+work.
+
+**Expect duplicates.** The ABI specification allows several error entries with the same name and
+even the same signature in one array, and says only the name
+matters.<Cite src="solidity-abi-spec" /> If two dependencies both define `Unauthorized()`, the
+decoded name is correct and says nothing about which produced it. A merged ABI must not create an
+impression of precision the payload cannot support.
+
+**Surface `raw` alongside the decoded name.** Whatever you render for users, log the original hex —
+it is the only part of the error that is evidence rather than interpretation.
+
+## What attribution actually costs
+
+If provenance is not in the payload, the honest options are two, and neither is free.
+
+**Accept that attribution is a tracing problem.** The frame that failed is visible in an execution
+trace, because a tracer sees the call tree the payload does not carry. That is why "reproduce it in
+a trace" is the first move on a forwarded revert rather than a fallback.
+
+**Re-tag at boundaries you control.** A contract can catch a failure from a sub-call and re-raise its
+own error carrying the callee's address and the original payload as a `bytes` argument:
+
+```solidity
+error CallFailed(address target, bytes reason);
+
+try v.dep() {
+} catch (bytes memory reason) {
+    revert CallFailed(address(v), reason);
+}
+```
+
+That gives the client something real: an address this contract observed, plus the inner bytes
+preserved for a second decoding pass. What it does not give you is truth about the inner frame —
+`address(v)` is what *this* contract called, and whatever `v` forwards from deeper down is still
+unattributed. You have added one trustworthy hop, not a stack trace.
+
+It also has costs worth stating before anyone adopts it reflexively: the payload grows by an offset,
+a length and the padded inner bytes; clients now see `CallFailed` where they used to see the inner
+error; and copying a hostile callee's return data into memory is the
+[returndata-bomb](/c/returndata-bomb) surface. Use it at a few deliberate boundaries — a router's
+entry point, a vault's strategy call — not everywhere.
+
+<Check type="explain" concept="error-data-untrusted">
+A router contract lets users swap through a chosen pool. Its frontend holds only the router's ABI.
+The router's code contains this, and the team is proud of it:
+
+```solidity
+try IPool(pool).swap(amountIn, minOut) returns (uint256 out) {
+    return out;
+} catch (bytes memory reason) {
+    if (bytes4(reason) == IPool.SlippageExceeded.selector) {
+        _refund(msg.sender, amountIn);      // "friendly" path
+        return 0;
+    }
+    revert(string(reason));
+}
+```
+
+The `pool` address is supplied by the caller. State every problem, and say which of them are
+security issues rather than usability ones.
+
+<Answer>
+**Security issue one: the selector check is attacker-controlled.** `pool` is a caller-supplied
+address, so the caller chooses which contract produces the revert data. Any contract can revert with
+bytes matching `SlippageExceeded`, whether or not it declares that error, because a selector is a
+hash of a string and nothing binds it to a
+contract.<Cite src="solidity-abi-spec" /> A caller who wants the refund path writes a four-line
+contract that always emits those four bytes, passes its address as `pool`, and gets `_refund` called
+without any swap having been attempted. This is the documentation's warning realised literally: error
+data must not be used for control flow.<Cite src="solidity-docs-contracts" />
+
+**Security issue two: it is a branch, so it is a decision.** Even with a fixed, trusted `pool`, the
+pool may forward an error from something *it* called — a token, an oracle — and the router would take
+the friendly path for a failure that has nothing to do with slippage. The specification names this
+case: a contract may receive an error not defined in any of the contracts it calls
+directly.<Cite src="solidity-abi-spec" />
+
+**Correctness issue: `bytes4(reason)` on empty data.** If the sub-call reverted with no data — a bare
+`require`, a non-`payable` receive, or an out-of-gas — `reason` is zero-length, and converting it
+yields `0x00000000`, verified on solc 0.8.36.<Cite src="measured-forge-1-7-1" /> That is a value the
+ABI specification reserves, so it will not collide with a real error, but the conversion silently
+produces something comparable rather than signalling that there was nothing to
+compare.<Cite src="solidity-abi-spec" /> The out-of-gas case is the nastiest, because
+[1/64th of the gas survives](/c/63-64-rule) and the router has enough left to run its handler and
+answer confidently about a call that merely ran out of gas.
+
+**Usability issue: `revert(string(reason))` mangles everything else.** It takes an already-encoded
+payload — likely a selector plus arguments — and re-wraps it as the *contents* of an `Error(string)`.
+The client now sees a string whose bytes are a different error's encoding, and the original is
+unrecoverable without knowing this was done. Forwarding the bytes unchanged, or wrapping them as a
+`bytes` argument of the router's own error, both preserve information; this does neither.
+
+**Usability issue: the frontend still cannot name pool errors.** The router's ABI contains the
+router's errors only, so `SlippageExceeded` — declared on `IPool`, thrown by the pool — is absent
+from the artifact the frontend holds.<Cite src="solidity-blog-custom-errors" /> Even the correctly
+forwarded errors arrive as unknown four-byte values until someone builds a merged error ABI.
+
+**What good looks like.** Decide the refund from *state the router can verify itself* — the output
+amount, the balances before and after — not from what the callee claims. Keep the `try`/`catch` for
+what it is good at, which is forwarding or wrapping the payload without interpreting it. And treat
+"which error was it" as a question for a trace and a log, never as a question for an `if`.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Every integration you write** inherits this. When a token, a pool or an oracle you call fails, the
+bytes you get back are a claim from an address you may not have chosen, forwarded through frames that
+did not sign it.
+
+**Proxies and routers** are where the ABI gap is worst, because the address your users interact with
+is structurally never the address that implements the behaviour, and its artifact structurally never
+lists the implementation's errors.
+
+**The security track** takes this further into a general shape: any check whose input is chosen by
+the party it defends against is not a check. Error selectors are one instance;
+`msg.sender == tx.origin` and `address.code.length` are others you have already met.
+
+**Events**, which the rest of this module is about, are the same problem with the sign flipped. A log
+carries the emitting address as a first-class field the EVM writes, not the contract — so a log
+*does* have a return address, and that single difference is why an indexer can be built on events and
+could never be built on revert data.

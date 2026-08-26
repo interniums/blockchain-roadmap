@@ -1,0 +1,372 @@
+---
+id: evm-yul-assembly-memory-safe-is-a-promise
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    solidity-inline-assembly,
+    solidity-yul,
+    solidity-layout-memory,
+    solidity-forum-memory-safe,
+    ottersec-memory-safety,
+    solidity-using-the-compiler,
+    solidity-via-ir-closer-look,
+    solidity-0836-release,
+    solady,
+  ]
+stack:
+  solc: "0.8.36"
+---
+
+Here is a keyword that looks like a safety feature and is the opposite of one.
+
+```solidity
+assembly ("memory-safe") {
+    ...
+}
+```
+
+Nothing about that annotation is checked. It does not cause the compiler to analyse the block, and
+it does not fail the build if the claim is false. It is an assertion **you** make, which the
+optimizer then acts on. The documentation's own warning is unusually direct: it is your
+responsibility to make sure the assembly actually satisfies the memory model, and annotating a block
+that violates one of the memory assumptions leads to incorrect and undefined behaviour that cannot
+easily be discovered by testing.<Cite src="solidity-inline-assembly" />
+
+"Cannot easily be discovered by testing" is the sentence to sit with. Most defects announce
+themselves eventually. This class does not, because whether it manifests is decided by the optimizer,
+and the optimizer's decisions are a function of code you did not write.
+
+## What the annotation actually asserts
+
+The rule is stated once and precisely. A memory-safe assembly block may only access the following
+memory ranges:<Cite src="solidity-inline-assembly" />
+
+1. Memory allocated by yourself, using an allocation mechanism that reads and advances the free
+   memory pointer.
+2. Memory allocated by Solidity — for example, memory within the bounds of a memory array you
+   reference.
+3. The scratch space between memory offset 0 and 64.
+4. Temporary memory located after the value of the free memory pointer at the beginning of the
+   block: memory "allocated" at the pointer without updating it.
+
+Then a fifth clause that is easy to miss because it is not in the list: if the block assigns to
+Solidity variables in memory, you must ensure that accesses through those variables also stay inside
+these ranges.<Cite src="solidity-inline-assembly" /> The documented counter-example is three lines of
+apparently harmless pointer assignment — setting a `bytes memory` variable to `0x40` inside the
+block, then indexing it from Solidity afterwards.<Cite src="solidity-inline-assembly" />
+
+Two qualifications sharpen the fourth range.
+
+**The restrictions apply even if the block reverts or terminates,** because this is about the
+optimizer rather than about execution.<Cite src="solidity-inline-assembly" /> The documentation's
+worked pair makes the point better than any paraphrase. This block is **not** memory-safe, because
+`returndatasize()` may exceed the 64-byte scratch space:
+
+```solidity
+assembly {
+    returndatacopy(0, 0, returndatasize())
+    revert(0, returndatasize())
+}
+```
+
+This one is, because memory beyond the free memory pointer can be used as temporary scratch:
+
+```solidity
+assembly ("memory-safe") {
+    let p := mload(0x40)
+    returndatacopy(p, 0, returndatasize())
+    revert(p, returndatasize())
+}
+```
+
+You do not need to update the free memory pointer when no allocation follows, but you may only use
+memory from the current pointer onwards.<Cite src="solidity-inline-assembly" /> And when a memory
+operation has length zero, any offset is acceptable — which is why `revert(0, 0)` is memory-safe
+despite naming offset zero.<Cite src="solidity-inline-assembly" />
+
+### The blocks that need no annotation
+
+Inline assembly that neither performs operations accessing memory nor assigns to Solidity variables
+in memory is automatically considered memory-safe and does not need to be
+annotated.<Cite src="solidity-inline-assembly" />
+
+The compiler team's own clarification on the forum is the more usable form of the rule: the only
+statements that require `memory-safe` — and that could be memory-*un*safe — are opcodes that concern
+memory, listed as `mload`, `mstore`, `calldatacopy`, `call`, `msize` and others, or access to
+variables outside the block that are of memory reference type. Code touching only storage or storage
+reference types is fine, as is calldata. Adding the annotation where it is not needed does not
+hurt.<Cite src="solidity-forum-memory-safe" />
+
+Note which opcode appears in that list. `call` is a memory operation, because its arguments and
+return area are memory ranges. A block that "only makes a call" is a block that touches memory.
+
+<Misconception
+  belief="Every inline assembly block needs the memory-safe annotation."
+  reality="A block that neither accesses memory nor assigns to a memory-reference variable is memory-safe automatically. Arithmetic on stack values, storage reads and writes, and calldata access all qualify."
+  why="The rule appears once, in a single sentence near the end of a long section, while the annotation itself appears in every production codebase — so the pattern you learn by reading real code is 'always annotate', with no visible boundary."
+  src="solidity-forum-memory-safe"
+/>
+
+## Why omitting it is not the conservative choice
+
+The instinct is that asserting nothing is safe and asserting something is risky. For correctness that
+is right. For everything else it is backwards, and the reason is a single Yul built-in.
+
+Without inline assembly, the compiler can rely on memory remaining in a well-defined state at all
+times, which is what lets the IR pipeline move local variables from stack to memory to avoid
+stack-too-deep and perform additional memory optimisations.<Cite src="solidity-inline-assembly" /> It
+communicates that reliance to the optimizer with `memoryguard`: the caller of `memoryguard(size)`
+promises to use memory only in the range below `size` or in the unbounded range starting at the
+returned pointer.<Cite src="solidity-yul" /> That is the `mstore(64, memoryguard(0x80))` you saw at
+the top of the IR in the first lesson.
+
+<Figure
+  caption="One unannotated block anywhere, and the box on the right lands in a file that never mentions it."
+  alt="A chain: one unannotated memory-touching assembly block makes the IR emit a plain mstore of 128 instead of memoryguard, which disables stack-to-memory movement and related memory optimisations across the whole compilation unit, which can surface as stack-too-deep in an unrelated function."
+>
+  <Flow
+    nodes={[
+      { id: 'blk', label: 'one unannotated block', note: 'anywhere in the unit', col: 0, tone: 'accent' },
+      { id: 'guard', label: 'no memoryguard', note: 'IR emits mstore(64, 128)', col: 1, tone: 'warn' },
+      { id: 'off', label: 'memory passes disabled', note: 'globally, not locally', col: 2, tone: 'danger' },
+      { id: 'std', label: 'stack-too-deep', note: 'in a function you did not edit', col: 3, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+The presence of memory-unsafe assembly removes the guard. The IR generator emits a plain
+`mstore(64, 128)` instead, which tells the optimizer it can no longer assume the invariant — and
+therefore that it cannot use memory in any of its passes.<Cite src="ottersec-memory-safety" /> The
+pass that suffers most is the one that moves stack variables into memory, which is currently the only
+pass relying on the semantic information `memoryguard` carries.<Cite src="ottersec-memory-safety" />
+
+Two consequences follow, and both are counter-intuitive.
+
+**The effect is global, not local.** Moving stack variables to memory and additional memory
+optimisations are disabled *globally* in the presence of any inline assembly block that contains a
+memory operation or assigns to Solidity memory variables.<Cite src="solidity-inline-assembly" /> One
+unannotated helper degrades code in files that never call it.
+
+**It interacts with stack-too-deep.** Stack-to-memory movement is precisely the mitigation for
+running out of reachable stack slots. Disable it and a compilation unit can start failing to compile
+for reasons that have nothing to do with the function being edited. This is also why the qualifier in
+the 0.8.36 release matters here: the spilling that "effectively solves stack-too-deep" lives on the
+experimental SSA CFG backend, not on the pipeline most projects
+compile with.<Cite src="solidity-0836-release" />
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'No memory in the block', note: 'arithmetic, storage, calldata' },
+    { title: 'Memory, unannotated', note: 'the conservative instinct', tone: 'warn' },
+    { title: 'Memory, memory-safe', note: 'an unchecked claim', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What does the IR emit at offset 0x40?',
+      cells: [
+        'mstore(64, memoryguard(0x80))',
+        'mstore(64, 128), with no guard',
+        'mstore(64, memoryguard(0x80))',
+      ],
+    },
+    {
+      label: 'Can stack variables move to memory?',
+      cells: [
+        'Yes',
+        'No, and the loss applies across the compilation unit',
+        'Yes',
+      ],
+    },
+    {
+      label: 'Who checked that the block is safe?',
+      cells: [
+        'Nobody had to. Such a block is memory-safe automatically and needs no annotation',
+        'Nobody, and nothing was claimed',
+        'You did. The compiler does not analyse the block and will not fail the build',
+      ],
+    },
+    {
+      label: 'What does getting it wrong cost?',
+      cells: [
+        'There is nothing here to get wrong',
+        'Gas elsewhere, and compilations that begin failing on stack-too-deep',
+        'Undefined behaviour that the documentation says testing cannot easily discover',
+      ],
+    },
+  ]}
+  caption="The middle column is the one nobody chooses on purpose, and it is the only one that makes code outside the block worse."
+  alt="Three states of an assembly block compared: no memory access, memory access left unannotated, and memory access annotated memory-safe, across what the IR emits at 0x40, whether stack variables can move to memory, who checked the claim, and what being wrong costs."
+/>
+
+<Misconception
+  belief="Leaving the annotation off is the safe default — I am not claiming anything, so I cannot be wrong."
+  reality="It is safe for correctness and expensive for everything else. Any memory-touching block without it globally disables stack-to-memory movement and related memory optimisations across the compilation unit."
+  why="Declining to make a claim is genuinely the conservative move in most engineering contexts. Here the absence of the claim is itself information the optimizer consumes, so 'saying nothing' is a decision with a cost rather than an abstention."
+  src="solidity-inline-assembly"
+/>
+
+<Aside kind="note">
+There is a second, older way to write the annotation: the special comment
+`/// @solidity memory-safe-assembly` above the block, which exists for libraries that must compile
+across a range of compiler versions. It is now deprecated and scheduled for removal, and the
+documentation directs new code targeting recent compilers to use the block
+annotation.<Cite src="solidity-inline-assembly" /> You will still meet it constantly, because the
+widely-vendored libraries that pioneered careful annotation discipline were written when it was the
+only portable option.<Cite src="solady" /> Recognise it; do not copy it into new code.
+</Aside>
+
+## A false annotation is undefined behaviour
+
+Now the sharp end. If the claim is untrue, what breaks, and when?
+
+The optimizer, believing the guard, is free to place a spilled stack value in memory your block then
+overwrites. Which value, in which slot, at which offset, depends on the stack pressure in the
+surrounding function, on the optimizer settings, and on the pipeline. None of those is stable across
+edits. So the same source can compile correctly today and miscompile after someone adds two locals to
+an unrelated function in the same file — with a green test suite on both sides, because the test
+exercised a binary the refactor replaced.
+
+This is not a metaphor for undefined behaviour; it is the term the documentation uses, and violating
+the memory model with assembly marked memory-safe is one of only three places it uses
+it.<Cite src="ottersec-memory-safety" /> The audit-firm framing is worth adopting whole: memory
+safety is a promise between IR generation and optimisation, and the reason it can be exploited so
+thoroughly is the same reason signed integer overflow is undefined in C — assumptions about the
+program enable powerful optimisations, and undefined behaviour materialises as tricky bugs years
+later.<Cite src="ottersec-memory-safety" />
+
+<Misconception
+  belief="If the tests pass, the annotation was accurate."
+  reality="Whether a false annotation manifests depends on optimizer decisions that change when unrelated code changes. Passing tests establish that one particular compilation of one particular source tree behaved; they say nothing about the next one."
+  why="Tests are the normal way of establishing that something works, and for almost every other class of defect the inference is sound. Here the compiler output is not held fixed between the test run and the next commit, so the experiment does not control the variable that matters."
+  src="ottersec-memory-safety"
+/>
+
+### The one advanced case worth knowing
+
+The strict rule stops at offset 64. There is a documented extension: you may use memory up to, but
+not including, offset `0x80` and still declare the block memory-safe, under either of two
+conditions.<Cite src="solidity-inline-assembly" />
+
+**Either** by the end of the block the free memory pointer at `0x40` is restored to a sane value —
+its original value, or an increment of it from a real allocation — and the word at `0x60` is restored
+to zero.
+
+**Or** the block terminates, meaning execution can never return to high-level Solidity: for example,
+a block that unconditionally ends in `revert`.
+
+Both come with a caveat that recovers the previous lesson's zero-slot rule. The default value of a
+dynamic array in Solidity points at memory offset `0x60`, so for as long as you have changed that
+word you cannot rely on accurate lengths when reading dynamic arrays. Safety when overwriting the
+zero pointer is only guaranteed if the rest of the block does not interact with the memory of
+high-level Solidity objects, including by reading from offsets previously stored in
+variables.<Cite src="solidity-inline-assembly" />
+
+Read that as a scope rule. The extension is available to a block that has taken over the bottom of
+memory and hands it back, not to a block that borrows part of it while Solidity is still using the
+rest.
+
+## What review of an annotated block looks like
+
+The annotation is a claim, so review it as a claim rather than as syntax. Three questions settle it,
+and a block that cannot answer all three should lose the annotation or be rewritten in Solidity.
+
+**Which of the four ranges does every memory access fall into?** Not "does this look reasonable" —
+which numbered range, for each `mload`, `mstore`, `*copy`, `call` argument area and return area, and
+for every Solidity memory variable the block assigns to. A comment naming the range next to the block
+turns a re-review into a check.
+
+**If it allocates, does it advance the pointer, and is the advance rounded correctly?** Memory array
+elements occupy multiples of 32 bytes, so an unrounded advance leaves the next allocation
+misaligned.<Cite src="solidity-layout-memory" />
+
+**Does the block leave anything depending on memory past the pointer?** Range four permits temporary
+use of that region. It does not permit leaving a value there and reading it after the block, because
+the next Solidity statement may allocate over it — and, separately, that memory is not guaranteed to
+have been zero when you arrived.<Cite src="solidity-layout-memory" />
+
+A fourth question is about the codebase rather than the block: **which pipeline is this compiled
+with, and does CI compile it both ways?** The annotation is consumed by the Yul optimizer, which is a
+stage on one of the two pipelines.<Cite src="solidity-via-ir-closer-look" /> A false annotation can be
+inert under legacy codegen and fatal under via-IR, so a project that ships one configuration and
+tests another has arranged for the failure to appear only in production.
+
+<Check type="spot-bug" concept="annotation-is-unverified">
+Three annotated blocks from a review queue. For each, decide whether the annotation is true, and if
+not, name the range it violates.
+
+```solidity
+// A
+assembly ("memory-safe") {
+    let len := mload(data)              // data is a bytes memory parameter
+    result := keccak256(add(data, 0x20), len)
+}
+
+// B — inside a function that returns to Solidity afterwards
+assembly ("memory-safe") {
+    mstore(0x60, caller())
+    mstore(0x00, sload(ownerSlot))
+    same := eq(mload(0x00), mload(0x60))
+}
+
+// C
+assembly ("memory-safe") {
+    let p := mload(0x40)
+    calldatacopy(p, 0, calldatasize())
+    let ok := delegatecall(gas(), impl, p, calldatasize(), 0, 0)
+    returndatacopy(p, 0, returndatasize())
+    switch ok
+    case 0 { revert(p, returndatasize()) }
+    default { return(p, returndatasize()) }
+}
+```
+
+<Answer>
+**A — true.** Every access is inside a `bytes memory` array the block was handed: the length word at
+`data` and `len` bytes starting at `data + 0x20`. That is range two, memory allocated by Solidity
+within the bounds of an array you reference.<Cite src="solidity-inline-assembly" /> Note the block
+does touch memory, so the annotation is doing real work rather than being decorative.
+
+**B — false, and it is the subtle one.** The first two lines look symmetric: `0x00` is scratch space,
+which is range three. `0x60` is not. It is the zero slot, outside all four permitted ranges, and it
+is used as the initial value of dynamic memory arrays.<Cite src="solidity-layout-memory" /> After
+this block, any default-initialised dynamic array in the frame reports the caller's address as its
+length. The advanced rule does not rescue it either: that extension permits use up to but not
+including `0x80` only if `0x60` is restored to zero before returning to Solidity, or if the block
+terminates — and this block does neither.<Cite src="solidity-inline-assembly" /> The fix is free:
+use the second scratch word at `0x20` instead of `0x60`, or skip memory altogether, since `eq` on two
+stack values needs none.
+
+**C — true, and worth understanding rather than pattern-matching.** It writes at the free memory
+pointer without advancing it, which is range four, and it is allowed to leave nothing depending on
+that memory — which it does not, because every path out of the block is `revert` or `return`. The
+block terminates: execution never returns to high-level Solidity.<Cite src="solidity-inline-assembly" />
+That is what makes a proxy fallback one of the few places where taking over memory is
+straightforwardly defensible.
+
+**The meta-point.** A reviewer who reads all three as "assembly, annotated, presumably fine" passes
+the one that corrupts unrelated code. The three differ only in which addresses appear as literals,
+and no tool in a standard pipeline will flag the difference.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**When assembly is worth it** is the next lesson, and this one supplies the argument's main term.
+The cost of a block is not its gas or its line count; it is that every future reviewer must re-answer
+the three questions above, under a compiler whose behaviour is a moving target.
+
+**Upgradeable proxies** rely on exactly the terminating-block case in example C. Recognising why that
+block is safe — and why nearly-identical code that falls through to Solidity is not — is the
+difference between copying a fallback and owning one.
+
+**Foundry configuration** stops being a preference once you know the annotation is consumed by one
+pipeline's optimizer. If production compiles with `via_ir`, CI must too, and if it compiles both
+ways, both belong in the matrix.<Cite src="solidity-using-the-compiler" />
+
+**Security review** on the security track treats this as its own finding category, because it is one
+of very few defects where the code is correct, the tests pass, and the deployed bytecode is still
+wrong.

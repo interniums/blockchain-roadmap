@@ -1,0 +1,429 @@
+---
+id: altvm-anchor-what-it-costs
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [anchor-docs-zero-copy, solana-docs-compute-budget, solana-docs-fees, solana-docs-pda, anchor-docs-litesvm, anchor-docs-mollusk, anchor-repo-changelog, anchor-docs-account-types, anchor-account-constraints, anchor-docs-errors, anza-compute-units, anchor-docs, anchor-changelog]
+stack: {}
+---
+
+Your instruction gets 200,000 compute units by default.<Cite src="solana-docs-compute-budget" />
+
+By Anchor's own published figures, loading a single 10 KB account with `Account<'info, T>` costs
+about 50,000 of them — a quarter of the budget spent before your logic has run, on the act of copying
+bytes out of a buffer into a struct.<Cite src="anchor-docs-zero-copy" />
+
+That is what this lesson is about: the framework's convenience is code, code costs compute, and
+compute is a hard per-instruction ceiling rather than a bill you settle afterwards. Then the two
+things you do about it — an escape hatch for the accounts that dominate the cost, and a test setup
+fast enough that measuring becomes routine instead of an event.
+
+## The unit is compute units, and no EVM number transfers
+
+State this once, bluntly, because it is the single most common import error from the EVM track.
+Solana meters **compute units**. CU are not gas, are not convertible to gas, and have no shared cost
+table. Every constant you carry from the EVM — 2,100 for a cold `SLOAD`, 2,600 for a cold account
+access, 20,000 for a zero-to-nonzero `SSTORE` — describes a different instruction set with a different
+pricing model, and none of them tells you anything about a Solana program. Do not port them, do not
+analogise from them, and be suspicious of any comparison table that puts the two in the same column.
+
+What the budget looks like:
+
+<Matrix
+  cols={['Value']}
+  rows={[
+    {
+      label: 'Default CU per instruction',
+      cells: [<>200,000<Cite src="solana-docs-compute-budget" /></>],
+    },
+    {
+      label: 'Max CU per transaction',
+      cells: [{ v: <>1,400,000<Cite src="solana-docs-compute-budget" /></>, tone: 'warn' }],
+    },
+    {
+      label: 'Default CU per builtin instruction',
+      cells: [<>3,000<Cite src="solana-docs-compute-budget" /></>],
+    },
+    {
+      label: <code>create_program_address</code>,
+      cells: [<>1,500 CU<Cite src="solana-docs-pda" /></>],
+    },
+    {
+      label: <><code>find_program_address</code> worst case</>,
+      cells: [<>1,500 on entry + 1,500 per failed bump<Cite src="solana-docs-pda" /></>],
+    },
+  ]}
+  caption="Three defaults and two prices, all denominated in compute units — and not one of them converts to gas."
+  alt="The Solana compute budget an Anchor program is charged against: 200,000 CU by default per instruction, 1,400,000 CU maximum per transaction, 3,000 CU default per builtin instruction, 1,500 CU for create_program_address, and 1,500 CU on entry plus 1,500 per failed bump for find_program_address."
+/>
+
+The second row is the one that changes how you design. **1.4 million CU is a wall, not a bill.** An
+EVM transaction that needs more gas gets more gas if the sender will pay for it, up to the block
+limit. A Solana transaction that needs more than 1.4 million CU does not exist — it must be split
+into several transactions, which means the atomicity you were relying on has to be re-established by
+your own program state. "This operation is too expensive" is an architectural constraint on Solana
+and a pricing one on Ethereum.
+
+### Where Anchor's compute actually goes
+
+Four buckets, roughly in ascending order of how much they matter.
+
+**Each constraint is a comparison.** `mut`, `has_one`, `address`, `constraint = expr` — each expands
+to an `if` over a few words of memory.<Cite src="anchor-account-constraints" /> Individually
+negligible. Collectively a floor you pay every invocation.
+
+**The container checks are a comparison plus a deserialization.** Owner check and discriminator check
+are cheap; the Borsh decode is not, and it is the item that scales.<Cite src="anchor-docs-account-types" />
+
+**PDA derivation is priced explicitly, and this is the one you can control.** A bare `bump` searches;
+`bump = state.bump` derives once. The Solana documentation gives 1,500 CU for a single
+`create_program_address` and 1,500 on entry plus 1,500 for each failed bump in the search — so a
+constraint on an account whose canonical bump is a few steps down the range costs several thousand CU
+more than the stored-bump form, on every call, forever.<Cite src="solana-docs-pda" />
+
+**Serialization on exit.** An account marked `mut` is written back when the instruction
+ends.<Cite src="anchor-account-constraints" /> That is a second pass over the same bytes, and it is
+the half people forget when they reason about the cost of loading state.
+
+Two of those four scale with account size, which is why the escape hatch below is about size rather
+than about count.
+
+<Figure
+  caption="The bill runs from the first byte the container decodes to the last byte written back, and your handler is one step in the middle of it."
+  alt="A per-invocation pipeline in an Anchor program: deserialize the account, evaluate the constraints, run the handler, then serialize any mutable account back on exit."
+>
+  <Flow
+    nodes={[
+      { id: 'de', label: 'deserialize', note: 'Borsh decode, scales with size', col: 0, tone: 'warn' },
+      { id: 'con', label: 'constraints', note: 'one comparison per attribute', col: 1 },
+      { id: 'h', label: 'your handler', note: 'the part you wrote', col: 2, tone: 'accent' },
+      { id: 'ser', label: 'serialize on exit', note: 'a second pass over the same bytes', col: 3, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+## What you pay for the units you asked for
+
+The fee model has a property that inverts an EVM habit, and getting it backwards is expensive at
+scale.
+
+The base fee is 5,000 lamports per signature, split 50% burned and 50% to the
+validator.<Cite src="solana-docs-fees" /> The prioritization fee is
+`ceil(compute_unit_price * compute_unit_limit / 1,000,000)` lamports, all of it to the
+validator.<Cite src="solana-docs-fees" /> You have met that formula as
+[the priority fee formula](/c/priority-fee-formula); the term to stare at is `compute_unit_limit`.
+
+**The priority fee is determined by the compute unit limit you requested, not the units you
+used.**<Cite src="solana-docs-compute-budget" /> Leave the default 200,000 in place on an instruction
+that consumes 2,153 and you have paid priority on roughly 198,000 units of nothing. There is no
+refund; the EVM's "unused gas comes back" reflex is simply wrong here. The documented method is to
+simulate the transaction to measure consumption and add about a ten percent safety
+margin.<Cite src="solana-docs-compute-budget" />
+
+Which makes CU measurement a *product* concern rather than an optimisation hobby. Every instruction
+you ship with an unmeasured limit overpays on every call, and the overpayment scales with your
+traffic and with network contention.
+
+<Aside kind="warn">
+Two more facts that bite teams arriving from the EVM. Fees are charged on failed transactions as well
+as successful ones — a reverted EVM transaction also costs gas, but Solana's
+[fees charged on failure](/c/fees-charged-on-failure) apply to a wider set of failure modes, so a
+client that retries aggressively is paying for every attempt. And the compute-budget mechanism itself
+is changing: the Solana documentation states that in the upcoming v1 transaction format,
+ComputeBudget instructions are ignored for configuration and execute as no-ops that still cost 150 CU
+and an instruction slot, with limits and the priority fee set directly in the message config — and
+unset limits defaulting to **zero** rather than to today's
+values.<Cite src="solana-docs-compute-budget" /> Treat that as scheduled, not shipped, and re-read the
+page before you write anything that depends on defaults.
+</Aside>
+
+## When the cost is irrelevant, and when it is the whole argument
+
+Be honest about the size of this, in both directions.
+
+**For an application instruction, it does not matter.** A program whose instructions are called a few
+thousand times a day pays for its constraints in an amount of SOL that does not appear on any budget
+line. The compute those checks consume buys you the elimination of the two most common Solana
+vulnerability classes, and that trade is not close. Optimising a well-constrained application program
+for CU before you have measured anything is the Solana version of premature optimisation, with the
+added downside that the things you remove are the safety checks.
+
+**For a primitive invoked by CPI inside other people's transactions, the constant is the product.**
+If your program is a leg in a route, every transaction touching that route pays your per-invocation
+overhead, and it competes with your budget rather than yours. Below some threshold, integrating with
+you stops being affordable. That is the argument for dropping to a lower-level framework, and it is
+an argument about who bears the cost, not about elegance.
+
+<Aside kind="note">
+Circulating comparisons between Anchor and lower-level frameworks quote large percentage savings, and
+the ones we could trace come from conference-talk summaries with unstated methodology and unstated
+program shapes. Treat them as directional only. The number that matters is the one you measure on
+your own instruction, with the harness described below, and the measurement takes minutes once the
+harness exists.
+</Aside>
+
+## The escape hatch: `zero_copy` and `AccountLoader`
+
+Traditional deserialization with `Account<'info, T>` copies data from the account into a
+heap-allocated struct, and Anchor names three limits that follow: stack (4 KB) and heap (32 KB)
+constrain account sizes, deserialization consumes significant compute, and the data is duplicated in
+memory.<Cite src="anchor-docs-zero-copy" />
+
+Zero-copy with `AccountLoader<'info, T>` casts the raw account bytes to the struct type instead of
+copying, supporting accounts up to 10 MB (10,485,760 bytes) and a substantial reduction in CU for
+large accounts.<Cite src="anchor-docs-zero-copy" />
+
+Anchor publishes its own comparison, and it is worth reproducing with the caveat attached — these are
+the documentation's figures, with methodology unstated, and your account layout is not theirs:
+
+<Matrix
+  numeric
+  corner="Account size"
+  cols={[<code>Account&lt;T&gt;</code>, <code>AccountLoader&lt;T&gt;</code>]}
+  rows={[
+    { label: '1 KB', cells: ['~8,000 CU', '~1,500 CU'] },
+    { label: '10 KB', cells: [{ v: '~50,000 CU', tone: 'warn' }, '~5,000 CU'] },
+    { label: '100 KB', cells: [{ v: 'too large', tone: 'danger' }, '~12,000 CU'] },
+    { label: '1 MB', cells: [{ v: 'impossible', tone: 'danger' }, '~25,000 CU'] },
+  ]}
+  caption="Anchor's own published figures, methodology unstated: past a point the question stops being how fast the account loads and becomes whether it can be loaded at all."
+  alt="Anchor documentation figures for loading an account: at 1 KB about 8,000 compute units copied versus 1,500 mapped, at 10 KB about 50,000 versus 5,000, at 100 KB too large to copy versus about 12,000, and at 1 MB impossible to copy versus about 25,000."
+/>
+
+<Cite src="anchor-docs-zero-copy" />
+
+The shape is the message: below a kilobyte the difference is noise against a 200,000 CU budget, and
+somewhere in the tens of kilobytes `Account<T>` stops being an option at all rather than merely being
+slow.
+
+**Using it.** Annotate the struct with `#[account(zero_copy)]`, which derives `Copy`, `Clone`,
+`bytemuck::Zeroable`, `bytemuck::Pod` and `#[repr(C)]`, and add `bytemuck` with the
+`min_const_generics` feature.<Cite src="anchor-docs-zero-copy" /> Then load through
+`AccountLoader<'info, T>`, using `load_init` the first time — it also sets the account
+discriminator — and `load` or `load_mut` thereafter.<Cite src="anchor-docs-zero-copy" />
+
+**The allocation ceiling that surprises people.** The `init` constraint can allocate at most 10,240
+bytes, because under the hood it CPIs to the System Program and that is the CPI
+limit.<Cite src="anchor-docs-zero-copy" /> For anything larger, create the account in a separate
+instruction by calling the System Program directly and use the `zero` constraint, which verifies the
+account has not been initialized by checking that its discriminator has not been
+set.<Cite src="anchor-docs-zero-copy" /><Cite src="anchor-account-constraints" /> With eight bytes
+reserved for the discriminator, the maximum data size is 10,485,752
+bytes.<Cite src="anchor-docs-zero-copy" />
+
+**What you give up, which is the part the performance table does not show.** `#[repr(C)]` plus
+`Pod` means fixed-layout, plain-old-data fields only: no `Vec`, no `String`, no `HashMap`, and no
+enums with payloads. Alignment and padding become your problem, and a struct whose fields you reorder
+is a struct whose on-chain bytes now mean something else. Anchor's own guidance is to use zero-copy
+for accounts over roughly a kilobyte, arrays with many elements such as orderbooks and event queues,
+high-frequency operations and compute-sensitive programs, and to stay on `Account<T>` for small
+accounts, dynamic data structures and frequently changing
+schemas.<Cite src="anchor-docs-zero-copy" />
+
+That trade — layout obligations in exchange for not copying — is the same one the whole of the next
+module makes. Anchor offers it here one account at a time, which is exactly the right way to meet it
+first.
+
+<Misconception
+  belief="Zero-copy is the fast option, so I should use it everywhere."
+  reality="It is the option for large or hot accounts. It costs you dynamic types, forces fixed layout and alignment discipline, and makes schema changes into byte-layout migrations. For a 100-byte config account it buys a rounding error and takes on real obligations."
+  why="Performance tables show the axis where the technique wins and never the axis where it costs, and 'zero-copy' sounds like a strictly-better version of 'copy'."
+  src="anchor-docs-zero-copy"
+/>
+
+<Aside kind="note">
+Two cheaper steps before reaching for zero-copy. `Box<Account<'info, T>>` changes no checks at all and
+moves the deserialized struct off the stack onto the heap, which resolves a stack-overflow build error
+without changing your data model.<Cite src="anchor-docs-account-types" /> And Anchor carries a
+`LazyAccount` type behind a `lazy-account` feature for deferring field decoding, which has continued
+to receive fixes through 1.x — check its status for your version before designing around
+it.<Cite src="anchor-repo-changelog" />
+</Aside>
+
+## Three places to run a test, and the one you should live in
+
+Now the half of the lesson that changes your day.
+
+**An in-process SVM harness.** LiteSVM creates an in-process Solana VM optimised for program
+developers, and is much faster to run and compile than `solana-program-test` and
+`solana-test-validator`; it is available in Rust, TypeScript/JavaScript and
+Python.<Cite src="anchor-docs-litesvm" /> Programs are loaded from compiled bytes with
+`add_program` or `add_program_from_file`, and you can rewrite sysvars — including the clock — to test
+time-dependent logic directly.<Cite src="anchor-docs-litesvm" /> Being able to set the clock rather
+than wait for it is the equivalent of Foundry's `warp` cheatcode, and it lands in the same place in
+your workflow.
+
+**A minified harness with no runtime at all.** Mollusk goes further: it does not create any semblance
+of a validator runtime, but provisions a program execution pipeline directly from lower-level SVM
+components — a minified program cache, transaction context and invoke context — and executes the
+program's ELF through the BPF loader without AccountsDB, Bank or any other large Agave
+component.<Cite src="anchor-docs-mollusk" /> The consequence is that it is exceptionally fast, and
+the cost is that you must supply an explicit list of accounts because it has nowhere to load them
+from.<Cite src="anchor-docs-mollusk" />
+
+Mollusk is also where CU measurement is a first-class assertion. `process_and_validate_instruction`
+takes a list of `Check`s, and `Check::compute_units(...)` is one of
+them.<Cite src="anchor-docs-mollusk" /> That turns compute consumption into a regression test: a
+change that adds 3,000 CU to a hot instruction fails CI rather than being discovered in a fee report.
+
+**A validator-shaped local network.** Anchor 1.0 changed the default here — the CHANGELOG records
+Surfpool being used by default for `anchor test` and `anchor localnet`, and a `litesvm` test template
+added and made the default option on `anchor init`.<Cite src="anchor-repo-changelog" /> Verify both
+against the version you have installed rather than inheriting them from this
+page.<Cite src="anchor-changelog" />
+
+**And mainnet itself**, which is not a test environment but is where the accounts are. Everything
+your program touches that you did not create — an oracle account, a token mint with extensions, a
+pool owned by somebody else — exists only there.
+
+### The ladder, and the judgement
+
+The ordering is fidelity against milliseconds, and the discipline is to know which one each test
+needs.
+
+<Matrix
+  corner="Harness"
+  cols={['What it gives up', 'What it is for']}
+  rows={[
+    {
+      label: 'Mollusk',
+      cells: [
+        <>The whole runtime; you supply every account<Cite src="anchor-docs-mollusk" /></>,
+        'Unit tests, CU assertions, tight loops',
+      ],
+    },
+    {
+      label: 'LiteSVM',
+      cells: [
+        <>Consensus and networking<Cite src="anchor-docs-litesvm" /></>,
+        'Multi-instruction flows, sysvar manipulation',
+      ],
+    },
+    {
+      label: 'Local validator',
+      cells: ['Nothing structural; it is slow', 'Anything depending on validator behaviour'],
+    },
+    {
+      label: 'Fork of live state',
+      cells: [
+        'Nothing; it is slowest and least deterministic',
+        'Integration against real accounts and real programs',
+      ],
+    },
+  ]}
+  caption="Each rung buys realism by refusing to simulate something, and the order of what it refuses is the order of how fast it runs."
+  alt="Four test harnesses ordered by fidelity: Mollusk gives up the whole runtime, LiteSVM gives up consensus and networking, a local validator gives up nothing structural but is slow, and a fork of live state gives up nothing and is slowest."
+/>
+
+**Run the fast harness constantly and reserve the realistic ones for what actually depends on real
+accounts.** That sentence is the whole judgement, and it is the same one you already made in the
+Foundry track: unit tests in milliseconds, [fork tests](/c/fork-testing-purpose) for the handful of
+cases that need live state, in full knowledge that [fork tests are slow](/c/fork-tests-are-slow) and
+that a slow suite is a suite people stop running. Solana's version of that split is sharper, because
+the gap between an in-process SVM and a validator is larger than the gap between a local EVM and a
+fork.
+
+<Misconception
+  belief="Testing an Anchor program requires a local validator."
+  reality="In-process SVM harnesses run the same compiled program against an SVM instance in a fraction of the time, and current Anchor templates default to that path rather than to a validator-backed run."
+  why="Every pre-2026 tutorial opens by launching `solana-test-validator`, and the instruction is memorable because it is the first thing that goes wrong."
+  src="anchor-docs-litesvm"
+/>
+
+<Check type="explain" concept="anchor-test-stack">
+Your team ships a Solana program used by three partner protocols via CPI. The suite is 40 tests
+against a local validator, takes eleven minutes, and is run on merge only. Fees are rising and one
+partner has said your instruction is "expensive to route through".
+
+Write the plan: what you change about testing, what you measure, and how you decide whether to
+optimise the program at all.
+
+<Answer>
+**First, get a number, because "expensive" is not one.** Before touching the program, measure the
+instruction's CU consumption. Two routes, and use both. The cheap one is the transaction log: every
+invocation prints `consumed X of Y compute units`, so a devnet or mainnet transaction already tells
+you what a real call costs.<Cite src="anchor-docs-errors" /> The durable one is a Mollusk test
+asserting `Check::compute_units(...)`, which turns the figure into something CI
+defends.<Cite src="anchor-docs-mollusk" />
+
+**Second, check the cheapest possible win before optimising anything: the requested limit.** The
+priority fee is charged on the CU limit requested, not the CU
+consumed.<Cite src="solana-docs-compute-budget" /> If your client is not setting
+`SetComputeUnitLimit`, or is setting a padded number, the partner is being billed for units nobody
+uses. Simulate and add roughly ten percent.<Cite src="solana-docs-compute-budget" /> This can resolve
+the complaint entirely without a program change, and it should be checked first because it is a
+client fix rather than a redeploy.
+
+**Third, restructure the suite as a ladder rather than a single tier.** Move the bulk to an
+in-process harness: LiteSVM for multi-instruction flows and anything needing clock manipulation,
+Mollusk for per-instruction unit tests and every CU
+assertion.<Cite src="anchor-docs-litesvm" /><Cite src="anchor-docs-mollusk" /> Keep on the validator
+only the tests whose subject *is* validator behaviour, and add a small fork-based tier for the
+partners' real accounts. Eleven minutes on merge becomes seconds on save for most of the suite, and
+the reason that matters here is specific: you cannot iterate on compute cost with an eleven-minute
+feedback loop, so the test restructure is a precondition for the optimisation rather than a parallel
+piece of hygiene.
+
+**Fourth, look at the cost drivers in order of size, not in order of visibility.**
+
+*Account size and serialization.* If any instruction loads a large account with `Account<'info, T>`,
+that is likely the dominant term — Anchor's own figures put a 10 KB account at roughly 50,000 CU
+copied versus roughly 5,000 mapped.<Cite src="anchor-docs-zero-copy" /> Converting a hot, large,
+fixed-layout account to `#[account(zero_copy)]` plus `AccountLoader` is the single biggest available
+change, and it is the one with real obligations attached: no dynamic types, fixed layout, and a
+migration for the existing accounts.<Cite src="anchor-docs-zero-copy" />
+
+*PDA derivation.* Every constraint using a bare `bump` runs a search. Storing the canonical bump at
+creation and switching to `bump = state.bump` replaces 1,500 CU plus 1,500 per failed bump with a
+single 1,500 CU derivation, per constrained account, per
+call.<Cite src="solana-docs-pda" /><Cite src="anchor-account-constraints" /> Cheap to do, no data
+model change, and it also fixes the canonicalization hazard.
+
+*Accounts marked `mut` that are not written.* Each costs a serialization pass on exit and takes an
+exclusive write lock that hurts your partners' throughput as well as your
+fees.<Cite src="anchor-account-constraints" />
+
+*Constraints.* Last, and mostly do not. Individual constraint checks are small, and each one you
+remove is a security check you removed. If the measured constraint overhead is the dominant term,
+that is a finding about the shape of your program rather than a licence to
+delete.<Cite src="anza-compute-units" />
+
+**Fifth, decide about the framework itself, with the numbers in hand.** If after the above the
+instruction is still too expensive for a CPI leg, then you have the real version of the question the
+next module asks: is the remaining overhead worth what the framework generates. That decision needs a
+measured before-and-after on your own program, because the public comparisons come with unstated
+methodology and are directional at best.
+
+**What you tell the partner today.** The measured CU figure, the requested limit you are now setting
+and why it was wrong, and a date for the zero-copy change if the measurement supports it. Those are
+three concrete things, and the first two are available this week.
+
+**The meta-point.** Every step above depends on measurement being cheap. That is why the test-stack
+change comes before the optimisation and not after it: with an eleven-minute suite the honest answer
+to "should we optimise" is "we can't tell", and with a millisecond harness it is a number.
+</Answer>
+</Check>
+
+## What this unlocks
+
+This is the end of the module, so the payoff is a way of deciding rather than a next mechanism.
+
+- **The next module is the same trade, taken further.** Pinocchio drops the generated entrypoint, the
+  generated validation and the IDL to buy compute headroom. Everything you now know about what Anchor
+  generates is the list of what you would be writing yourself, and everything you know about what it
+  costs is the reason somebody would.
+- **The Solana security module** is where the vulnerability classes live, and you have met most of
+  them already as the shape of a check: owner, discriminator, signer, seeds, canonical bump,
+  re-initialization, revival. Arriving there having seen where each one comes from in the framework
+  makes it a review checklist instead of a list to memorise.<Cite src="anchor-docs" />
+- **The habit worth keeping** is the one this lesson is built around. Measure before you optimise,
+  and make measuring cheap enough that "measure first" is not an act of discipline. A Mollusk test
+  with a `compute_units` check costs you an afternoon once and answers the question forever
+  after.<Cite src="anchor-docs-mollusk" />
+
+And the sentence to carry out of the module as a whole. Anchor is the parts of a Solidity compiler
+that Solana does not have, re-implemented as macros that emit runtime checks — which means it can only
+enforce the invariants you thought to declare, it charges you for each one on every call, and the
+guarantee you did not write down is not enforced by anything at all. Reading an `Accounts` struct as
+a list of claims, and asking what is missing from it, is the skill this module exists to build.

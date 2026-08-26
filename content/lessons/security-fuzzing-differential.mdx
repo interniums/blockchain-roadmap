@@ -1,0 +1,369 @@
+---
+id: security-fuzzing-differential
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [measured-forge-1-7-1, tob-diffusc, crytic-diffusc, bsc-echidna-testing-approaches, crytic-echidna, tob-why-fuzzing]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Two differential tests over the same pair of `mulDiv` implementations — one hand-rolled `a * b / d`,
+one with a full 512-bit intermediate. Same fuzzer, same seed, same budget. Measured on forge
+1.7.1:<Cite src="measured-forge-1-7-1" />
+
+```text
+[PASS] testFuzz_valuesAgree(uint256,uint256,uint256)   (runs: 256)
+[FAIL] testFuzz_successAgrees(uint256,uint256,uint256) (runs: 4)
+       success flags differ: false != true
+       a = 38059
+       b = 115792089237316195423570985008687907853269984665640564039457584007913129639933
+       d = 758696102784961237417212656327120
+```
+
+`b` is `2^256 − 3`. The product `a * b` needs 272 bits, so the naive implementation reverts on
+Solidity 0.8's overflow check while the full-precision one returns
+5,808,559,063,512,261,687,513,108,197,340,833,303,263,214,573,629 — a perfectly good `uint256`.
+
+The first test passed 256 runs against a target that disagrees with its reference on the fourth
+input the fuzzer generated. The difference is four lines, and it is the whole subject of this lesson.
+
+## The oracle is the other implementation
+
+[Differential fuzzing](/c/differential-fuzzing) removes the step everything before this lesson has
+been about. You do not state a property. You feed identical inputs to two implementations of the same
+function and assert that they agree.<Cite src="tob-diffusc" /> Any disagreement is a bug in one of
+them, and which one is a question for afterwards.
+
+This is worth reaching for exactly when hand-writing the property is hard: arithmetic you cannot
+easily characterise, a curve you cannot state a closed form for, a bit-packing routine whose only
+specification is the code. It is worth *not* reaching for when the property is easy, because a
+differential test tells you two things disagree and never tells you which is right.
+
+Trail of Bits' framing is precise about the mechanics: fuzzers outside the smart contract world watch
+for crashes, and smart contract fuzzing watches for invariant violations — so differential fuzzing for
+contracts is external testing, with test functions that take a random input, feed it into matching
+functions in both implementations, and compare the results of the two
+calls.<Cite src="tob-diffusc" /> External testing, because both implementations have to be reachable
+from outside.<Cite src="bsc-echidna-testing-approaches" />
+
+<Figure
+  caption="With a second implementation as the oracle, both halves of a result have to be compared: whether the call succeeded, and only then what it returned."
+  alt="One fuzzed input is fed to both the target and the reference implementation. Their success flags are compared first, then the hashes of their return data, and any disagreement is the finding."
+>
+  <Flow
+    nodes={[
+      { id: 'i', label: 'one fuzzed input', note: 'clamped only where both agree it is out of scope', col: 0, tone: 'muted' },
+      { id: 't', label: 'target', note: 'the implementation under test', col: 1, row: 0 },
+      { id: 'r', label: 'reference', note: 'a library, a model, or the previous version', col: 1, row: 1, tone: 'accent' },
+      { id: 'c', label: 'compare', note: 'success flags first, then keccak of the return data', col: 2 },
+      { id: 'd', label: 'disagreement', note: 'the finding — which side is wrong is a separate question', col: 3, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'i', to: 't' },
+      { from: 'i', to: 'r' },
+      { from: 't', to: 'c' },
+      { from: 'r', to: 'c' },
+      { from: 'c', to: 'd', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+## The four lines that decide whether it works
+
+Here is the weak harness, the one that passed 256 runs:
+
+```solidity
+function testFuzz_valuesAgree(uint256 a, uint256 b, uint256 d) public view {
+    d = bound(d, 1, type(uint256).max);
+    try h.naive(a, b, d) returns (uint256 n) {
+        assertEq(n, h.full(a, b, d));
+    } catch { }                       // <-- the bug in the test
+}
+```
+
+The `catch` block is empty, so every input on which the naive implementation reverts is silently
+dropped. Which is to say: **the harness discards exactly the inputs where the two implementations
+disagree most loudly.** A revert is a behavioural difference, and often the most important one — a
+function that reverts where its reference succeeds is a denial of service, and one that succeeds
+where its reference reverts has removed a guard.
+
+The strong harness compares three things: whether each call succeeded, and if both did, whether the
+returned bytes match.
+
+```solidity
+function testFuzz_successAgrees(uint256 a, uint256 b, uint256 d) public view {
+    d = bound(d, 1, type(uint256).max);
+    (bool okN, bytes memory outN) =
+        address(h).staticcall(abi.encodeWithSelector(h.naive.selector, a, b, d));
+    (bool okF, bytes memory outF) =
+        address(h).staticcall(abi.encodeWithSelector(h.full.selector, a, b, d));
+    assertEq(okN, okF, "success flags differ");
+    if (okN) assertEq(keccak256(outN), keccak256(outF), "values differ");
+}
+```
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'testFuzz_valuesAgree', note: 'PASS, 256 runs', tone: 'danger' },
+    { title: 'testFuzz_successAgrees', note: 'FAIL on run 4', tone: 'good' },
+  ]}
+  rows={[
+    { label: 'How does it reach the two implementations?', cells: [
+      'try / catch around the naive one',
+      'A low-level staticcall to each, so neither revert propagates into the harness',
+    ] },
+    { label: 'What happens on an input where one reverts?', cells: [
+      'The catch block is empty, so the input is dropped without a word',
+      'The two success flags differ and the assertion fails',
+    ] },
+    { label: 'What region does it actually cover?', cells: [
+      'Only the inputs where the two already agree about legality',
+      'Every input, including the ones where exactly one of them reverts',
+    ] },
+    { label: 'What did the measured run report?', cells: [
+      '256 runs, no counterexample',
+      'A counterexample with b = 2^256 - 3, whose product needs 272 bits',
+    ] },
+  ]}
+  caption="Four lines of difference decide whether the campaign can see a denial of service at all."
+  alt="The weak and strong differential harnesses compared: a try/catch harness that drops reverting inputs and passes 256 runs, against a low-level-call harness that compares success flags and fails on the fourth generated input."
+/>
+
+That shape is not an invention either. It is what Diffusc generates automatically, and the reasoning
+in Trail of Bits' write-up is exactly this: low-level calls are used so the wrapper can check whether
+a call to either target reverts, rather than the wrapper itself reverting, because the goal is to
+check that both calls either succeed or fail together — and only then to compare return
+values.<Cite src="tob-diffusc" /> Their generated wrapper is two `assert` lines with the same
+structure.<Cite src="tob-diffusc" />
+
+<Misconception
+  belief="A differential test compares outputs, so comparing outputs is enough."
+  reality="Reverting is an output. A harness that only compares returned values on the inputs where both calls succeeded has silently restricted itself to the region where the two implementations already agree about legality."
+  why="`try`/`catch` is the idiomatic way to call something that might revert, and an empty catch reads as 'this input does not apply' rather than 'this input is the finding'."
+  src="tob-diffusc"
+/>
+
+Three more details of the generated wrapper are worth copying.
+
+**Compare hashed return data, not decoded values.** `keccak256(outV1) == keccak256(outV2)` works for
+any return type, including tuples and dynamic types, without the harness needing to know the
+signature.<Cite src="tob-diffusc" />
+
+**Set the sender explicitly, and set it the same for both.** Diffusc emits `hevm.prank(msg.sender)`
+before each of the two calls, in case the target function is sensitive to the sender
+address.<Cite src="tob-diffusc" /> A differential test that calls one implementation from the wrapper
+and the other from a pranked address is testing the prank.
+
+**Call through the proxy, not the implementation, when there is one.** If a proxy address is
+supplied, the generated wrapper uses the proxy's address as the call target rather than the
+implementation's.<Cite src="tob-diffusc" /> Testing the implementation directly tests different code:
+the storage layout, the fallback and the delegatecall context all disappear.
+
+## Choosing the reference is the real decision
+
+The reference does not have to be a second full implementation, and the belief that it does is what
+stops most people from using this technique.
+
+<Misconception
+  belief="Differential fuzzing needs two comparable systems, so it is only for teams maintaining a reimplementation."
+  reality="The reference can be one library function, a model written in another language, or the previous version of the same contract — and for that last case the harness can be generated automatically."
+  why="The word 'differential' suggests two peers. In practice the reference is usually smaller, slower, and less capable than the target, and that is fine, because its only job is to be independently correct."
+  src="tob-diffusc"
+/>
+
+Four references, in rough order of how often they are available:
+
+**A trusted library function.** Your optimised `mulDiv`, `sqrt` or exp/log against OpenZeppelin's or
+Solady's. This is the cheapest differential test in existence and it is the one to run on any
+hand-rolled maths in a codebase you are reviewing. The measured example at the top of this lesson is
+this case.
+
+**The previous version of the same contract.** The upgrade case, which is where the tooling is.
+
+**A model you write from the specification, optimising for obviousness rather than gas.** A hundred
+lines of unoptimised Solidity implementing what the whitepaper says, with no packing, no assembly and
+no clever branches. It will be too expensive to deploy and that does not matter — it never leaves the
+test suite.
+
+**A model in another language.** Python or Rust with exact rationals, invoked over the `ffi`
+cheatcode. Both engines gate this deliberately: Echidna's `allowFFI` is `false` by default, and
+Medusa's `enableFFI` is `false` with an explicit warning that enabling it may allow arbitrary code
+execution on your machine.<Cite src="crytic-echidna" /> Worth the friction when the reference needs
+arbitrary precision, which Solidity cannot give you.
+
+The choice is not a technicality. **Choosing the reference is choosing what you are willing to treat
+as correct**, and the whole result of the campaign is relative to that choice. Two consequences follow
+immediately.
+
+If the reference and the target share a lineage — one was written by copying the other, or both
+descend from the same audited codebase — a shared bug is invisible. This is common-mode failure, and
+it is the reason "we diffed against the fork we came from" is weaker evidence than it sounds.
+
+And if the reference is the thing you actually doubt, the test is inverted. Diffing a new
+implementation against an old one you already suspect tells you where they differ, which is
+information about the diff and not about correctness.
+
+## The upgrade case, and what the tooling actually buys
+
+The single most common real application is an upgrade: run V1 and V2 against identical inputs and
+assert they agree, then manually review the disagreements. Diffusc generates that
+harness.<Cite src="crytic-diffusc" /><Cite src="tob-diffusc" />
+
+The generation is not just boilerplate. It runs Slither over both versions, compares them at the
+intermediate-representation level so that comment and formatting changes are ignored, and then
+performs **taint analysis**: an unmodified function is tainted if it reads or writes a storage
+variable that a new or modified function also writes, or if it internally calls a modified
+function.<Cite src="tob-diffusc" /> Cross-contract taint follows external calls out of the modified
+set into other contracts.
+
+The reason to care is scope reduction. On the Compound upgrade that caused the September–October 2021
+token distribution bug — the one that ultimately cost about $40 million in erroneously distributed
+COMP — two new functions and seven modified ones tainted 21 state variables and 26 functions. Taint
+analysis cut the Comptroller's fuzz surface from 69 functions to 38, a 45% reduction, and
+cross-contract analysis cut Comp from 19 functions to 4 and the cToken contract from 78 to 16, a 79%
+reduction each.<Cite src="tob-diffusc" />
+
+That is the argument for the tool in one number: the same budget spread over 38 functions instead of
+69 is a materially deeper campaign.
+
+### The part that cannot be generated
+
+Two limitations are stated plainly in the write-up and both are the kind that decide whether the
+technique works on your codebase.
+
+**Intended differences.** Some functions are supposed to behave differently — that is usually why the
+upgrade exists. The generated invariants for those have to be reviewed and discarded by
+hand.<Cite src="tob-diffusc" /> Nothing automates the judgment of which differences are the point.
+
+**Initialisation.** The tool cannot infer protocol setup — linking contracts, minting tokens to the
+right addresses — nor how upgrades are actually performed, and the recommended pattern is to write a
+new contract inheriting the generated one and override the constructor, the upgrade function, and any
+wrapper needing specific preconditions.<Cite src="tob-diffusc" /> For Compound specifically, the
+generic upgrade function that just writes the implementation slot had to be replaced, because
+`_become` on the new implementation triggers upgrade logic that does more than repoint the
+proxy.<Cite src="tob-diffusc" />
+
+The third detail is the one that generalises furthest. The Compound bug required a user to have
+interacted with a market **before** the upgrade, so the harness has to be able to perform the upgrade
+*in the middle* of a generated call sequence — hence a dedicated `upgradeV2()` action the fuzzer can
+schedule wherever it likes.<Cite src="tob-diffusc" /> With that in place and custom initialisation
+written, the bug is detectable in under an hour of fuzzing.<Cite src="tob-diffusc" />
+
+**Take the pattern even if you never run the tool:** if the state transition you are testing is an
+event rather than a function — an upgrade, a migration, a parameter change, a pause — it belongs in
+the handler as an action, not in `setUp` as a precondition. Putting it in `setUp` tests only the
+world after it happened.
+
+<Aside kind="note">
+Diffusc has three modes and the trade-off between the first two is a good template for any fork
+decision. **Standard mode** deploys everything locally, is faster because it makes no RPC requests,
+and needs custom initialisation. **Fork mode** fetches the contracts from their on-chain addresses,
+needs much less initialisation because the contracts are already initialised, and can automatically
+discover token holders to send transactions from. **Hybrid mode** takes V1 from chain and V2 from a
+file, for testing against something not yet deployed.<Cite src="tob-diffusc" /> On Compound, the bug
+was easier to trigger in standard mode — because only holders who had interacted with specific
+markets before the upgrade could exploit it, and the odds of the tool discovering one of those
+addresses were poor — though it did reproduce in fork mode once a known exploiter address was
+supplied by hand.<Cite src="tob-diffusc" /> Automatic actor discovery is not the same as discovering
+the *right* actor.
+</Aside>
+
+## Worked example: building the mulDiv harness
+
+Four steps, and the third is the one people skip.
+
+**Subgoal: get both implementations behind one interface, callable externally.** A differential test
+is external testing by construction, so both need to be reachable through a call. Put them on one
+harness contract:
+
+```solidity
+contract MulDivHarness {
+    function naive(uint256 a, uint256 b, uint256 d) external pure returns (uint256) {
+        return (a * b) / d;
+    }
+    function full(uint256 a, uint256 b, uint256 d) external pure returns (uint256) {
+        return Full.mulDiv(a, b, d);
+    }
+}
+```
+
+**Subgoal: clamp only what the two implementations agree is out of scope.** Here that is `d == 0`,
+because division by zero is not a behavioural difference worth reporting — both should fail. Every
+other clamp would be a decision to exclude a disagreement, which is lesson two's tight-side failure
+in its most direct form.
+
+**Subgoal: compare success before comparing values.** The four lines above. Skip this and you get
+`testFuzz_valuesAgree`, which passes.
+
+**Subgoal: read the counterexample as a claim about which side is wrong.** The measured failure has
+`a * b` at 272 bits, so the naive path reverts and the full-precision path returns a value that fits.
+Now decide: is the naive implementation wrong to revert, or is the full one wrong to succeed?
+
+The answer depends on the caller. If this is a fee calculation where the intermediate genuinely
+cannot exceed 256 bits given the protocol's caps, the revert is unreachable and the difference is
+theoretical — and you should say so in the report, with the cap that makes it unreachable. If the
+inputs are user-controlled balances, the revert is a denial of service on a function that should have
+worked, and it is a finding.
+
+**This is the step differential fuzzing cannot do for you.** It hands you a disagreement. Naming the
+correct side requires knowing which one the specification meant, and if you do not know that, you
+have found out that the specification is incomplete — which is itself a finding worth writing up.
+
+<Check type="explain" concept="reference-model">
+Your team is replacing a Solidity implementation of a bonding curve with a gas-optimised assembly
+version. A colleague proposes a differential campaign: fuzz both with identical inputs, assert equal
+outputs, ship when green.
+
+Say what that campaign proves, what it cannot prove, and one change that materially improves it.
+
+<Answer>
+**What it proves: that the optimisation preserved behaviour.** This is the ideal case for differential
+fuzzing — the reference is the code that has been in production, the target is a rewrite, and the
+intended difference is exactly zero. There are no functions that are supposed to disagree, so no
+manual triage of intended differences is needed, which removes the technique's main
+cost.<Cite src="tob-diffusc" />
+
+**What it cannot prove: that either implementation is correct.** If the original bonding curve rounds
+in the user's favour, a faithful assembly port rounds in the user's favour identically and the
+campaign is green throughout. Differential fuzzing is blind to any bug the reference already has —
+common-mode failure, and here it is guaranteed rather than merely possible, because the target was
+*derived from* the reference.
+
+**A second thing it cannot prove: that behaviour is preserved outside the clamped input range.**
+Assembly rewrites are exactly where the boundaries matter — a missing overflow check, a truncating
+mask, a shift that behaves differently at the top of the word. Any clamp on the fuzzed inputs that
+excludes `type(uint256).max`, `2^128` or zero excludes the cases most likely to differ.
+
+**The change that materially improves it: add a third oracle.** Keep the differential test, and
+alongside it write the properties the curve is supposed to satisfy in its own right — monotonicity of
+price in supply, path independence of a split purchase, the round trip between buy and sell. Those
+run against **both** implementations and can fail on both, which is precisely the case the
+differential test is structurally unable to reach.
+
+**And one mechanical fix:** compare success flags, not just values, using low-level calls. An
+assembly rewrite that stops reverting where the original reverted is the most likely defect class
+here, and a `try`/`catch` harness will not see it.<Cite src="tob-diffusc" />
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Lesson five** is what makes a differential campaign converge rather than merely run — corpus reuse
+matters more here than anywhere, because the inputs that reach a disagreement are precisely the
+inputs worth mutating.
+
+**Lesson six** is the fork case, which is what turns the upgrade harness from a lab exercise into
+something you can run against a protocol as it actually exists.
+
+**The formal verification module** takes the same pair of implementations and asks for equivalence
+over all inputs rather than the sampled ones. The comparison is instructive: a differential fuzz
+campaign gives you a counterexample in seconds and no coverage guarantee; an equivalence proof gives
+you the guarantee and takes considerably longer to set up. Run the fuzzer first — the counterexample
+it finds in four runs is a counterexample the prover would also have found, and finding it cheaply
+tells you not to bother proving anything yet.<Cite src="tob-why-fuzzing" />
+
+**And the habit worth keeping:** any time you are about to write a property for a piece of arithmetic
+and find yourself unable to state it cleanly, stop and ask whether a reference already exists. Very
+often the property you were struggling to phrase is "it does what that library does".

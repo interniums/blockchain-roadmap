@@ -1,0 +1,258 @@
+---
+id: altvm-token-2022-close-and-reinit
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [solana-token-2022-extensions-ref, neodyme-token-2022, offside-token-2022-part1, spl-token-2022-docsrs-extensiontype, eip-6780]
+stack: {}
+---
+
+Everything the last four lessons taught you to check is a read of the mint's **current** state. Unpack
+it, list its extensions, decide. That procedure is correct, it is more than ERC-20 ever offered, and
+this lesson is about the specific way it is not enough.
+
+A mint carrying `MintCloseAuthority` can be closed, and a new mint initialised at the same address
+with a different extension set — while the token accounts created under the old mint go on existing,
+untouched, still valid, and still playing by rules that no longer apply to anybody else. This is
+Token-2022's sharpest foot-gun, above transfer fees and above hooks, because it defeats a correct
+process rather than catching a careless one.
+
+## The extension, and the note attached to it
+
+`MintCloseAuthority` fills a real gap. Under the original Token program, owners can close token
+accounts but mints can never be closed, so the rent locked in a mint is unrecoverable once the token
+has served its purpose. Token-2022 lets a mint be closed if the `MintCloseAuthority` extension was
+initialised before the mint was.<Cite src="solana-token-2022-extensions-ref" />
+
+Two conditions gate it: the close instruction must be signed by the close authority, and **the total
+supply of the mint must be zero**.<Cite src="solana-token-2022-extensions-ref" /><Cite src="neodyme-token-2022" />
+
+That second condition is why this reads as harmless at first. Zero supply sounds like "nobody holds
+this token", which sounds like "nothing is at stake". Neodyme asks the right follow-up — what happens
+to the token accounts created for a mint when it gets closed? — and answers it in two words:
+**nothing happens**. You can end up with token accounts for a mint that no longer exists, and
+Token-2022 allows reinitialising a mint at the same address, so those orphan token accounts become
+associated with a different mint from the one they were created
+for.<Cite src="neodyme-token-2022" />
+
+The extension guide carries the warning itself, and it is worth quoting because it names the exact
+mechanism rather than gesturing at it:
+
+> Closing and reinitializing a mint with different extensions can lead to problems if any token
+> accounts exist at the time of closing. For example, if a mint is closed and reinitialized with the
+> transfer fee extension, there may be existing token accounts **without** the transfer fee
+> extension, allowing them to **bypass fee
+> checks**.<Cite src="solana-token-2022-extensions-ref" />
+
+## Why the token accounts are the vulnerability
+
+The mechanism is a desynchronisation between two objects, and it follows directly from the layout you
+learned in lesson two.
+
+Extension state lives on **both** the mint and the token accounts. That is why the enumeration
+contains paired variants: `TransferFeeConfig` on the mint and `TransferFeeAmount` on the account,
+`TransferHook` and `TransferHookAccount`, `NonTransferable` and `NonTransferableAccount`, `Pausable`
+and `PausableAccount`.<Cite src="spl-token-2022-docsrs-extensiontype" /> When you create a token
+account for a mint, the account is sized and initialised to carry whatever paired extensions that
+mint's configuration requires.
+
+Note the tense. **The account is configured at the moment it is created, from the mint as it was
+then.** Closing the mint does not revisit it; reinitialising it does not either. Nothing walks the set
+of existing accounts, because on this machine nothing can — there is no iteration over accounts inside
+a program, and the accounts a transaction touches must be declared. An account created before an
+extension existed simply lacks the paired record, permanently.
+
+Then recall the enforcement detail from lesson three. Plain `transfer` fails on a fee-bearing mint
+because `process_transfer`, with no mint account passed, checks whether the **source account** carries
+`TransferFeeAmount` or `TransferHookAccount` and returns `MintRequiredForTransfer` if it
+does.<Cite src="offside-token-2022-part1" /> Neodyme makes the same observation from the attacker's
+side: the bypass works **because the check for the Transfer Fee extension only happens on the source
+account**.<Cite src="neodyme-token-2022" /> An account with no paired record is an account on which
+that check finds nothing, so the gate that should have forced `transfer_checked` never fires.
+
+<Figure
+  caption="The address survives the close and so do the accounts, so one mint ends up with two populations of holders playing by different rules."
+  alt="A mint carrying MintCloseAuthority is used to create token accounts that carry no TransferFeeAmount record. Its supply is driven to zero and the close authority closes it. It is reinitialised at the same address with a transfer fee, and the pre-existing accounts, never revisited, keep transferring fee-free."
+>
+  <Flow
+    lanes={['the first mint', 'accounts created under it', 'the close', 'the second mint']}
+    nodes={[
+      { id: 'm0', label: 'mint M', note: 'MintCloseAuthority, no fee', col: 0 },
+      { id: 'a', label: 'accounts A1…An', note: 'no TransferFeeAmount', col: 1, tone: 'warn' },
+      { id: 'c', label: 'supply zero, closed', note: 'the close authority signs', col: 2 },
+      { id: 'm1', label: 'mint M again', note: 'same address, now a fee', col: 3, tone: 'accent' },
+    ]}
+    edges={[
+      { from: 'm0', to: 'a' },
+      { from: 'a', to: 'c' },
+      { from: 'c', to: 'm1', label: 'reinit' },
+      { from: 'm1', to: 'a', label: 'and A1…An never pay it', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+Neodyme's own framing of that scenario is not the abstract one. A group of bad actors creates a mint
+with no extensions and sets up token accounts for themselves and their friends, then closes the mint
+and reinitialises it with a transfer fee. On the surface it looks like a simple mistake corrected by
+reinitialisation. With their original accounts they transfer without fees, while regular users
+pay.<Cite src="neodyme-token-2022" />
+
+## The same trick against three different rules
+
+The fee case is the one with a profit motive. The other two are the ones that break a protocol that
+believed a mint's guarantee.
+
+**KYC gating that does not gate.** A new mint freezes all new accounts on initialisation so the
+creator can enforce know-your-customer checks before anyone transacts. But existing token accounts do
+not require reinitialisation, so they **bypass the KYC restriction** entirely — unapproved accounts
+can transfer funds even though they were never permitted
+to.<Cite src="neodyme-token-2022" /> Everything the compliance design assumed about "every holder was
+approved" is false for a set of accounts that predates the design.
+
+**Soulbound tokens that are not bound.** Neodyme's example is a project that creates a mint and
+forgets `NonTransferable`. Before minting any tokens they notice, close the mint, and correctly
+reinitialise it. During that window an attacker creates multiple token accounts — and can now freely
+transfer these "soulbound" tokens or change the token accounts'
+owners.<Cite src="neodyme-token-2022" /> Read the shape: the *correction* is what created the
+exposure. A team that had never noticed the omission would have shipped a transferable token and known
+it.
+
+**And a quieter one that is not an exploit at all.** Offside Labs points out that if a mint is closed
+and re-created with a different purpose at the same address, **inconsistencies arise if your project
+stores information related to the mint account**, and recommends redesigning so that code consistently
+fetches data from the correct mint.<Cite src="offside-token-2022-part1" /> Any cache keyed by mint
+address — decimals, symbol, risk parameters, a listing record, an oracle mapping — is a claim that the
+address identifies a thing. After a reinitialisation it identifies a different thing with the same
+name.
+
+<Misconception
+  belief="Reading a mint's current extension set tells me the rules for that token, because most extensions cannot be added after creation."
+  reality="It tells you the rules for accounts created under the mint as it exists now. A mint with a close authority can be closed and reinitialised at the same address with a different extension set, and accounts created under the old configuration survive with the old paired extensions — so two accounts of the same mint can behave differently."
+  why="Addresses feel like identity, and on Ethereum a deployed token's rules mostly are fixed to its address, so 'fixed at creation' hardens into 'permanent' without anyone deciding it should."
+  src="neodyme-token-2022"
+/>
+
+## What the EVM analogue is, and where it stops being one
+
+You have seen an address whose behaviour changes: that is a [proxy](/c/upgrade-key-risk). The familiar
+half is a stable address with mutable behaviour and an authority that can change it, reviewed by the
+same question — who holds the key.
+
+The unfamiliar half is that a proxy upgrade changes the rules for *everyone at once*. No cohort keeps
+transacting under the previous implementation, because the implementation is the only code that runs.
+Here the change leaves a **grandfathered population** whose accounts carry the old paired extensions,
+and no instruction exists that would sweep them up.
+
+The closest EVM construction is the metamorphic-contract pattern — destroy a contract, deploy
+different code at the same address — and that path is largely closed: since EIP-6780, `SELFDESTRUCT`
+only deletes code, storage and the account when it runs **in the same transaction the contract was
+created**; otherwise it transfers the account's ether and deletes
+nothing.<Cite src="eip-6780" /> Ethereum narrowed the one mechanism that let an address change what it
+*is*. Token-2022 ships an equivalent as a documented extension, with a note explaining what it does to
+existing accounts.<Cite src="solana-token-2022-extensions-ref" /> It is
+[reinitialisation](/c/reinitialization-attack) and [account revival](/c/account-revival-attack)
+arriving as a *feature*, on the one account type every protocol on the chain reads.
+
+## What you can actually do about it
+
+Neodyme is honest that there is no clean answer, and the honesty is the useful part:
+
+> The solution is not that straightforward. If you support a mint in your protocol, check that it
+> hasn't been reinitialized at any point. Note that it isn't enough to disallow mints with the
+> closeable mint extension — **because it could be a mint that used to be closeable, but has been
+> reinitialized as non-closeable.**<Cite src="neodyme-token-2022" />
+
+That last clause is the one to sit with. The obvious control — reject any mint carrying
+`MintCloseAuthority` — is necessary and insufficient, because the absence of the extension is
+consistent with two histories: a mint that was never closeable, and a mint that was closeable, was
+closed, and came back without it. A read of the account cannot distinguish them, since the account
+does not record its own past.
+
+So the controls come in layers, and they are worth ranking by what each actually buys.
+
+**1. Reject `MintCloseAuthority` at listing.** Cheap, and it removes the mints that can do this to you
+*next*. It says nothing about what has already happened.
+
+**2. Establish provenance from history, not from state.** "Has this mint ever been closed" is a
+question about the address's transaction history or an indexer's record of mint initialisations, not
+about the mint's bytes. If your listing process is a human reading an explorer, this is a step in it.
+If your listing process is automated, this is an integration you do not have yet.
+
+**3. Validate the source account, not only the mint.** This is the control that specifically catches
+the desynchronisation, because the desynchronisation *is* a mismatch between the two. If the mint
+carries `TransferFeeConfig`, every account you accept as a source should carry `TransferFeeAmount`;
+if it does not, the account predates the fee and is exactly the account Neodyme's attackers were
+using.<Cite src="neodyme-token-2022" /> Unpack both objects and compare their extension lists rather
+than trusting either alone.
+
+**4. Re-read rather than cache.** Fetch the mint's extension state on the path that uses it, and key
+nothing durable to the assumption that a mint address means one
+thing.<Cite src="offside-token-2022-part1" />
+
+**5. And the one that was already true before you knew any of this.** Credit the measured balance
+delta. The delta does not care which cohort the source account belongs to, what the fee was supposed
+to be, or whether the mint's configuration is the one you read an hour ago. Every other control here
+checks a model of the world; that one measures it, which is why it is the only one this lesson cannot
+break.
+
+<Check type="predict" concept="mint-close-and-reinit-hazard">
+Your listing pipeline rejects any mint whose extension list contains `MintCloseAuthority`, and
+otherwise accepts the mint and records its decimals and extension set in your database. A mint passes.
+Six weeks later, support reports that a handful of wallets are transferring this token into your
+protocol without paying the fee everyone else pays, and your fee revenue is short.
+
+Predict what happened, and say which single change to the pipeline would have caught it.
+
+<Answer>
+**What happened.** The mint you checked is not the mint that existed when those wallets created their
+token accounts. It was closeable, its supply was driven to zero, the close authority closed it, and it
+was reinitialised at the same address — this time with `TransferFeeConfig` and without
+`MintCloseAuthority`, so your gate saw a clean mint.<Cite src="neodyme-token-2022" /> The wallets in
+question hold token accounts created under the first mint, which therefore carry no `TransferFeeAmount`
+record. Because the transfer path's fee check is made on the **source
+account**,<Cite src="offside-token-2022-part1" /><Cite src="neodyme-token-2022" /> those accounts pass
+the check that should have forced `transfer_checked`, and plain `transfer` succeeds fee-free. The
+extension guide describes exactly this consequence of reinitialising with the transfer fee
+extension.<Cite src="solana-token-2022-extensions-ref" />
+
+**Why the gate could not see it.** Rejecting `MintCloseAuthority` is a statement about the future, and
+Neodyme says why it is not enough: the mint could be one that used to be closeable and was
+reinitialised as non-closeable.<Cite src="neodyme-token-2022" /> Nothing in the mint's bytes records
+that it has a previous life.
+
+**The single change with the best return.** Not a better mint check — an **account** check. On every
+deposit, unpack the source token account and require its extension set be consistent with the mint's:
+`TransferFeeConfig` on the mint implies `TransferFeeAmount` on the
+account.<Cite src="spl-token-2022-docsrs-extensiontype" /> A mismatch is either an account predating
+the mint's current configuration or an account that does not belong to this mint at all. It catches
+the case at the moment of use rather than at listing, which is the right place, because the
+grandfathered population can grow after you list.
+
+**The second change, cheaper, which should also happen.** Credit the measured balance delta. Your fee
+revenue would still be short — that is the mint's business — but your internal ledger would never have
+been wrong, and the discrepancy would have surfaced in a reconciliation rather than a support ticket.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**A correction to the module's own good news.** Lessons two through five taught that a mint's
+capabilities are readable, and they are. This bounds the claim: reading a mint tells you what it can
+do **to accounts created from now on**. The complete statement is that a mint's extension list is a
+fact about the present, its close authority is a fact about the future, and its history is a fact you
+have to go and get.
+
+**A validation habit that generalises past this hazard.** Whenever a system stores related state on
+two objects with independent lifetimes, ask what happens when one is replaced and the other is not.
+That is the whole bug — mint and token account here, proxy and storage in Track 04, a schema and its
+unmigrated rows in every database you have run.
+
+**And the reason this module's reflection prompt ends where it does.** Sorting extensions into reject,
+handle and harmless is worth almost nothing unless you can say what stops a mint moving between your
+buckets after you listed it. You now know the mechanism, and for a closeable mint the honest answer is
+that nothing does.
+
+The next lesson turns to the extension that hides the most and promises the least: confidential
+transfers, where the amounts are encrypted, the participants are not, and the difference between those
+two facts is where most of the misunderstanding lives.

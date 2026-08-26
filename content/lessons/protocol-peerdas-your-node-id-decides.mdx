@@ -1,0 +1,467 @@
+---
+id: protocol-peerdas-your-node-id-decides
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [consensus-specs-fulu-das-core, consensus-specs-fulu-validator, consensus-specs-fulu-p2p, consensus-specs-fulu-preset, consensus-specs-v161-mainnet-config, fc-electra-beacon-chain-v161, eip-7594]
+stack: {}
+---
+
+Two nodes, same hardware, same client, same config file, started from two different key files. One
+custodies columns 3, 41, 88 and 119. The other custodies four completely different ones. Neither
+operator chose, neither can change it without changing identity, and — this is the part that makes
+the whole networking design work — **a third party can compute both answers from the public node ids
+before connecting to either machine**.
+
+That is not a convenience. It is the mechanism that turns "find someone who has column 37" from a
+broadcast question into a table lookup, and it is why PeerDAS peering is a discovery problem rather
+than a polling problem.
+
+This lesson works through the derivation, the two-stage indirection almost every summary skips, how
+much you are obliged to hold, and the costs the design accepted in exchange.
+
+## The derivation, line by line
+
+```python
+def get_custody_groups(node_id: NodeID, custody_group_count: uint64) -> Sequence[CustodyIndex]:
+    assert custody_group_count <= NUMBER_OF_CUSTODY_GROUPS
+    if custody_group_count == NUMBER_OF_CUSTODY_GROUPS:
+        return [CustodyIndex(i) for i in range(NUMBER_OF_CUSTODY_GROUPS)]
+
+    current_id = uint256(node_id)
+    custody_groups: List[CustodyIndex] = []
+    while len(custody_groups) < custody_group_count:
+        custody_group = CustodyIndex(
+            bytes_to_uint64(hash(uint_to_bytes(current_id))[0:8]) % NUMBER_OF_CUSTODY_GROUPS
+        )
+        if custody_group not in custody_groups:
+            custody_groups.append(custody_group)
+        if current_id == UINT256_MAX:
+            current_id = uint256(0)
+        else:
+            current_id += 1
+
+    assert len(custody_groups) == len(set(custody_groups))
+    return sorted(custody_groups)
+```
+
+<Cite src="consensus-specs-fulu-das-core" />
+
+Six things are happening, and each one is load-bearing.
+
+**The input is the node id, nothing else.** Not a stake weight, not an IP, not a registration. Your
+[discv5](/c/discv5) identity is the seed, so custody is a function of a key you already had.
+
+**The mixing is a plain hash, truncated.** Take the 256-bit counter, hash it, keep the first eight
+bytes as a big-endian uint64, reduce mod 128.<Cite src="consensus-specs-fulu-das-core" /> The
+[hash function](/c/hash-function) is doing one job here — uniformity — and none of the three
+resistance properties you know are what is being relied on. Nobody is trying to forge a custody
+assignment; anyone can recompute it.
+
+**Collisions are skipped, not re-drawn.** If the group is already in the list, the loop increments and
+tries again rather than resampling. This is sampling without replacement implemented by rejection.
+
+**The counter increments from the node id, and wraps.** `current_id += 1`, with an explicit
+`UINT256_MAX` wrap to zero.<Cite src="consensus-specs-fulu-das-core" /> The wrap exists so the
+function terminates for every possible id, including the largest one — a detail that matters to
+implementers and nobody else, until someone's implementation overflows on a hostile id.
+
+**Full custody short-circuits.** If the count equals `NUMBER_OF_CUSTODY_GROUPS`, return all of them
+without hashing anything.<Cite src="consensus-specs-fulu-das-core" /> Supernodes skip the loop.
+
+**The result is sorted.** Which makes two nodes' custody lists comparable and cacheable without
+worrying about draw order.
+
+<Figure
+  caption="Nobody assigns anything. The same public function of a public id, run by anyone, lands on the same columns."
+  alt="A left-to-right derivation. The node id seeds a counter which is hashed; the first eight bytes of the digest reduced modulo 128 name a custody group; groups accumulate until custody_group_count of them are held; each group maps to its columns by the stride 128 times i plus the group. A back edge shows a group that is already held being skipped while the counter still advances."
+>
+  <Flow
+    lanes={['identity', 'mixing', 'the draw', 'what you hold']}
+    nodes={[
+      { id: 'nid', label: 'node id', note: 'your discv5 identity', col: 0, tone: 'accent' },
+      { id: 'h', label: 'hash(counter)', note: 'counter starts at the node id', col: 1 },
+      { id: 'g', label: 'mod 128', note: 'one custody group, until you have custody_group_count', col: 2 },
+      { id: 'c', label: 'columns', note: '128 · i + group', col: 3, tone: 'accent' },
+    ]}
+    edges={[
+      { from: 'nid', to: 'h' },
+      { from: 'h', to: 'g' },
+      { from: 'g', to: 'c', label: 'kept' },
+      { from: 'g', to: 'h', label: 'already held: counter + 1', tone: 'plain', dashed: true },
+    ]}
+  />
+</Figure>
+
+### Run it once by hand
+
+Take the node id `0x7f3a…9833` and derive its custody, using the spec's SHA-256 `hash`, its
+little-endian `ENDIANNESS`, and `NUMBER_OF_CUSTODY_GROUPS` =
+128.<Cite src="consensus-specs-fulu-das-core" /><Cite src="consensus-specs-v161-mainnet-config" />
+Each row hashes `node_id + offset` and reduces the first eight bytes mod 128:
+
+<Matrix
+  numeric
+  corner="offset"
+  cols={['drawn group', 'note']}
+  rows={[
+    { label: '+0', cells: [{ v: '47', tone: 'accent' }, ''] },
+    { label: '+1', cells: [{ v: '94', tone: 'accent' }, ''] },
+    { label: '+2', cells: [{ v: '56', tone: 'accent' }, ''] },
+    { label: '+3', cells: [{ v: '125', tone: 'accent' }, ''] },
+    { label: '+4', cells: ['31', ''] },
+    { label: '+5', cells: [{ v: '56', tone: 'warn' }, { v: 'already held — skipped, counter still advances', tone: 'warn' }] },
+    { label: '+6', cells: ['97', ''] },
+    { label: '+7', cells: ['65', ''] },
+  ]}
+  caption="Every row here is reproducible by anyone holding this node's ENR — the derivation has no secret input."
+  alt="Eight successive offsets from the node id and the custody group each one draws: +0 gives 47, +1 gives 94, +2 gives 56, +3 gives 125, +4 gives 31, +5 gives 56 again which is already held and is skipped while the counter still advances, +6 gives 97, +7 gives 65."
+/>
+
+At `custody_group_count` = 4 the function returns `[47, 56, 94, 125]` after sorting. At 8 it returns
+`[31, 47, 56, 65, 94, 97, 104, 125]`. The first list is a subset of the second, which is the property
+the next section is about — and the skip at offset +5 is the rejection step: the counter advanced,
+the list did not.
+
+Since `columns_per_group` is 1 today, that node's four custodied *columns* are 47, 56, 94 and
+125.<Cite src="consensus-specs-fulu-das-core" /> Anyone holding its ENR can compute that list without
+contacting it.
+
+### The property that makes the whole scheme peerable
+
+The subtle part is not the hashing. It is this note, attached to the deterministic-selection section:
+
+> increasing the `custody_size` parameter for a given `node_id` extends the returned list (rather
+> than being an entirely new shuffle) such that if `custody_size` is unknown, the default
+> `CUSTODY_REQUIREMENT` will be correct for a subset of the node's
+> custody.<Cite src="consensus-specs-fulu-das-core" />
+
+Because the loop always starts at the same seed and appends, the sequence of groups a node draws is a
+*prefix chain*. A node with a count of 8 holds the 4 groups it would have held at 4, plus 4 more.
+Sorting the output hides this, but the underlying draw order is stable.
+
+Two consequences follow, and both are the difference between a workable peering strategy and an
+unworkable one.
+
+**A stale or missing advertisement degrades gracefully.** If you do not know a peer's current
+`custody_group_count`, assume the minimum of 4 and you are still *correct* about those four groups —
+you just do not know about the rest. Compare the alternative: a design where changing the count
+reshuffles everything would make every stale cache entry actively wrong, and a node raising its
+custody would silently stop being a valid source for columns it still holds.
+
+**Raising custody is monotone.** A node that increases its count never stops custodying anything it
+custodied before. That is what makes the balance-driven scaling in the next section safe to apply
+dynamically, mid-operation, without a re-peering storm.
+
+<Misconception
+  belief="Custody assignment is random, or is something an operator configures per column."
+  reality="It is a pure function of the node id and one integer, computable by anyone. An operator's only lever is the integer — how many groups — and even that only ratchets upward in practice."
+  why="'Assignment' implies an assigner. There is no coordinator here; the network agrees because everyone can run the same function."
+  src="consensus-specs-fulu-das-core"
+/>
+
+## Groups are not columns, even though both are 128
+
+Custody is assigned in **custody groups**, and columns are derived from groups. Two constants, both
+128, and they mean different things:
+
+- `NUMBER_OF_CUSTODY_GROUPS` = 128 is a **configuration** value — the number of custody groups
+  available for nodes to custody.<Cite src="consensus-specs-fulu-das-core" /><Cite src="consensus-specs-v161-mainnet-config" />
+- `NUMBER_OF_COLUMNS` = 128 is a **preset** value, defined as
+  `uint64(CELLS_PER_EXT_BLOB)`.<Cite src="consensus-specs-fulu-preset" />
+
+Different files, different categories of constant, different reasons for their values. They coincide
+today, which is exactly why the distinction is easy to lose.
+
+The mapping between them is one function:
+
+```python
+def compute_columns_for_custody_group(custody_group: CustodyIndex) -> Sequence[ColumnIndex]:
+    assert custody_group < NUMBER_OF_CUSTODY_GROUPS
+    columns_per_group = NUMBER_OF_COLUMNS // NUMBER_OF_CUSTODY_GROUPS
+    return [ColumnIndex(NUMBER_OF_CUSTODY_GROUPS * i + custody_group)
+            for i in range(columns_per_group)]
+```
+
+<Cite src="consensus-specs-fulu-das-core" />
+
+With both constants at 128, `columns_per_group` is 1 and group *g* maps to column *g*. The stride
+`NUMBER_OF_CUSTODY_GROUPS * i + custody_group` is there so that when a group holds several columns,
+those columns are spread across the matrix rather than adjacent — a group of two would hold columns
+*g* and *g* + 128, not *g* and *g* + 1.
+
+**Why the indirection exists at all** is a design-history point that saves you from a specific error.
+Earlier PeerDAS drafts assigned columns directly to nodes; the shipped design assigns groups and
+derives columns.<Cite src="eip-7594" /> Material written before the change describes a model the
+network does not run. When you read an explanation that says "the node id hashes to a column", check
+its date — the arithmetic looks the same today only because the ratio happens to be one.
+
+<Misconception
+  belief="Custody groups are just a fancy name for columns."
+  reality="A group is a bundle of columns, and the bundle size is NUMBER_OF_COLUMNS // NUMBER_OF_CUSTODY_GROUPS. It is 1 today. The two constants live in different files and are changed by different kinds of upgrade."
+  why="They are equal, so every worked example produces identical numbers under either reading, and nothing corrects you."
+  src="consensus-specs-fulu-das-core"
+/>
+
+## How much you must hold
+
+Three numbers, each with a different justification.
+
+**A plain full node: `CUSTODY_REQUIREMENT` = 4 custody groups**, described as the minimum number an
+honest node custodies and serves samples from.<Cite src="consensus-specs-fulu-das-core" /> Four of
+128 — about 3% of the extended matrix — and the node stores those columns for the pruning period and
+answers peer requests for samples on them.<Cite src="consensus-specs-fulu-das-core" />
+
+**A node with validators: `VALIDATOR_CUSTODY_REQUIREMENT` = 8, scaling with balance.** The rule is a
+function, not a constant:
+
+```python
+def get_validators_custody_requirement(state, validator_indices) -> uint64:
+    total_node_balance = sum(state.validators[i].effective_balance for i in validator_indices)
+    count = total_node_balance // BALANCE_PER_ADDITIONAL_CUSTODY_GROUP
+    return min(max(count, VALIDATOR_CUSTODY_REQUIREMENT), NUMBER_OF_CUSTODY_GROUPS)
+```
+
+<Cite src="consensus-specs-fulu-validator" />
+
+`BALANCE_PER_ADDITIONAL_CUSTODY_GROUP` is 32 ETH,<Cite src="consensus-specs-fulu-validator" /><Cite src="consensus-specs-v161-mainnet-config" />
+so one group per 32 ETH of attached effective balance, floored at 8 and capped at 128. The cap binds
+at 4,096 ETH, which is where a node becomes a supernode by
+obligation.<Cite src="consensus-specs-fulu-p2p" />
+
+Read the input carefully: it is the sum of **effective balances** of the validators attached to this
+node, taken from the latest **finalized** `BeaconState`.<Cite src="consensus-specs-fulu-validator" />
+Not the validator count. Since Electra a single compounding validator can hold up to
+`MAX_EFFECTIVE_BALANCE_ELECTRA` = 2,048 ETH against a `MIN_ACTIVATION_BALANCE` of
+32,<Cite src="fc-electra-beacon-chain-v161" /> so one validator can be worth 64 custody groups and
+sixty-four 32-ETH validators are worth the same sixty-four. Anyone still counting validators to
+predict custody is using a pre-Electra model.
+
+**Anything up to 128, voluntarily.** A node may custody and serve more than the honesty requirement,
+and advertises that by setting a higher value in its ENR — up to `NUMBER_OF_CUSTODY_GROUPS`,
+indicating a super-full node.<Cite src="consensus-specs-fulu-das-core" /> EIP-7594 calls this out as
+a property the design deliberately supports: any node may voluntarily custody more than the bare
+minimum, which increases the performance of the mechanism, and alternative schemes do not readily
+support that transparent scaling.<Cite src="eip-7594" />
+
+### The requirement ratchets
+
+The spec's rules for *changing* your custody are asymmetric, and the asymmetry is the interesting
+part.
+
+Going up: a node should dynamically adjust its groups without operator input as attached effective
+balances change, and if the requirement increases it should immediately advertise the updated
+`custody_group_count` and may backfill.<Cite src="consensus-specs-fulu-validator" />
+
+Going down: it **should not**. If a node's requirement decreases it should continue to custody,
+advertise and serve the previous highest `custody_group_count`, and that highest value should persist
+across restarts.<Cite src="consensus-specs-fulu-validator" /> Nodes should also cope with several
+changes inside one retention period — up one epoch, down the next.
+
+That is a ratchet, and it exists because the network's memory is eighteen days long. A node that
+advertised 12 groups yesterday has peers who have cached that fact and columns that other nodes are
+counting on being served. Dropping to 8 because a validator exited would silently remove four columns
+from those peers' sampling plans. The ratchet trades a little wasted storage for the property that an
+advertisement is never retroactively falsified.
+
+The counterpart on the wire is `earliest_available_slot` in the status RPC: when a
+`custody_group_count` is set, that field should reflect the slot at which it was updated, and may be
+lowered progressively as a backfill advances.<Cite src="consensus-specs-fulu-validator" /> It is the
+node saying "I hold these groups, but only from here forward, and I am working backwards".
+
+## What the determinism buys, and what it costs
+
+### It turns discovery into computation
+
+A new ENR key `cgc` carries the custody group count as a big-endian uint64 with no leading zero
+bytes, added once `FULU_FORK_EPOCH` is set to anything other than
+`FAR_FUTURE_EPOCH`.<Cite src="consensus-specs-fulu-p2p" /> The same value appears in `MetaData` v3,
+retrievable over a request/response protocol, and clients may reject peers advertising less than
+`CUSTODY_REQUIREMENT`.<Cite src="consensus-specs-fulu-p2p" />
+
+Put the pieces together and a node scanning the discv5 table can, for every record it has ever seen,
+compute the exact column set that record's owner is obliged to serve — before dialling, before a
+handshake, without asking. A node missing column 37 filters its known peers to those whose derived
+groups include the group mapping to column 37 and dials one of them. That is the entire peering
+strategy, and it only works because the function is public and its inputs are public.
+
+### It gives every column a custodian, without anyone arranging it
+
+Nothing in the design assigns a caretaker to column 37. Uniform hashing does it statistically, and the
+arithmetic is worth doing because it explains where the design's real fragility sits.
+
+A minimum-custody node covers any given group with probability 4/128 = 1/32. With *N* independent
+nodes, the chance that some particular group has no custodian at all is (31/32)ᴺ:
+
+| nodes | P(a given group has no custodian) | expected groups with none |
+| --- | --- | --- |
+| 100 | 4.2 × 10⁻² | 5.4 |
+| 500 | 1.3 × 10⁻⁷ | 1.6 × 10⁻⁵ |
+| 1,000 | 1.6 × 10⁻¹⁴ | 2.1 × 10⁻¹² |
+
+At a hundred nodes, five groups are expected to be orphaned. At a thousand, the expectation is
+effectively zero. Coverage is not a property of the parameters; it is a property of the *population*,
+and it arrives abruptly somewhere in the low hundreds.
+
+That is exactly the answer the spec gives when asked whether 128 subnets destabilise the network: the
+number of subnets does not really matter, what matters to network stability is the number of nodes
+and the churn rate — if the node count is too low a partition becomes likely when some nodes go down,
+and a high churn rate demands *more* nodes because nodes are more often
+off.<Cite src="consensus-specs-fulu-das-core" />
+
+Read that as a monitoring instruction rather than a reassurance. The quantity to watch on a PeerDAS
+network is population and churn, not subnet count — and the arithmetic above is the honest version of
+"the columns will be out there somewhere".
+
+### It turns non-response into evidence
+
+The spec draws the consequence explicitly: due to the deterministic custody functions, a node knows
+exactly what a peer should be able to respond to, and a peer that does not respond to samples of its
+custodied columns may be downscored or
+disconnected.<Cite src="consensus-specs-fulu-p2p" /> Compare a design with self-chosen custody, where
+"I do not have that" is always a legitimate answer and there is nothing to score.
+
+### The ENR carries more than custody, and one entry exists because of BPO forks
+
+`cgc` is not the only Fulu addition to the record, and the neighbouring one explains something about
+how blob capacity changes interact with peering.
+
+BPO forks change blob parameters without changing the fork version. The spec says so directly: the
+fork version changes only for regular forks, *not BPO forks*, while `next_fork_epoch` is the epoch of
+the next fork **whether regular or BPO**.<Cite src="consensus-specs-fulu-p2p" /> So the classic
+`ENRForkID` comparison can see that *something* is coming without being able to tell what.
+
+Hence `nfd` — next fork digest — added under Fulu alongside `cgc`, communicating the digest of the
+next scheduled fork regardless of whether it is regular or blob-parameters-only. Nodes must evaluate
+it alongside the existing `next_*` fields, and on a mismatch must not disconnect before the fork
+boundary but may afterwards.<Cite src="consensus-specs-fulu-p2p" /> Nodes that have not upgraded
+simply ignore the unknown entry, and `nfd` mismatches do not cause
+disconnects.<Cite src="consensus-specs-fulu-p2p" />
+
+The pattern is worth naming: a lightweight fork class that changes network behaviour without changing
+the fork version needed a *new* peering signal, because the old one was tied to versions. Cheap
+upgrade mechanisms are rarely free at the networking layer.
+
+### The knobs an operator actually has
+
+Three, and only one of them is really a dial.
+
+**`custody_group_count`, upward.** A node may advertise more than the minimum, up to
+128.<Cite src="consensus-specs-fulu-das-core" /> The cost is linear and computable: one column is one
+cell per blob, so across the 131,072 slots of the retention
+window<Cite src="consensus-specs-fulu-p2p" /> at a 21-blob cap:
+
+| custody groups | columns held | storage over the window, blocks full |
+| --- | --- | --- |
+| 4 (minimum) | 4 | ≈ 21 GiB |
+| 8 (validator floor) | 8 | ≈ 42 GiB |
+| 128 (supernode) | 128 | ≈ 672 GiB |
+
+Those are ceilings at `MAX_BLOBS_PER_BLOCK` = 21 with every block
+full,<Cite src="consensus-specs-v161-mainnet-config" /> which no real period is.
+
+**Peer count and peer selection.** Not a custody setting, but the thing that determines whether the
+columns you *don't* hold are reachable in time. EIP-7594 makes this an explicit design property: a
+focus on peers allows redundancy, since a node generally has many peers and the peer count can also
+be cheaply increased.<Cite src="eip-7594" />
+
+**Which columns.** Not a knob. You get what your key gives you.
+
+<Aside kind="note">
+What the mainnet distribution of `custody_group_count` actually looks like — how many nodes sit at 4,
+how many at the validator floor of 8, how many altruistically higher, how many at 128 — is a
+measurement, and this curriculum does not have a verified figure for it. It is also the single most
+decision-relevant number for anyone reasoning about reconstruction margins, because the reconstruction
+rule needs holders of half the matrix and the minimum-custody population contributes 4/128 each. The
+values are public in every ENR, so it is measurable by anyone willing to crawl discv5 and derive.
+Measure it before you assume it.
+</Aside>
+
+### It costs you the ability to choose or rotate
+
+Custody follows identity, so the only way to change your columns is to change your node id — which
+means a new ENR, re-peering from scratch, losing accumulated peer scores, and either backfilling the
+new columns across the retention window or advertising a late `earliest_available_slot` and being a
+partial source until you catch up.<Cite src="consensus-specs-fulu-validator" />
+
+The specification declines to rotate custody for now and says why, in a FAQ answer worth having
+precisely:
+
+> To start with a simple, stable backbone, for now, we don't shuffle the custody assignments via the
+> deterministic custody selection helper `get_custody_groups`. However, staggered rotation likely
+> needs to happen on the order of the pruning period to ensure subnets can be utilized for recovery.
+> For example, introducing an `epoch` argument allows the function to maintain stability over many
+> epochs.<Cite src="consensus-specs-fulu-das-core" />
+
+Two things to take from that. It names the timescale on which rotation would have to happen — the
+pruning period, not per slot — and it names the mechanism, an `epoch` argument threaded into the
+existing function. It is a stated intention with no schedule and no shipped design, so treat it as a
+known gap rather than a coming feature.
+
+<Check type="predict" concept="deterministic-custody-from-nodeid">
+An infrastructure team runs forty full nodes and proposes a policy: rotate every node's key weekly,
+so that no long-lived mapping between their machines and a column set exists, "the same way we rotate
+credentials". They note correctly that custody is public and derivable, so today anyone can profile
+which of their machines holds what.
+
+Predict what breaks, and say whether their privacy concern is a real one that the protocol leaves
+open.
+
+<Answer>
+**Every rotation resets the node's custody obligation to a fresh set of columns it does not have.**
+
+New node id, new `get_custody_groups` output, four different columns.<Cite src="consensus-specs-fulu-das-core" />
+The node is obliged to serve those columns across the retention window of 4,096
+epochs<Cite src="consensus-specs-fulu-p2p" /> — roughly eighteen days — and it has none of that
+history. Its honest move is to backfill, which the spec requires when custody changes: a node must
+backfill columns from all of its custody groups when
+syncing.<Cite src="consensus-specs-fulu-das-core" /><Cite src="consensus-specs-fulu-validator" />
+Weekly rotation means permanently backfilling eighteen days of columns, so the fleet is always
+mid-backfill and never fully useful.
+
+**Second breakage: they become bad peers, measurably and by design.** Peers derive what each node
+should hold and downscore or disconnect nodes that fail to answer for their custodied
+columns.<Cite src="consensus-specs-fulu-p2p" /> A freshly rotated node advertises a `cgc` and cannot
+answer for most of its window. The protocol has no way to distinguish that from a node that is simply
+refusing, because there is no "I am new" exemption in the scoring rule — only
+`earliest_available_slot`, which limits the damage but also advertises the node as a partial source
+for a week at a time.<Cite src="consensus-specs-fulu-validator" />
+
+**Third: they lose the ratchet's protection and gain nothing from it.** The ratchet exists so an
+advertisement is never retroactively falsified.<Cite src="consensus-specs-fulu-validator" /> Rotating
+identity falsifies the whole advertisement, cleanly, every week.
+
+**Is the privacy concern real? Yes, and the protocol accepts it.** Custody is public, deterministic
+and permanent by construction — that is the property the design is built on, since the alternative is
+asking peers what they have and believing them.<Cite src="consensus-specs-fulu-das-core" /> A node id
+is a stable pseudonymous identifier with a stable, publicly computable data fingerprint. The spec's
+own answer to "why don't we rotate custody" is a plan for *protocol-level* staggered rotation on the
+order of the pruning period, with an epoch argument — not something an operator implements by
+churning keys.<Cite src="consensus-specs-fulu-das-core" />
+
+**What to advise instead.** Separate the two goals. If the concern is linking machines to network
+identities, that is addressed at the transport and address layer, not by rotating the key that
+custody depends on. If the concern is being profiled as a data source, note that the profile is
+already computable for every node on the network and is *intended* to be — it is how anyone finds a
+column. And if they want the rotation property specifically, the honest status is: proposed in a FAQ,
+scoped to the pruning period, not specified and not scheduled.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now answer, for any node id and count, exactly which columns that node must hold — and you
+know that the answer extends rather than reshuffles as the count
+grows.<Cite src="consensus-specs-fulu-das-core" /> That derivation is the addressing scheme the rest
+of the networking design assumes.
+
+**Next: what a node checks beyond what it keeps.** Custody is four groups; sampling is eight, or the
+custody count if that is larger, and the two are related by
+`sampling_size = max(SAMPLES_PER_SLOT, custody_group_count)`.<Cite src="consensus-specs-fulu-das-core" />
+The next lesson works out why eight is enough, what the number is a bound *on*, and the two
+substitutions people make in that argument that quietly change what it proves.
+
+**Carry the ratchet.** Any time you see a node advertise a capability that peers will cache for
+eighteen days, ask what stops the advertisement from becoming false — and notice that this protocol's
+answer is "you are not allowed to withdraw it".

@@ -1,0 +1,417 @@
+---
+id: infra-rpc-economics-the-expensive-methods
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [alchemy-eth-getlogs, alchemy-compute-units, alchemy-compute-units-explainer, chainstack-request-units, quicknode-full-vs-archive, eth-archive-nodes, execution-apis-spec, execution-apis-filter-schema, geth-ns-debug, erigon-trace-namespace, erigon-rpc-namespaces, eip-7935, consensus-specs, viem-multicall, ethereum-org-json-rpc]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+Pull a month of usage broken down by method and the distribution is almost always the same shape. Two
+or three methods account for most of it, and they are not the methods anyone would have guessed from
+reading the code. The frontend, which makes the most requests, is rarely the largest line. The job
+nobody thinks about — the backfill, the reconciliation sweep, the activity feed — is.
+
+Three things write most of an RPC bill: **a log query over a wide block range**, **a contract call
+inside a loop**, and **anything that reconstructs execution**. This lesson takes each apart, and along
+the way settles two definitions that people routinely get wrong: what actually makes a query an
+archive query, and why there are two different tracing APIs that are not interchangeable.
+
+## The log query, and the caps that shape it
+
+You already know the [filter grammar](/c/getlogs-topic-semantics) and what a
+[bloom filter](/c/logs-bloom) does and does not buy you. What that lesson did not cover is that
+`eth_getLogs` is the only standard method whose *cost to serve* is unbounded in the request. Every
+other read names one thing: an account, a slot, a block. A log query names a range, and the work
+scales with it.
+
+Providers respond the way you would: they cap it. Alchemy publishes its caps per plan tier and per
+chain, and the shape is instructive.<Cite src="alchemy-eth-getlogs" />
+
+<Matrix
+  numeric
+  corner="Chain group"
+  cols={['Free', 'Pay As You Go', 'Enterprise']}
+  rows={[
+    {
+      label: 'Ethereum, Base, Optimism, Arbitrum, Polygon and several others',
+      cells: [{ v: '10', tone: 'danger' }, 'unlimited', 'unlimited'],
+    },
+    { label: 'Berachain', cells: [{ v: '10', tone: 'danger' }, { v: '1,000', tone: 'warn' }, '10,000'] },
+    { label: 'All other chains', cells: [{ v: '10', tone: 'danger' }, '10,000', '10,000'] },
+  ]}
+  caption="Alchemy's published eth_getLogs block-range caps, read 26 August 2026: the same backfill loop is legal on one chain and rejected on the next."
+  alt="Alchemy's supported eth_getLogs block ranges: 10 blocks on the free tier for every chain group; unlimited on Ethereum, Base, Optimism, Arbitrum, Polygon and several others at Pay As You Go and Enterprise; 1,000 on Berachain at Pay As You Go rising to 10,000 at Enterprise; and 10,000 on all other chains at both paid tiers."
+/>
+
+Plus a hard ceiling on the answer rather than the question: "All responses will be capped at
+150MB."<Cite src="alchemy-eth-getlogs" /> And a note attached to the 10,000-block entries that
+querying wider ranges "is possible but less likely to succeed", recommending splitting large queries
+into smaller parts.<Cite src="alchemy-eth-getlogs" />
+
+Four things follow, and each one has bitten a real team.
+
+**The free tier is not a small version of the paid tier.** Ten blocks is two minutes of chain. Any
+code that scans history is not slow on the free tier — it is *impossible*, and it fails with an error
+about the range rather than about the plan. This is the single most common reason a tutorial works for
+its author and not for the reader.
+
+**The cap is per chain, so multi-chain code needs per-chain constants.** The same backfill loop with
+one hard-coded chunk size is correct on mainnet and wrong on the fourth chain you added.
+
+**"Unlimited" is not unlimited.** It means the block range is not the binding constraint; the 150MB
+response cap still is.<Cite src="alchemy-eth-getlogs" /> A range query over a busy contract during a
+mint can exceed a size limit at a range that worked yesterday.
+
+**Chunk size is a cost decision, not a correctness decision.** Halve the chunk and you double the
+request count; double it and you eventually get an error. Under a per-method table that is a linear
+trade in units. Under the near-flat rule it is worse than linear in a specific way — the billing block
+for `eth_getLogs` is `fromBlock` if set, so every chunk of a historical scan is charged at the archive
+rate, and halving the chunk size doubles the number of archive-rate
+requests.<Cite src="chainstack-request-units" />
+
+### The constant you inherited is now wrong
+
+There is a reason to re-tune rather than copy. The L1 gas limit was raised to 60 million by
+EIP-7935.<Cite src="eip-7935" /> A block with double the gas can carry roughly double the logs, so a
+chunk size chosen when blocks were half as full now returns roughly twice the data. Nothing in your
+code changed; the denominator did.
+
+The symptom is a backfill that used to work and now fails intermittently on the busiest ranges — the
+ranges that matter. The fix is not a bigger constant, it is not having a constant:
+
+```ts
+// Adaptive chunking: shrink on failure, recover slowly.
+let span = 10_000n
+let from = startBlock
+
+while (from <= endBlock) {
+  const to = from + span - 1n > endBlock ? endBlock : from + span - 1n
+  try {
+    const logs = await client.getLogs({ address, fromBlock: from, toBlock: to })
+    await handle(logs)
+    from = to + 1n
+    if (span < 10_000n) span = span * 2n        // creep back up after a good run
+  } catch (e) {
+    if (span === 1n) throw e                     // a single block cannot be split
+    span = span / 2n                             // range or size cap: halve and retry
+  }
+}
+```
+
+Two details are the whole point. **The floor case must throw**, because a single block that exceeds
+the response cap is a real condition and an infinite halving loop is worse than an error. And **the
+recovery must be gradual**, because a scan that shrinks on the busy stretch and immediately jumps back
+to the maximum will fail on the next busy stretch too — you want the loop to learn the shape of the
+history it is walking.
+
+<Misconception
+  belief="A wide-range log query is slow but basically free, because it is one request."
+  reality="It is one request whose cost to serve scales with the range and the result set, which is why it is the only standard read providers cap on both axes — and why splitting it into a hundred chunks turns one expensive request into a hundred billed ones."
+  why="Every other JSON-RPC read costs the same regardless of arguments, so 'one request, one price' is a correct generalisation everywhere except here."
+  src="alchemy-eth-getlogs"
+/>
+
+## The other half of the bill is a loop
+
+The second pattern produces no error at all, which is why it survives to production.
+
+```ts
+// The shape that writes the invoice.
+for (const token of userTokens) {
+  balances[token] = await client.readContract({
+    address: token, abi: erc20Abi, functionName: 'balanceOf', args: [user],
+  })
+}
+```
+
+Every iteration is an `eth_call`. Twelve tokens is twelve calls; a thousand NFT ids is a thousand.
+There is no cap to hit and no failure to notice — the code works, the page renders, and the line item
+grows with the size of the user's portfolio rather than with the number of users.
+
+The counter is the one you already know: batch the reads into a single contract invocation with
+[multicall](/c/viem-multicall-batching), which collapses N calls into
+one.<Cite src="viem-multicall" /> Twelve `eth_call`s at 26 units become
+one.<Cite src="alchemy-compute-units" />
+
+The habit worth building is not "use multicall". It is **treating any `await` inside a loop over
+chain data as a cost defect by default**, the same way you would treat an N+1 query in an ORM. It has
+the same cause — an abstraction that makes one remote read look like a local field access — and the
+same fix.
+
+<Aside kind="note">
+There is a second-order effect worth naming. Collapsing twelve calls into one also collapses twelve
+*independent* results into one atomic read at one block. That is a correctness improvement, not just a
+cost one, and it is the same property the lesson after next builds a whole failure mode out of.
+</Aside>
+
+## What actually makes a query an archive query
+
+Now the definition, because the word misleads almost everyone.
+
+An archive query is **not** an analytics query, a big query, or a query by a data team. It is any call
+that names a block older than the short window of recent state a full node keeps. Nothing else.
+
+The window is small and it is documented. QuickNode describes a full node as storing and maintaining
+"recent block data (i.e., the last 128 blocks) on disk", and an archive node as one that "inherits the
+same capabilities as Full nodes and also builds an archive of historical
+states".<Cite src="quicknode-full-vs-archive" /> Ethereum.org makes the same distinction from the
+state side.<Cite src="eth-archive-nodes" /> Chainstack draws its billing boundary at the same place:
+for most EVM chains, a request targeting data "127 or more blocks behind" the tip is archive rather
+than latest.<Cite src="chainstack-request-units" />
+
+At twelve-second slots, 128 blocks is a little over twenty-five
+minutes.<Cite src="consensus-specs" /><Cite src="quicknode-full-vs-archive" /> **Anything older than
+about half an hour is history.** Sit with that, because it reframes the whole category:
+
+- "What was this user's balance at the governance snapshot block" — archive.
+- "Re-price this position as of yesterday's close" — archive.
+- "Show the pool reserves at the block before the incident" — archive.
+- "Retry the job that failed forty minutes ago, at the block it was pinned to" — archive, and it was
+  not archive when the job first ran. That one is genuinely surprising and it produces the most
+  confusing bug report in this whole area: *the same code, with the same arguments, worked an hour
+  ago.*
+
+Note what the arguments look like in each case. They are `eth_call`, `eth_getBalance`,
+`eth_getStorageAt` — ordinary reads — with a block number in the last
+parameter.<Cite src="ethereum-org-json-rpc" /> There is no `archive_` namespace and no flag. The
+block tag is the entire difference between a request any endpoint answers and a request that needs a
+different class of node behind it.
+
+<Misconception
+  belief="Archive nodes are for analytics teams and data pipelines."
+  reality="Any historical block tag makes it an archive query, including a single balance lookup at a governance snapshot. Ordinary product features cross that line constantly, usually without anyone noticing until the endpoint changes."
+  why="'Archive' sounds like cold storage and bulk export, so people map it onto the workload rather than onto the block tag, which is where it actually lives."
+  src="quicknode-full-vs-archive"
+/>
+
+### What this costs is now provider-specific
+
+The old teaching was that archive access costs many times more than latest access. Do not carry that
+as a general rule any more.
+
+For most providers this routes to a different backend rather than a different price line. Chainstack's
+published rule prices an archive request at exactly **2** request units against 1 for
+latest.<Cite src="chainstack-request-units" /> Alchemy's compute-unit table prices methods, not block
+ages — `eth_getBalance` is 20 whether you ask about the tip or about a block from
+2021.<Cite src="alchemy-compute-units" />
+
+So the honest statement is: **archive is a capability question first and a price question second, and
+the price question has a different answer per provider.** The capability question is the one that
+bites, because it has a binary answer. The identical request succeeds against an archive-backed
+endpoint and fails against a pruned one, and the error will talk about the block, or about missing
+state, rather than about retention — the same failure the fork-testing lesson described from the other
+side, where a pinned historical block turns a test into a statement about your provider's node
+policy.
+
+## Two tracing APIs, and neither of them is standard
+
+The third expensive category is reconstruction: internal calls, value transfers made by contracts,
+step-by-step execution. This is where portability stops being theoretical.
+
+**Start with what the specification actually contains.** The execution API spec does have a `debug_`
+namespace — and it has exactly six methods: `debug_getBadBlocks`, `debug_getRawBlock`,
+`debug_getRawBlockAccessList`, `debug_getRawHeader`, `debug_getRawReceipts` and
+`debug_getRawTransaction`.<Cite src="execution-apis-spec" /> Every one of those is a raw-data getter.
+**Not one of them is a tracer.** And there is no `trace_` namespace in the specification at
+all.<Cite src="execution-apis-spec" />
+
+So the moment your product needs to know what happened *inside* a transaction, you have left the
+standard interface. Two conventions fill the gap, and they came from different clients.
+
+**The `debug_` tracers are Geth's.** Geth's reference describes its debug API as giving "access to
+several non-standard RPC methods, which will allow you to inspect, debug and set certain debugging
+flags during runtime", and documents `debug_traceTransaction`, `debug_traceCall`, `debug_traceBlock`,
+`debug_traceBlockByNumber`, `debug_traceBlockByHash`, `debug_traceChain` and
+others.<Cite src="geth-ns-debug" /> Note the framing: these are operator and debugging tools that
+became a product API because there was nothing else.
+
+**The `trace_` namespace comes from the OpenEthereum lineage and lives on in Erigon.** Erigon
+documents it as a module "for getting a deeper insight into transaction processing" containing two
+distinct APIs: an **ad-hoc tracing API** and a **transaction-trace filtering
+API**.<Cite src="erigon-trace-namespace" /> The ad-hoc side takes a configuration object naming the
+tracer type — `trace` for the sequence of external calls, internal messages and value transfers;
+`vmTrace` for a step-by-step trace including opcodes and gas; `stateDiff` for the altered portions of
+state — and lets you specify the transaction three ways: as a hypothetical call, as raw signed
+transaction data, or as a mined transaction hash.<Cite src="erigon-trace-namespace" /> The filtering
+side returns a full externality trace searchable by address, covering all `CREATE`s, self-destructs
+and every variant of `CALL` with input, output, gas, value and success
+status.<Cite src="erigon-trace-namespace" />
+
+The two differ in more than naming:
+
+<Compare
+  axis=""
+  columns={[
+    { title: <><code>debug_</code> (Geth lineage)</> },
+    { title: <><code>trace_</code> (OpenEthereum lineage, Erigon)</> },
+  ]}
+  rows={[
+    {
+      label: 'In the execution-API spec?',
+      cells: [
+        <>the namespace, yes — the tracers, no<Cite src="execution-apis-spec" /></>,
+        <>no<Cite src="execution-apis-spec" /></>,
+      ],
+    },
+    {
+      label: 'Response shape',
+      cells: [
+        'tracer-dependent, nested call frames',
+        <>flat list of actions, each with a <code>traceAddress</code> path<Cite src="erigon-trace-namespace" /></>,
+      ],
+    },
+    {
+      label: 'Search by address across blocks',
+      cells: [
+        { v: 'not offered', tone: 'warn' },
+        { v: <>yes, the trace-filtering API<Cite src="erigon-trace-namespace" /></>, tone: 'good' },
+      ],
+    },
+    {
+      label: 'Must be enabled',
+      cells: [
+        'operator choice',
+        <><code>trace</code> must be in <code>--http.api</code><Cite src="erigon-trace-namespace" /></>,
+      ],
+    },
+  ]}
+  caption="Neither convention is in the specification, so 'my provider supports tracing' names a lineage rather than a capability."
+  alt="The debug_ tracers come from Geth, are not in the execution-API specification, return nested call frames, cannot search by address across blocks, and are enabled at the operator's discretion. The trace_ namespace comes from the OpenEthereum lineage, is not in the specification either, returns a flat list of actions carrying traceAddress paths, offers a trace-filtering API that searches by address, and must be listed in Erigon's --http.api."
+/>
+
+That `traceAddress` field is the most concrete difference: it "gives the exact location in the call
+trace" as a path of indices — index in root, index in the first `CALL`, and so
+on.<Cite src="erigon-trace-namespace" /> A flat list plus a path, versus a nested object. Code that
+walks one does not walk the other, and no adapter is going to make the two return the same thing,
+because the filtering API has no counterpart on the other side at all.
+
+Erigon since v3.4 also supports **flat tracers**, which produce OpenEthereum-compatible call traces in
+a flat list with an explicit subtraces count, available from the ad-hoc methods by including `trace`
+in the trace-type array.<Cite src="erigon-trace-namespace" /> Useful, and worth noticing for what it
+implies: compatibility here is a feature someone implements, per client, per version, not a property
+of the protocol.
+
+<Aside kind="warn">
+Two more constraints that decide whether tracing works at all.
+
+**Tracing is usually an archive workload.** Erigon's ad-hoc tracing works "as long the blocks have not
+yet been pruned", and for replaying a mined transaction the node "must be in archive mode, or the
+transaction must be within the most recent 1000 blocks".<Cite src="erigon-trace-namespace" /> A
+tracing integration that works on today's transactions and fails on last week's is not a bug in your
+code.
+
+**Whether you get either namespace is the provider's choice.** Erigon exposes namespaces via
+`--http.api`, and its list includes `eth`, `debug`, `trace`, `erigon`, `txpool`, `ots`, `overlay` and
+more — with `overlay`, for replaying blocks with state overrides, marked archive-nodes-only.<Cite src="erigon-rpc-namespaces" />
+A commercial endpoint on the same plan may enable a different subset than the one you developed
+against.
+</Aside>
+
+And the cost, since that is what this lesson is about: `debug_traceTransaction` is 40 units and
+`trace_transaction` is 40 on the weighted table — but `debug_traceTransaction` carries a throughput
+charge of 1000 where `trace_transaction` carries none listed, meaning it defaults to its 40.<Cite src="alchemy-compute-units" /><Cite src="alchemy-compute-units-explainer" />
+Two methods that answer nearly the same question, priced identically against volume and 25× apart
+against throughput. Under the near-flat rule both are simply 2 request units, because the whole
+`debug_` and `trace_` families are priced as archive regardless of block
+age.<Cite src="chainstack-request-units" />
+
+<Figure
+  caption="Choosing a tracing convention is also choosing the rate at which you are allowed to run it."
+  alt="On Alchemy's table both tracing methods cost 40 compute units against volume, but debug_traceTransaction carries a throughput charge of 1000 while trace_transaction has none listed and therefore defaults to its 40."
+>
+  <Bars
+    unit="compute units"
+    axisLabel="the axis a backfill loop saturates"
+    caption="throughput charge — Alchemy, read 26 August 2026"
+    items={[
+      { label: 'trace_transaction', value: 40, note: 'none listed — its 40 CU' },
+      { label: 'debug_traceTransaction', value: 1000, tone: 'danger', note: '40 CU against volume' },
+    ]}
+  />
+</Figure>
+
+<Check type="spot-bug" concept="getlogs-is-the-cost-driver">
+An indexer backfills two years of one contract's `Transfer` events, then keeps a live tail. Here is
+the design, as written in the PR description:
+
+1. Loop from the deployment block to head in fixed 10,000-block chunks, calling `eth_getLogs` for each.
+2. For every log, call `eth_getBlockByNumber` to get the timestamp.
+3. For every log, call `eth_call` on the token to fetch `decimals()` for formatting.
+4. For any transfer where `from` is a contract, call `debug_traceTransaction` to find which internal
+   call moved the value.
+5. Once caught up, poll `eth_getLogs` for the last 10 blocks every 12 seconds.
+
+It runs correctly against mainnet on a paid plan. Then the team adds a second chain and the backfill
+starts failing, and separately the monthly bill is four times the forecast. Find the defects.
+
+<Answer>
+**Six, and they divide cleanly into "fails" and "costs".**
+
+**1 — The fixed 10,000-block chunk is a per-chain constant treated as a global one.** Alchemy's
+supported range is unlimited on Ethereum and several major chains at Pay As You Go, but 10,000 on all
+other chains and 1,000 on some, with 10 on the free tier
+everywhere.<Cite src="alchemy-eth-getlogs" /> "It works on mainnet" is not evidence about chain two.
+And even where 10,000 is permitted, the note says wider ranges are less likely to succeed and large
+queries should be split — a warning that the boundary is soft.<Cite src="alchemy-eth-getlogs" />
+
+**2 — There is no adaptive fallback and no response-size handling.** Responses are capped at
+150MB.<Cite src="alchemy-eth-getlogs" /> With the L1 gas limit at 60 million a block carries far more
+logs than it used to,<Cite src="eip-7935" /> so a chunk size that fit yesterday can overflow on a busy
+range. Halve on failure, recover gradually, and throw at a span of one.
+
+**3 — Step 2 is the largest line item and it is entirely avoidable.** One
+`eth_getBlockByNumber` per *log* means the request count scales with transfers, not with blocks. At 20
+units each,<Cite src="alchemy-compute-units" /> a busy month of a popular token is millions of units
+for a timestamp that is identical for every log in the same block. Fetch one block header per block —
+or take the timestamp from the chunk's blocks once — and the line collapses by whatever the average
+logs-per-block is.
+
+**4 — Step 3 fetches an immutable value in a loop, forever.** `decimals()` does not change. One call
+at deployment time, cached, replaces N calls at 26 units each.<Cite src="alchemy-compute-units" /> If
+you must read it per token, batch it with [multicall](/c/viem-multicall-batching).<Cite src="viem-multicall" />
+
+**5 — Step 4 is the throughput hazard, and it is also a portability landmine.**
+`debug_traceTransaction` is 40 units against volume but 1000 against
+throughput.<Cite src="alchemy-compute-units" /> A backfill loop is exactly the traffic shape that
+saturates a throughput budget, so this step will produce 429s long before it produces a large invoice.
+It is also outside the standard method set entirely — the specification's `debug_` namespace contains
+six raw-data getters and no tracer<Cite src="execution-apis-spec" /> — so chain two's endpoint may not
+offer it, and a provider offering `trace_` instead returns a flat list with `traceAddress` paths
+rather than nested frames, which is a different parser.<Cite src="erigon-trace-namespace" />
+
+**6 — The live tail is the cheapest part and the only part that is right.** Ten blocks every twelve
+seconds is inside every documented cap.<Cite src="alchemy-eth-getlogs" /> Keep it. Do add the overlap
+deliberately — ten blocks of look-back gives you reorg tolerance for free — and make the handler
+idempotent, because the overlap guarantees repeats.
+
+**The forecast miss, diagnosed.** The team forecast against blocks and got billed against logs. Steps
+2 and 3 both scale with the number of transfers, which is a number nobody wrote in the estimate. That
+is the general failure: **estimate against the thing your loop iterates over, and read the loop, not
+the description of the loop.**
+
+**One more thing to check before the rewrite.** Ask whether the trace step is load-bearing at all. If
+the goal is attributing value movements, the transaction-trace filtering API searches by address
+across blocks in one request where the naive design issues one trace per
+transfer<Cite src="erigon-trace-namespace" /> — but it only exists on one of the two conventions, so
+the answer determines which providers you can use. That decision is the whole of the migration lesson,
+two from here.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next**, the provider that is down, or worse, the one that is *behind*. You now know which of your
+calls are expensive; the next lesson is about what happens to all of them when one endpoint stops
+answering, and about a subtler failure where every request succeeds and the answers still do not agree
+with each other.
+
+**Then**, migration. Notice how much of this lesson was already about portability without saying so:
+per-chain range caps, a tracing namespace that depends on the client behind the endpoint, a filtering
+API with no counterpart on the other convention. Every one of those is a line in your migration cost,
+and they are invisible until the day you try.
+
+**And a measurement worth taking this week.** Pull your last month's usage grouped by method. If you
+cannot, that is itself the finding. If you can, the ranking will almost certainly disagree with your
+intuition — and the top line will be a job, not a screen.

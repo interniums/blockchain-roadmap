@@ -1,0 +1,314 @@
+---
+id: scaling-op-stack-a-node-that-is-two-processes
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [op-specs-protocol-overview, op-docs-components, op-docs-op-stack-intro, op-specs-configurability, op-specs-derivation, op-docs-key-management, op-docs-derivation-pipeline, optimism-releases, superchain-registry-chainlist, superchain-registry-op-config, op-docs-alt-da-mode, op-docs-transaction-finality]
+stack: {}
+---
+
+Someone hands you the runbook for a chain that is already live and asks you to keep it up. You open
+the compose file expecting one service and find five: `op-geth`, `op-node`, `op-batcher`,
+`op-proposer`, `op-challenger`. Two of them hold private keys that must stay online. One of them
+talks to Ethereum constantly and will silently stop if its L1 balance runs out. One of them does
+nothing at all until somebody attacks you, and if it is not running you will not find out until it
+matters.
+
+That process list is the honest definition of "running an L2". This module takes it apart. This
+lesson does the two processes at the centre — because the way they are named will actively mislead
+you, and the correction is the idea the whole module hangs off.
+
+<Figure
+  caption="Every process you operate points at L1. The L2 chain is what comes back out of it."
+  alt="The five OP Stack processes arranged around Ethereum L1: op-batcher publishes block data, op-proposer publishes output roots and op-challenger disputes the wrong ones, all writing to L1; L1 blocks feed op-node, which drives op-geth over the Engine API."
+>
+  <Flow
+    dir="down"
+    lanes={['system interactions', 'the input', 'derivation', 'execution']}
+    nodes={[
+      { id: 'bat', label: 'op-batcher', note: 'publishes the block data', col: 0, tone: 'warn' },
+      { id: 'pro', label: 'op-proposer', note: 'publishes output roots', col: 0, tone: 'warn' },
+      { id: 'cha', label: 'op-challenger', note: 'disputes the wrong ones', col: 0 },
+      { id: 'l1', label: 'Ethereum L1', note: 'batch inbox, portal, dispute games', col: 1, tone: 'muted' },
+      { id: 'node', label: 'op-node', note: 'derivation engine', col: 2, tone: 'accent' },
+      { id: 'geth', label: 'op-geth', note: 'EVM, state, JSON-RPC', col: 3 },
+    ]}
+    edges={[
+      { from: 'bat', to: 'l1', label: 'batch data' },
+      { from: 'pro', to: 'l1', label: 'output roots' },
+      { from: 'cha', to: 'l1', label: 'disputes' },
+      { from: 'l1', to: 'node', label: 'L1 blocks' },
+      { from: 'node', to: 'geth', label: 'Engine API' },
+    ]}
+  />
+</Figure>
+
+## You already know this shape, and that is the trap
+
+From the infrastructure track you know that [an Ethereum node is two processes](/c/node-two-process-model):
+an execution client holding the EVM, the state and the JSON-RPC surface, and a consensus client
+running fork choice and attestations, with neither one a node on its own.
+
+An OP Stack node has exactly that shape. The execution client is `op-geth`, a lightly modified Geth.
+The consensus client is `op-node`. They speak over the same [Engine API](/c/engine-api) you already
+know, with the same JWT-authenticated socket.
+
+The design goal is explicitly to keep that shape. The specification lists *maximal compatibility with
+ETH1 nodes* as an architecture goal, wants the implementation to minimise any differences with a
+vanilla Geth node, and says the execution engine and rollup node use the Engine API to build the
+canonical L2 chain.<Cite src="op-specs-protocol-overview" /> It goes further: the execution engine
+leverages Geth's existing mempool and sync implementations including snap sync, and running a replica
+should be as simple as running a Geth node.<Cite src="op-specs-protocol-overview" /> The
+EVM module in the rollup configuration is described as a lightly modified EVM that adds support for
+L2 transactions initiated on Ethereum plus an extra L1 data fee.<Cite src="op-docs-components" />
+
+So the familiar shape is deliberate, and it will carry you a long way. It will also hand you one
+false belief, and the false belief is about the second process.
+
+## `op-node` is not a consensus client
+
+On Ethereum, the consensus client's job is to find out what everyone else thinks. It gossips
+attestations, applies fork choice over other validators' votes, and arrives at a head by *agreement*.
+Two honest Ethereum nodes can transiently disagree about the head, and the protocol's entire job is
+to resolve that.
+
+`op-node` never does any of that, because on an OP Stack chain there is nothing for L2 nodes to
+agree about.
+
+The specification states the property directly: the rollup chain can be deterministically derived
+given an L1 Ethereum chain, and the fact that the entire rollup chain can be derived based on L1
+blocks is what makes Optimism a rollup.<Cite src="op-specs-protocol-overview" /> It even writes the
+signature of the function:
+
+```text
+derive_rollup_chain(l1_blockchain) -> rollup_blockchain
+```
+
+That is a pure function.<Cite src="op-specs-protocol-overview" /> Feed two honest `op-node` processes
+the same L1 chain and the same rollup configuration and they compute the same L2 chain, block for
+block. There is no vote, no quorum, no fork choice among peers. The next lesson works the function
+out in detail; what matters here is what it does to the process you are operating.
+
+<Misconception
+  belief="op-node reaches consensus with the other L2 nodes, the way a beacon client does with other beacon clients."
+  reality="OP Stack L2 nodes run no consensus among themselves. Each one independently derives the same chain from L1 data, which is why one honest sequencer output is enough and why a second node is a verifier rather than a voter."
+  why="The component is filed under 'consensus client' in every diagram, and on L1 that word means agreement between peers. Here it means 'the process that decides what the blocks must contain', which is a different job entirely."
+  src="op-specs-protocol-overview"
+/>
+
+The specification's own name for the internal component is more honest than "consensus client": the
+part of the rollup node that does this work is called the **rollup driver**, and it is described as
+essentially an infinite loop that runs the block derivation function.<Cite src="op-specs-protocol-overview" />
+Read `op-node` as a *derivation engine*, and every confusing thing about it becomes obvious.
+
+### Then what is the gossip network for?
+
+There is a peer-to-peer network between rollup nodes, so the question is fair. The specification is
+precise about its role: submitted blocks propagate over Geth's own network, while **unsubmitted**
+blocks are propagated using a separate peer-to-peer network of rollup nodes — and this is optional,
+provided as a convenience to lower latency for verifiers and their JSON-RPC
+clients.<Cite src="op-specs-protocol-overview" />
+
+Optional, and a convenience. Blocks that have not yet reached L1 are announced by the sequencer and
+authenticated by a signature from a dedicated role — the configurability spec calls it the
+*Sequencer P2P / Unsafe head signer*, administered by the System Config
+Owner.<Cite src="op-specs-configurability" /> That is authenticated broadcast from a designated
+publisher, not agreement among peers. Nobody votes. If you turn the gossip network off, your node
+still reconstructs the identical chain from L1; it just learns about each block later.
+
+## The Engine API sequence, unchanged
+
+Because `op-node` drives `op-geth` over the standard Engine API, the four-call loop is the one you
+already learned. For each iteration of derivation the rollup driver:<Cite src="op-specs-protocol-overview" />
+
+<Figure
+  caption="The same four calls as on L1, with one difference: attributes are supplied on every iteration, not on the rare slot you propose."
+  alt="The rollup driver's four Engine API calls per iteration: forkchoiceUpdated with payload attributes returns a payload ID; getPayload returns the payload including its block hash; newPayload returns a validation status; a second forkchoiceUpdated sets the head block hash and the head advances, after which the loop repeats."
+>
+  <Flow
+    nodes={[
+      { id: 'fcu1', label: '1. forkchoiceUpdated', note: 'state, payloadAttributes → payload ID', col: 0, tone: 'accent' },
+      { id: 'get', label: '2. getPayload', note: 'payloadID → payload, incl. block hash', col: 1 },
+      { id: 'new', label: '3. newPayload', note: 'payload → validation status', col: 2 },
+      { id: 'fcu2', label: '4. forkchoiceUpdated', note: 'headBlockHash = new hash → head advances', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'fcu1', to: 'get' },
+      { from: 'get', to: 'new' },
+      { from: 'new', to: 'fcu2' },
+      { from: 'fcu2', to: 'fcu1', label: 'the next iteration of derivation' },
+    ]}
+  />
+</Figure>
+
+**Subgoal: notice which side supplies the attributes.** On L1, [forkchoiceUpdated](/c/engine-forkchoiceupdated)
+carries payload attributes only when *this* node is the proposer for the slot, which is rare. On an
+OP Stack node the rollup driver supplies attributes on every single iteration, because it is not
+asking "should I build?" — it is asserting "this is what the next block contains, build it".
+
+**Subgoal: name the consequence for the execution client.** `op-geth` has no opinion about which
+block comes next. It executes what it is handed and reports whether the result is valid. All of the
+chain's identity lives in `op-node`, which is why a corrupted or mismatched rollup configuration is
+a much worse failure than a corrupted execution database: the database can be resynced from the
+chain, but the configuration *is* the chain.
+
+<Aside kind="note">
+The Engine API method versions moved with the hardforks — the spec notes that Ecotone blocks must use
+`newPayloadV3` while pre-Ecotone blocks must use V2.<Cite src="op-specs-protocol-overview" /> This is
+the first hint of a theme that runs through the whole module: an OP Stack chain is not a fixed
+artefact, it is a chain at a *version*, and the version determines which bytes are legal. Lesson five
+takes that seriously as an operations problem.
+</Aside>
+
+## The other three processes, and what each one costs you
+
+`op-geth` and `op-node` make a node. They do not make a chain. Three more processes turn a node into
+an operating rollup, and the specification draws them outside the node box, under *system
+interactions*: a batch submitter, an output submitter, and a
+challenger.<Cite src="op-specs-protocol-overview" />
+
+**`op-batcher`.** Reads the sequencer's blocks and publishes their data to the L1 batch inbox
+address.<Cite src="op-specs-protocol-overview" /> You met [the batcher](/c/batcher) in the blobs
+module; the thing worth carrying here is that the batch inbox is not a contract. The specification is
+explicit that it is not a smart contract but an arbitrarily selected account assumed to have no known
+private key, historically derived as `0xFF0000....` followed by the L2 chain
+ID.<Cite src="op-specs-protocol-overview" /> OP Mainnet's registry entry shows exactly that form:
+`batch_inbox_addr = "0xFF00000000000000000000000000000000000010"`, chain ID
+10.<Cite src="superchain-registry-op-config" /> Data posted there is never executed. It is written to
+Ethereum purely so that anyone can read it back.
+
+**`op-proposer`.** Publishes output roots to L1 so the bridge has a state commitment to pay
+withdrawals against.<Cite src="op-specs-protocol-overview" /> Note what it is *not* doing: it is not
+producing blocks and it is not required for the chain to advance. Stop it and the chain keeps running
+while withdrawals stop settling — a failure mode your users experience and your block explorer does
+not show.
+
+**`op-challenger`.** Watches proposals and disputes the wrong ones.<Cite src="op-specs-protocol-overview" />
+It is the only one of the five whose entire value is contingent: it does nothing measurable for
+months and then is the difference between a bad output root being overturned and being paid out.
+
+Two of these hold hot keys, and the docs say so plainly: the addresses for the batcher and the
+proposer need to have their private keys online somewhere for a component of the system to work, and
+if these addresses are compromised the system can be exploited — with an HSM or a cloud KMS used
+through `eth_signTransaction` as the suggested mitigation.<Cite src="op-docs-key-management" /> The
+cold-wallet roles, by contrast, cannot be used without human intervention and are set up as multisigs
+so that groups of people control them.<Cite src="op-docs-key-management" /> You have seen this
+distinction before in the security track; here it comes with an operational floor, because two of
+those keys must be online *by design*.
+
+<Misconception
+  belief="Deploying the L1 contracts is the hard part; after that the chain runs itself."
+  reality="Deploying contracts is a one-off scripted step. Running a batcher and a proposer with online keys and funded L1 balances, running a challenger that earns nothing until it is needed, plus an RPC fleet and monitoring, is a continuing operations commitment."
+  why="The deployment has a tutorial with a satisfying end state, and the operations do not. This asymmetry is also the entire commercial case for rollup-as-a-service providers."
+  src="op-docs-key-management"
+/>
+
+## Modular means every layer is a decision somebody made
+
+The docs describe the stack as a collection of software components that either define new layers or
+fit as modules within them, and are explicit that it is a work in progress with layers still
+evolving, tightly defined near the bottom and loosely defined near the
+top.<Cite src="op-docs-components" /> The layers named are data availability, sequencing, derivation,
+execution, settlement and governance.<Cite src="op-docs-components" /> Not every module described is
+in a production state; the page marks some as *in development* or
+*proposed*.<Cite src="op-docs-components" />
+
+The consequence is the thing to carry out of this lesson. Because the data availability layer is a
+module, the DA page states that the module used has a significant impact on the security model of a
+system — and gives the failure directly: if a certain piece of data can no longer be retrieved from
+the DA layer, it may not be possible to sync the chain.<Cite src="op-docs-components" /> Alt-DA mode
+exists as a supported option, and its own page says plainly that it will always have more trust
+assumptions than posting data to L1 Ethereum, and that in its current iteration with generic
+commitments it fully trusts the chain operator to make data
+available.<Cite src="op-docs-alt-da-mode" />
+
+You can see both choices in the live registry. Of the 31 mainnet chains listed in the Superchain
+Registry's `chainList.json` on 26 August 2026, 21 record `dataAvailabilityType: "eth-da"` and 10
+record `"alt-da"`.<Cite src="superchain-registry-chainlist" /> Same codebase; the
+[rollup versus validium](/c/rollup-vs-validium) distinction you learned in the data-availability
+module falls out of a config field, one chain at a time.
+
+<Misconception
+  belief="Launching a chain on the OP Stack gives it Ethereum's security automatically."
+  reality="It gives you the codebase. Where data goes, whether a challenger runs, whether fault proofs are permissioned, and who holds the upgrade keys are per-deployment choices, and the registry shows chains that answered each of them differently."
+  why="The stack's reputation is inherited wholesale by every chain that runs it, and the phrase 'built on the OP Stack' is used in marketing where 'configured like OP Mainnet' would be the actual claim."
+  src="op-docs-components"
+/>
+
+<Check type="explain" concept="two-client-node">
+You are on call for an OP Stack chain. For each incident below, say which of the five processes is
+implicated, what a user notices, and what your dashboard shows if you only monitor the L2 block
+number.
+
+1. `op-batcher`'s L1 account runs out of ETH at 02:00.
+2. `op-proposer` crashes and nobody notices for three days.
+3. `op-node` is restarted with a rollup configuration whose `seq_window_size` differs from every
+   other node's.
+4. `op-challenger` was never started at all.
+5. `op-geth` falls over and restarts with a corrupted database.
+
+<Answer>
+**1 — the batcher, and this is the dangerous one.** The sequencer keeps building and gossiping blocks,
+so users transact normally and the L2 block number keeps climbing. What stops is data reaching
+Ethereum. The `unsafe` head advances and the `safe` head freezes; the gap between them is the only
+symptom.<Cite src="op-docs-transaction-finality" /> If it runs long enough the derivation pipeline
+reaches its limit: the docs state that if the sequencing window is exceeded without a valid batch
+being discovered on L1, the pipeline reverts all unsafe blocks from that period and progresses using
+a default block that is empty except for deposits.<Cite src="op-docs-derivation-pipeline" /> Blocks
+users already saw confirmed are discarded. Monitoring the block number detects none of this.
+
+**2 — the proposer.** Blocks keep coming, the safe head keeps advancing, everything on the L2 looks
+healthy. Withdrawals stop settling on L1, because no new output root is being published for the
+bridge to pay against.<Cite src="op-specs-protocol-overview" /> The people who notice are the ones
+trying to leave, and they contact support rather than your alerting.
+
+**3 — the node, and it is the worst kind of failure.** The sequencing window is an input to the
+derivation function.<Cite src="op-specs-derivation" /> Change it on one node and that node computes
+a different `derive_rollup_chain` from the same L1 data, so it diverges from every peer and *no
+protocol mechanism repairs it* — there is no consensus to fall back on. This is exactly why the
+configuration is treated as chain identity: the spec records `seq_window_size` as an input to
+derivation, and the registry pins it per chain.<Cite src="op-specs-derivation" /><Cite src="superchain-registry-op-config" />
+
+**4 — the challenger, and nothing at all happens.** No log line, no alert, no user complaint, for as
+long as every proposal is honest. The cost of not running it is invisible until the day it is the
+only thing standing between a false output root and the bridge. The presence of a challenger is an
+operational fact about your chain, not a property of the stack you deployed.
+
+**5 — the execution client, and it is the least alarming.** `op-geth`'s state is reconstructible: it
+holds no chain identity, only the result of applying inputs `op-node` supplied. Resync it, from
+Geth's own snap sync if you like.<Cite src="op-specs-protocol-overview" /> Compare with case 3 — the
+process holding gigabytes of state is the cheap one to lose, and the process holding a few kilobytes
+of configuration is the expensive one.
+
+**The pattern.** Four of the five failures are invisible to block-number monitoring, and the two
+loudest-sounding components are the two whose failure you would detect last.
+</Answer>
+</Check>
+
+## Version pinning is part of the definition
+
+One more consequence of "the configuration is the chain": these components ship as versioned releases
+that must be compatible with each other and with the contract release your chain is on. As of
+26 August 2026 the monorepo's release history shows `op-node/v1.19.5` published on 20 August 2026,
+`op-contracts/v7.0.0` on 25 June 2026 as the most recent non-prerelease contracts tag, and
+`op-supernode/v1.0.1` also on 20 August 2026, with `op-contracts/v8.0.0-rc.3` present as a
+prerelease.<Cite src="optimism-releases" /> Those numbers move; the releases page is the source, and
+checking it is part of the job rather than something you do once.
+
+## Where this pays off
+
+**The next lesson** works `derive_rollup_chain` out properly — the epoch structure, the sequencing
+window, the pipeline stages — and shows why "the L2 is a function of L1" is a security claim and not
+an implementation detail.
+
+**The lesson after it** explains why a chain exposes three different heads over JSON-RPC, and why a
+product that treats `safe` as final has taken on a reorg risk nobody wrote down.
+
+**The Superchain lessons** are about what happens when many operators run this same five-process
+stack and want to share contracts, governance and eventually messages. Every shared thing in that
+list is a shared failure mode too.
+
+**Your own systems.** If you consume an L2 through an RPC endpoint, you are downstream of all five of
+these processes and you can observe exactly two of them. The alert that catches the most, for the
+least work, is the gap between `latest` and `safe`.

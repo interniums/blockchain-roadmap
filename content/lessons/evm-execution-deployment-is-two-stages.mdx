@@ -1,0 +1,435 @@
+---
+id: evm-execution-deployment-is-two-stages
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    execution-specs,
+    execution-specs-osaka-interpreter,
+    execution-specs-osaka-system,
+    execution-specs-osaka-address,
+    execution-specs-osaka-gas,
+    eip-1014,
+    eip-170,
+    eip-3860,
+    eip-3541,
+    eip-7903,
+    eip-7907,
+    eip-161,
+    eip-2681,
+    eip-7702,
+    erc-7955,
+    eip-1167,
+    deterministic-deployment-proxy,
+    foundry-create2-guide,
+    solidity-0836-release,
+  ]
+stack:
+  cast: "1.7.1"
+---
+
+A team runs the same deployment script against two chains. Same source, same factory, same salt, and
+the word "deterministic" in the name of the tool. They get two different addresses.
+
+Between the two runs, somebody changed a constructor argument — a treasury address, in a config file,
+in a different repository.
+
+A second team writes `require(msg.sender.code.length == 0, "no contracts")` to keep contracts out of a
+sale. An attacker calls it from a constructor and walks through, because during construction the
+account has no code yet.
+
+Both surprises come from the same fact. **Deploying is not "putting your contract on chain". It is
+running a program whose output happens to be a contract.** Once you hold that, the two address
+formulas, the size limits and the constructor's odd status all follow.
+
+## Two stages
+
+Creation opens a frame like any other, with one difference: the account at the target address has no
+code, so the frame executes the **initcode** supplied by the creator rather than code fetched from an
+account.<Cite src="execution-specs-osaka-system" />
+
+That frame runs to completion like any other frame. If it returns normally, the bytes it returned
+become the account's permanent code:<Cite src="execution-specs-osaka-interpreter" />
+
+```python
+evm = process_message(message)
+if not evm.error:
+    contract_code = evm.output
+    contract_code_gas = ulen(contract_code) * GasCosts.CODE_DEPOSIT_PER_BYTE
+    if len(contract_code) > 0 and contract_code[0] == 0xEF:
+        raise InvalidContractPrefix
+    charge_gas(evm, contract_code_gas)
+    if len(contract_code) > MAX_CODE_SIZE:
+        raise OutOfGasError
+    set_code(tx_state, message.current_target, contract_code)
+```
+
+So there are two programs, not one.
+
+**Stage one — the initcode.** Your constructor's logic, plus whatever setup the compiler adds, plus
+the code that returns stage two. It executes exactly once, in a frame that ends the moment it returns.
+
+**Stage two — the runtime code.** The bytes stage one returned. This is what `EXTCODECOPY` sees, what
+every future call executes, and what a block explorer shows you.
+
+<Figure
+  caption="The stored code is an output of the program, not the program — and every check that can reject it runs after the deposit gas has already been charged."
+  alt="A creation opens a frame with no code at the target and runs the supplied initcode, with constructor arguments appended to its bytes. If that frame returns, the returned bytes are checked for a leading 0xEF, charged 200 gas per byte, and checked against the 24,576-byte limit; only then are they stored as the account's permanent runtime code."
+>
+  <Flow
+    lanes={['the creator', 'stage one', 'the gate', 'stage two']}
+    nodes={[
+      { id: 'c', label: 'CREATE or CREATE2', note: 'initcode, arguments appended', col: 0 },
+      { id: 'i', label: 'initcode runs', note: 'your constructor, once', col: 1, tone: 'accent' },
+      { id: 'g', label: 'prefix, deposit, size', note: 'each failure burns the frame', col: 2, tone: 'danger' },
+      { id: 'r', label: 'runtime code stored', note: 'what every later call executes', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'c', to: 'i' },
+      { from: 'i', to: 'g', label: 'returns bytes', tone: 'accent' },
+      { from: 'g', to: 'r', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+The constructor is in stage one only. It is not in the deployed bytecode, it cannot be called later,
+and it does not appear in the ABI as something callable. There is no mechanism by which it could:
+nothing kept a copy.
+
+<Misconception
+  belief="The constructor lives in the deployed contract, since the source file describes one contract."
+  reality="The constructor runs once, inside the initcode frame, and is discarded when that frame ends. The deployed bytecode contains only what the initcode chose to return."
+  why="A single source file compiles to a single artefact in every other toolchain you have used, so 'the contract' feels like one thing. Solidity's output makes the split visible if you look — `bytecode` and `deployedBytecode` are separate fields in the compiler's JSON — but nothing in the language surfaces it."
+  src="execution-specs"
+/>
+
+### Three consequences you will meet
+
+**`EXTCODESIZE` of an account under construction is zero.** The code is stored by `set_code` only
+after the initcode frame returns.<Cite src="execution-specs-osaka-interpreter" /> An "is this a
+contract" check based on code length is therefore bypassable by calling from a constructor — which was
+already true before EIP-7702, and is now false in the other direction as well, since a delegated EOA
+carries 23 bytes of code.<Cite src="eip-7702" /> The check does not work in either direction; the
+accounts module treats that at length.
+
+**Constructor arguments are appended to the initcode.** They are not passed as calldata — the
+creation frame's `data` is empty, and the arguments are ABI-encoded and concatenated onto the end of
+the initcode bytes, where the compiler-generated prologue reads them out with `CODECOPY`. This is the
+mechanism behind the first opening scene, and it is the single most consequential detail in the
+CREATE2 section below.
+
+**Storing the code is charged per byte.** `CODE_DEPOSIT_PER_BYTE` is 200 in the Osaka fork's
+`GasCosts`.<Cite src="execution-specs-osaka-gas" /> A contract at the maximum permitted size therefore
+costs 24,576 × 200 = 4,915,200 gas in code deposit alone, before any constructor logic. That is why
+deployment cost tracks contract size so closely, and why splitting logic into libraries or a proxy
+changes the bill rather than merely the architecture.
+
+<Aside kind="warn">
+Read the order of operations in that snippet again. The `0xEF` prefix check comes first, then the
+deposit gas is charged, and only then is the size checked — and exceeding the size raises
+`OutOfGasError`. All three failures are exceptional halts, which means the creating frame loses every
+remaining unit of gas.<Cite src="execution-specs-osaka-interpreter" /> A contract that is a hundred
+bytes too large does not fail cheaply with a helpful message. It burns the transaction.
+</Aside>
+
+## CREATE: the address is a function of who and when
+
+`CREATE` computes the new address from the deployer and the deployer's nonce:<Cite src="execution-specs-osaka-address" />
+
+```python
+computed_address = keccak256(rlp.encode([address, nonce]))
+canonical_address = computed_address[-20:]
+```
+
+Do it by hand once. Take deployer `0x1111111111111111111111111111111111111111` at nonce 0. The RLP
+encoding of a two-element list containing a 20-byte string and zero is `0xd6` (list, 22 bytes of
+payload), `0x94` (string, 20 bytes), the twenty address bytes, and `0x80` (the empty string, which is
+how [RLP encodes zero](/c/rlp)):
+
+```text
+preimage : 0xd694111111111111111111111111111111111111111180
+keccak256: 0x66220277eb3f14e172ca3ac48f7a45ebde059392e46a46dcc14ab24681a961ea
+last 20  : 0x8F7a45eBDe059392E46A46DCc14AB24681A961Ea
+```
+
+`cast compute-address 0x1111111111111111111111111111111111111111 --nonce 0` returns the same
+address, computed on this machine with cast 1.7.1 on 26 August 2026. Increment the nonce and the
+address moves with no relationship to the previous one:
+
+| deployer nonce | resulting address |
+|---|---|
+| 0 | `0x8F7a45eBDe059392E46A46DCc14AB24681A961Ea` |
+| 1 | `0x15452EC016c4dc8c549E7fe6Ff4b26324Ea8b7A4` |
+| 2 | `0x39c2540Cc64C8562269200ee459DC2853aAB9d87` |
+
+**The code plays no part.** Two completely different contracts deployed by the same account at the
+same nonce land at the same address; the same contract deployed twice by the same account never does.
+
+<Misconception
+  belief="A contract's address is derived from its code, the way a content-addressed artefact is."
+  reality="Under CREATE it is derived from the deployer's address and the deployer's nonce. The code is not an input. Under CREATE2 the code *is* an input, which is a different scheme entirely."
+  why="Content addressing is the intuition every engineer brings from Git, Docker and IPFS, where an artefact's identity is its content. Here identity is a claim about *who created it and when in their history*, which is why 'is this the contract I audited' is a question the address cannot answer and bytecode verification exists."
+  src="execution-specs-osaka-address"
+/>
+
+Two details around the nonce, both of which appear as branches in the specification. A newly created
+contract account starts with nonce 1 rather than 0, a rule that arrived with EIP-161 and is
+implemented as an `increment_nonce` on the new target before the initcode
+runs.<Cite src="eip-161" /><Cite src="execution-specs-osaka-interpreter" /> And a deployer whose nonce
+has reached 2^64 − 1 cannot create at all: `CREATE` pushes 0 and returns, another failure that is not
+an exception.<Cite src="eip-2681" /><Cite src="execution-specs-osaka-system" />
+
+## CREATE2: the address is a function of what
+
+`CREATE2` replaces "when" with "what":<Cite src="execution-specs-osaka-address" /><Cite src="eip-1014" />
+
+```python
+preimage = b"\xff" + address + salt + keccak256(call_data)
+computed_address = keccak256(preimage)[-20:]
+```
+
+The deployer's nonce is deliberately absent. The address depends on three things: the deploying
+account, a 32-byte salt you choose, and the keccak of the exact initcode bytes.
+
+**Subgoal — pick a real initcode.** The ERC-1167 minimal proxy is a good one, because its whole body
+is a `DELEGATECALL` to a hard-coded implementation.<Cite src="eip-1167" /> For implementation
+`0x1111…1111` the standard initcode is:
+
+<Figure
+  caption="Fifty-five bytes, of which twenty are a choice. Change those twenty and every CREATE2 address derived from this initcode moves."
+  alt="The ERC-1167 minimal proxy initcode: ten bytes of deploy prologue that return the forty-five bytes after them, ten bytes that copy the incoming calldata, the twenty-byte implementation address, and fifteen bytes that DELEGATECALL it and return whatever comes back."
+>
+  <Anatomy
+    value="0x3d602d80600a3d3981f3363d3d373d3d3d363d7311111111111111111111111111111111111111115af43d82803e903d91602b57fd5bf3"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 22, label: 'deploy prologue', note: 'returns the 45 bytes after it', tone: 'muted' },
+      { from: 22, to: 42, label: 'copy calldata', note: 'runtime code begins here' },
+      { from: 42, to: 82, label: 'implementation', note: 'the only part you choose', tone: 'accent' },
+      { from: 82, to: 112, label: 'delegatecall and return', note: 'bubbles the result back', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+**Subgoal — hash it.** `cast keccak` on those bytes gives
+`0xa2d88143eeea48efcc9f4a249ebe53d688d02897963ffc34032b89239ec11b5e`.
+
+**Subgoal — build the 85-byte preimage.** One byte of `0xff`, twenty bytes of deployer, thirty-two
+bytes of salt, thirty-two bytes of initcode hash. With the canonical CREATE2 factory at
+`0x4e59b44847b379578588920cA78FbF26c0B4956C` and a zero salt, hashing that preimage gives
+`0xe7f3783302757086623818fa054b6011f1702e2c86d4ac85402532a282b124bb`.
+
+**Subgoal — take the last twenty bytes.** `0x054B6011F1702E2c86D4AC85402532A282B124bB`. Which is
+exactly what `cast compute-address 0x4e59b448… --salt 0x00…00 --init-code 0x3d602d…` reports, so the
+formula and the tool agree.
+
+**Subgoal — change one thing and watch the address move.** Swap the implementation address in the
+proxy's body from `0x1111…1111` to `0x2222…2222`. The initcode hash becomes
+`0x100119e6c2c500692ce3d11bb1218d751a6e4343d712634c8735d3f40f32f3f2` and the address becomes
+`0x2179cdc6a2e84847D8664FACfd1232cA15D44773` — no relationship to the first.
+
+That last step is the first opening scene. Constructor arguments are part of the initcode, so a
+changed argument is changed initcode, is a changed hash, is a changed address. And it is not only
+arguments: a different compiler version, a different optimiser setting or a different `--via-ir`
+choice all produce different initcode bytes for identical source, and therefore a different
+address.<Cite src="solidity-0836-release" />
+
+<Misconception
+  belief="A CREATE2 address is fixed by the contract's source, so 'deterministic deployment' means the same source lands at the same address everywhere."
+  reality="It is fixed by keccak256 of the initcode. That includes ABI-encoded constructor arguments and reflects every compiler and optimiser setting that changed a byte of output."
+  why="'Deterministic deployment' is nearly always explained with a formula whose middle term is written as `keccak256(initcode)` and then discussed as if it read `keccak256(source)`. The constructor-argument case in particular is almost never mentioned, because tutorials use contracts with no constructor arguments."
+  src="eip-1014"
+/>
+
+<Aside kind="note">
+The standard escape from this is the pattern usually called
+[CREATE3](/c/create3-pattern): deploy a tiny fixed proxy with CREATE2 — fixed initcode, so a fixed
+address for a given salt — and have that proxy `CREATE` your real contract. The real contract's
+address then depends only on the proxy's address and its nonce, and not at all on your constructor
+arguments or compiler settings. You pay an extra deployment for the privilege.
+</Aside>
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'CREATE', note: 'deployer and nonce' },
+    { title: 'CREATE2', note: 'deployer, salt and initcode', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What goes into the address?',
+      cells: ['The deployer address and its nonce', 'The deployer address, a 32-byte salt, and keccak of the initcode'],
+    },
+    {
+      label: 'Is the code an input?',
+      cells: ['No — two unrelated contracts at one nonce collide', 'Yes — one changed byte lands somewhere else'],
+    },
+    {
+      label: 'Do constructor arguments move it?',
+      cells: ['No', 'Yes — they are appended to the initcode'],
+    },
+    {
+      label: 'Does a compiler or optimiser change move it?',
+      cells: ['No', 'Yes — different bytes, different hash'],
+    },
+    {
+      label: 'Can you show a user the address first?',
+      cells: ['Only if you can predict the deployer nonce at that moment', 'Yes — nothing about the future is an input'],
+    },
+    {
+      label: 'What is the address a claim about?',
+      cells: ['Who created it, and when in their history', 'Exactly what was created'],
+    },
+  ]}
+  caption="Both formulas are a keccak with its last twenty bytes taken, and they answer completely different questions — which is why swapping one for the other is never a drop-in change."
+  alt="CREATE derives an address from the deployer and its nonce, so the code plays no part, constructor arguments and compiler settings do not affect it, and predicting the address requires knowing the deployer's nonce. CREATE2 derives it from the deployer, a chosen salt and the keccak hash of the initcode, so constructor arguments and compiler settings do change it and the address is knowable before any deployment."
+/>
+
+### "The same address on every chain" has an asterisk
+
+The factory at `0x4e59b44847b379578588920cA78FbF26c0B4956C` is the one most tooling reaches for by
+default, and it exists at that address on many chains because it was bootstrapped with Nick's
+method — a pre-signed transaction with no known private key, whose sender is recovered from a
+made-up signature.<Cite src="deterministic-deployment-proxy" /><Cite src="foundry-create2-guide" />
+
+That bootstrap has a specific failure mode. The published deployment transaction carries a fixed gas
+price of 100 gwei, a fixed gas limit of 100,000, and a signature with no EIP-155 chain
+id.<Cite src="deterministic-deployment-proxy" /> It therefore cannot be replayed onto a chain that
+requires replay protection, or one whose gas schedule makes that limit insufficient. On those chains
+the factory is simply not there — Foundry's own guide says as much, and offers a
+`create2_deployer` setting for exactly that case.<Cite src="foundry-create2-guide" /> "CREATE2 gives
+you the same address everywhere" is false in a specific, teachable way, and it surfaces at deployment
+time on the one chain nobody tested. ERC-7955 is a Draft proposing a replacement permissionless
+factory bootstrapped via EIP-7702 rather than a pre-signed transaction, for precisely this
+reason.<Cite src="erc-7955" />
+
+## The three limits
+
+Three ceilings govern what can be deployed, and all three are live today.
+
+**Runtime code: 24,576 bytes.** EIP-170's limit, implemented as `MAX_CODE_SIZE = 0x6000` in the
+specification.<Cite src="eip-170" /><Cite src="execution-specs-osaka-interpreter" /> Exceeding it is an
+exceptional halt after the deposit gas has already been charged.
+
+**Initcode: 49,152 bytes, and metered.** EIP-3860 caps initcode at twice the runtime limit —
+`MAX_INIT_CODE_SIZE = 2 * MAX_CODE_SIZE` — and charges `CODE_INIT_PER_WORD`, which is 2, per 32-byte
+word of initcode.<Cite src="eip-3860" /><Cite src="execution-specs-osaka-gas" /><Cite src="execution-specs-osaka-interpreter" />
+The metering is small in absolute terms — 3,072 gas at the maximum size — and exists to price the
+hashing and analysis work that unbounded initcode would otherwise impose for free. `CREATE2`
+additionally pays the keccak per-word charge over the initcode, because it hashes
+it.<Cite src="execution-specs-osaka-system" />
+
+**Deployed code may not begin with `0xEF`.** EIP-3541 reserved that first byte in 2021, and the
+specification raises `InvalidContractPrefix` on it.<Cite src="eip-3541" /><Cite src="execution-specs-osaka-interpreter" />
+The reservation is why EIP-7702's 23-byte delegation designator can start with `0xef0100` and be
+unambiguous: no ordinary deployment could ever have produced those bytes.<Cite src="eip-7702" />
+
+<Misconception
+  belief="EOF is about to lift the code size limits, so designing around 24,576 bytes is a temporary problem."
+  reality="EOF was rejected for Fusaka and its experimental Solidity backend was removed in 0.8.36. EIP-170's 24,576 and EIP-3860's 49,152 are the live ceilings with no scheduled replacement."
+  why="EOF was pre-announced continuously through 2024 and 2025, with specifications, testnets and compiler support, so a large body of material describes it in the present tense. Two Draft proposals do target the ceilings — EIP-7903 would remove the initcode cap, EIP-7907 would raise runtime code to 64 KB and meter code loading — but neither is assigned to a fork."
+  src="solidity-0836-release"
+/>
+
+Both of those drafts are worth knowing by name rather than by content.<Cite src="eip-7903" /><Cite src="eip-7907" />
+What you can build against today is 24,576 bytes, and the practical responses are the ones that have
+always applied: move logic into libraries reached by `DELEGATECALL`, split across a proxy and several
+implementations, or deploy per-instance clones that share one copy of the code.<Cite src="eip-1167" />
+
+<Aside kind="warn">
+Deployment is also where the per-transaction gas cap bites first. A single monolithic deployment
+close to the size limit spends nearly five million gas on code deposit alone, before the constructor
+runs, and the transaction-level ceiling applies whatever room the block has. Size is a gas problem
+before it is a limit problem.<Cite src="execution-specs-osaka-gas" />
+</Aside>
+
+<Check type="explain" concept="create2-address">
+A factory deploys per-user vaults with CREATE2, using the user's address as the salt, so that a vault
+address can be shown in the interface before the vault exists — funds sent there are recoverable once
+the vault is deployed.
+
+```solidity
+function vaultOf(address user) public view returns (address) {
+    bytes memory initcode = abi.encodePacked(
+        type(Vault).creationCode,
+        abi.encode(user, feeRecipient)     // feeRecipient is a storage variable
+    );
+    return address(uint160(uint256(keccak256(
+        abi.encodePacked(bytes1(0xff), address(this), bytes32(uint256(uint160(user))), keccak256(initcode))
+    ))));
+}
+```
+
+Users are shown `vaultOf(msg.sender)` and told to fund it. Six months in, governance updates
+`feeRecipient`.
+
+Explain precisely what breaks, for whom, and what the funds situation is afterwards.
+
+<Answer>
+**Every undeployed vault's predicted address changes the instant `feeRecipient` changes, and every
+already-deployed vault keeps its old one.**
+
+`feeRecipient` is a constructor argument, so it is ABI-encoded into the initcode. The initcode hash is
+an input to the address formula.<Cite src="eip-1014" /><Cite src="execution-specs-osaka-address" />
+Change the argument, change the hash, change the address — and `vaultOf` is a `view` function that
+reads current storage, so it starts returning the new address immediately.
+
+**Three distinct populations, three different outcomes.**
+
+*Users who deployed before the change.* Fine. Their vault exists at the old address and their funds
+are in it. But `vaultOf(user)` now returns a *different* address for them, so the interface points at
+an empty address they have never used. Any code that calls `vaultOf` to locate an existing vault is
+now looking in the wrong place.
+
+*Users who were shown an address and funded it but had not deployed.* This is the damaging case. Their
+ether sits at the old counterfactual address. The factory can no longer deploy there, because it
+would have to use the old initcode and it no longer has the old `feeRecipient` value — it was
+overwritten. The funds are not lost in the sense of being burned; they are at an address whose only
+possible occupant is a contract nobody can now construct from the factory's current code. Recovering
+them requires knowing the old value and having a path to deploy that exact initcode.
+
+*Users who arrive after the change.* Fine, and this is what makes the incident quiet. Everything
+works for new users, so the failure is invisible in ordinary monitoring and only shows up in support
+tickets from the middle population.
+
+**The design error, named.** A counterfactual address is a *commitment*, and this design lets
+governance change the commitment after it has been published. Anything that appears in an initcode
+must be treated as immutable for the lifetime of every address ever derived from it.
+
+**Two fixes, and the trade-off between them.** Take mutable configuration out of the constructor and
+read it from the factory at runtime — the vault asks for `feeRecipient` rather than being told at
+birth — which costs a `CALL` per use and makes the address depend only on the user. Or use the
+[CREATE3 pattern](/c/create3-pattern), where the final address depends on a fixed intermediate
+proxy's address and nonce and is therefore independent of the initcode entirely, at the cost of a
+second deployment per vault.
+
+**The general rule.** Every byte of initcode is part of the address. Ask of every constructor
+argument: could this value ever be different at deployment time than it was when we showed someone the
+address? If it could, it does not belong in a constructor.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The opcode that stopped deleting things**, next, closes the module by explaining why the one
+instruction that used to un-deploy a contract no longer does, and what that changed about the
+metamorphic-contract tricks that CREATE2 made possible.
+
+**Factories and clones** in the Solidity track are this lesson turned into patterns: ERC-1167 minimal
+proxies, factory-per-user designs, and the `factory-create-vs-create2` decision are all downstream of
+which of the two address formulas you pick.<Cite src="eip-1167" />
+
+**Deterministic multi-chain deployment** in the toolchain track is where the asterisk above becomes
+operational — which factory exists on which chain, how to verify the initcode hash you are about to
+commit to, and why a deployment script that hard-codes an address is safer than one that recomputes
+it.<Cite src="foundry-create2-guide" />
+
+**Counterfactual accounts** in the account-abstraction material rest entirely on the CREATE2 property
+that an address can be known and funded before any code exists at it. The `Check` above is the failure
+mode that design has to engineer around.
+
+And the size limits reappear whenever a contract grows: the choice between a large monolith, a
+library-heavy design and a diamond is decided by 24,576 bytes far more often than by
+architecture.<Cite src="eip-170" />

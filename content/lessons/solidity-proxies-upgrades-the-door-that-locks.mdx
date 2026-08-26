@@ -1,0 +1,294 @@
+---
+id: solidity-proxies-upgrades-the-door-that-locks
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-1822, eip-1967, eip-6780, oz-src-uups, oz-src-initializable, oz-src-erc1967proxy, oz-src-proxyadmin, oz-upgrades-faq, oz-docs-writing-upgradeable, oz-changelog, oz-issue-6362, zealynx-upgrade-patterns, measured-gas-constants]
+stack: { solidity: "0.8.36" }
+---
+
+The release compiles. The tests pass. The implementation deploys, `upgradeToAndCall` succeeds, the
+`Upgraded` event fires with the right address, and the contract works.
+
+It also can never be changed again, by anyone, ever, and nothing about the transaction said so.
+
+This lesson is about the specific ways that happens under UUPS, which of them the chain catches,
+which of them your tooling catches, and which of them nothing catches.
+
+## The asymmetry, stated once
+
+Under a transparent proxy, `upgradeToAndCall` is code inside a contract you deployed once and will
+never redeploy.<Cite src="oz-src-proxyadmin" /> Nothing you ship later can remove it.
+
+Under UUPS, `upgradeToAndCall` is code inside the implementation.<Cite src="oz-src-uups" /> Replacing
+the implementation replaces the upgrade mechanism along with everything else. Every release re-ships
+the ability to release.
+
+ERC-1822 said this in 2019, in a warning block, and it is still the clearest statement of the
+hazard: the compatibility and update functions must be present in the Logic Contract, and failure to
+include them may prevent upgrades and could allow the Proxy Contract to become entirely
+unusable.<Cite src="eip-1822" />
+
+## Four ways to lock the door
+
+**One — do not inherit the mechanism at all.** The new implementation is a perfectly good contract
+that does not extend `UUPSUpgradeable`. It has no `upgradeToAndCall`, so once it is behind
+the proxy there is no function that can change the pointer.
+
+**Two — inherit it and guard it with a check that can never pass.**
+
+```solidity
+function _authorizeUpgrade(address) internal override onlyOwner {}
+```
+
+That is the documented, recommended override.<Cite src="oz-src-uups" /> It is also fatal the moment
+`owner()` is `address(0)`, which happens whenever the owner was never set on the proxy, was
+renounced, or lives in a storage slot the current implementation is not reading. Every call fails
+authorisation, including the one that would fix it.
+
+**Three — inherit it and guard it with nothing.**
+
+```solidity
+function _authorizeUpgrade(address) internal override {}
+```
+
+This compiles, deploys, and passes every functional test, because it is only exercised on the upgrade
+path. It is not bricking — it is the opposite, and worse: anyone at all can point your proxy at their
+own code, and your users' storage goes with it. `_authorizeUpgrade` is declared `internal virtual`
+with no body in the library precisely so that you cannot forget to write *something*; the compiler
+will not let you deploy an abstract contract. It cannot check that what you wrote is a
+restriction.<Cite src="oz-src-uups" />
+
+**Four — keep upgradeability but replace the safety mechanism.** OpenZeppelin's own source names
+this one: the security mechanism ensures an upgrade does not turn off upgradeability accidentally,
+"although this risk is reinstated if the upgrade retains upgradeability but removes the security
+mechanism, e.g. by replacing `UUPSUpgradeable` with a custom implementation of
+upgrades."<Cite src="oz-src-uups" /> Write your own `upgradeTo` that does the `SSTORE` directly, ship
+it once, and you have removed the check that would have refused the *next* bad upgrade.
+
+## What the chain checks
+
+Before writing the new pointer, `_upgradeToAndCallUUPS` calls `proxiableUUID()` on the candidate and
+requires the ERC-1967 implementation slot back.<Cite src="oz-src-uups" /><Cite src="eip-1967" />
+
+```solidity
+try IERC1822Proxiable(newImplementation).proxiableUUID() returns (bytes32 slot) {
+    if (slot != ERC1967Utils.IMPLEMENTATION_SLOT) revert UUPSUnsupportedProxiableUUID(slot);
+    ERC1967Utils.upgradeToAndCall(newImplementation, data);
+} catch {
+    revert ERC1967Utils.ERC1967InvalidImplementation(newImplementation);
+}
+```
+
+Map that onto the four failures above:
+
+| Failure | Caught on-chain? |
+|---|---|
+| One — no `UUPSUpgradeable` at all | **yes**, the call reverts in the `catch` |
+| Two — `_authorizeUpgrade` can never pass | **no** — the candidate is structurally a valid UUPS contract |
+| Three — `_authorizeUpgrade` unguarded | **no** — and the upgrade it permits is not this one |
+| Four — custom upgrade mechanism answering `proxiableUUID` | **no** |
+
+So the on-chain guard checks the *shape* of the new implementation. It has no view of your
+authorisation policy and no way to acquire one: `_authorizeUpgrade` is internal, has no signature to
+call, and would need to be evaluated against a future caller who does not exist yet.
+
+Two more things it does not do, both worth knowing precisely.
+
+**It does not run on the new code.** The `try` block executes in the *current* implementation's
+bytecode, reached through the proxy. If your current implementation is one that already lacks the
+mechanism — because a previous upgrade removed it — then there is no code left running that performs
+this check, or indeed any upgrade at all. **The guard protects the upgrade after this one, and only
+while it is still there.**
+
+**It is a call, not an inspection.** The EVM offers no way to ask whether an address contains a
+given function, so the only available test is to invoke it — a `STATICCALL` into an account that is
+cold on first touch, 2,600 gas against 100 warm.<Cite src="measured-gas-constants" /> That is also
+why `proxiableUUID` carries `notDelegated`, as the previous lesson covered: a proxy that answered it
+correctly could be upgraded *to*, and would then delegate into itself.<Cite src="oz-src-uups" />
+
+<Figure
+  caption="A candidate that passes the shape check can still be one nobody is able to call, and the release after it has no code left to check anything."
+  alt="v1 of a UUPS implementation runs the proxiableUUID shape check against candidate v2 and accepts it. Once v2 is live with an _authorizeUpgrade that no caller can satisfy, the next upgrade never runs, so nothing performs the check again."
+>
+  <Flow
+    lanes={['running code', 'the candidate', 'after the upgrade', 'the release after that']}
+    nodes={[
+      { id: 'v1', label: 'v1, live behind the proxy', note: 'its bytecode runs the check', col: 0, tone: 'good' },
+      { id: 'cand', label: 'candidate v2', note: 'answers proxiableUUID()', col: 1 },
+      { id: 'live', label: 'v2, live behind the proxy', note: '_authorizeUpgrade can never pass', col: 2, tone: 'danger' },
+      { id: 'next', label: 'v3', note: 'no caller gets that far', col: 3, tone: 'danger', dashed: true },
+    ]}
+    edges={[
+      { from: 'v1', to: 'cand', label: 'shape check', tone: 'good' },
+      { from: 'cand', to: 'live', label: 'accepted' },
+      { from: 'live', to: 'next', label: 'never runs', tone: 'danger', dashed: true },
+    ]}
+  />
+</Figure>
+
+## What the tooling checks
+
+OpenZeppelin's plugins add the second layer, and the FAQ describes the arrangement exactly as two
+layers of mitigation: an off-chain check by the plugins and an on-chain fallback in the contract
+itself.<Cite src="oz-upgrades-faq" /> The off-chain half is the one that can read your source, so it
+is the one that can catch failure two — an `_authorizeUpgrade` that cannot pass — and the storage
+layout problems the next lesson is about.
+
+The limits are structural rather than accidental.
+
+- **It is opt-in.** Nothing in the chain requires an upgrade to have gone through the plugin. A
+  `cast send` to `upgradeToAndCall` works identically.
+- **It runs where you run it.** The check happens on your machine or in your CI against your
+  sources. A multisig signer approving the transaction sees calldata, not a validation result.
+- **It is a pre-flight check, not a repair.** When the module's case-study contract asked whether
+  tooling could help *after* an incompatible upgrade had landed, the OpenZeppelin collaborator's
+  answer was that once an incompatible upgrade has been made there is not really tooling to fix
+  that, and the tooling's focus is on preventing those upgrades in the first
+  place.<Cite src="oz-issue-6362" />
+
+<Misconception
+  belief="The upgrades plugin will stop me from bricking the contract."
+  reality="It will stop you when you use it, from your machine, before you send the transaction. It has no presence on-chain and no ability to undo a bad upgrade once mined. The on-chain half only rejects an implementation that is not structurally UUPS at all."
+  why="'The plugin validates upgrades' sounds like a property of the deployment, and on every other platform a failed validation means a failed deploy. Here the validation and the deploy are separate systems and only one of them is authoritative."
+  src="oz-upgrades-faq"
+/>
+
+## The implementation account is a live contract too
+
+One more locking mechanism, on the other side of the pair.
+
+The implementation is deployed, has code, and is callable by anyone. If it has an unguarded
+`initialize()`, someone can call it on the implementation account and become the owner of that
+account — not of your proxy, whose storage is separate, but of the code your proxy borrows.
+OpenZeppelin's answer is a constructor on the implementation that burns the initializer
+immediately:<Cite src="oz-src-initializable" />
+
+```solidity
+/// @custom:oz-upgrades-unsafe-allow constructor
+constructor() {
+    _disableInitializers();
+}
+```
+
+The classic escalation from there — take over the implementation, make it `selfdestruct`, and every
+proxy pointing at it delegates into an empty account — is no longer the live threat it was.
+EIP-6780 restricted `SELFDESTRUCT` to only remove code when it runs in the same transaction that
+created the contract.<Cite src="eip-6780" /> The advice survives the change in mechanism, because the
+rules for upgradeable code still prohibit `selfdestruct` and unconstrained `delegatecall` in an
+implementation, and an owned implementation remains an attacker-controlled contract that your users'
+tooling will treat as canonical.<Cite src="oz-docs-writing-upgradeable" />
+
+<Figure
+  caption="Nothing in this sequence touches the proxy's storage, which is exactly why an owned implementation is easy to miss."
+  alt="An implementation deployed without _disableInitializers can be initialized by anyone directly on the implementation account, giving an attacker ownership of the account the proxy borrows code from. From there the historic escalation was selfdestruct, which since EIP-6780 removes code only in the transaction that created the contract; what remains is attacker-controlled code that tooling still treats as canonical."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'dep', label: 'implementation deployed', note: 'constructor did not burn the initializer', col: 0, tone: 'warn' },
+      { id: 'init', label: 'anyone calls initialize()', note: 'on the implementation account, not the proxy', col: 1, tone: 'danger' },
+      { id: 'own', label: 'attacker owns that account', note: 'the code your proxy borrows', col: 2, tone: 'danger' },
+      { id: 'sd', label: 'selfdestruct', note: 'since EIP-6780, removes code only in the creating transaction', col: 3, tone: 'muted', dashed: true },
+      { id: 'canon', label: 'attacker-controlled code', note: 'which your tooling still treats as canonical', col: 3, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+The proxy side of the same problem was closed by default in Contracts 5.6.0: `ERC1967Proxy` reverts
+with `ERC1967ProxyUninitialized` if deployed without an initializing
+call.<Cite src="oz-changelog" /><Cite src="oz-src-erc1967proxy" /> The implementation side is still
+your constructor to write.
+
+<Check type="spot-bug" concept="uups-bricking-risk">
+A team ships version 3 of a UUPS-upgradeable staking contract. It is deployed to a fresh
+implementation address and the upgrade transaction succeeds. Here is everything relevant:
+
+```solidity
+contract StakingV3 is Initializable, OwnableUpgradeable, UUPSUpgradeable {
+    bytes32 public constant UPGRADER = keccak256("UPGRADER_ROLE");
+    mapping(address => bool) public hasRole;
+
+    function initializeV3(address upgrader) public reinitializer(3) {
+        hasRole[upgrader] = true;
+    }
+
+    function _authorizeUpgrade(address) internal override {
+        require(hasRole[msg.sender], "not upgrader");
+    }
+}
+```
+
+The upgrade was performed with `upgradeToAndCall(stakingV3, "")`. Name the failure, say at exactly
+which moment it became unrecoverable, and say which of the two guards would have caught it.
+
+<Answer>
+**The failure.** `initializeV3` was never called. The upgrade passed empty `data`, so no setup call
+ran, so `hasRole` is empty for every address. `_authorizeUpgrade` requires `hasRole[msg.sender]`,
+which is false for everyone including the deployer, the multisig and the original owner. There is no
+function on this contract that writes `hasRole` other than `initializeV3` — and `initializeV3` is
+guarded by `reinitializer(3)`, which is a one-shot per version number, not an open door.
+
+Whether `initializeV3` can still be called depends on the `_initialized` value already stored:
+`reinitializer(n)` reverts `InvalidInitialization` if the contract is already initialized to `n` or
+greater.<Cite src="oz-src-initializable" /> If version 2 left `_initialized` at 2, the team is
+lucky and can still call `initializeV3` in a separate transaction. If a previous release had already
+consumed version 3 or higher, they cannot, and the contract is finished.
+
+**The moment.** Not the deploy, and not the upgrade call — the moment was **choosing empty `data`**.
+Deployment and initialization are atomic when they are one transaction and are two independent
+events when they are two, and the second one is not guaranteed to be possible. `upgradeToAndCall`
+exists specifically so the upgrade and its setup are one state transition.<Cite src="oz-src-uups" />
+
+**Which guard would have caught it.** Neither, on-chain: `StakingV3` inherits `UUPSUpgradeable`, so
+`proxiableUUID` answers correctly and the shape check passes.<Cite src="oz-src-uups" /> The off-chain
+plugin is the layer with source visibility and therefore the only one that could flag an
+authorisation predicate over uninitialized state.<Cite src="oz-upgrades-faq" />
+
+**One smaller bug worth naming.** `UPGRADER` is declared and never used: this is a hand-rolled
+`mapping` dressed as `AccessControl`, and its `public` getter is `hasRole(address)`, which no
+integrator expecting `hasRole(bytes32,address)` will find.
+</Answer>
+</Check>
+
+## The pre-flight list
+
+Five checks, each of which corresponds to a specific failure above. Run them against the *bytecode
+you are about to point the proxy at*, not against the branch you think you built.
+
+1. **Does the candidate answer `proxiableUUID()` with the ERC-1967 implementation slot?** One
+   `eth_call` against the deployed implementation address. This is the same check the chain will
+   make, run before you spend the transaction.<Cite src="oz-src-uups" />
+2. **Simulate an upgrade *out* of the candidate on a fork.** Point a forked proxy at it, then
+   upgrade again to a throwaway implementation, signing as the account that will actually hold the
+   key in production. This is the only check that exercises `_authorizeUpgrade` as a real caller,
+   and it is the one that catches failures two and four.
+3. **Confirm the authorisation state exists before it is needed.** Read `owner()`, or your role
+   mapping, on the proxy *after* the simulated upgrade. Uninitialized authorisation state is the
+   shape the module's case study died in.<Cite src="oz-issue-6362" />
+4. **Bundle initialization into the upgrade.** If the release adds state, `data` is a
+   `reinitializer(n)` call, not an empty string, and `n` is one you have confirmed is
+   unused.<Cite src="oz-src-initializable" />
+5. **Check the implementation is locked.** `_disableInitializers()` in its constructor, verified by
+   calling `initialize` against the implementation address on a fork and asserting it
+   reverts.<Cite src="oz-src-initializable" />
+
+<Aside kind="warn">
+The `_authorizeUpgrade` you are shipping is evaluated by a caller in the future, against state that
+exists in the future. Every one of these checks exists because that is not a thing you can test by
+reading the diff — and reading the diff is what a code review is.
+</Aside>
+
+## Where this pays off
+
+This lesson has been about losing the *ability* to upgrade. The last lesson is about the other half:
+an upgrade that succeeds and leaves the contract holding state its new code cannot read.
+
+A live proxy on BNB Smart Chain sits in exactly that intersection. Its authorisation state is in
+slots the new implementation does not look at, so every upgrade path is closed — and the function
+that would set that state reverts before it writes anything.<Cite src="oz-issue-6362" /> Neither half
+alone would have been fatal.
+
+Carry forward the sentence that makes the pattern predictable: **under UUPS, the ability to upgrade
+is application state, and application state is something you can forget to set.**<Cite src="zealynx-upgrade-patterns" />

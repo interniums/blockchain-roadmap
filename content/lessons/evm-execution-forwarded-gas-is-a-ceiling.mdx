@@ -1,0 +1,383 @@
+---
+id: evm-execution-forwarded-gas-is-a-ceiling
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    eip-150,
+    execution-specs-osaka-gas,
+    execution-specs-osaka-system,
+    execution-specs-osaka-interpreter,
+    rareskills-eip150,
+    eip-2929,
+    eip-7825,
+    eip-7607,
+    eip-1884,
+    solidity-changelog,
+    solidity-error-handling,
+    excessively-safe-call,
+  ]
+stack: {}
+---
+
+A relayer service takes signed user intents, wraps each one in a transaction it pays for, and submits
+it. Estimation returns 184,000 gas. The relayer sends 184,000. The transaction lands, the receipt says
+success, the relayer collects its fee.
+
+The user's action did not happen. Somewhere three frames down, a sub-call ran out of gas, returned
+false, and a caller two levels up treated the failure as an acceptable outcome and carried on.
+
+Nothing malfunctioned. The gas limit on a transaction is not a promise about any frame except the
+first, and the amount a caller hands to a callee is a *ceiling* the protocol may quietly lower. This
+lesson is about the rule that makes that true, the attack it killed, and the attack it created.
+
+## The rule, in one line of specification
+
+Here is the entire 63/64 rule as the executable specification states it:<Cite src="execution-specs-osaka-gas" />
+
+```python
+def max_message_call_gas(gas: Uint) -> Uint:
+    return gas - (gas // Uint(64))
+```
+
+Whatever a caller holds, at least one sixty-fourth of it stays behind. This has been true since
+EIP-150 in 2016.<Cite src="eip-150" />
+
+The reason is stated in the EIP itself: before it, a contract could forward everything it had, so a
+callee that consumed all available gas left its caller with nothing — no gas to inspect the result, no
+gas to clean up, no gas to fail loudly. The caller could not survive the callee. The 63/64 rule makes
+survival structural rather than a matter of care.<Cite src="eip-150" /><Cite src="rareskills-eip150" />
+
+### The full computation, in order
+
+The one-liner is only half of it. What actually reaches the callee comes out of
+`calculate_message_call_gas`, and the order of operations matters:<Cite src="execution-specs-osaka-gas" />
+
+```python
+call_stipend = Uint(0) if value == 0 else call_stipend
+if gas_left < extra_gas + memory_cost:
+    return MessageCallGas(gas + extra_gas, gas + call_stipend)
+
+gas = min(gas, max_message_call_gas(gas_left - memory_cost - extra_gas))
+
+return MessageCallGas(gas + extra_gas, gas + call_stipend)
+```
+
+Walk it as four steps.
+
+**Subgoal — pay the fixed charges first.** `extra_gas` is the account-access charge plus, for a
+value-bearing call, the value-transfer charge and possibly the new-account charge. `memory_cost` is
+whatever expanding the input and output regions costs in the *caller's* frame. Both come off the top,
+before anything is forwarded.
+
+**Subgoal — apply the cap to what is left.** `max_message_call_gas` runs on
+`gas_left - memory_cost - extra_gas`, not on the raw remaining gas. Warming a call target with an
+access list therefore does two things at once: it lowers `extra_gas`, and it raises the base the
+63/64 fraction is taken from.<Cite src="eip-2929" />
+
+**Subgoal — take the minimum, and notice what is not there.** `gas = min(gas, ...)`. If the caller
+asked for more than the cap allows, the request is silently trimmed. There is no error, no flag, and
+nothing anywhere that tells the callee it received less than the caller intended, or tells the caller
+that its request was reduced.
+
+**Subgoal — add the stipend, if any.** The gas made available to the sub-call is
+`gas + call_stipend`, and `call_stipend` is zero unless the call carries value, in which case the
+specification's `GasCosts.CALL_STIPEND` is 2,300.<Cite src="execution-specs-osaka-gas" /> That is a
+small allowance added on top so a plain ether transfer to a contract can at least run a trivial
+receive handler.
+
+<Figure
+  caption="Every arrow here is a subtraction, and the caller's own number turns up only inside a min whose other argument it cannot see."
+  alt="Forwarded gas is computed in order: the caller's remaining gas has extra_gas and the caller's own memory expansion cost taken off first, the 63/64 cap is applied to that remainder rather than to the raw remaining gas, the caller's requested amount is then reduced to whichever is smaller, and a 2,300 stipend is added on top only when the call carries value."
+>
+  <Flow
+    lanes={['the caller holds', 'off the top', 'the cap', 'the callee receives']}
+    nodes={[
+      { id: 'g', label: 'gas_left', note: 'everything this frame has', col: 0, tone: 'accent' },
+      { id: 'x', label: 'less the fixed charges', note: 'account access, value, new account', col: 1, tone: 'warn' },
+      { id: 'cap', label: 'less one sixty-fourth', note: 'of the remainder, not of gas_left', col: 2, tone: 'accent' },
+      { id: 'out', label: 'min(asked, cap)', note: 'plus 2,300 if value is non-zero', col: 3, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+<Aside kind="note">
+The named constants around this, read out of `GasCosts` in the Osaka fork of the execution
+specification on 26 August 2026: `CALL_STIPEND` 2,300, `CALL_VALUE` 9,000, `NEW_ACCOUNT` 25,000,
+`COLD_ACCOUNT_ACCESS` 2,600, `WARM_ACCESS` 100.<Cite src="execution-specs-osaka-gas" /> These are
+constants that have moved before and can move again — EIP-1884 repriced a family of state-access
+opcodes in 2019 with exactly this kind of breakage in view.<Cite src="eip-1884" /> Read them from
+the fork you are targeting rather than from any table, including this one.
+</Aside>
+
+<Misconception
+  belief="`call{gas: gasleft()}` forwards everything you have."
+  reality="It forwards at most 63/64 of what remains after the call's own fixed charges. The expression names a ceiling that the protocol then reduces."
+  why="The syntax reads as an exact quantity, and `gasleft()` is a real number the machine will tell you. What the syntax cannot show is that the value is an argument to a `min`, not an instruction. Writing `gasleft()` there is a way of saying 'as much as allowed', which is usually what you meant — but it is not what it says."
+  src="eip-150"
+/>
+
+<Misconception
+  belief="`call{gas: x}` guarantees the callee receives x gas."
+  reality="It is a maximum. If less is available the call proceeds with less, and neither side is told. A contract that needs a sub-call to have had at least N gas must check `gasleft()` itself, before and after."
+  why="Named parameters read as requirements everywhere else — a timeout, a buffer size, an allocation request. Failure to satisfy them normally produces an error. Here the shortfall is absorbed silently, because there is no mechanism in the instruction for reporting one."
+  src="rareskills-eip150"
+/>
+
+## The decay, and the attack it killed
+
+If each frame keeps a sixty-fourth, forwarded gas shrinks geometrically with depth. After `d` nested
+calls the innermost frame holds at most `G × (63/64)^d`.
+
+Take the largest budget a single transaction can have — since the Fusaka upgrade a transaction is
+capped at 16,777,216 gas, which is 2^24, regardless of how much room the block
+has.<Cite src="eip-7825" /><Cite src="eip-7607" />
+Run the arithmetic on that ceiling:
+
+| depth | gas that could still reach the innermost frame |
+|---|---|
+| 10 | ~14,300,000 |
+| 100 | ~3,470,000 |
+| 200 | ~719,000 |
+| 500 | ~6,380 |
+| 1000 | ~2.4 |
+| 1024 | ~1.7 |
+
+This is arithmetic on the rule, not a measurement: it is `16777216 × (63/64)^d` with the integer
+flooring ignored, and it assumes each frame spends *nothing* except what the rule withholds. Real
+frames also pay for the call instruction itself, so the reachable depth is lower still. Simulating the
+same decay with a fixed per-frame consumption gives depth 500 at 100 gas per frame, 474 at 150, and
+293 at 2,600 — again arithmetic, not observation, and again worth reproducing yourself with a
+recursive contract and a `gasleft()` probe rather than believed.
+
+The point does not depend on the exact figure. **The 1024-frame depth limit is not reachable through
+gas-consuming calls.** You run out of gas hundreds of frames earlier, every time.
+
+<Misconception
+  belief="An attacker can exhaust the 1024-frame call stack to make a victim contract's internal call fail for reasons unrelated to its logic."
+  reality="That attack died with EIP-150 in 2016. Geometric gas decay starves the call chain long before frame 1024, so the depth counter cannot be driven to its limit by calls that do anything."
+  why="The call-depth attack is memorable, genuinely worked, and appears in security material that does not carry a date. It also produced a body of defensive code and folklore that outlived the threat by a decade, which is why you still meet contracts guarding against it."
+  src="eip-150"
+/>
+
+The depth limit still exists and still fails the way the previous lesson described — gas returned, 0
+pushed, execution continues.<Cite src="execution-specs-osaka-system" /> It is simply no longer a
+lever anyone can pull.
+
+## The attack it created
+
+Removing one attack created another, and this one is live.
+
+Because forwarded gas is a ceiling chosen by the caller, a caller can supply *just enough* gas for its
+own logic to complete and *not enough* for a sub-call to finish. The sub-call halts exceptionally.
+The outer frame sees false. If the outer code ignores that boolean, or treats failure as an acceptable
+outcome, the transaction succeeds having skipped the work it was supposed to do.
+
+That is **gas griefing**, and it is the opening scene. It has three ingredients, all of which must be
+present:
+
+1. Somebody other than the beneficiary chooses the gas limit — a relayer, a keeper, a batching
+   contract, an account-abstraction bundler.
+2. The outer logic can complete on less gas than the whole operation needs.
+3. The result of the inner call is not enforced.
+
+Remove any one and the attack disappears. Which is the useful way to hold it, because the third
+ingredient is the only one you usually control.
+
+<Figure
+  caption="The only party who chose a gas number here is the one who profits from there not being enough of it."
+  alt="A relayer sets the transaction gas limit high enough for its own path and no higher. The sub-call receives 63/64 of an insufficient remainder, halts exceptionally and pushes false. The outer frame continues, consuming the nonce and paying the fee, and the transaction receipt reports success."
+>
+  <Flow
+    lanes={['who chooses', 'the sub-call', 'the outer frame', 'what anyone sees']}
+    nodes={[
+      { id: 'r', label: 'relayer sets the limit', note: 'enough for its own path', col: 0, tone: 'danger' },
+      { id: 's', label: 'sub-call starved', note: '63/64 of not enough', col: 1, tone: 'danger' },
+      { id: 'o', label: 'outer frame carries on', note: 'nonce spent, fee paid', col: 2, tone: 'warn' },
+      { id: 'rc', label: 'receipt: status 1', note: 'the work did not happen', col: 3, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="If the transaction succeeded, everything it was supposed to do happened."
+  reality="An inner frame can fail on gas while the outer frame completes normally and reports success. A green receipt is a statement about the outermost frame and about nothing beneath it."
+  why="Atomicity is usually all-or-nothing at the boundary you interact with — a database transaction, an HTTP request, a job. Here atomicity is per frame, and a caller is free to observe a nested failure and carry on. That freedom is a feature when someone used it deliberately and an incident when nobody did."
+  src="eip-150"
+/>
+
+### What does not fix it
+
+**Checking `gasleft()` before the call.** The check passes, the call is made with 63/64 of what you
+had, and the callee runs out anyway because 63/64 of a small number is still a small number.
+
+**A larger fixed gas argument.** `call{gas: 100000}` is a maximum. When the caller holds less than
+that, the call proceeds with less, silently, by the `min` above.
+
+**Trusting the receipt.** A transaction's status flag reflects the outermost frame only. An inner
+frame that reverted or halted contributes nothing to it.<Cite src="execution-specs-osaka-interpreter" />
+
+### What does
+
+**Enforce the boolean.** `require(ok)` converts a silent skip into a loud failure, which pushes the
+cost of griefing back onto the griefer: the transaction now fails and they have wasted their own gas
+for no state change.
+
+**Measure gas across the call, not before it.** Record `gasleft()` immediately before and immediately
+after, and require the difference to be at least what the operation was supposed to consume. This is
+the only construction that detects "the callee was starved" as distinct from "the callee failed on its
+own merits", and it is what relayer contracts that take griefing seriously actually do.
+
+**Make the outer logic depend on the inner result.** If the payment to the relayer is computed from
+state that only the inner call can produce, a starved inner call stops being profitable to arrange.
+
+<Aside kind="warn">
+The 2,300-gas stipend is not a defence and has not been one for years. It is a fixed number priced
+against opcode costs that have been repriced repeatedly since it was chosen, so "the recipient can
+only log an event with 2,300 gas" is an assumption about a 2016 gas schedule.<Cite src="eip-1884" />
+The compiler now agrees: since 0.8.31, solc warns about the deprecation of `send` and `transfer` on
+`address`.<Cite src="solidity-changelog" /> Use `call` with an explicit reentrancy guard, and treat
+the gas you forward as a decision rather than a default.
+</Aside>
+
+### So how much should you forward?
+
+Three answers, in descending order of how often they are right.
+
+**Forward everything the rule allows, and check the result.** Omitting the gas argument entirely —
+`addr.call(data)` with no `{gas: ...}` — forwards the maximum the rule permits, which is what you want
+whenever the callee is trusted or the whole operation is meant to succeed or fail together. The 63/64
+reserve means you are still alive afterwards to branch on the boolean. This is the default for a
+reason.
+
+**Cap it deliberately when the callee is hostile and the failure is acceptable.** A notification hook,
+an optional callback, a best-effort refund: these are cases where you genuinely want a bound, because
+an unbounded callee could otherwise consume the whole transaction. Pick the bound from measurement of
+the honest path plus headroom, and document what happens when it is hit.
+
+**Never cap it to a number you read somewhere.** A fixed gas argument is an assertion about a gas
+schedule, and gas schedules change. EIP-1884's own backwards-compatibility section says it plainly:
+contracts that assume a fixed gas cost for calls, or for internal sections, may cease to
+function — and it names the 2,300 stipend as the case most likely to
+break.<Cite src="eip-1884" />
+
+The asymmetry worth internalising: **too much forwarded gas costs you nothing when the callee behaves,
+because unspent gas comes back. Too little costs you a silent skip.** The failure modes are not
+symmetric, so the default should not be either.
+
+## Why estimation cannot save you
+
+`eth_estimateGas` is where these two properties collide, and the failure mode is specific enough to
+be worth naming.
+
+Estimation is a dry run followed by a binary search: execute the transaction at some limit, see
+whether it succeeds, narrow the range. The search is only correct if success is monotonic in the gas
+limit — if a transaction that works at N also works at N+1. That assumption breaks whenever behaviour
+depends on the gas *available* rather than on the gas *needed*, and the 63/64 rule is exactly such a
+dependency. A transaction can be estimated to N, sent with N, and fail deep in the call tree, because
+at N the innermost frame receives fractionally less than it did during the run that the estimator
+sampled.
+
+Two practical consequences.
+
+**An estimate is a floor with no margin, not a budget.** Tooling adds headroom for this reason, and
+the appropriate headroom is a property of your call graph's depth, not a universal percentage.
+
+**An estimation failure is not a revert.** A node reporting that gas required exceeds allowance is
+making a balance-and-allowance statement, not a claim about the transition function. Reading
+estimation errors as revert reasons produces confidently wrong diagnoses.
+
+## The other way a caller gets hurt
+
+There is a symmetric hazard worth mentioning here because it is also about gas at a frame boundary,
+and it runs in the opposite direction.
+
+A caller that copies a sub-call's return data into memory pays memory-expansion gas proportional to
+the size of that data — and the callee chooses the size. A malicious callee can return megabytes,
+forcing the caller to pay a quadratic expansion cost it never agreed to, which is a denial of service
+against the caller rather than the callee. The mitigation is to bound how much return data you copy,
+using `RETURNDATASIZE` to decide rather than copying blindly; the pattern is well enough known to have
+a widely used library implementation.<Cite src="excessively-safe-call" />
+
+Both hazards have the same root. **Gas at a frame boundary is a negotiation with no protocol.** The
+caller picks how much to hand over and cannot be sure it was enough; the callee picks how much to hand
+back and the caller pays for it.
+
+<Check type="predict" concept="gas-griefing">
+A payments contract lets a relayer execute pre-signed user operations and take a fee:
+
+```solidity
+function execute(UserOp calldata op, bytes calldata sig) external {
+    require(_verify(op, sig), "bad signature");
+    nonces[op.sender]++;
+    (bool ok, ) = op.target.call{gas: op.callGas}(op.callData);
+    emit Executed(op.sender, ok);
+    _payRelayer(msg.sender, FLAT_FEE);
+}
+```
+
+The team's position: the boolean is not ignored, it is recorded in an event, and the user consented to
+`op.callGas` when they signed. Predict what a hostile relayer does, and what it costs them.
+
+<Answer>
+**The relayer sends the transaction with a total gas limit chosen so that `op.callGas` cannot be
+honoured.**
+
+`op.callGas` is a maximum, not a requirement. `min(gas, max_message_call_gas(...))` will silently
+trim it to 63/64 of whatever remains in the frame at that moment.<Cite src="execution-specs-osaka-gas" />
+The relayer controls the transaction-level gas limit, so they control what remains. They pick a limit
+generous enough for `_verify`, the nonce write, the event and `_payRelayer`, and too small for the
+sub-call.
+
+**What the relayer gains.** The nonce increments, so the user's signed operation is consumed and
+cannot be replayed. The event is emitted with `ok == false`, which almost nothing reads. `_payRelayer`
+pays out. The relayer is paid the flat fee for having done nothing, and can repeat it against every
+operation in the queue.
+
+**What it costs them.** Slightly *less* than executing honestly, because they skipped the expensive
+part. That is the whole problem: the griefing is not merely possible, it is the profit-maximising
+strategy. Any design where the fee does not depend on the work is a design that pays for not doing
+the work.
+
+**Three defects, ranked.**
+
+1. **The fee is unconditional.** `_payRelayer` runs whether `ok` is true or false. Gate it, or compute
+   it from something only a successful call produces.
+2. **The nonce is consumed before the call and never restored.** A user's operation is destroyed by a
+   failed attempt, which turns a griefing attack into a denial of service against the user as well as
+   a theft from the protocol.
+3. **`op.callGas` is treated as a guarantee.** The only way to establish that the sub-call actually
+   received what the user signed for is to measure it: read `gasleft()` before and after and require
+   the observed consumption, or the observed availability, to meet the signed figure. Nothing in the
+   call instruction reports it.
+
+**The one that is not a defect.** Recording the boolean in an event is genuinely better than
+discarding it — it makes the attack visible in hindsight. It is monitoring, not enforcement, and the
+team's mistake was counting it as the latter.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Three ways out of a frame** is next, and it completes this picture from the callee's side. You now
+know why a caller is always alive to observe a failure; the next lesson is about what the caller can
+actually tell about it, which is less than you would like.
+
+**Silent call failure** as a practice exercise is this lesson made concrete: build the two-contract
+case, prove in a test that the outer transaction succeeds with state changed and the inner work
+skipped, then fix it and prove the fix.
+
+**Account abstraction** in the app track inherits every ingredient of gas griefing at once — a bundler
+choosing gas limits on behalf of a user, a validation phase that must complete, and an execution phase
+that may not. The gas-accounting rules in that design exist because of exactly this
+mechanism.<Cite src="eip-150" />
+
+**Gas estimation and CI gas gates** in the toolchain track need the monotonicity caveat above. A gas
+snapshot taken in a test harness with different warmth and different depth is not the number your
+users pay, and the 63/64 rule is one of the reasons the two diverge.<Cite src="eip-2929" />
+
+Finally, the failure taxonomy this lesson keeps gesturing at — halted, reverted, returned false —
+stops being three overlapping words in the next lesson and becomes three distinct machine states with
+three distinct fingerprints.<Cite src="solidity-error-handling" />

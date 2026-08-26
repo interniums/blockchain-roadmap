@@ -1,0 +1,273 @@
+---
+id: evm-execution-the-opcode-that-stopped-deleting
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    eip-6780,
+    eest-eip6780,
+    execution-specs-osaka-system,
+    execution-specs-osaka-interpreter,
+    execution-specs-osaka-gas,
+    eip-3529,
+    eip-1014,
+    eip-7864,
+  ]
+stack: {}
+---
+
+An incident response goes like this. A contract has a kill switch. Something goes wrong, the switch is
+pulled, the transaction confirms, and the team writes in the postmortem that the contract has been
+destroyed and the exposure is closed.
+
+Then the monitoring keeps firing. The contract answers calls. Its storage reads back exactly as it
+did before. Its code is still there and still executable. The only thing that actually happened is
+that its ether went somewhere else.
+
+The team is not confused about their own code. They are working from documentation that was correct
+until Cancun, and `SELFDESTRUCT` is the one instruction in this module whose meaning changed
+underneath the material that describes it.
+
+## What it used to do, and what it does now
+
+**Before EIP-6780** the instruction did what its name says. It scheduled the account for deletion:
+code removed, storage removed, the account itself erased from the state trie, with its remaining
+balance sent to a beneficiary address.
+
+**Since EIP-6780** — live from Cancun — the deletion happens only if the contract was created in the
+*same transaction* that destroys it. In every other case the code and storage survive, the account
+stays in the state, and only the ether moves.<Cite src="eip-6780" />
+
+The specification implements the distinction with a set:<Cite src="execution-specs-osaka-system" />
+
+```python
+move_ether(state, originator, beneficiary, originator_balance)
+
+# register account for deletion only if it was created
+# in the same transaction
+if originator in evm.message.tx_env.state.created_accounts:
+    set_account_balance(state, originator, U256(0))
+    evm.accounts_to_delete.add(originator)
+
+evm.running = False
+```
+
+`created_accounts` is populated by `mark_account_created` when a creation frame
+opens.<Cite src="execution-specs-osaka-interpreter" /> Membership in that set is the entire condition.
+Everything else about the instruction is unchanged: the balance sweep happens unconditionally, the
+frame halts, and under a static context it raises `WriteInStaticContext` like any other mutating
+operation.<Cite src="execution-specs-osaka-system" />
+
+<Figure
+  caption="One branch is a deletion and the other is a transfer, and nothing in the source of the contract executing it says which one you are in."
+  alt="SELFDESTRUCT moves the whole balance to the beneficiary first, without any condition. It then tests whether the executing account is in the transaction's created_accounts set: if it is, the balance is zeroed and the account is registered for deletion, and if it is not, the code, storage and account all survive and only the ether has moved."
+>
+  <Flow
+    lanes={['the opcode', 'unconditional', 'the one condition', 'the outcome']}
+    nodes={[
+      { id: 's', label: 'SELFDESTRUCT', note: 'beneficiary off the stack', col: 0, tone: 'accent' },
+      { id: 'm', label: 'move_ether', note: 'the whole balance, always', col: 1, tone: 'warn' },
+      { id: 'q', label: 'in created_accounts?', note: 'born in this transaction', col: 2, tone: 'accent' },
+      { id: 'del', label: 'account erased', note: 'address deployable again', col: 3, tone: 'good' },
+      { id: 'live', label: 'code and storage survive', note: 'still callable, forever', col: 3, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 's', to: 'm' },
+      { from: 'm', to: 'q', tone: 'warn' },
+      { from: 'q', to: 'del', label: 'yes', tone: 'good' },
+      { from: 'q', to: 'live', label: 'no', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="SELFDESTRUCT deletes a contract."
+  reality="Since Cancun it deletes only a contract created within the same transaction. Otherwise the code and storage survive, the account remains callable, and the instruction is a balance sweep with a halt attached."
+  why="The opcode's name is a promise, and the behaviour it names was true for eight years. EIP-6780 shipped in 2024, so search results, tutorials, security checklists and a large amount of contract source all predate it and describe the old semantics in the present tense."
+  src="eip-6780"
+/>
+
+<Misconception
+  belief="Selfdestructing is a way to make a contract permanently unreachable."
+  reality="The contract remains deployed and callable, and every function it exposes still works. If you need a contract to become inert, the code must be written to become inert — a paused flag, or a fallback that reverts."
+  why="Removal is how you decommission things everywhere else: delete the deployment, revoke the certificate, drop the table. There is no equivalent here, and there has not been one since Cancun for anything that outlives its creating transaction."
+  src="eip-6780"
+/>
+
+## Why the change was made
+
+Not for safety, and not because anyone liked the instruction. Because unbounded state deletion is
+incompatible with where the state format is going.
+
+Ethereum's state is being prepared for a migration away from the hexary Merkle-Patricia trie, and the
+live direction is EIP-7864's unified binary tree, which freezes the existing trie and starts a new
+one for subsequent writes.<Cite src="eip-7864" /> Any scheme of that kind has to reason about what
+exists. An instruction that can erase an arbitrary quantity of storage in a single call — a contract
+with a million slots, removed in one instruction — makes the cost of a state transition unbounded and
+the migration logic far harder to reason about. Restricting deletion to accounts created within the
+same transaction bounds it to state that the same transaction just created, which is a quantity the
+transaction already paid for.<Cite src="eip-6780" />
+
+The gas schedule had already been moving the same way. EIP-3529 removed the `SELFDESTRUCT` refund
+entirely in 2021, on the grounds that refunds were being used as a gas battery rather than as an
+incentive to clean up state.<Cite src="eip-3529" /> Between the two changes, the instruction lost
+both its effect and its reward.
+
+<Aside kind="note">
+The costs still on the books, read from the Osaka fork's `GasCosts` on 26 August 2026:
+`OPCODE_SELFDESTRUCT_BASE` is 5,000, plus the cold account-access charge of 2,600 if the beneficiary
+has not been touched in this transaction, plus `OPCODE_SELFDESTRUCT_NEW_ACCOUNT` of 25,000 if the
+beneficiary does not yet exist and the contract has a non-zero balance to send
+it.<Cite src="execution-specs-osaka-gas" /><Cite src="execution-specs-osaka-system" /> You are paying
+up to about thirty-three thousand gas for what is, in the ordinary case, a transfer.
+</Aside>
+
+## The sweep still does the two things it always did
+
+Strip out the deletion and one capability remains, and it is the one that has always caused problems.
+
+**Ether can be pushed into a contract without its consent.** `move_ether` runs unconditionally, before
+the `created_accounts` check.<Cite src="execution-specs-osaka-system" /> No code executes at the
+beneficiary — no `receive`, no `fallback`, no chance to reject. So a contract that treats
+`address(this).balance` as an accounting invariant can have that invariant broken by anyone willing
+to spend the gas, and this remains true after EIP-6780 because the sweep was never the part that
+changed.
+
+**Ether can be burnt.** If the beneficiary is the contract itself *and* the contract was created in
+this transaction, the balance is set to zero as part of the deletion — the specification's own comment
+says the ether is burnt.<Cite src="execution-specs-osaka-system" /> Outside that case, naming yourself
+as beneficiary is a transfer to yourself and therefore a no-op.
+
+Both of these are reasons the instruction is worth understanding even though you will almost certainly
+never write it. It is a thing that can happen *to* your contract.
+
+## What actually broke
+
+Two patterns died with EIP-6780, and both were load-bearing for somebody.
+
+**Metamorphic contracts.** The trick was: deploy with `CREATE2` to a fixed address, `SELFDESTRUCT` to
+clear the code, then deploy *different* code to the *same* address with the same salt — because the
+CREATE2 address depends on the initcode hash, and a factory whose initcode fetches code from somewhere
+mutable keeps the same hash while producing different runtime code.<Cite src="eip-1014" /> The result
+was an address whose code could change with no proxy, no admin slot and no on-chain signal that an
+upgrade had occurred. Every security tool that answered "has this address's code changed" was answering
+a question that mattered a great deal.
+
+Outside a single transaction, that sequence no longer works: the first `SELFDESTRUCT` leaves the code
+in place, so the address is not redeployable.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Before Cancun', note: 'what the name promises', tone: 'muted' },
+    { title: 'Since Cancun', note: 'EIP-6780', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'Is the code removed?', cells: ['Yes', 'Only if the contract was created in this transaction'] },
+    { label: 'Is the storage removed?', cells: ['Yes', 'Only in that same case'] },
+    { label: 'Does the account leave the state?', cells: ['Yes', 'Only in that same case'] },
+    { label: 'Does the balance reach the beneficiary?', cells: ['Yes', 'Yes — unconditionally, before the check'] },
+    { label: 'Can the address be redeployed at?', cells: ['Yes — this was the metamorphic trick', 'Only if the code never outlived its birth transaction'] },
+    { label: 'Is any gas refunded?', cells: ['No — EIP-3529 removed the refund in 2021', 'No'] },
+    { label: 'Does an owner-only kill switch stop the contract?', cells: ['Yes', 'No — every function still works'] },
+  ]}
+  caption="Every row the opcode's name promises has become conditional. The one row that did not change is the one the name never mentioned."
+  alt="SELFDESTRUCT before and after EIP-6780: code removal, storage removal, account removal and address reuse all became conditional on the contract having been created in the same transaction, while the unconditional transfer of the whole balance to the beneficiary is unchanged and the gas refund had already been removed in 2021."
+/>
+
+**Kill switches.** Any contract holding an owner-only `selfdestruct` as its emergency stop now has an
+emergency stop that transfers the treasury and leaves every function callable. Treat every such
+contract you inherit as though the switch does nothing, because for the purposes of stopping
+execution, it does.
+
+**What still works** is the same-transaction create-and-destroy pattern: deploy a helper, use it,
+destroy it, all within one transaction. That is the only surviving legitimate use, and essentially all
+remaining real-world usage falls into it. The exact usage statistics circulating for this are from
+secondary summaries rather than a primary dataset, so treat "essentially all" as a direction rather
+than a measurement.
+
+<Aside kind="warn">
+The conformance tests are the right arbiter when a client, a tool or a document disagrees about any of
+this. The execution spec tests carry a dedicated EIP-6780 suite covering the same-transaction cases,
+the balance-sweep cases and the interaction with `CREATE2` redeployment.<Cite src="eest-eip6780" /> If
+a local fork, an L2 or a testing framework behaves differently from what this lesson describes, that
+suite is what settles it.
+</Aside>
+
+<Check type="predict" concept="selfdestruct-neutered">
+A protocol deploys per-trade escrow contracts with `CREATE2`, keyed on a hash of the trade parameters
+as salt. When a trade settles, the escrow calls `selfdestruct(treasury)`. The team's design note says
+this "frees the address for reuse and reclaims the state".
+
+Predict what actually happens, in two scenarios: (a) the escrow is deployed in one transaction and
+destroyed in a later one, which is the normal flow, and (b) a caller deploys and settles the escrow
+within a single transaction.
+
+<Answer>
+**(a) The normal flow — nothing is freed and nothing is reclaimed.**
+
+The escrow was created in an earlier transaction, so it is not in `created_accounts` when
+`selfdestruct` runs.<Cite src="execution-specs-osaka-system" /> The treasury receives the balance. The
+escrow's code and storage stay exactly where they were, and the account remains in the state trie
+forever.
+
+Three follow-on effects, in increasing order of how much they will cost the team.
+
+*The address is not reusable.* `CREATE2` at an address that already holds code fails — the
+specification checks that the target account is deployable and pushes 0 if it is
+not.<Cite src="execution-specs-osaka-system" /> So a second trade with the same parameters cannot
+deploy an escrow at all, and the factory reports failure by pushing zero rather than by reverting,
+which a caller that does not check will read as success.
+
+*The old escrow is still callable, with its old storage intact.* Every function on it works. If any
+of them assumed "this contract only exists while a trade is open", that assumption is now false, and
+whether it matters depends on what those functions do.
+
+*No state is reclaimed and no refund arrives.* The `SELFDESTRUCT` refund was removed by
+EIP-3529.<Cite src="eip-3529" /> The team is paying roughly five thousand gas plus access charges for
+a transfer.<Cite src="execution-specs-osaka-gas" />
+
+**(b) Deploy and settle in one transaction — the design works as written.**
+
+The escrow is in `created_accounts`, so code and storage are erased, the balance goes to the treasury,
+and the address becomes deployable again. This is the surviving legitimate use of the instruction, and
+it is legitimate precisely because the state being deleted was created and paid for in the same
+transaction.<Cite src="eip-6780" />
+
+**The uncomfortable part.** Scenario (b) means the same contract behaves differently depending on
+something no line of its source mentions: whether it happens to be settling in its birth transaction.
+A test suite that deploys and exercises a contract inside one test function may be sitting entirely
+inside case (b) while production runs entirely in case (a) — and the test will pass. This is the
+argument for exercising the deploy-then-act path across separate transactions, and for reading the
+EIP-6780 conformance suite rather than inferring behaviour from a green test.<Cite src="eest-eip6780" />
+
+**The fix.** Do not use address reuse as a design primitive. Include a nonce or an incrementing
+counter in the salt so every escrow gets a fresh address, and mark settled escrows inert with a flag
+their own code checks. Deletion is not available; inertness has to be written.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**State growth** as a protocol-level concern is the reason this instruction was neutered, and it is
+the same pressure behind [the state-format migration](/c/state-growth-problem), history expiry and
+stateless clients. EIP-6780 is a small, concrete instance of a constraint that shapes a great deal of
+the roadmap: anything unbounded that every node must carry forever eventually gets
+priced or removed.<Cite src="eip-7864" />
+
+**Upgradeability** in the Solidity track is where the death of metamorphic contracts actually lands.
+With code at a fixed address now genuinely immutable outside its creating transaction, the only ways
+to change behaviour are the explicit ones — a proxy with a pointer, a beacon, a diamond — all of which
+leave a visible on-chain signal. That is a net improvement in auditability, and it is worth knowing
+that it was a side effect of a state-management decision rather than a security one.
+
+**Force-fed ether** reappears in the security track as its own vulnerability class, because the sweep
+described above is one of two ways to push ether into a contract that does not want it — the other
+being a block reward or withdrawal credited directly to the address. Any invariant of the form
+`address(this).balance == expected` is breakable, and always was.
+
+And it closes this module the way it opened: the machine is small, its instructions are few, and the
+surprising behaviour is almost never in the instruction you are reading. It is in what the instruction
+stopped doing, what it never did, or what it does to somebody else's frame.

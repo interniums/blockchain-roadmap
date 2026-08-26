@@ -1,0 +1,428 @@
+---
+id: security-static-analysis-reading-without-running
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [measured-static-analysis-2026-08-26, foundry-lint-docs, crytic-slither, slither-detector-docs, slither-printer-docs, slither-action, cyfrin-aderyn, aderyn-detector-severity, cyfrin-audit-tools, crytic-building-secure-contracts, sok-1b-loss, owasp-sc-top-10, sarif-oasis-v210, arxiv-audit-gap-2026]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+Here is a contract with five defects in it. Four of them are the kind that end up in an incident
+report.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.36;
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function balanceOf(address who) external view returns (uint256);
+}
+
+contract Vault {
+    mapping(address => uint256) public shares;
+    uint256 public totalShares;
+    IERC20 public asset;
+    address public owner;
+
+    function setOwner(address newOwner) external {
+        owner = newOwner;
+    }
+
+    function deposit(uint256 amount) external {
+        uint256 s = amount * totalShares / (asset.balanceOf(address(this)) + 1);
+        shares[msg.sender] += s;
+        totalShares += s;
+    }
+
+    function withdraw(uint256 amt) external {
+        uint256 bal = shares[msg.sender];
+        require(bal >= amt);
+        (bool ok, ) = msg.sender.call{value: amt}("");
+        require(ok);
+        shares[msg.sender] = bal - amt;
+        totalShares -= amt;
+    }
+
+    function shift(uint256 x, uint256 y) external pure returns (uint256) {
+        return x >> y * 2;
+    }
+
+    function sweep(address[] calldata tos) external {
+        for (uint256 i = 0; i < tos.length; i++) {
+            asset.transfer(tos[i], 1);
+        }
+    }
+}
+```
+
+You can name them at a glance, because Track 04 spent a module on each. `setOwner` is an
+[access-control failure](/c/access-control-failure) with no modifier at all. `withdraw` sends value
+before it writes state, so it is [classic reentrancy](/c/reentrancy-classic) with the effects and the
+interaction in the wrong order. `deposit` divides by a balance an attacker can move by transferring
+tokens in directly, which is the [first-depositor inflation surface](/c/inflation-first-depositor-attack)
+in its rawest form. `sweep` ignores the boolean an ERC-20 transfer returns.
+
+Now here is what the static analyser that ships inside your toolchain says about it. Run on this
+machine with forge 1.7.1 and solc 0.8.36, at every severity level the tool
+offers.<Cite src="measured-static-analysis-2026-08-26" />
+
+<Matrix
+  corner="Lint"
+  cols={['Level', 'Location', 'Message']}
+  rows={[
+    { label: 'multi-contract-file', cells: [{ v: 'note', tone: 'muted' }, 'src/Vault.sol:4:11', 'prefer having only one contract, interface or library per file'] },
+    { label: 'multi-contract-file', cells: [{ v: 'note', tone: 'muted' }, 'src/Vault.sol:9:10', 'prefer having only one contract, interface or library per file'] },
+    { label: 'erc20-unchecked-transfer', cells: [{ v: 'warning', tone: 'warn' }, 'src/Vault.sol:40:13', "ERC20 'transfer' and 'transferFrom' calls should check the return value"] },
+  ]}
+  caption="A pattern matcher can see a discarded return value and two contracts sharing a file; it cannot see authorisation, ordering, or who controls a divisor."
+  alt="The complete output of forge lint on the vault contract at every severity level the tool offers: two notes about multiple contracts in one file at lines 4 and 9, and one warning that an ERC-20 transfer return value is unchecked at line 40."
+/>
+
+One real finding, and it is the least expensive of the five. Two notes about file organisation. The
+missing authorisation, the reentrancy and the manipulable divisor produced nothing.
+
+This is not a broken tool. It is a tool doing exactly the job its category can do, and this lesson is
+about knowing which job that is before you decide what a clean run entitles you to believe.
+
+<Figure
+  caption="This lesson is the first column; each of the next three exists because of a specific thing the tier before it declined to collect."
+  alt="The module's four tiers, left to right: static analysis over structure with no execution, symbolic testing over input classes via a solver, property fuzzing over reachable states by sampling, and proving over all executions within a model."
+>
+  <Flow
+    nodes={[
+      { id: 'sa', label: 'static analysis', note: 'structure, never executed', col: 0, tone: 'accent' },
+      { id: 'sym', label: 'symbolic testing', note: 'input classes, via a solver', col: 1 },
+      { id: 'fuzz', label: 'property fuzzing', note: 'reachable states, sampled', col: 2 },
+      { id: 'prove', label: 'proving', note: 'all executions in a model', col: 3 },
+    ]}
+    edges={[
+      { from: 'sa', to: 'sym', label: 'needs values' },
+      { from: 'sym', to: 'fuzz', label: 'needs sequences' },
+      { from: 'fuzz', to: 'prove', label: 'needs absence' },
+    ]}
+  />
+</Figure>
+
+## What "without running it" actually buys
+
+A static analyser never executes the contract. It parses the source into an abstract syntax tree,
+usually lowers that into an intermediate representation with a control-flow graph attached, and then
+matches structural patterns over the result. Slither's is called SlithIR, and its whole purpose is to
+make those patterns expressible in a few lines of Python rather than as tree
+surgery.<Cite src="crytic-slither" />
+
+That buys speed, because there is no state, no fork and no gas — Slither advertises an average
+execution time of under a second per contract<Cite src="crytic-slither" /> — and it buys totality,
+because the analyser visits every function whether or not a test reaches it. A dead branch and a hot
+path get the same attention.
+
+It costs one thing, and the cost is structural rather than a quality problem. The analyser reasons
+about all paths *approximately* instead of about any path *exactly*. It does not know what
+`asset.balanceOf` returns, what values reach `amt`, or who calls `setOwner`, because knowing any of
+those would require running the code against real state.
+
+So every detector sits somewhere on a trade between two error modes:
+
+- **Miss a real instance of the pattern.** The bug is there, the tool is silent.
+- **Report an instance that is unreachable, intended, or already handled elsewhere.**
+
+A detector tuned so that it never misses will necessarily produce the second kind, because the
+information that would let it discriminate is exactly the information it declined to collect by not
+executing. This is why "reduce the false positives" is not a bug report you can file against the
+category. It is the category.
+
+<Misconception
+  belief="False positives mean the analyser is badly written."
+  reality="Over-reporting is the price of never missing, and it is paid in a currency the analyser cannot see. A detector that reasons about approximate paths must flag instances it cannot rule out."
+  why="Every other tool in an engineer's day — compiler, type checker, test runner — is expected to be exact, so an inexact one reads as unfinished rather than as a different kind of instrument."
+  src="crytic-building-secure-contracts"
+/>
+
+## Slither, read as a shape rather than a list
+
+The conventional first pass is Slither: a Solidity and Vyper analysis framework written in Python,
+with a detector suite, a printer suite, an API for writing your own analyses, and a GitHub Action for
+CI.<Cite src="crytic-slither" /><Cite src="slither-action" />
+
+Every detector reports two axes rather than one severity: an **impact** and a **confidence**. Impact
+is how bad this would be if real. Confidence is how sure the detector is that it is real. Counting the
+detector table in the project README on 26 August 2026 gives one hundred detectors, distributed like
+this; each one has its own wiki entry describing the pattern it
+matches.<Cite src="measured-static-analysis-2026-08-26" /><Cite src="crytic-slither" /><Cite src="slither-detector-docs" />
+
+<Matrix
+  numeric
+  corner="Impact"
+  cols={['High confidence', 'Medium confidence', 'Row total']}
+  rows={[
+    { label: 'High', cells: [{ v: '15', tone: 'accent' }, '14', '29'] },
+    { label: 'Medium', cells: ['14', '14', '28'] },
+    { label: 'Low', cells: ['8', '9', '17'] },
+    { label: 'Informational', cells: [{ v: '17', tone: 'muted' }, { v: '4', tone: 'muted' }, '21'] },
+    { label: 'Optimization', cells: [{ v: '5', tone: 'muted' }, '—', '5'] },
+  ]}
+  caption="Impact and confidence are separate axes, and the distribution across them is what turns a hundred detectors into a reading order."
+  alt="Slither's one hundred detectors counted on 26 August 2026, by impact — high, medium, low, informational and optimization — against high and medium confidence, with row totals of 29, 28, 17, 21 and 5."
+/>
+
+Treat the total as a moving number — it changes with releases, and any comparison you build on it goes
+stale the next time someone merges a detector. The *shape* is the durable part, and it tells you three
+things a bare count does not.
+
+**Twenty-six of the hundred are not about security at all.** Informational and Optimization detectors
+report naming conventions, dead code, and variables that could be `constant`. They are useful, they
+are not findings, and if you read the output top to bottom they are most of what you read.
+
+**Only fifteen are both high impact and high confidence.** That is your first-pass triage queue, and
+it is short enough to read in full on any codebase. Running with the impact and confidence filters
+turned up is not cutting corners; it is reading the tool the way its authors labelled it.
+
+**The high-impact, medium-confidence band is where the work is.** Fourteen detectors — including the
+reentrancy family — flag a serious pattern the tool cannot confirm. Every one of those is a question
+addressed to you, not an answer.
+
+### The half of Slither that is not a detector
+
+The part experienced reviewers use most is the part that reports nothing at all. **Printers** dump
+structure rather than findings.<Cite src="slither-printer-docs" /> A few worth knowing by
+name:<Cite src="crytic-slither" />
+
+- `human-summary` and `contract-summary` — the orientation pass on a codebase you have never seen.
+- `entry-points` — every state-changing entry point and the variables it touches. This is your attack
+  surface, enumerated by a machine instead of by grep.
+- `vars-and-auth` — for each function, the state variables it writes and the authorisation it
+  performs.
+- `call-graph`, `inheritance-graph`, `cfg` — the diagrams you would otherwise draw by hand.
+
+Sit with `vars-and-auth`, because it is the sharpest illustration of where the boundary between tool
+and reviewer falls. It will not tell you that `setOwner` is missing a check. It will hand you a table
+with `setOwner` in one column, `owner` in the written-state column, and *nothing* in the authorisation
+column — and you supply the judgement that the cell should not be empty. The tool did the enumeration,
+which is the part humans do badly. You did the intent, which is the part the tool cannot do at all.
+
+There is also a set of standalone commands built on the same framework:
+`slither-check-upgradeability` for delegatecall-based upgrade paths, `slither-read-storage`,
+`slither-check-erc` for standard conformance.<Cite src="crytic-slither" /> If you worked through
+[storage collisions](/c/storage-collision) in Track 04, the first is a machine that asks the questions
+you learned to ask.
+
+## Aderyn, and what its severity scale refuses
+
+Aderyn is Cyfrin's analyser: Rust, open source, no configuration needed on a Foundry or Hardhat
+project, and reports in Markdown, JSON or SARIF.<Cite src="cyfrin-aderyn" />
+
+SARIF is worth pausing on. It is an OASIS standard for the output of static analysis
+tools<Cite src="sarif-oasis-v210" /> and it is what makes a finding a *record* rather than a line of
+terminal output — one a code-scanning dashboard can ingest, deduplicate across runs, and hold open
+until someone dispositions it. Slither reaches the same destination through its GitHub Action, which
+uploads to code scanning.<Cite src="slither-action" /> The last lesson in this module comes back to
+why that matters more than it looks like it should.
+
+The received framing is that Aderyn trades coverage for signal — fewer detectors, tuned to waste less
+of a reviewer's attention.<Cite src="cyfrin-audit-tools" /> Half of that is right, and it is not the
+half people repeat.
+
+Counting the detector modules on the project's development branch on 26 August 2026 gives thirty-nine
+high-severity detectors and forty-nine low-severity ones: eighty-eight in
+total.<Cite src="measured-static-analysis-2026-08-26" /><Cite src="cyfrin-aderyn" /> Against Slither's
+hundred, that is not a meaningfully smaller suite. Coverage is not where these two tools differ.
+
+What differs is the scale. Aderyn's severity type has exactly two variants — high and
+low.<Cite src="aderyn-detector-severity" /> There is no Medium. There is no Informational, no
+Optimization, and no separate confidence axis. Every detector the project ships has been forced into
+one of two buckets, and the design bet is that a reviewer reads a two-column report and triages a
+five-by-two one.
+
+That is a real, arguable position rather than marketing. A Medium is the finding nobody dispositions:
+too serious to close without reading, not serious enough to read today. Collapsing the scale removes
+the place those accumulate, at the cost of forcing a call on borderline detectors.
+
+<Misconception
+  belief="More detectors is better, so pick the analyser with the bigger suite."
+  reality="On a count taken the same day, the two leading analysers were within about a dozen detectors of each other. What actually differs is the reporting taxonomy and therefore how much reviewer attention the output consumes — and reviewer attention, not analysis time, is the resource in short supply."
+  why="Detector count is the one number that is easy to compare, publish and put in a table, so it becomes the axis of comparison regardless of whether it predicts anything."
+  src="cyfrin-audit-tools"
+/>
+
+The practical answer is not to pick. Both are free, both run in seconds, and they parse Solidity
+through entirely different front ends.<Cite src="crytic-slither" /><Cite src="cyfrin-aderyn" /> Two
+independent parsers disagreeing about your contract is itself information, and the module's first
+practice is exactly that comparison.
+
+## The analyser you did not know you were running
+
+Foundry ships a linter of its own. It is not marketed as a security tool, and it behaves like one
+anyway.
+
+Two facts from `forge config` on this machine matter more than the marketing. The default severity set
+is high, medium and low — informational and gas lints are off unless you ask. And `lint_on_build` is
+**true**, which means `forge build` has been running a static analyser over your source on every
+compile.<Cite src="measured-static-analysis-2026-08-26" /><Cite src="foundry-lint-docs" />
+
+The documentation indexes ninety-one lints across six severity levels, with high-severity entries whose
+names read like a direct port of Slither's high-impact set: `arbitrary-send-eth`,
+`controlled-delegatecall`, `encode-packed-collision`, `reentrancy-eth`,
+`unprotected-initializer`.<Cite src="foundry-lint-docs" />
+
+Then check the binary against the documentation. Probing all ninety-one documented lint ids against
+forge 1.7.1 with `forge lint --only-lint <id>`: **twenty-three are recognised and sixty-eight are
+rejected as an unknown lint id.**<Cite src="measured-static-analysis-2026-08-26" /> Everything in the
+list above — `reentrancy-eth`, `arbitrary-send-eth`, `tx-origin`, `protected-vars`,
+`missing-zero-check` — is in the sixty-eight.
+
+<Aside kind="warn">
+This is the trap, and it is worse than a stale docs page. A team reads the lint index, sees
+`reentrancy-eth` in the high-severity section, concludes that `forge build` already covers reentrancy,
+and stops there. On the pinned release they are actually running, it does not. The published docs
+describe a build that is ahead of the last tagged binary, and nothing in either the docs or the tool
+output says so.
+
+The check takes one command per lint id and it is the same discipline as
+[pinning your compiler](/c/solc-pinning): the artefact you run is the fact, the documentation is a
+claim about some artefact.
+</Aside>
+
+That is also why the twenty-three that *do* exist are worth knowing individually. Four of them are
+security-relevant — `erc20-unchecked-transfer`, `unchecked-call`, `divide-before-multiply`,
+`incorrect-shift` — plus the two ERC interface checks, `unsafe-typecast` and `block-timestamp`. The
+rest are naming conventions, unused imports and gas hints.<Cite src="measured-static-analysis-2026-08-26" />
+A useful set. Not a security gate.
+
+## Working the output: a triage pass
+
+The skill this lesson is really teaching is not "run Slither". It is what you do with the twenty
+lines that come back. Here is the pass, run over the output at the top of this lesson.
+
+**Subgoal: establish what the tool was capable of seeing.** Before reading a single finding, name the
+category. This is pattern matching over structure with no execution and no state. It can see that a
+return value is discarded, that two contracts share a file, that a shift's operands look reversed. It
+cannot see who is allowed to call anything, what a price should be, or whether an ordering is
+deliberate. Doing this first stops you from reading silence as evidence.
+
+**Subgoal: disposition every finding, including the ones you dismiss.** `erc20-unchecked-transfer` at
+line 40 is real: some tokens return false instead of reverting, and `sweep` would carry on through the
+loop. Disposition: fix, wrap in a safe-transfer helper. `multi-contract-file` twice: style, not
+security. Disposition: acknowledged, suppressed with a reason. A finding without a written disposition
+is one you will re-decide from scratch next week, which is how twenty lines consume attention forever.
+
+**Subgoal: name what the tool could not have found, before you look.** Write the list from the code,
+not from the report: `setOwner` has no caller restriction; `withdraw` interacts before it updates;
+`deposit` divides by a balance an outsider can move. Now compare. Three defects, three silences. The
+comparison is the calibration — do it once on a codebase you know and the phrase "Slither found
+nothing" permanently stops meaning what it used to.
+
+**Subgoal: convert the silence into a question for the next tier.** Each of the three has a natural
+next instrument, and the rest of this module is that list. Authorisation is a human question against a
+role table. The ordering bug is a property a fuzzer can falsify in seconds. The divisor is arithmetic,
+which is where symbolic execution earns its keep. None of them is a static-analysis question, which is
+the correct conclusion to draw from a clean static-analysis run.
+
+## What the tools structurally cannot infer
+
+Point the category at the loss data and the shape of the problem is unmistakable. Among smart-contract
+*vulnerability* categories, the systematic review of severe real-world attacks puts **access control**
+at the top of the ranking by value lost, with logic errors next, and reentrancy well below
+both.<Cite src="sok-1b-loss" /> Widen the frame to every documented incident, including operational
+compromise that never touched a contract bug, and stolen keys and phishing both rank above access
+control — the counts disagree about what to include, not about the arithmetic.<Cite src="arxiv-audit-gap-2026" />
+What survives either framing is the gap between access control and reentrancy. The 2026 OWASP Smart
+Contract Top 10, built from the previous year's incidents, leads with access control and puts
+business-logic bugs second.<Cite src="owasp-sc-top-10" />
+
+<Aside kind="note">
+This module deliberately publishes the *ranking* and not the per-class dollar totals. The figures in
+circulation for the two leading categories cover periods that do not line up with each other, and
+reproducing them side by side would imply a comparison the underlying sources do not
+support.<Cite src="sok-1b-loss" /> The ordering is what the argument needs and the ordering is not in
+dispute.
+</Aside>
+
+Both leading categories are questions about **intent**. "Should this function be callable by anyone?"
+has no answer in the source, because the source is the thing being questioned. `setOwner` is
+syntactically indistinguishable from a setter that is genuinely meant to be open, and a detector that
+flagged every unguarded state write would flag most of every codebase — which is the over-reporting
+failure mode arriving from the other direction.
+
+So the two categories that lead the smart-contract vulnerability rankings are precisely the two an
+analyser cannot reach, and the categories it handles best — the mechanical, pattern-shaped ones — sit further down the list. That is not an
+argument against running it. It is an argument against ever reporting a clean run as a result.
+
+<Misconception
+  belief="A clean static-analysis run means the contract is in reasonable shape."
+  reality="It means no configured detector matched a structural pattern. The two categories that top the smart-contract vulnerability rankings are access-control intent and business logic, neither of which is a structural pattern, and a contract with both can produce a completely empty report — as the one at the top of this lesson nearly did."
+  why="A tool that prints nothing looks exactly like a tool that found nothing to find, and empty output is the same shape as a passing test suite, which we are trained to read as good news."
+  src="sok-1b-loss"
+/>
+
+<Check type="spot-bug" concept="static-analysis">
+A team hands you a pull request with this evidence attached:
+
+- `slither . --filter-paths lib` — 0 findings
+- `aderyn .` — 0 high, 3 low, all three acknowledged in the report
+- `forge build` — clean, and the repo has `lint_on_build` at its default
+
+They are asking for sign-off on a contract that holds user deposits and has an admin-only pause
+function and an admin-only fee setter.
+
+What have you actually been shown, what have you not been shown, and what is the single highest-value
+thing you would ask for next?
+
+<Answer>
+**What you have been shown.** That no detector in three independently written suites matched a
+structural pattern in the non-library source. That is genuinely worth something: it rules out the
+mechanical families — reversed shift operands, discarded transfer return values, unchecked low-level
+calls, `encodePacked` collisions, dangerous strict equalities. Three parsers agreeing is stronger than
+one, because the tools have different front ends and different detector
+sets.<Cite src="crytic-slither" /><Cite src="cyfrin-aderyn" />
+
+**What you have not been shown, in order of how much it costs you.**
+
+*Whether "admin-only" is true.* Nothing in that evidence bundle establishes that the pause function
+and the fee setter carry a check, and nothing establishes what the check compares against. This is the
+category that leads the smart-contract vulnerability rankings by value lost, and it outweighs
+reentrancy many times over in every published count<Cite src="sok-1b-loss" /> — yet it is invisible to
+all three tools, because the correct authorisation for a function is a fact about the product rather
+than about the code.
+
+*Whether the tools ran on what you think they ran on.* `--filter-paths lib` excludes dependencies —
+reasonable, and also means a vendored library is out of scope. A clean run over the wrong file set is
+the most common way a green report is technically true and useless.
+
+*Whether `forge build` was doing what they believe.* On forge 1.7.1, sixty-eight of the ninety-one
+documented lints are not in the binary, including every reentrancy lint. A team quoting `lint_on_build`
+as reentrancy coverage is quoting the documentation, not their
+toolchain.<Cite src="measured-static-analysis-2026-08-26" />
+
+*Whether anything about the economics holds.* Share pricing, rounding direction, fee accounting: no
+detector has an opinion about arithmetic that is legal and wrong.
+
+**The single highest-value ask.** Not another tool. Ask for `slither . --print vars-and-auth` — or the
+same table by hand — covering every state-changing entry point, with the authorisation column filled
+in and each empty cell justified in one sentence.<Cite src="slither-printer-docs" /> It converts the
+open question into an enumerated one, it is cheap, it is exactly the output a printer is for, and it
+puts the intent judgement in front of the person who has it. The three zero-finding reports told you
+what nobody needed to ask. That table tells you whether the costliest contract-vulnerability category applies.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson stops approximating.** Symbolic execution keeps the "do not run it against real
+state" property but replaces pattern matching with a solver that reasons about actual input values —
+which is how the manipulable divisor in `deposit` becomes a machine-answerable question rather than a
+silence.
+
+**The two after it buy back the information this category threw away.** Fuzzing runs the code against
+generated inputs; proving runs it against all of them within a model. Each tier exists because of a
+specific thing static analysis declined to collect, and knowing which thing is how you choose.
+
+**The false-positive argument reappears as an economic one.** In the audit-craft module the same
+observation is stated as [the cost of a false positive](/c/false-positive-cost): reviewer attention is
+the budget, and every finding you make someone read is drawn against it.
+
+**And the calibration transfers past Solidity.** "What can this tool see, and what is it structurally
+blind to" is the question to ask of a coverage report, a monitoring alert, a type checker and an audit
+report. The instrument that has never surprised you is the one whose blind spot you have not found
+yet.

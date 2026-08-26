@@ -1,0 +1,435 @@
+---
+id: evm-execution-three-ways-out-of-a-frame
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    eip-140,
+    eip-211,
+    execution-specs-osaka-interpreter,
+    execution-specs-osaka-system,
+    solidity-error-handling,
+    solidity-docs-contracts,
+    excessively-safe-call,
+    eip-658,
+  ]
+stack:
+  cast: "1.7.1"
+---
+
+A support ticket says the transfer succeeded and the tokens never arrived. The user has a transaction
+hash. The explorer shows a green tick. The contract's own event log shows the transfer being recorded.
+Every observable says it worked.
+
+Somewhere inside that transaction, a frame ended badly, pushed a zero onto its caller's stack, and
+the caller did not look.
+
+This lesson is about the four ways a frame can end, the three signals a caller can use to tell them
+apart, and the encoding of the payload that carries the reason. It is the least glamorous material in
+the module and the source of more production incidents than anything else in it.
+
+## Four exits, three outcomes
+
+A frame's execution ends in exactly one of four ways. Group them by what they do to three things: the
+frame's state changes, the frame's remaining gas, and the bytes the caller can read afterwards.
+
+| exit | state changes | remaining gas | output bytes | caller's stack |
+|---|---|---|---|---|
+| `RETURN` | kept | returned to caller | whatever you returned | 1 |
+| `STOP` | kept | returned to caller | none | 1 |
+| `REVERT` | undone | returned to caller | whatever you passed | 0 |
+| exceptional halt | undone | **consumed entirely** | none | 0 |
+
+The last row covers an invalid opcode, a jump to a non-`JUMPDEST`, a stack underflow or overflow, an
+out-of-bounds `RETURNDATACOPY`, a mutation attempted under `STATICCALL` — and running out of gas,
+which is a special case of the same thing rather than a category of its own.
+
+The mechanism is the pair of handlers you met in the first lesson of this
+module.<Cite src="execution-specs-osaka-interpreter" />
+
+```python
+except ExceptionalHalt as error:
+    evm.gas_left = Uint(0)
+    evm.output = b""
+    evm.error = error
+except Revert as error:
+    evm.error = error
+```
+
+Both paths then call `restore_tx_state`, so both undo everything the frame did. The exceptional path
+additionally zeroes the gas and discards the output. `REVERT` exists precisely to *not* do those two
+things: EIP-140 introduced it in 2017 so that a contract could stop, undo, and still say
+why.<Cite src="eip-140" />
+
+<Figure
+  caption="Two endings that could not be more different arrive at the caller as the same zero; only the buffer and the gas separate them."
+  alt="A frame ends in one of three outcomes. RETURN or STOP keeps its state changes and returns its unspent gas, and the caller sees 1. REVERT undoes its state changes but still returns unspent gas and a payload, and the caller sees 0. An exceptional halt undoes state, consumes all remaining gas and discards the output, and the caller also sees 0."
+>
+  <Flow
+    lanes={['the frame ends', 'one of three ways', "the caller's stack"]}
+    nodes={[
+      { id: 'f', label: 'the frame ends', note: 'four exits, three outcomes', col: 0, tone: 'accent' },
+      { id: 'ok', label: 'RETURN or STOP', note: 'state kept, gas returned', col: 1, tone: 'good' },
+      { id: 'rev', label: 'REVERT', note: 'state undone, gas returned', col: 1, tone: 'warn' },
+      { id: 'halt', label: 'exceptional halt', note: 'state undone, gas gone', col: 1, tone: 'danger' },
+      { id: 'one', label: '1', note: 'output: what you returned', col: 2, tone: 'good' },
+      { id: 'zero', label: '0', note: 'output: your payload, or nothing', col: 2, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'f', to: 'ok', tone: 'good' },
+      { from: 'f', to: 'rev', tone: 'warn' },
+      { from: 'f', to: 'halt', tone: 'danger' },
+      { from: 'ok', to: 'one', tone: 'good' },
+      { from: 'rev', to: 'zero', tone: 'warn' },
+      { from: 'halt', to: 'zero', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="`assert` compiles to the invalid opcode and burns all your gas."
+  reality="Since Solidity 0.8.0 a failed `assert` reverts with `Panic(uint256)` and returns the unused gas. The burn-everything behaviour is pre-0.8 history."
+  why="It was true, it was taught heavily, and it was the whole basis of the 'require for inputs, assert for invariants — and assert is expensive' rule that many engineers learned first. The Solidity documentation records the change in a single note: panic exceptions used the invalid opcode before 0.8.0, which consumed all gas available to the call."
+  src="solidity-error-handling"
+/>
+
+<Aside kind="note">
+`STOP` deserves one line of attention because it is the default. A frame whose code simply runs off
+the end — or which reaches a `STOP` — succeeds with empty output. That is why calling *any* function
+on an account with no code succeeds: the empty program halts immediately, having done nothing, and
+pushes 1.
+</Aside>
+
+## What a caller can actually see
+
+From the calling frame, a sub-call leaves behind exactly three observable things.
+
+**The boolean.** 1 for success, 0 for either kind of failure.<Cite src="execution-specs-osaka-system" />
+Both failure modes look identical here.
+
+**The return-data buffer.** Populated with the callee's output whatever the outcome — the revert
+payload on a revert, and nothing at all on an exceptional halt, because the handler discarded the
+output.<Cite src="execution-specs-osaka-interpreter" />
+
+**The gas.** A revert hands back the unspent portion. An exceptional halt hands back nothing from that
+frame.
+
+So the caller's diagnostic table looks like this:
+
+| what you observe | what happened |
+|---|---|
+| 1, any output | success |
+| 0, non-empty output | the callee reverted, and told you why |
+| 0, empty output, large gas consumption | probably an exceptional halt, most likely out of gas |
+| 0, empty output, small gas consumption | a bare `revert()`, a depth-limit refusal, or an insufficient-balance `CALL` |
+
+The bottom two rows are the reason "the call failed" is so often as much as anyone can say. Empty
+revert data is genuinely ambiguous, and the ambiguity is structural rather than a gap in tooling.
+
+<Aside kind="warn">
+`require(cond)` with no message reverts with empty data — not even a selector.<Cite src="solidity-error-handling" />
+Every bare `require` in your codebase is a future incident where the only information available is
+"something in this contract said no". Custom errors cost four bytes of return data and remove the
+entire class of unexplained failure; there is no configuration in which they are the more expensive
+option in engineering terms.
+</Aside>
+
+## The boolean nobody checks
+
+`CALL`, `DELEGATECALL` and `STATICCALL` push 1 or 0. Nothing propagates automatically. That is the
+whole of the machine's error-handling design.<Cite src="eip-140" />
+
+Solidity hides this, but only for one of its two call syntaxes, and the split is worth memorising
+because it is where the opening scene came from.
+
+**High-level calls check and bubble up.** `token.transfer(to, amount)` compiles to a `CALL` followed
+by a branch: if the boolean is 0, re-raise, forwarding the callee's error data. The documentation
+lists the situations in which this happens, and it explicitly excludes the low-level
+operations.<Cite src="solidity-error-handling" />
+
+**Low-level calls do not.** `addr.call(...)`, `addr.delegatecall(...)`, `addr.staticcall(...)`,
+`send`, and any hand-written assembly `call` return a boolean and nothing else happens. The compiler
+will warn about an unused return value; it will not stop you.
+
+**High-level calls also check that the target has code.** Solidity inserts an `EXTCODESIZE` check
+before an external function call and reverts if the account is empty, because otherwise the call would
+succeed and return nothing and the decoder would produce zeros.<Cite src="solidity-docs-contracts" />
+A low-level call performs [no such check](/c/raw-call-no-existence-check).
+
+<Misconception
+  belief="A failed inner call aborts the whole transaction."
+  reality="A low-level call pushes 0 and execution continues at the next instruction. Only Solidity's high-level call syntax inserts the check and the re-raise, and only for calls made through that syntax."
+  why="Every mainstream language propagates exceptions by default and requires you to opt out. Here the default is the opposite and the opt-in is invisible at the call site, because both syntaxes look like method invocation. The result is that whether a failure propagates depends on which of two nearly identical spellings someone used."
+  src="eip-140"
+/>
+
+That misconception has a second-order form that is more dangerous, because it survives the first
+correction. A contract that dutifully writes `(bool ok, ) = addr.call(data);` and then never mentions
+`ok` again is *not* checking anything. Neither is one that writes `emit Result(ok)`. Checking means a
+branch that changes what happens.
+
+## The return-data buffer
+
+`RETURNDATASIZE` and `RETURNDATACOPY` read one buffer per frame, and its behaviour has four properties
+that between them account for a whole family of assembly bugs.<Cite src="eip-211" />
+
+**It holds the last sub-call's output, whatever the outcome.** A revert payload lands there. That is
+exactly how revert reasons are recovered: the callee's `REVERT` wrote bytes, the handler kept them,
+and the caller reads them out.
+
+**It is cleared at the start of every sub-call.** The specification sets `evm.return_data = b""` as
+the first statement of the shared call implementation.<Cite src="execution-specs-osaka-system" /> So a
+call that never happens — one refused by the depth limit, or a value-bearing call the contract cannot
+afford — leaves the buffer empty rather than stale.
+
+**It is overwritten by the next sub-call.** Anything you need must be copied out before you call
+anything else. In a loop over several external calls, only the last one's data survives.
+
+**`CREATE` is asymmetric.** On success the buffer is set to empty, because the useful output was the
+address. On failure it holds the initcode's revert payload — which is the only way to find out why a
+deployment failed.<Cite src="execution-specs-osaka-system" />
+
+<Misconception
+  belief="The return-data buffer holds the output of the last successful call."
+  reality="It holds the output of the last call, whatever its outcome. A revert payload lands there too — which is precisely how revert reasons are recovered — and a `CREATE` that fails puts its initcode's revert data there while a `CREATE` that succeeds leaves it empty."
+  why="The name says 'return data', and returning is what a successful call does. Nothing in the naming hints that the buffer is really 'the bytes the last sub-call left behind', which is the accurate description and covers all four exits."
+  src="eip-211"
+/>
+
+<Misconception
+  belief="`RETURNDATACOPY` zero-pads a read past the end of the buffer, the way `CALLDATACOPY` does."
+  reality="It halts exceptionally. Reading beyond `RETURNDATASIZE` is an error, not a padded read, and the two opcodes are deliberately asymmetric."
+  why="Their names, signatures and operand orders are identical, which invites the analogy. The rationale is that calldata is attacker-supplied and short reads should degrade gracefully, whereas return data is a response whose length you can always query first — so a read past the end is a bug in your code rather than a hostile input."
+  src="eip-211"
+/>
+
+There is a fifth trap that sits between the buffer and memory, and it caught a lot of hand-written
+assembly. When a `CALL` copies output into the caller's memory, the specification writes
+`child_evm.output[:min(memory_output_size, len(output))]` — the *smaller* of what you asked for and
+what arrived.<Cite src="execution-specs-osaka-system" /> If the callee returned fewer bytes than you
+reserved, the rest of your buffer keeps whatever was in it. Read the size, do not assume it.
+
+### The other direction: return-data as a weapon
+
+The buffer is sized by the callee, and copying from it costs the caller memory-expansion gas. A
+callee that returns a very large payload therefore imposes a cost on its caller that the caller never
+agreed to, which is a denial of service running from callee to caller.
+
+The mitigation is to read `RETURNDATASIZE` and copy only a bounded prefix, rather than copying
+whatever arrived. Solidity's high-level call syntax copies everything, so this is one of the small
+number of places where dropping to assembly is the correct engineering answer rather than a
+premature optimisation; the pattern has a widely used library
+implementation.<Cite src="excessively-safe-call" />
+
+## Revert payloads are ABI-encoded calls
+
+The bytes in that buffer are not a string. They are encoded exactly like calldata: a four-byte
+selector followed by ABI-encoded arguments.<Cite src="solidity-error-handling" />
+
+Three shapes exist.
+
+**`Error(string)`, selector `0x08c379a0`.** Produced by `require(cond, "message")` and by
+`revert("message")`. The selector is the first four bytes of `keccak256("Error(string)")`, which you
+can confirm in one line with `cast keccak "Error(string)"`.
+
+**`Panic(uint256)`, selector `0x4e487b71`.** Produced by compiler-inserted checks, and by `assert`.
+The argument identifies which check failed. The documented codes
+are:<Cite src="solidity-error-handling" />
+
+| code | meaning |
+|---|---|
+| `0x00` | generic compiler-inserted panic |
+| `0x01` | `assert` with a false argument |
+| `0x11` | arithmetic overflow or underflow outside an `unchecked` block |
+| `0x12` | division or modulo by zero |
+| `0x21` | conversion of an out-of-range value into an enum |
+| `0x22` | access to an incorrectly encoded storage byte array |
+| `0x31` | `.pop()` on an empty array |
+| `0x32` | array, `bytesN` or slice index out of bounds |
+| `0x41` | allocating too much memory, or creating an array that is too large |
+| `0x51` | calling a zero-initialised variable of internal function type |
+
+Two of those are worth committing to memory because you will meet them constantly: `0x11` is the
+overflow check that arrived with Solidity 0.8, and `0x32` is an index out of bounds. Seeing
+`0x4e487b71` followed by `...0011` in a trace and recognising it as an overflow saves an hour.
+
+**A custom error, selector = first four bytes of the keccak of its canonical signature.** So
+`error InsufficientBalance(address account, uint256 needed, uint256 available)` has canonical
+signature `InsufficientBalance(address,uint256,uint256)` and selector `0xdb42144d` — parameter names
+are not part of the signature, exactly as with [function selectors](/c/abi-function-selector).
+
+<Misconception
+  belief="A revert reason is a string, so an unrecognised revert means the string was missing."
+  reality="A revert payload is an ABI-encoded call to a synthetic function. The string case is one selector out of many. Opaque hex in a trace usually means a custom error whose ABI your decoder does not have."
+  why="Every tool renders the `Error(string)` case as bare text, because that is the case a human can read without a lookup. The rendering hides the encoding so effectively that the other cases look like corruption rather than like a different, equally well-formed message."
+  src="solidity-error-handling"
+/>
+
+<Aside kind="note">
+This is also why bubbling a revert up unchanged is worth doing carefully. Copying the callee's return
+data and re-reverting with it preserves the original selector and arguments, so the caller's caller
+can still decode it. Replacing it with a string of your own — `require(ok, "swap failed")` — discards
+the actual reason and replaces it with a label. Both are common; only one is debuggable.
+</Aside>
+
+### Decoding one by hand
+
+Do this once and you will never mistake a revert payload for a string again. Here is the full return
+data produced by `require(false, "insufficient allowance")`, generated on this machine with cast
+1.7.1:
+
+<Figure
+  caption="Three of these four fields exist only to say where the string is. The string itself is the last one."
+  alt="The return data from require(false, 'insufficient allowance'): a four-byte Error(string) selector 08c379a0, a 32-byte offset word holding 0x20, a 32-byte length word holding 0x16, and a 32-byte word holding the 22 UTF-8 bytes of the message right-padded with zeros."
+>
+  <Anatomy
+    value="0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000016696e73756666696369656e7420616c6c6f77616e636500000000000000000000"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 10, label: 'selector', note: 'keccak("Error(string)")[0:4]', tone: 'accent' },
+      { from: 10, to: 74, label: 'offset', note: '0x20 — where the tail begins', tone: 'warn' },
+      { from: 74, to: 138, label: 'length', note: '0x16 = 22 bytes', tone: 'warn' },
+      { from: 138, to: 202, label: 'the message', note: 'UTF-8, right-padded to 32', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+**Subgoal — read the selector.** `08c379a0` is `Error(string)`. Four bytes.
+
+**Subgoal — read the head.** `0x20` is the offset, in bytes, from the start of the argument block to
+where the dynamic argument's data begins — the standard [head-and-tail
+layout](/c/abi-head-tail) for a dynamic type. It is 32 because there is one argument.
+
+**Subgoal — read the length and the bytes.** `0x16` is 22, the length in bytes. The next 22 bytes are
+the UTF-8 message, right-padded with zeros to a 32-byte boundary.
+
+**Subgoal — count the total.** One hundred bytes to carry twenty-two characters. The same failure
+expressed as a custom error with no arguments would be four bytes. That size comparison is the honest
+one to make; this corpus deliberately publishes no *gas* figure for the difference, because the
+circulating numbers come from benchmarks with unstated optimiser settings and disagree with one
+another.
+
+A `Panic` payload is simpler, being a fixed-size argument:
+`4e487b71` followed by `0x…0011` is an arithmetic overflow. Thirty-six bytes, no head, no tail.
+
+## `try`/`catch` is these pieces assembled
+
+Solidity's `try`/`catch` is not a new mechanism. It is the boolean, the buffer and the selectors
+above, arranged into syntax.<Cite src="solidity-error-handling" />
+
+An external call is made. If the boolean is 1, the success block runs with the decoded return values.
+If it is 0, the return-data buffer is examined: a leading `08c379a0` routes to
+`catch Error(string reason)`, a leading `4e487b71` routes to `catch Panic(uint errorCode)`, and
+anything else — including empty data — routes to `catch (bytes memory lowLevelData)` or the bare
+`catch` block.
+
+Three limitations follow directly from the mechanism rather than from the language design.
+
+**It only wraps external calls.** There is no frame boundary around an internal call, so there is no
+boolean to branch on and no snapshot to restore. `try` on your own internal function is not
+expressible.
+
+**It cannot catch your own frame running out of gas.** If the *caller* exhausts its gas, there is no
+caller left to run the catch block. What it can catch is the *callee* running out — which works only
+because the 63/64 rule left the caller alive, as the previous lesson set out.
+
+**An empty `catch` block is not a handler.** It is a decision to continue as though the call had
+succeeded. That is sometimes exactly right and it is the same silent-failure shape as an unchecked
+boolean wearing better syntax.
+
+## Where the transaction receipt fits
+
+One level up, the receipt carries a status field: 1 for success, 0 for failure, added by EIP-658 so
+that the outcome of a transaction could be read without re-executing it.<Cite src="eip-658" />
+
+That flag describes the outermost frame and nothing else. A transaction whose top-level call returned
+normally has status 1 no matter how many inner frames reverted along the way. The opening scene's
+green tick was accurate; it simply answered a different question from the one the user was asking.
+
+The general rule, and it is worth stating flatly: **atomicity in the EVM is per frame, not per
+transaction.** A transaction is atomic only in the sense that its outermost frame is. Every nested
+call is its own unit of undo, and a caller is free to catch a failure and carry on — which is a
+feature when it is deliberate and an incident when it is not.
+
+<Check type="spot-bug" concept="call-returns-a-boolean">
+This adapter forwards a swap to a router and reports the outcome:
+
+```solidity
+function swap(address router, bytes calldata data) external returns (uint256 out) {
+    uint256 before = token.balanceOf(address(this));
+
+    (bool ok, bytes memory ret) = router.call(data);
+    if (!ok) {
+        assembly { revert(add(ret, 0x20), mload(ret)) }
+    }
+
+    out = abi.decode(ret, (uint256));
+    require(token.balanceOf(address(this)) - before >= out, "shortfall");
+}
+```
+
+The author's claim: the boolean is checked, the original revert reason is bubbled up unchanged rather
+than being replaced with a label, and the balance check catches a router that lies about its output.
+
+Find the failure this code does not handle, and say what an attacker or an unlucky user sees.
+
+<Answer>
+**The bug is in the failure path, and it is that an empty `ret` produces a revert with no data.**
+
+Three of the four failure shapes from the table above produce empty output: an exceptional halt in the
+router, a depth-limit refusal, and a bare `revert()`.<Cite src="execution-specs-osaka-interpreter" />
+When any of those occurs, `ret` has length zero, the assembly block reverts with a zero-length
+payload, and the caller of `swap` receives exactly the unexplained failure this contract was written
+to avoid. The bubble-up is correct for the case where the router explained itself and silently
+degrades to nothing for the case where it did not — which is the case you most need information
+about, because it is the one where the router ran out of gas.
+
+**Out of gas is the specific scenario to picture.** The router halts exceptionally, so the handler
+zeroes its output and consumes its whole allowance.<Cite src="execution-specs-osaka-interpreter" />
+The caller still holds at least a sixty-fourth of what it had, so `swap` is alive and reaches the
+assembly block with an empty `ret`. It then reverts with nothing, and the user's wallet reports a
+transaction that failed for no stated reason.
+
+**A second, quieter defect: `abi.decode` on the success path.** If the router succeeds but returns
+fewer than 32 bytes — including the case where `router` has no code at all, which succeeds with empty
+output — the decoder's length check fails and the call reverts, with a compiler-generated failure that
+says nothing about the router. `router` is a parameter, so nothing here establishes that it is a
+contract at all; a low-level call performs no existence check, and the high-level `EXTCODESIZE` guard
+that would have caught it is not present on this path.<Cite src="solidity-docs-contracts" />
+
+**Third, smaller: `token.balanceOf(...) - before` underflows if the balance dropped.** In Solidity 0.8
+that is `Panic(0x11)`, not the `"shortfall"` message the author intended, so the one deliberate error
+string in this function is unreachable in the case it was written for.
+
+**The fix for the main bug is one branch.** When `ret.length == 0`, revert with a custom error of your
+own — `error RouterFailedSilently(address router)` — so the caller learns which of the two worlds it
+is in. Preserving the callee's data when it exists and supplying your own when it does not is the
+complete pattern; doing only the first half is the common mistake.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Deployment is a two-stage rocket**, next, is where the exceptional-halt row of the first table
+starts to matter for reasons other than debugging: a deployment whose returned code is too large, or
+begins with the wrong byte, halts exceptionally and consumes everything.
+
+**Revert bubbling** and [revert blindness](/c/revert-blindness) in the security track are this lesson
+applied adversarially — what an attacker learns from your error messages, and what your monitoring
+loses when a contract swallows a failure it should have surfaced.
+
+**Try/catch in Solidity** is a construct built entirely out of the pieces here: an external call, a
+branch on the boolean, and a decode of the return-data buffer against `Error(string)` and
+`Panic(uint256)`. Knowing that is why it cannot catch an out-of-gas failure in its own frame and why
+its catch clauses are shaped the way they are.<Cite src="solidity-error-handling" />
+
+**Custom errors** in the Solidity track become an easy decision once you have seen the four-byte
+selector next to the alternative. The corpus deliberately publishes no gas figure for the comparison —
+the circulating numbers come from benchmarks with unstated optimiser settings and disagree with each
+other — but the return-data size difference is not in dispute, and neither is the debuggability.
+
+And the whole failure taxonomy feeds the testing track, where `vm.expectRevert` and its newer
+overloads are precise about *which* of these four exits they assert, and where asserting the wrong one
+produces a test that passes for the wrong reason.

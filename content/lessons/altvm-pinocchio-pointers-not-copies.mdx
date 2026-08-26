@@ -1,0 +1,415 @@
+---
+id: altvm-pinocchio-pointers-not-copies
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [pinocchio-repo, pinocchio-sdk-manifest, pinocchio-entrypoint-source, pinocchio-crate-versions, helius-pinocchio, helius-p-token, helius-optimizing-solana-programs, simd-0266-proposal, solana-upgrades-p-token, p-token-program-manifest, p-token-entrypoint-source, solana-docs-compute-budget, anchor-crate-versions]
+stack: {}
+---
+
+Here is the fact that should make you suspicious of every performance story you have been told about
+Solana programs.
+
+When SPL Token was rewritten to remove framework overhead, `InitializeImmutableOwner` — an instruction
+whose entire job is to set a flag on a freshly created account — fell from 1,404 compute units to
+38.<Cite src="simd-0266-proposal" /><Cite src="solana-upgrades-p-token" />
+
+There is no algorithm in `InitializeImmutableOwner`. There is nothing to make cleverer. Whatever those
+1,366 compute units were, they were not the instruction.
+
+This lesson is about what they were, and about the library that removed them.
+
+## Pinocchio is a layer, not a rival
+
+Start by placing it correctly, because almost everyone places it wrong.
+
+Pinocchio is a Rust library that replaces the `solana-program` crate as the thing your on-chain code
+is built on.<Cite src="pinocchio-repo" /><Cite src="helius-pinocchio" /> Its own README describes it
+as a library to create Solana programs with the only dependencies being types from the Solana SDK
+designed for on-chain programs — a `no_std` crate, optimised for both compute-unit consumption and
+binary size.<Cite src="pinocchio-repo" />
+
+Draw the stack and the confusion resolves itself:
+
+<Figure
+  caption="One 'or', and it is at the parsing layer — everything above it is unchanged by the choice."
+  alt="A four-layer stack: the SVM runtime writes the input buffer; either solana-program or pinocchio turns that buffer into Rust values; Anchor sits on solana-program and adds accounts, constraints and an IDL; your program sits on top of Anchor, or directly on pinocchio."
+>
+  <Flow
+    dir="down"
+    lanes={['runtime', 'buffer parsing', 'framework', 'you']}
+    nodes={[
+      { id: 'rt', label: 'SVM runtime', note: 'writes the input buffer', col: 0, tone: 'muted' },
+      { id: 'sp', label: 'solana-program', note: 'turns the buffer into Rust values', col: 1 },
+      { id: 'pin', label: 'pinocchio', note: 'turns the buffer into Rust values', col: 1, row: 1, tone: 'accent' },
+      { id: 'anc', label: 'Anchor', note: 'adds accounts, constraints, an IDL', col: 2 },
+      { id: 'you', label: 'your program', col: 3 },
+    ]}
+    edges={[
+      { from: 'rt', to: 'sp' },
+      { from: 'rt', to: 'pin' },
+      { from: 'sp', to: 'anc' },
+      { from: 'anc', to: 'you' },
+      { from: 'pin', to: 'you' },
+    ]}
+  />
+</Figure>
+
+[Anchor](/c/anchor-purpose) sits *above* the crate that parses the buffer, not beside it. It depends on
+that layer, adds instruction discriminators, typed account wrappers and account-deserialization
+logic on top, and generates the constraint code you write
+declaratively.<Cite src="helius-pinocchio" /> Pinocchio replaces the layer underneath. It has no
+account model, no constraint DSL, no IDL, because those are not the kind of thing it is.
+
+<Misconception
+  belief="Pinocchio is a competing framework to Anchor — you pick one."
+  reality="It replaces the solana-program crate, a layer below where Anchor sits. It has no account model, no constraint DSL and no IDL, and its CPI helper crates can be used from otherwise-Anchor code."
+  why="Both answer the question 'what do I build a Solana program with', so they get filed as alternatives."
+  src="pinocchio-repo"
+/>
+
+### Read the manifest, not the tagline
+
+"Zero dependencies" is the phrase everyone repeats. Open `sdk/Cargo.toml` in the repository and the
+dependency list is not empty: `solana-account-view`, `solana-address`, `solana-program-error`, an
+optional `solana-instruction-view` behind the `cpi` feature, and `solana-define-syscall` on the Solana
+and BPF targets.<Cite src="pinocchio-sdk-manifest" />
+
+The README's own wording is the accurate one: the only dependencies are types from the Solana SDK
+specifically designed for on-chain programs, which mitigates dependency
+issues.<Cite src="pinocchio-repo" /> That is a meaningfully different and more defensible claim than
+"none". The point was never a count. It was that a program's build should not drag in a general-purpose
+crate graph whose transitive updates you do not control.
+
+This is worth doing every time in this module: the manifest and the release list are primary artifacts,
+and the tagline is a summary of them written at some earlier moment.
+
+<Aside kind="warn">
+The published `pinocchio` crate is still pre-1.0 — the 0.11.x line, with 0.11.2 published on 9 June
+2026, on a crate first published in July 2024.<Cite src="pinocchio-crate-versions" /> Two consequences
+follow. Minor versions carry breaking changes, and **the type names moved**: current documentation uses
+`AccountView` and `Address`, re-exported from `solana-account-view` and
+`solana-address`.<Cite src="pinocchio-repo" /><Cite src="pinocchio-sdk-manifest" /> Older code — and
+most tutorials — uses `AccountInfo` and `Pubkey`. Check what your pinned version actually exports
+before copying a snippet; do not inherit a version number from any course, including this one.
+</Aside>
+
+## The entrypoint, and what it is really made of
+
+The standard entrypoint macro does three jobs at once, and the interesting move is that Pinocchio pulls
+them apart so you can decline each one individually.
+
+`entrypoint!` is a convenience that invokes three other
+macros:<Cite src="pinocchio-repo" /><Cite src="pinocchio-entrypoint-source" />
+
+```rust
+program_entrypoint!(process_instruction);  // declares the entrypoint
+default_allocator!();                      // installs the bump global allocator
+default_panic_handler!();                  // installs the panic hook
+```
+
+Each is replaceable. `no_allocator!` installs a global allocator that panics on any allocation
+attempt.<Cite src="pinocchio-repo" /> `nostd_panic_handler!` replaces the `std`-dependent hook with one
+that logs the file, line and column of the panic and calls the `abort()`
+syscall.<Cite src="pinocchio-repo" /> Those are the next lesson's subject.
+
+The entrypoint itself is where this lesson lives, and Pinocchio documents its difference from the
+standard SDK macro in one sentence: it represents an entrypoint that does not perform allocations or
+copies when reading the input buffer.<Cite src="pinocchio-entrypoint-source" />
+
+Compare that with what the standard entrypoint does. It walks the buffer and builds owned Rust values,
+copying account data out of the buffer into heap structures, and installs the allocator and panic
+handler as it goes.<Cite src="helius-pinocchio" /> By the time your handler is called, the buffer has
+been read end to end and a parallel set of structures exists on the heap.
+
+### The account type is a pointer
+
+The signatures look identical, which is exactly why the difference is easy to miss. Both crates hand
+your handler a program id, a slice of accounts and a slice of instruction
+data.<Cite src="helius-pinocchio" /> The difference is what one element of that slice *is*.
+
+Where `solana-program` writes data into an account struct that owns it, Pinocchio's account struct is
+itself a pointer to the underlying input data representing that account, which removes the copying and
+saves compute units.<Cite src="helius-pinocchio" /> Every field is reached through a method, and
+anything that is not a primitive comes back as a reference, so the zero-copy property holds all the way
+down rather than only at the top.<Cite src="helius-pinocchio" />
+
+If you want the claim in its most literal possible form, p-token's hand-written entrypoint contains
+this:
+
+```rust
+transmute::<*mut u8, AccountInfo>(input.add(ACCOUNT1_HEADER_OFFSET))
+```
+
+That is a raw pointer into the input buffer being reinterpreted as an account
+value.<Cite src="p-token-entrypoint-source" /> Not parsed into one. Reinterpreted as one. The account
+type is the pointer.
+
+### A third option: parse nothing until asked
+
+There is a variant most treatments skip, and it sharpens the idea.
+
+`lazy_program_entrypoint!` does not parse the input at all. It wraps it and hands your handler an
+`InstructionContext` with methods to parse on demand: `remaining()`, `next_account()`,
+`instruction_data()` and `program_id()`.<Cite src="pinocchio-repo" /> The documentation is explicit
+about the motivation — the standard macro parses the whole input and provides the three pieces
+separately, which consumes compute units before the program begins its execution, and in some cases a
+program benefits from controlling when parsing happens, *including whether parsing is needed at
+all*.<Cite src="pinocchio-repo" />
+
+It also states the limit honestly: the lazy entrypoint suits programs with one or very few
+instructions, because the program now handles parsing itself and that grows complex as instruction
+count rises; for larger programs the eager macro is likely both easier and more
+efficient.<Cite src="pinocchio-repo" /> And it sets up neither allocator nor panic handler, so you must
+declare those yourself.<Cite src="pinocchio-repo" />
+
+Notice what the existence of this API tells you. Somebody measured, found that *parsing accounts the
+instruction will not use* was a real cost, and shipped a way to skip it. That only makes sense in a
+world where the parse is a significant share of a small instruction's budget.
+
+## Where the savings actually came from
+
+Now the honest accounting, because this is the claim the module rests on and it is usually asserted
+rather than shown.
+
+You will find a figure in circulation that roughly seventy per cent of p-token's savings came from the
+entrypoint and zero-copy account reading. **This lesson does not use that number.** It appears in
+secondary summaries with no methodology attached, and it could not be traced to a primary artifact
+while writing this. What follows is the decomposition you can verify yourself from the proposal and
+the source.
+
+**Evidence 1 — the savings are nearly uniform across unrelated instructions.** SIMD-0266 publishes the
+before-and-after table. Expressed as a percentage of the original cost: `Transfer` 1.6%,
+`TransferChecked` 1.6%, `SyncNative` 2.0%, `MintTo` 2.6%, `Burn` 2.6%,
+`InitializeImmutableOwner` 2.7%, `FreezeAccount` 3.4%, `SetAuthority` 3.8%, `CloseAccount`
+4.1%, `Approve` 4.2%.<Cite src="simd-0266-proposal" /><Cite src="solana-upgrades-p-token" />
+
+Those instructions do wildly different amounts of work. A `TransferChecked` validates two token
+accounts, a mint and an authority; `SyncNative` reads a lamport balance and writes a field. If the
+saving came from better algorithms, the percentages would scatter with the algorithms. They do not.
+They cluster between roughly 2% and 4%. A saving that is nearly constant across unrelated workloads is
+a saving on something those workloads share.
+
+**Evidence 2 — the instruction with no algorithm saved as much as the rest.**
+`InitializeImmutableOwner` went from 1,404 CU to 38.<Cite src="simd-0266-proposal" /> Its work is
+setting a flag. Whatever consumed the other 1,366 units ran before and around that work, not inside it.
+
+**Evidence 3 — the outliers are informative in the other direction.** `InitializeMultisig2` is the
+worst ratio in the table at 11.2%, dropping only from 2,826 CU to 318.<Cite src="simd-0266-proposal" />
+Multisig initialisation genuinely iterates over up to eleven signer accounts. It has real work in it,
+so a larger share of its cost survives. That is the same signal read from the other end: the more your
+instruction actually does, the smaller the fraction of it that framework overhead represented.
+
+**Evidence 4 — one named component, with a number.** SIMD-0266 states that logging the instruction name
+consumes more than 100 compute units, which in some cases is almost the same amount required to execute
+the instruction, and gives the comparison directly: p-token's `Transfer` costs 76 CU without logs and
+186 CU with them.<Cite src="simd-0266-proposal" /> So of the roughly 4,569 CU that `Transfer` shed,
+about 110 was the cost of writing a fixed string that nothing was obliged to read. In p-token, logging
+now sits behind a Cargo feature that is off by default.<Cite src="p-token-entrypoint-source" />
+
+Put those together and the conclusion is not "roughly seventy per cent". It is stronger and better
+attested: **the dominant cost of a small Solana instruction was the fixed machinery of being invoked at
+all — parsing a twenty-thousand-byte buffer into owned values, installing an allocator, installing a
+panic handler, emitting a log — and none of it was the program.**
+
+<Misconception
+  belief="p-token's compute savings came from a smarter transfer algorithm."
+  reality="The savings are nearly uniform across instructions that share no logic, and the largest proportional wins are on instructions with essentially no logic at all. The cost that was removed was the fixed cost of being invoked."
+  why="Optimisation stories are usually about algorithms, so the reader looks in the body of the function."
+  src="simd-0266-proposal"
+/>
+
+## The Track 05 discipline, transposed
+
+You have done this before. In the gas work you learned that folklore optimisations —
+tighter loops, cleverer arithmetic — are usually rounding errors next to one `SSTORE`, and that the
+only way to know is to measure rather than to reason from the shape of the code.
+
+The same discipline applies here, with the target moved. On the EVM the thing that dominates is state
+access. On Solana, for a small program, the thing that dominates is *invocation*: a cost that is
+constant per call, that appears in no line of your source, and that a profiler pointed at your business
+logic will never show you.
+
+Three tools make it visible, all of them worth reaching for before you reach for Pinocchio:
+
+- `sol_log_compute_units()`, a syscall that logs consumption at a specific point in
+  execution — wrap a routine in two calls and subtract.<Cite src="helius-optimizing-solana-programs" />
+- The `consumed X of Y compute units` line every program invocation
+  emits.<Cite src="simd-0266-proposal" />
+- A local execution harness. p-token's own test suite uses Mollusk for exactly
+  this.<Cite src="p-token-program-manifest" />
+
+Two cautions on the comparison figures you will meet. First, a widely quoted claim that Pinocchio saves
+around 84% of compute units versus equivalent Anchor code comes from a conference summary with
+unstated methodology — treat it as directional, not as a benchmark; the p-token numbers are far better
+attested because the proposal publishes the table. Second, published CU figures drift with tooling: the
+proposal lists `Transfer` at 76 CU while a contemporaneous vendor write-up of the same program lists
+79.<Cite src="simd-0266-proposal" /><Cite src="helius-p-token" /> Neither is wrong. They were measured
+at different commits. Numbers at this granularity are snapshots.
+
+<Aside kind="note">
+The `anchor-lang` crate left 0.x and is now on a 1.x line, with a 2.0 release candidate published in
+August 2026.<Cite src="anchor-crate-versions" /> Any comparison of "Anchor overhead versus Pinocchio
+overhead" that predates that is comparing against a different Anchor. Re-measure rather than inherit.
+</Aside>
+
+## Two bills, usually added together
+
+There is a bookkeeping error that makes almost every published Anchor-versus-Pinocchio comparison
+unusable, and now that the stack diagram is in place you can see it.
+
+Porting an Anchor program to Pinocchio removes *two* different costs at once.
+
+**Bill one is the entrypoint.** That is everything above: parsing the padded buffer into owned values,
+copying account data onto the heap, installing an allocator and a panic handler. This cost belongs to
+`solana-program`, and an Anchor program pays it because Anchor is built on that
+crate.<Cite src="helius-pinocchio" /> Replacing the entrypoint removes it. Nothing about your program's
+guarantees changes.
+
+**Bill two is the generated checks.** Anchor's typed account wrappers and constraints compile into real
+code that runs on every invocation — discriminator comparisons, owner comparisons, signer checks, PDA
+re-derivations. That is [what Anchor's convenience costs in compute](/c/anchor-costs-compute). Dropping
+it also saves units, but it saves them by *not doing something that was protecting you*.
+
+<Compare
+  columns={[
+    { title: 'Bill one', note: 'the entrypoint', tone: 'good' },
+    { title: 'Bill two', note: 'the generated checks', tone: 'warn' },
+  ]}
+  rows={[
+    {
+      label: 'What is removed?',
+      cells: [
+        <>Parsing the padded buffer into owned values, copying data to the heap, the allocator and the panic handler<Cite src="helius-pinocchio" /></>,
+        'Discriminator comparisons, owner comparisons, signer checks, PDA re-derivations',
+      ],
+    },
+    {
+      label: 'Whose layer is it?',
+      cells: [
+        <><code>solana-program</code>, which Anchor is built on<Cite src="helius-pinocchio" /></>,
+        "Anchor's own typed wrappers and constraints",
+      ],
+    },
+    {
+      label: "What happens to the program's guarantees?",
+      cells: [
+        { v: 'Nothing changes', tone: 'good' },
+        { v: 'You stop doing something that was protecting you', tone: 'danger' },
+      ],
+    },
+    {
+      label: 'What kind of decision is it?',
+      cells: [
+        'An engineering result',
+        { v: 'A proposal that needs a reviewer', tone: 'warn' },
+      ],
+    },
+  ]}
+  caption="Same units, same benchmark, opposite risk: one bill is bookkeeping and the other is protection."
+  alt="The two costs a port to Pinocchio removes, compared: the entrypoint's parsing, copying, allocator and panic handler, which changes no guarantee, against Anchor's generated discriminator, owner, signer and PDA checks, which does."
+/>
+
+A benchmark that reports one number for "Anchor versus Pinocchio" has added those two bills together
+and handed you the total. The two halves have opposite risk profiles: the first is free, the second is
+[a security decision](/c/pinocchio-security-tradeoff). This is the concrete reason the circulating 84%
+figure is not actionable — not that the number is implausible, but that it does not tell you which half
+you would be buying.
+
+When you run your own comparison, run it in two steps. Port the entrypoint first and measure. Then
+remove generated checks one at a time, and measure again. The first measurement is an engineering
+result. The second is a proposal that needs a reviewer.
+
+### The hybrid nobody mentions
+
+Because Pinocchio is a layer rather than a framework, the choice is not all-or-nothing at the program
+boundary.
+
+The project publishes satellite crates alongside the core library — `pinocchio-system`,
+`pinocchio-token`, `pinocchio-token-2022`, `pinocchio-associated-token-account` — which version
+independently of `pinocchio` itself.<Cite src="pinocchio-crate-versions" /> These are cross-program
+invocation helpers: cheap ways to construct and dispatch a CPI to the common programs. An otherwise
+ordinary Anchor program can use them for its hot CPI paths and keep its constraints, its IDL and its
+account wrappers everywhere else.
+
+That matters more than it sounds, because of a number from the last lesson: a CPI costs a flat
+`DEFAULT_INVOCATION_COST` of 1,000 CU before the callee runs at
+all.<Cite src="solana-docs-compute-budget" /> A program that performs several token CPIs per
+instruction is paying that repeatedly, and the cost sits in the calling code — which is yours to
+change, without rewriting anything else.
+
+Keep the granularity in mind for the last lesson of this module. The unit of decision is an
+instruction, or even a call site. It is not a program, and it is certainly not a team's identity.
+
+## What you give up, stated now
+
+Zero-copy is sold as a pure win. It is not, and the honest framing is available directly from what you
+have just read.
+
+When the standard entrypoint hands you an owned struct, a deserializer has already decided the field
+layout, checked that the byte count matches the type, and given the result a Rust type that the
+compiler will police. When your account value is a pointer into the runtime's buffer, none of those
+three jobs vanished. They moved to you: alignment and padding become your responsibility, the length
+check becomes something you write, and the "type" of the bytes becomes a claim you assert rather than
+one the compiler verifies.
+
+<Misconception
+  belief="Zero-copy just means faster."
+  reality="It means reading raw bytes at pointers, so the alignment, padding and lifetime obligations a serializer was discharging on your behalf become yours."
+  why="The term names a removed cost, so it reads as a free win rather than a transfer of responsibility."
+  src="pinocchio-repo"
+/>
+
+<Check type="explain" concept="entrypoint-is-the-big-win">
+A colleague reads the p-token numbers and concludes: "our AMM's swap instruction costs about 90,000
+CU, so if we port it to Pinocchio we should expect roughly the same 95-98% saving and land near 3,000."
+
+Explain why that inference is wrong, what a better estimate would be, and what single measurement would
+settle it.
+
+<Answer>
+**Why the inference fails.** The percentages in SIMD-0266 are not a property of Pinocchio. They are the
+ratio between a *fixed* overhead and the *particular* instructions in the token program, which are
+tiny. `Transfer` at 4,645 CU has almost no logic in it, so removing a fixed overhead of a few thousand
+units removes almost all of it.<Cite src="simd-0266-proposal" /> The percentage is large because the
+denominator is small.
+
+You can see the correction inside the same table. `InitializeMultisig2` does real iterative work and
+only reached 11.2% of its original cost, against `Transfer`'s 1.6%.<Cite src="simd-0266-proposal" />
+The more an instruction does, the less of it is overhead, and the smaller the achievable percentage.
+
+**A better estimate.** Model the saving as an absolute number, not a ratio. The overhead being removed
+is on the order of a few thousand compute units per invocation — roughly the difference between what a
+near-empty SPL Token instruction cost and what a near-empty p-token instruction costs, which is
+1,404 CU against 38 for `InitializeImmutableOwner`.<Cite src="simd-0266-proposal" /> Against a 90,000
+CU swap, that is a saving in the low single-digit percentage range, not ninety-five. The rewrite would
+land somewhere near 86,000 CU, not 3,000, unless the port also rewrote the swap maths — which is a
+separate project with a separate risk profile.
+
+**The measurement that settles it.** Split the instruction's cost into "before my logic" and "my
+logic". Call `sol_log_compute_units()` as the first statement of the handler and again as the
+last.<Cite src="helius-optimizing-solana-programs" /> The delta is your logic. The difference between
+that delta and the total the runtime reports for the invocation is the overhead Pinocchio can address.
+If the overhead is 3,000 out of 90,000, you now have the argument in one number, and it is an argument
+against the rewrite.
+
+**The reframe worth carrying.** "How much can Pinocchio save?" is the wrong question. The right one is
+"what fraction of this instruction's cost is paid before my first line runs?" — and that fraction is
+decided by how small your instruction is, not by which library you use.
+</Answer>
+</Check>
+
+## What this unlocks
+
+You can now answer the question this module exists for at the level of mechanism: the framework was
+costing you a fixed per-invocation charge to turn a heavily padded buffer into comfortable Rust values,
+plus an allocator and a panic handler you may never have used, plus a log line nothing depends on. A
+library that declines all of that is not doing anything clever. It is doing less.
+
+The two lessons that follow take the two halves of the bill. The next one is about owning the bytes:
+what a `repr(C)` struct cast onto an account's data slice actually requires of you, why every
+multi-byte field in a production Pinocchio program is a byte array rather than an integer, and what
+dropping the allocator and the panic handler buys beyond compute — including the part that shows up as
+rent. The one after is about the other half of what the framework was doing, which was not performance
+at all: it was checking that the accounts you were handed are the accounts you think they are.

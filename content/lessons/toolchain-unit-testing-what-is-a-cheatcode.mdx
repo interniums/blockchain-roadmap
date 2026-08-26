@@ -1,0 +1,315 @@
+---
+id: toolchain-unit-testing-what-is-a-cheatcode
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    foundry-cheatcodes-overview,
+    foundry-cheatcode-assume,
+    forge-std-base-1-16-2,
+    forge-std-vm-1-16-2,
+    forge-std-stdcheats-1-16-2,
+    forge-std-repo,
+    solidity-abi-spec,
+    eip-7702,
+    measured-forge-cli-1-7-1,
+    measured-forge-1-7-1,
+  ]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+A fuzz test on a payments contract fails after four months of green runs. The counterexample:
+
+```
+[FAIL] testFuzz_TransferTo(address) (runs: 137)
+  Args: [0x7109709ECfa91a80626fF3989D68f67F5b1DD12D]
+```
+
+The engineer on call reads the trace, sees a transfer to a contract that behaves like nothing they
+have ever deployed, and spends an hour looking for a reentrancy bug. There is no bug. The fuzzer
+generated the one address in the entire 160-bit space that Foundry treats specially, and the test
+called into it.
+
+This lesson is about why that address exists, what happens when you call it, and the three things
+that follow — including the exclusion that would have saved the hour.
+
+## `vm` is an interface, not a keyword
+
+Nothing about cheatcodes is compiler magic. Cheatcodes are made available through use of the
+cheatcode address `0x7109709ECfa91a80626fF3989D68f67F5b1DD12D`, and you access them via `vm`,
+available in the Forge Standard Library's `Test` contract.<Cite src="foundry-cheatcodes-overview" />
+
+In forge-std that is two ordinary declarations:
+
+```solidity
+address internal constant VM_ADDRESS = 0x7109709ECfa91a80626fF3989D68f67F5b1DD12D;
+Vm internal constant vm = Vm(VM_ADDRESS);
+```
+
+Both appear in forge-std v1.16.2's `Base.sol`, which `Test` inherits.<Cite src="forge-std-base-1-16-2" />
+`Vm` is a Solidity interface — a long list of external function signatures with doc comments, and no
+implementation anywhere.<Cite src="forge-std-vm-1-16-2" />
+
+So when you write `vm.warp(1_000_000)`, the compiler does exactly what it does for any interface
+call on any address: it ABI-encodes a call and emits a `CALL`. You already know how that encoding is
+built — four bytes of selector derived from the canonical signature, then the arguments in 32-byte
+words.<Cite src="solidity-abi-spec" /> Here it is, produced by `cast` on this machine:
+
+```
+$ cast sig "warp(uint256)"
+0xe5d6bf02
+
+$ cast calldata "warp(uint256)" 1000000
+0xe5d6bf0200000000000000000000000000000000000000000000000000000000000f4240
+```
+
+<Figure
+  caption="A cheatcode invocation is a stock ABI-encoded call; solc emits nothing here it would not emit for any interface."
+  alt="The calldata 0xe5d6bf02 followed by one 32-byte word: four bytes of selector for warp(uint256), then 1000000 encoded as 0x0f4240."
+>
+  <Anatomy
+    value="0xe5d6bf0200000000000000000000000000000000000000000000000000000000000f4240"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 10, label: 'selector', note: 'warp(uint256)', tone: 'accent' },
+      { from: 10, to: 74, label: 'one 32-byte word', note: '1000000 = 0x0f4240' },
+    ]}
+  />
+</Figure>
+
+<Cite src="measured-forge-cli-1-7-1" /> Four bytes of selector, one word holding `0x0f4240`. That
+blob, sent to `0x7109…D12D`, is the entire cheatcode.
+
+What makes it a cheatcode is what happens on the other side: Foundry's EVM **intercepts** calls to
+that address and performs the effect, instead of executing code
+there.<Cite src="foundry-cheatcodes-overview" /> No contract at that address runs your calldata. The
+host reads the selector, recognises `warp`, and reaches into the block environment.
+
+<Figure
+  caption="Five ordinary steps, and the compiler knows none of them are special."
+  alt="vm.warp is a call on an interface, solc ABI-encodes it, the EVM makes a message call to the fixed cheatcode address, Foundry's EVM intercepts that address instead of executing code there, and the block timestamp is rewritten."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'src', label: 'vm.warp(1_000_000)', note: 'a call on an interface', col: 0 },
+      { id: 'enc', label: 'solc ABI-encodes it', note: 'selector plus one word', col: 1 },
+      { id: 'call', label: 'CALL 0x7109…D12D', note: 'an ordinary message call', col: 2, tone: 'accent' },
+      { id: 'int', label: 'the host intercepts', note: 'no code at that address runs', col: 3, tone: 'warn' },
+      { id: 'eff', label: 'block.timestamp moves', note: 'the frame returns', col: 4, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+You can see the frames in a trace. Run any test with `-vvvv` on forge 1.7.1 and cheatcode invocations
+appear as call frames against a target labelled `VM`:
+
+```
+├─ [0] VM::stopPrank()
+│   └─ ← [Return]
+```
+
+<Cite src="measured-forge-cli-1-7-1" /> A call frame, with a return, at zero gas — sitting in the
+same trace, in the same column, as the calls into your own contracts.
+
+<Misconception
+  belief="Cheatcodes are a special syntax the Foundry compiler understands."
+  reality="They are ordinary ABI-encoded CALLs to one fixed address, emitted by stock solc. Foundry's EVM intercepts that address rather than executing code at it."
+  why="`vm.warp` reads like a built-in, it needs no deployment, and nothing in a project's source defines what it does."
+  src="foundry-cheatcodes-overview"
+/>
+
+### Three things that follow, and one of them will bite you
+
+**Cheatcodes are typed, and `Vm.sol` is the list worth reading.** Because the interface is real
+Solidity, every cheatcode has a signature and a doc comment sitting in one file in the library you
+have already vendored.<Cite src="forge-std-vm-1-16-2" /> When the docs site and a blog post disagree,
+`lib/forge-std/src/Vm.sol` in your own repo is the tiebreaker, because it is the version you are
+actually compiling against.
+
+**The list moves.** Cheatcodes ship with forge-std and with the binary, so what exists depends on
+what you have pinned. A concrete example: articles still assert that Foundry cannot force a storage
+slot cold. forge-std v1.16.2 declares `cool(address)` and `coolSlot(address,bytes32)`, with the doc
+comment "Marks the slots of an account and the account address as
+cold".<Cite src="forge-std-vm-1-16-2" /> Grep before you believe an absence claim.
+
+**Anything can call the address.** It is a constant, not a capability handed to test contracts. This
+is not a hypothetical concern — it is the mechanism behind the failure at the top of this lesson, and
+it is the subject of the last section.
+
+### `Vm` and `VmSafe`: two interfaces, one address
+
+`Vm.sol` declares two interfaces, and `Base.sol` binds both to the same constant — `vm` and
+`vmSafe`, each pointing at `0x7109…D12D`.<Cite src="forge-std-base-1-16-2" /> The relationship is
+inheritance: `interface Vm is VmSafe`.<Cite src="forge-std-vm-1-16-2" />
+
+The split is not "safe for you" versus "dangerous for you". The header comment is specific: the
+`VmSafe` interface does not allow manipulation of the EVM state or other actions that may result in
+Script simulations differing from on-chain execution, and it is recommended to only use those cheats
+in scripts.<Cite src="forge-std-vm-1-16-2" />
+
+That distinction matters the moment you factor a helper out of a test into something a deployment
+script also imports. A script simulates, then broadcasts what it simulated. A helper that calls
+`vm.warp` produces a simulation of a world that will not exist when the transaction lands. Typing the
+helper against `VmSafe` makes the compiler enforce the boundary; typing it against `Vm` means you are
+promising to remember.
+
+One more line from the top of that file is worth reading: "Automatically @generated by
+scripts/vm.py. Do not modify manually."<Cite src="forge-std-vm-1-16-2" /> `Vm.sol` is not a
+hand-maintained wrapper that can drift from the implementation. That is why it is the tiebreaker.
+
+## The families, and why the shape matters more than the names
+
+There are hundreds of cheatcodes. Memorising them is the wrong goal; knowing which drawer to open is
+the right one. The documented categories are: **Environment**, **Assertions**, **Fuzzer**,
+**Forking**, **External**, **Signing**, **Utilities**, **Files**, **RPC** and **State
+Snapshots**.<Cite src="foundry-cheatcodes-overview" />
+
+Read them as answers to questions rather than as a taxonomy:
+
+- **Environment** — *"what does the chain look like right now?"* `warp`, `roll`, `prank`, `deal`,
+  `store`. These rewrite the world your contract observes. The next lesson is entirely about this
+  family, because it is where the expensive mistakes live.
+- **Assertions** — *"did the thing I expected happen?"* `expectRevert`, `expectEmit`, `expectCall`.
+  Two lessons from now, and the rest of this module's title.
+- **Fuzzer** — *"which generated inputs count?"* `assume`, and forge-std's `bound`. Constraining the
+  search is its own skill and its own module.
+- **Forking** — *"what does real deployed state look like?"* `createFork`, `selectFork`, `rollFork`.
+- **External** — *"can I reach outside the EVM?"* `ffi`, `env`, JSON and TOML parsing.
+- **Signing** — *"can I produce a valid signature for this key?"*
+- **Utilities** — *"can I make this trace readable?"* `label`, `addr`, `makeAddr`.
+- **Files**, **RPC**, **State Snapshots** — file access, direct RPC calls, and save/restore points
+  for EVM state.
+
+Two of these deserve a note now rather than later.
+
+**Utilities are not cosmetic.** A trace full of `0x328809Bc…` is a trace you will misread. Two
+cheatcodes fix that. `vm.label(address, string)` "Labels an address in call
+traces".<Cite src="forge-std-vm-1-16-2" /> forge-std's `makeAddr(name)` composes it with key
+derivation: it hashes the name to a private key, derives the address, and labels it — so the same
+name always produces the same address across runs and machines, and the trace prints
+`alice`.<Cite src="forge-std-stdcheats-1-16-2" />
+
+The determinism is the underrated half. A hard-coded `address(0xA11CE)` is also readable, but it has
+no key behind it, so the moment a test needs a signature from that account you are back to inventing
+one. `makeAddrAndKey` hands you both.<Cite src="forge-std-stdcheats-1-16-2" /> Treat labelling as
+part of writing the fixture, not as polish — every debugging session afterwards is cheaper.
+
+**`ffi` is a hole in the sandbox.** The External family reaches outside the
+EVM.<Cite src="foundry-cheatcodes-overview" /> `ffi` runs a command on your machine and returns its
+output to the test, which is exactly as dangerous as it sounds when you have just cloned an
+unfamiliar repository and typed `forge test`. Legitimate uses exist — differential testing against a
+reference implementation in another language, generating fixtures from a script — and none of them
+require you to run someone else's suite without reading the config first. Know the family exists so
+that `ffi = true` in a `foundry.toml` reads as a fact about trust rather than as a build setting.
+
+**State Snapshots are the escape hatch you will want twice a year.** The family lets a test capture
+EVM state and return to it, which is how you compare two mutually exclusive continuations from one
+expensive starting point without paying for the setup twice.<Cite src="foundry-cheatcodes-overview" />
+It is the manual version of the isolation the runner already gives you between cases, and reaching
+for it inside a single test is usually a sign the test is doing two jobs.
+
+## The cheatcode address is a valid `address` value
+
+Now the failure at the top.
+
+Nothing in the type system distinguishes `0x7109709ECfa91a80626fF3989D68f67F5b1DD12D` from any other
+`address`. A fuzzer asked to produce an `address` parameter is drawing from the full space, and that
+space contains this one. When your contract then calls into the generated address, the call is
+intercepted, the host tries to interpret your calldata as a cheatcode invocation, and what comes back
+is not your contract's behaviour.
+
+The documentation says so directly, and gives the fix as a line to copy: if you encounter errors for
+this address when using fuzzed addresses in your tests, you may wish to exclude it from your fuzz
+tests with `vm.assume(address_ != 0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);`<Cite src="foundry-cheatcodes-overview" />
+
+This is one of the cases where `vm.assume` is the right tool rather than the discouraged one.
+`assume` discards the current run and starts another, so it is a poor way to express a *range*
+constraint — the rejection rate eats your run budget.<Cite src="foundry-cheatcode-assume" /> But
+excluding one address out of 2^160 rejects essentially nothing, which is precisely the situation
+`assume` is for.
+
+The habitual exclusion set for a fuzzed `address` parameter is three entries, and it is worth writing
+all three every time rather than adding them one incident at a time:
+
+```solidity
+function testFuzz_TransferTo(address to, uint256 amount) public {
+    vm.assume(to != address(0));                                          // burn hole
+    vm.assume(to != address(this));                                       // the test contract
+    vm.assume(to != 0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);          // the cheatcode address
+    amount = bound(amount, 0, token.balanceOf(alice));
+    ...
+}
+```
+
+<Aside kind="warn">
+Note what the exclusions are *not* doing. They are narrowing the space the property is tested over,
+and every narrowing is a place a bug can hide. Excluding `address(0)` because a transfer to it
+reverts is fine; excluding it because the test failed there and you wanted green is how a real
+defect gets fenced off. The constraints on a fuzz test are part of what a reviewer has to read, and
+they are the part reviewers skip.
+</Aside>
+
+<Check type="spot-bug" concept="cheatcode-address-in-fuzzing">
+A team hits the cheatcode-address failure and fixes it like this:
+
+```solidity
+contract PayoutTest is Test {
+    function testFuzz_Payout(address recipient, uint96 amount) public {
+        vm.assume(recipient.code.length == 0);   // "only pay EOAs, keeps it simple"
+        vm.deal(address(payouts), amount);
+        payouts.send(recipient, amount);
+        assertEq(recipient.balance, amount);
+    }
+}
+```
+
+The suite is green and the cheatcode-address failure is gone. Name what this fix costs, and what it
+does and does not actually exclude.
+
+<Answer>
+**It works, and for a reason the author probably did not intend.** The guard excludes any address
+with code. Whether it excludes the cheatcode address depends on what `EXTCODESIZE` returns there —
+which is a host implementation detail, not something the interface promises. A fix whose correctness
+rests on an undocumented property of the harness is a fix that can stop working on a version bump,
+silently, and reproduce the original mystery. Write the exclusion the documentation gives you:
+`vm.assume(recipient != 0x7109709ECfa91a80626fF3989D68f67F5b1DD12D)`.<Cite src="foundry-cheatcodes-overview" />
+
+**The real cost is the coverage it silently deletes.** `recipient.code.length == 0` removes every
+contract recipient from the search space. That is the entire population that can reject a value
+transfer, re-enter, consume unbounded gas in a `receive`, or revert on purpose. A payouts contract's
+interesting failures are *exclusively* in the region this line excludes, so the fuzz test now
+explores the part of the space where nothing can go wrong. It will stay green through a rewrite of
+the payment loop.
+
+**And the guard does not mean what it says.** `code.length == 0` has not identified an EOA since
+EIP-7702 — a delegated EOA carries a code entry pointing at its
+delegate.<Cite src="eip-7702" /> You met that as
+[the broken code-length check](/c/code-length-check-broken); the comment "only pay EOAs" is
+describing a check that no longer performs it.
+
+**The shape to take away.** A constraint added to make a fuzz test stop failing needs a written
+justification, because the constraint and the bug live in the same place. Two exclusions here look
+identical in the diff — one is a documented harness artefact, the other quietly deletes the test's
+purpose.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next lesson:** the Environment family in full — `prank`, `deal`, `warp`, `roll` — and the specific
+way each one invites you to write a test that passes while proving nothing. You now have the frame
+you need for all of them: each is a call with a moment and a lifetime, not a setting.
+
+**Two lessons on:** the Assertions family, where the mechanism you have just learned explains the
+module's nastiest trap. `expectRevert` is a call that *registers* something; the next call *consumes*
+it. Once you see registration and consumption as two separate calls in a trace, the nesting bug stops
+being surprising.
+
+**And a habit for the whole track:** when a cheatcode does not behave as an article says, open
+`lib/forge-std/src/Vm.sol`.<Cite src="forge-std-repo" /> The signature and the doc comment for the
+version you are compiling against are twenty lines of reading, and they are authoritative in a way
+that no rendered page pinned to no version can be — including for the pins this module uses, forge
+1.7.1 and forge-std v1.16.2.<Cite src="measured-forge-1-7-1" /><Cite src="forge-std-vm-1-16-2" />

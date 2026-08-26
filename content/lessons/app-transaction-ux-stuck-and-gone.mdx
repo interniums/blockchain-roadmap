@@ -1,0 +1,376 @@
+---
+id: app-transaction-ux-stuck-and-gone
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    eip-1559,
+    geth-cli-options,
+    ethereum-org-json-rpc,
+    viem-errors-glossary,
+    viem-wait-for-transaction-receipt,
+    anvil-rpc-methods,
+    chainpath-conflict-register,
+  ]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+Four support tickets arrive within ten minutes, all saying the same thing: *"all my transactions are
+stuck"*.
+
+Three of them are one user with one stuck transaction and three later ones queued behind it. The
+fourth is a user whose transaction was quietly evicted from every pool that held it an hour ago and is
+never coming back, and whose interface is showing exactly the same spinner as the other three.
+
+Those two situations need opposite advice. "Wait, or pay more" is correct for the first and cruel for
+the second. "Send it again" is correct for the second and actively harmful for the first. Your UI
+cannot currently tell them apart, and neither can the user, because from the outside both look like
+`null` returned from `eth_getTransactionReceipt` forever.
+
+This lesson makes them distinguishable. The instrument, throughout, is the nonce.
+
+## One queue per account, and it is strictly ordered
+
+You have [nonce ordering](/c/nonce-ordering) already: an account's transactions execute in strict
+increasing nonce order, and a [gap](/c/nonce-gap) is not executable.
+
+The product consequence is head-of-line blocking, and it is worth stating in the language of the
+systems you have built before. **An externally-owned account is a single-consumer FIFO queue with no
+skip and no timeout.** Not a thread pool. Not a work queue with retries. One slot at a time, in order,
+forever.
+
+Two things follow immediately, and both surprise teams.
+
+**For a user**, one transaction at a low fee cap parks everything they do afterwards. They approve a
+token at a moment of low fees, walk away, come back during a spike, and their swap — sent at a
+perfectly sensible fee — cannot be mined, because the approval in front of it cannot. The swap's own
+fee is irrelevant. There is no bypass.
+
+**For your application**, any account you control that sends more than one transaction inherits the
+same constraint. A relayer, a keeper, a batch settler, a faucet, an automated market operation: all of
+them are one queue. If you have ever built a system where "just add another worker" was the answer to
+throughput, this is the case where it is not, and where the number of parallel senders you can have is
+exactly the number of funded addresses you are willing to operate.
+
+<Figure
+  caption="The transactions behind a parked one are not slow. They are ineligible, and their own fee caps are not consulted."
+  alt="Three transactions from one account in nonce order. The one at nonce N carries a fee cap under the base fee and is drawn as a cost; the transactions at N+1 and N+2 carry generous caps and are drawn dashed because nonce ordering makes them not executable at all while N is outstanding."
+>
+  <Flow
+    lanes={['nonce N', 'nonce N + 1', 'nonce N + 2']}
+    nodes={[
+      { id: 'n0', label: 'approve', note: 'cap under base fee', col: 0, tone: 'warn' },
+      { id: 'n1', label: 'swap', note: 'cap well over', col: 1, tone: 'muted', dashed: true },
+      { id: 'n2', label: 'everything after', note: 'never reached', col: 2, tone: 'muted', dashed: true },
+    ]}
+    edges={[
+      { from: 'n0', to: 'n1', label: 'blocks', tone: 'warn' },
+      { from: 'n1', to: 'n2', label: 'blocks', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="A stuck transaction only affects itself; later ones with higher fees will overtake it."
+  reality="Nothing overtakes. Nonce order is a validity rule, not a scheduling preference, so a transaction at nonce N+1 is not includable at all until N is. A high fee on a blocked transaction buys nothing."
+  why="Every other queue you have used has priority, or at least parallelism. Fee markets look like priority — and they are, but only among transactions that are individually eligible."
+  src="eip-1559"
+/>
+
+## Parked: the fee cap is a ceiling, not a bid
+
+The first stuck case is not stuck at all in the sense of being broken. It is waiting for the market to
+come to it.
+
+[EIP-1559](/c/eip-1559-fee-fields) gave the transaction two fee fields, `max_priority_fee_per_gas` and
+`max_fee_per_gas`, and imposed a validity condition:
+`transaction.max_fee_per_gas >= block.base_fee_per_gas`, so "the signer is willing to pay the current
+base fee".<Cite src="eip-1559" /> The effective price actually charged is
+`priority_fee_per_gas = min(transaction.max_priority_fee_per_gas, transaction.max_fee_per_gas - block.base_fee_per_gas)`
+added to the base fee, and the base fee itself "is not given to anyone (it is
+burned)".<Cite src="eip-1559" />
+
+Read the validity condition as a UI fact rather than an equation. **While the base fee sits above the
+cap the sender signed, the transaction is not merely unattractive — it is invalid for inclusion in that
+block.** No amount of proposer greed can include it. And the moment the base fee falls back under the
+cap, it becomes eligible again, with nothing having changed on the sender's side.
+
+That is why "pending for an hour" is not a synonym for "failed". A transaction signed during a quiet
+hour with a modest cap can sit through a busy afternoon and be mined that evening, exactly as
+authorised, at whatever the base fee is then. Nothing decayed. Nothing expired at the protocol level.
+
+The interface consequence is that this state has two honest sentences and one dishonest one:
+
+- Honest: "the network is currently more expensive than the maximum you approved."
+- Honest: "this will be included if fees fall, or you can replace it with a higher cap."
+- Dishonest: "your transaction failed."
+
+<Aside kind="note">
+This also explains a class of bug report that looks supernatural: *the transaction went through by
+itself in the middle of the night.* It did. The user, or your app, had already authorised it. The base
+fee came down. Nobody did anything. If your product treated the earlier timeout as terminal and undid
+its own optimistic state, you now have a confirmed on-chain action and an application that believes it
+never happened — the failure mode
+[the optimistic-UI boundary lesson](/c/tx-optimistic-ui-boundary) is built to prevent.
+</Aside>
+
+## Dropped: eviction, and the absence of any announcement
+
+The second case is genuinely terminal for that hash, and nothing tells you.
+
+A mempool is not part of consensus. It is a node's local cache, bounded, with its own admission and
+eviction policy — which you have from [mempool as a public broadcast](/c/mempool-is-a-public-broadcast)
+and [the node-local view](/c/mempool-view-is-node-local). What is worth making concrete here is how
+small and how *policy-shaped* those bounds are. go-ethereum's command-line defaults:
+
+| Flag | Default | What it governs |
+| --- | --- | --- |
+| `--txpool.globalslots` | 5120 | "Maximum number of executable transaction slots for all accounts" |
+| `--txpool.accountslots` | 16 | "Minimum number of executable transaction slots guaranteed per account" |
+| `--txpool.globalqueue` | 1024 | "Maximum number of non-executable transaction slots for all accounts" |
+| `--txpool.accountqueue` | 64 | "Maximum number of non-executable transaction slots permitted per account" |
+| `--txpool.pricelimit` | 1 | "Minimum gas price tip to enforce for acceptance into the pool" |
+| `--txpool.lifetime` | `3h0m0s` | "Maximum amount of time non-executable transaction are queued" |
+
+Every one of those is a default on one client, settable by whoever runs the node, and none of them is
+in any EIP.<Cite src="geth-cli-options" /> That matters twice over: it means the numbers above are not
+a specification you can rely on, and it means the behaviour differs between the node your wallet talks
+to, the node your backend talks to, and the nodes that actually build blocks.
+
+Read the table for its shape rather than its values. There is a bounded set of *executable* slots, a
+separately bounded set of *non-executable* ones — the queued, nonce-gapped transactions — and a clock
+on the second set but not the first. A transaction can therefore leave a pool because it lost a
+competition for space, because it sat too long in the queued category, or because the node restarted
+and its pool started empty.
+
+**None of these produces a notification.** There is no `eth_transactionDropped`. There is no receipt
+saying "discarded". The transaction simply stops being anywhere, and every subsequent
+`eth_getTransactionReceipt` returns the same `null` it was returning while everything was
+fine.<Cite src="ethereum-org-json-rpc" />
+
+<Misconception
+  belief="If a transaction were dropped, the node would tell me, or at least the library would."
+  reality="Nothing emits an event. Dropping is an omission, and omissions are only visible by comparison with something else — here, the account's nonce."
+  why="Message brokers publish dead-letter events, and HTTP has a status code for everything. Both trained the expectation that failure is announced."
+  src="ethereum-org-json-rpc"
+/>
+
+## Telling them apart: the nonce comparison
+
+The whole distinction reduces to one question. **Is the slot this transaction was using still open?**
+
+`eth_getTransactionCount` returns the number of transactions sent from an address, and takes a block
+parameter that accepts a block number or the tags `latest`, `earliest`, `pending`, `safe` and
+`finalized`.<Cite src="ethereum-org-json-rpc" /> Two of those tags are the ones that matter here, and
+the difference between them is the entire diagnostic.
+
+- **`latest`** — the count as of the last mined block. This is *how many of this account's
+  transactions have actually executed*, and therefore the nonce the account's next executed
+  transaction must carry.
+- **`pending`** — the count including transactions the node is currently holding in its own pool.
+  This is *that node's opinion* about what is queued, and it is exactly as authoritative as that one
+  node's view of the world.
+
+### The procedure
+
+**Subgoal: establish whether the slot has been consumed, because that is a fact about the chain rather
+than about anyone's pool.** Read the count at `latest` and compare it with the nonce of the transaction
+you are tracking.
+
+- `latestCount > txNonce` — the slot is gone. Something at that nonce executed. If it was not your
+  hash, it was a replacement or another transaction from the same account, and your hash will never
+  appear. This is terminal, and you should go and find out what *did* land at that nonce
+  ([lesson four](/c/tx-replacement-changes-the-hash)).
+- `latestCount == txNonce` — the slot is still open. Your transaction has not executed and nothing
+  else has taken its place. It is either still alive somewhere or it was dropped, and these two are
+  what you have to separate next.
+- `latestCount < txNonce` — there is a gap in front of you. An earlier transaction from this account
+  has not executed, so yours is not even eligible. This is the head-of-line case, and the thing to fix
+  is the *earlier* nonce, not this one.
+
+**Subgoal: separate "alive somewhere" from "dropped", knowing that you cannot do it conclusively.**
+With the slot open, read the count at `pending` from as many independent endpoints as you have.
+
+- `pendingCount > txNonce` on a node — that node is still holding it. It is alive there. It may not be
+  alive anywhere else.
+- `pendingCount == latestCount` everywhere you asked — none of the nodes you can see is holding it.
+  That is evidence, not proof. Some other node may still have it, and a proposer only needs one.
+
+<Figure
+  caption="One RPC call splits an identical-looking silence three ways. The receipt on its own splits it none."
+  alt="A decision flow starting from a null receipt. Comparing the account's transaction count at the latest tag against the tracked nonce gives three branches: count greater than the nonce means the slot was consumed and the hash is terminal; count equal means the slot is open, which sends you to the pending tag; count less means an earlier nonce is blocking. Asking the pending tag then splits into alive on that node, or missing everywhere you asked, which is evidence rather than proof."
+>
+  <Flow
+    nodes={[
+      { id: 'q', label: 'null receipt', note: 'again', col: 0, tone: 'warn' },
+      { id: 'gt', label: 'latest > nonce', note: 'slot consumed', col: 1, tone: 'danger' },
+      { id: 'eq', label: 'latest = nonce', note: 'slot still open', col: 1 },
+      { id: 'lt', label: 'latest < nonce', note: 'a gap in front', col: 1, tone: 'warn' },
+      { id: 'term', label: 'terminal', note: 'find what did land', col: 2, tone: 'danger' },
+      { id: 'ask', label: 'ask pending', note: 'every endpoint you have', col: 2 },
+      { id: 'head', label: 'fix the earlier one', note: 'not this nonce', col: 2, tone: 'warn' },
+      { id: 'alive', label: 'pending > nonce', note: 'alive on that node', col: 3 },
+      { id: 'gone', label: 'pending = latest', note: 'evidence, not proof', col: 3, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'q', to: 'gt', tone: 'danger' },
+      { from: 'q', to: 'eq' },
+      { from: 'q', to: 'lt', tone: 'warn' },
+      { from: 'gt', to: 'term', tone: 'danger' },
+      { from: 'eq', to: 'ask' },
+      { from: 'lt', to: 'head', tone: 'warn' },
+      { from: 'ask', to: 'alive' },
+      { from: 'ask', to: 'gone', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+**Subgoal: turn the ambiguity into a UI decision instead of pretending it away.** The honest state is
+"we can no longer find this transaction". The honest options offered alongside it are: keep watching
+(cheap, might resolve itself), or replace at the same nonce with a higher fee (costs gas, resolves it
+either way — the subject of the next lesson). What you must not do is offer "send it again" as a fresh
+transaction, because if the original is alive on a node you cannot see, a second transaction at the
+*next* nonce means the user has now authorised the action twice.
+
+<Aside kind="warn">
+That last hazard is the one that turns a display bug into a money bug. "Retry" in most software means
+"do the same thing again". Here, doing the same thing again at a new nonce means doing it *additionally*,
+and the two transactions can both be included in the same block. A retry in this domain is a
+**replacement at the same nonce**, never a new one — which is why the button in the next lesson is
+wired the way it is.
+</Aside>
+
+### Why the same comparison explains the wallet's nonce errors
+
+The two tags are also how the next nonce gets chosen in the first place. A wallet or library that is
+about to sign asks for the count at `pending`, so that a transaction you sent thirty seconds ago is
+counted and the new one goes behind it rather than colliding with it.<Cite src="ethereum-org-json-rpc" />
+That is the right default and it inherits the same weakness as everything else here: the answer is one
+node's opinion.
+
+Which is why the two failure shapes you see in the wild are mirror images of a disagreement about that
+opinion. Sign against a node that has *forgotten* a live transaction and you reuse a nonce that is
+already spoken for. Sign against a node that is *behind* and you leave a hole, so your transaction is
+queued rather than executable and sits in the non-executable category with a clock on it. viem gives
+both their own error classes, `NonceTooLowError` among them, rather than one generic nonce
+failure.<Cite src="viem-errors-glossary" />
+
+### What the client library gives you, and what it does not
+
+viem exports `TransactionNotFoundError`, `TransactionReceiptNotFoundError` and
+`WaitForTransactionReceiptTimeoutError` as separate classes, all extending
+`BaseError`.<Cite src="viem-errors-glossary" /> That distinction is useful and it is not the same as
+the diagnosis above: `TransactionNotFoundError` tells you a node could not find the transaction, which
+is one input to the nonce comparison, not a substitute for it.
+
+`waitForTransactionReceipt` will detect a *replacement*, because it scans new blocks for a transaction
+sent from the same nonce and reports it through `onReplaced`.<Cite src="viem-wait-for-transaction-receipt" />
+It has no equivalent for a drop, and it could not have one: there is no observation that establishes a
+drop, only an accumulating absence.
+
+<Aside kind="note">
+The research register for this curriculum records that current mempool eviction behaviour — how long a
+transaction survives in a given client's pool before being discarded — was not established from
+primary sources, and the widely repeated figures for the minimum fee bump required to replace one are
+client policy rather than protocol.<Cite src="chainpath-conflict-register" /> Treat everything in this
+section as *shape*, verified from one client's documented defaults, and treat any specific duration as
+something to measure against the nodes you actually use.
+</Aside>
+
+## Reproducing both states locally
+
+Neither of these is a state you want to first encounter in production, and both are two commands on a
+local node.
+
+**Parked.** Turn off automatic mining with `evm_setAutomine` (parameter `enabled`, "true for instant
+mining, false to stop instant mining"), then set the next block's base fee above your transaction's cap
+with `anvil_setNextBlockBaseFeePerGas`, which "Sets the base fee of the next block. Only supported when
+EIP-1559 is active".<Cite src="anvil-rpc-methods" /> Send the transaction, mine with `anvil_mine`, and
+watch it not be included. Lower the base fee, mine again, and watch it appear — with no action from the
+sender in between. That last step is the one worth showing a product manager.
+
+**Dropped.** `anvil_dropTransaction` "Removes a transaction from the pool. Returns the hash if the
+transaction was pending, otherwise `null`", taking the transaction
+hash.<Cite src="anvil-rpc-methods" /> This is the only way most engineers ever see the dropped state
+deliberately, and the point of the exercise is to observe what your UI does *without* being told: the
+receipt stays `null`, no error is raised, and the nonce at `latest` never advances.
+
+**Head-of-line blocking.** Automine off, send three transactions at nonces N, N+1, N+2 where the first
+has an unusably low fee cap, then mine. Exactly none of them is included. Raise the base fee, mine
+again, still none. This is the demo that ends the argument about whether the queue is really strict.
+
+<Check type="explain" concept="tx-dropped">
+Your backend runs a settlement account that submits one transaction every few minutes. At 14:02 it
+submits nonce 4,181 with a `maxFeePerGas` set from a fee estimate taken a minute earlier. Base fee
+climbs sharply from 14:03. Your monitor polls every 30 seconds and finds:
+
+- 14:05 — `getTransactionCount(latest) = 4181`, `getTransactionCount(pending) = 4182`, no receipt
+- 14:40 — `getTransactionCount(latest) = 4181`, `getTransactionCount(pending) = 4181`, no receipt
+- 15:20 — `getTransactionCount(latest) = 4182`, and a receipt exists for a hash that is **not** the one
+  you sent
+
+Say what happened in each window, what your monitor should have alerted on and when, and what the
+settlement job should have done at 14:40 — including what it must not do.
+
+<Answer>
+**14:05 — alive and parked.** `pending` is one ahead of `latest`, so the node you are asking is holding
+your transaction and considers it executable-in-waiting. `latest` has not moved, so it has not been
+mined. Combined with the fee history, the diagnosis is that the base fee has risen above the
+`maxFeePerGas` you signed, which makes it invalid for inclusion until the base fee comes back
+down.<Cite src="eip-1559" /> Nothing is broken. No alert beyond an informational "submission parked"
+is warranted yet.
+
+**14:40 — the node no longer has it.** `pending` has fallen back to equal `latest`. Your transaction is
+not in that node's pool any more. The slot at 4,181 is still open, so it was not replaced and it was
+not mined; it was evicted, or the node restarted, or you are talking to a different node behind a load
+balancer than the one that accepted it. That last possibility is why this is evidence and not proof,
+and why the check is worth repeating against a second endpoint before acting.
+
+The alert belongs here, and its text matters: **"submission no longer visible in mempool; nonce 4,181
+still open"** — not "transaction failed". The alert is about your loss of visibility, which is exactly
+what you observed.
+
+**15:20 — something else took the slot.** `latest` advanced to 4,182, so a transaction at nonce 4,181
+executed, and it was not yours. Either an operator or another process sharing this key sent one, or a
+replacement was broadcast at that nonce. Your hash is now permanently unresolvable — no future poll
+will ever return a receipt for it. The correct move is to look up what *did* land at that nonce and
+reconcile against it, which is the case for keying your records on `(address, chainId, nonce)` rather
+than on the hash.
+
+**What the job should have done at 14:40.** Broadcast a **replacement at nonce 4,181** with a higher
+fee cap — same intent, same nonce, new fee — and start tracking the new hash while keeping the same
+record. This resolves the ambiguity in one move: whichever of the two lands, exactly one transaction at
+nonce 4,181 executes, and the account is unblocked either way.
+
+**What it must not do.** Submit the settlement again as a *new* transaction at nonce 4,182. If the
+original is still alive on a node you cannot see — which is precisely the situation you failed to rule
+out — both can be included, and you have settled twice. The absence of a transaction from your view of
+the mempool is not the absence of a transaction from the network, and the retry semantics of every
+other system you have built are wrong here for exactly that reason.
+
+**One further thing to fix upstream.** A fee estimate taken a minute before signing became invalid
+during a climb. That is not an argument for enormous caps on everything; it is an argument for the fee
+cap being a deliberate parameter of a settlement job — chosen against how long you are willing to be
+parked — and for the job owning a replacement path rather than treating each submission as fire-and-
+forget.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The next lesson is the only lever this one identified.** Replacement is the sole mechanism that
+resolves both states: it un-parks a transaction whose cap was too low, and it settles the ambiguity of
+a possibly-dropped one. It is also the mechanism behind the Cancel button, which turns out not to
+cancel anything.
+
+**In your own systems, the audit is short.** Find every account your infrastructure signs with, and
+ask what happens to the *second* transaction when the first parks. If the answer is "we have never
+thought about it", the answer in production is "everything behind it stops, silently, and the alert
+that fires is about something else".
+
+**And one wording change pays for the lesson.** Anywhere your interface currently says a transaction
+failed after a timeout, it is making a claim it cannot support. "We have stopped watching" is both true
+and more useful, and it leaves the user's next action available instead of pushing them toward the one
+that duplicates their spend.

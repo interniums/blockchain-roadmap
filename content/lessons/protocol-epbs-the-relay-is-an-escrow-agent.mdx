@@ -1,0 +1,364 @@
+---
+id: protocol-epbs-the-relay-is-an-escrow-agent
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [flashbots-relay-incident-2023-04, flashbots-relay-incident-2022-11, flashbots-mev-boost-docs, builder-specs, eip-7732, relayscan-io, mevboost-pics, ethresearch-epbs-threads, consensus-specs-mainnet-config-gloas]
+stack: {}
+---
+
+At 11:29pm UTC on 2 April 2023, a validator that had been registered seventeen days earlier
+requested a block header from a relay for the slot it was about to propose.
+
+It received one. The relay was holding a block built by a builder, and that block contained bundles
+from several sandwich bots which had, hours earlier, taken the bait: a series of public-mempool swaps
+with infinite slippage against deep pools, crafted to look like the most profitable sandwich targets
+of the day.
+
+The proposer then signed the header — after setting its state root and parent root to zero. Signed,
+invalid, and returned to the relay.
+
+The relay did what its code said. It verified that the proposer's signature over the header was
+correct, attempted to publish the block, and released the body to the proposer. The publish failed:
+the local beacon nodes rejected the block, because a block with a zeroed state root is not a block.
+**The body was released anyway.**<Cite src="flashbots-relay-incident-2023-04" />
+
+The proposer now held every transaction in a block that would never exist, including the sandwich
+bundles. It built its own block for the same slot, ordered so that the sandwiches came apart, and
+proposed it. Roughly twenty million dollars moved.<Cite src="flashbots-relay-incident-2023-04" />
+
+This lesson is about why that was possible, what class of thing the relay is, and which parts of the
+failure are bugs that got patched versus properties that are still there.
+
+## The escrow is a procedure, not a cryptographic guarantee
+
+You already know [the shape](/c/relay-escrow): the proposer sees a commitment, signs it, and the relay
+releases the body. It is worth being exact about *why* an intermediary is needed at all, because the enshrined
+design is best understood as removing the need rather than replacing the party.
+
+Two parties want to trade. The builder has a block worth a lot; the proposer has the exclusive right
+to publish a block this slot. Neither can go first:
+
+- If the builder sends the block first, the proposer can publish the block's contents as its own
+  work and pay nothing. Everything valuable in the block is in the transactions, and transactions
+  are copyable.
+- If the proposer commits first without seeing anything, it has no assurance the thing it committed
+  to is even a valid block, and it can be made to miss its slot.
+
+A relay resolves this the way escrow resolves it everywhere: a third party takes custody, checks the
+goods, and releases them only against a binding commitment from the buyer.<Cite src="flashbots-mev-boost-docs" />
+
+<Figure
+  caption="The signature travels backwards, to the party still holding the goods. That return leg is the whole trust assumption."
+  alt="The builder hands a complete block and its promised payment to the relay, which offers the proposer only a header; the proposer's signed blinded block travels back to the relay, which then releases the body and publishes the block."
+>
+  <Flow
+    lanes={['builds', 'takes custody', 'commits', 'publishes']}
+    nodes={[
+      { id: 'b', label: 'builder', note: 'hands over the whole block', col: 0 },
+      { id: 'r', label: 'relay', note: 'validates, offers a header', col: 1, tone: 'warn' },
+      { id: 'p', label: 'proposer', note: 'signs contents it cannot see', col: 2, tone: 'accent' },
+      { id: 'n', label: 'network', note: 'the assembled block', col: 3 },
+    ]}
+    edges={[
+      { from: 'b', to: 'r', label: 'block + promised payment' },
+      { from: 'r', to: 'p', label: 'header' },
+      { from: 'p', to: 'r', label: 'signed blinded block', tone: 'warn' },
+      { from: 'r', to: 'n', label: 'body released' },
+    ]}
+  />
+</Figure>
+
+The essential property to notice is what is doing the work. **Nothing here is enforced by
+cryptography or by the state transition function.** The signature over the header is real, and it
+binds the proposer to that header. But "release the body only after the signature exists" is a
+branch in a Go program running on a server owned by a company. It is a procedure. The security of the
+whole arrangement is the security of that procedure, plus the honesty of whoever operates it, plus
+the correctness of its implementation.
+
+The 2023 incident is what it looks like when the procedure has one missing conditional. The escrow
+agent checked *that the buyer signed* and did not check *that what the buyer signed was usable*.
+
+<Misconception
+  belief="The relay's escrow is enforced by the protocol, so the exchange is trustless."
+  reality="It is enforced by relay software. The proposer's signature is cryptographic; the decision to reveal the body is a code path in a service the consensus specification does not model."
+  why="'Commit-reveal' is a cryptographic-sounding phrase, and the commit half genuinely is cryptographic — which makes it easy to assume the reveal half is too."
+  src="builder-specs"
+/>
+
+## Why the theft was uncontested, and what that says about fork choice
+
+There is a second half to the 2023 mechanism that is more interesting than the missing check, and it
+is the part that generalises.
+
+Normally, a proposer that obtains a block body and then publishes a *different* block for the same
+slot has done something visible and costly. It has equivocated — two signed blocks for one slot —
+and, more practically, its replacement block has to race the relay's block for attestations. The
+relay published first and has a head start; the equivocating proposer is behind and loses the
+fork-choice race in the ordinary case.<Cite src="flashbots-relay-incident-2023-04" />
+
+That defence evaporated here for a reason nobody had priced in. The relay *could not* publish,
+because the header the proposer signed was invalid. So there was no competing block. The attacker's
+block was the only candidate for the slot and won by walkover.<Cite src="flashbots-relay-incident-2023-04" />
+
+Sit with the structure of that. The safety property everyone relied on — "stealing the body doesn't
+help you, because you'd have to beat the relay's block" — was conditional on the relay's block
+existing, and the attacker controlled whether it existed. A defence that depends on your adversary
+performing an action is not a defence.
+
+<Aside kind="warn">
+This is the reasoning pattern worth carrying out of the module, more than any specific container
+name. When you read a claimed guarantee in a system like this, ask which party's action the
+guarantee depends on. "The honest builder's payload will be canonical" and "the honest proposer will
+be paid" are the two properties EIP-7732 claims to enforce, and the reason it is worth reading the
+fork-choice rules carefully is exactly that each claim needs to survive an adversary who declines to
+act.<Cite src="eip-7732" />
+</Aside>
+
+## The fix, and the second exposure it revealed
+
+The patch was direct: relays were changed to require a successful publish before releasing the body,
+so a signed-but-invalid header no longer buys you anything.<Cite src="flashbots-relay-incident-2023-04" />
+
+Following up, the same teams found a related problem that had nothing to do with invalid headers. A
+proposer could simply ask for the block *late* — far enough into its slot that the block could not
+land — and the relay would hand over the body regardless. A proposer holding two consecutive slots
+could use the contents of the first to build the second. Even a proposer with a single slot could
+grief a builder into revealing its block for nothing, by deliberately missing the
+slot.<Cite src="flashbots-relay-incident-2023-04" />
+
+The mitigation was a cutoff: after some number of seconds into the proposer's slot, the relay stops
+returning bodies. Relays deployed a two-second cutoff on the evening of 3 April 2023. Then honest
+validators started missing slots, and the cutoff was raised to three seconds the following
+morning.<Cite src="flashbots-relay-incident-2023-04" />
+
+**Read that sequence carefully, because it is a small, complete example of the thing this module is
+about.** A trust assumption was tightened. The tightening imposed a real cost on honest participants
+— a validator whose networking is a little slow now loses its slot instead of merely losing its
+bid — and the parameter had to be relaxed until the honest cost was tolerable. There was no setting
+that removed the risk without also removing something from someone honest. The writeup says as much
+in its own words: further investigation was still needed on whether the mitigation was worth its
+cost.<Cite src="flashbots-relay-incident-2023-04" />
+
+Hold that thought until the free-option lesson, where enshrined PBS faces a structurally identical
+question and reaches for a structurally similar answer.
+
+### The party that lost the money was not in the escrow
+
+One detail of the 2023 incident deserves separating out, because it changes what the incident is
+evidence *of*.
+
+The escrow arrangement has two counterparties: the proposer and the builder. Neither of them lost
+money. The proposer was the attacker. The builder — `builder0x69` in the writeup — had its block
+leaked, which is a real harm, but the funds that moved belonged to somebody else
+entirely.<Cite src="flashbots-relay-incident-2023-04" />
+
+The money belonged to the sandwich bots, whose bundles were inside that block. They had been baited
+into it deliberately: from 16 March 2023 the attacker registered a validator and waited for a
+proposal slot, and shortly before it arrived, sent public-mempool swaps with infinite slippage
+against pools with substantial liquidity — trades that look to a searcher like the most attractive
+sandwich targets available, and that are unprofitable to sandwich if the sandwich comes
+apart.<Cite src="flashbots-relay-incident-2023-04" />
+
+So the sequence of harm ran: searcher submits bundle to builder, builder submits block to relay,
+relay leaks block to proposer, proposer disassembles the bundle. The searcher had no relationship
+with the relay and no way to evaluate its code. It was exposed to the correctness of an escrow it was
+never a party to, two hops upstream.
+
+That is the general property, and it survives every patch that has been applied. **In a pipeline of
+voluntary bilateral arrangements, the risk each party carries is the union of everyone's
+implementation quality, not their own counterparty's.** Enshrining the proposer-builder exchange
+changes the terms of one hop in that chain. It does not, by itself, give a searcher any protocol
+guarantee about what happens to a bundle it sends to a builder — a limitation worth remembering when
+the module reaches what enshrinement does not fix.
+
+## Three failure modes, stated at the right strength
+
+The 2023 incident is the vivid one. It is not the whole argument, and overstating it is a way to get
+the argument wrong. Name the modes separately and say precisely how strong each claim is.
+
+### Correlated implementation failure
+
+Relay implementations are few, shared and open source. The 2023 vulnerability existed in the
+majority of relays — the `mev-boost-relay` implementation and `Dreamboat` are both named in the
+writeup — which means one defect had market-wide reach.<Cite src="flashbots-relay-incident-2023-04" />
+
+The November 2022 incident is the cleaner demonstration of the same property. A builder submitted
+bids carrying an incorrect `timestamp` and `prev_randao`; beacon nodes rejected the resulting bids;
+proposers across the network fell back to building locally, and MEV-Boost block share visibly dropped
+for hours.<Cite src="flashbots-relay-incident-2022-11" /> No stake was lost and no slots were missed,
+which is exactly the point: the failure was to the *market*, and the market is where nine in ten
+blocks live.
+
+**Strength of claim: strong, and evidenced twice.** A small number of shared implementations produces
+correlated failure. That is a structural property, not an accusation about any operator.
+
+<Aside kind="note">
+Both incidents were survivable for one reason: local fallback worked. A proposer that could not get
+a usable bid built its own block and proposed it on time. If you operate validators, that is the
+capability worth verifying rather than assuming — an execution client kept in sync and capable of
+producing a payload on demand, not merely kept running to serve the consensus client's engine calls.
+The distinction only becomes visible on the day the market is unavailable, which is the worst day to
+discover it.<Cite src="flashbots-relay-incident-2022-11" />
+</Aside>
+
+### Censorship chokepoint
+
+A relay sees complete blocks before publication and decides whether to publish them. That makes it
+the cheapest place in the entire pipeline to apply a rule about which transactions may appear. Any
+filtering obligation that lands anywhere in this supply chain lands most naturally there.
+
+**Strength of claim: strong on structure, weak on any particular number.** The structural argument is
+solid and does not depend on measurement. The measurements — what fraction of blocks came from
+relays applying a filter, in which month — move constantly and published figures disagree. If you
+need a number, take it from a live dashboard over a stated window and quote the window with
+it.<Cite src="relayscan-io" /><Cite src="mevboost-pics" />
+
+### Compellability and discretion
+
+A relay is an operating company. It can decide who may connect, it can blacklist a builder, and it
+can be subject to legal process. The November 2022 writeup records a relay briefly blacklisting a
+specific builder address while a fix was prepared, and unblocking it
+afterwards.<Cite src="flashbots-relay-incident-2022-11" /> That was a defensive act during an active
+incident and it was disclosed. It is also a demonstration that the capability is routine and
+unilateral.
+
+**Strength of claim: definitional rather than empirical.** The relay is a trusted third party in the
+strict sense — a party whose misbehaviour is possible and whose good behaviour is assumed. Whether it
+misbehaves is a separate question from whether it can.
+
+<Matrix
+  corner="Failure mode"
+  cols={['What the relay is able to do', 'Strength of the claim']}
+  rows={[
+    {
+      label: 'Correlated implementation failure',
+      cells: [
+        <>One defect reaches most of the market at once<Cite src="flashbots-relay-incident-2023-04" /></>,
+        { v: <>Strong, and evidenced twice<Cite src="flashbots-relay-incident-2022-11" /></>, tone: 'warn' },
+      ],
+    },
+    {
+      label: 'Censorship chokepoint',
+      cells: [
+        'See every block before publication and decide whether to publish it',
+        { v: <>Strong on structure, weak on any particular number<Cite src="relayscan-io" /></>, tone: 'plain' },
+      ],
+    },
+    {
+      label: 'Compellability and discretion',
+      cells: [
+        <>Decide who may connect, blacklist a builder, answer legal process<Cite src="flashbots-relay-incident-2022-11" /></>,
+        { v: 'Definitional rather than empirical', tone: 'muted' },
+      ],
+    },
+  ]}
+  caption="Three claims about the same party, at three different evidential strengths — and only the first one rests on incidents rather than on structure."
+  alt="Correlated implementation failure is strong and evidenced by two incidents; the censorship chokepoint is strong structurally but has no citable measurement; compellability is definitional, a property of being an operating company."
+/>
+
+<Misconception
+  belief="A relay failure means proposers miss their slots."
+  reality="The normal failure is a fallback to locally built blocks: the proposer earns less and the chain continues. Missed slots appeared only in the specific late-request scenario and in the mitigation that was deployed against it."
+  why="'Single point of failure' is usually read as 'liveness failure', but this intermediary sits on the revenue path, not the block-production path."
+  src="flashbots-relay-incident-2022-11"
+/>
+
+## What the relay cannot do
+
+Refusing to overclaim is part of getting this right. Several things a trusted third party might
+plausibly be able to do, this one cannot.
+
+**It cannot make an invalid block valid.** Everything the relay publishes is validated by every node
+on the network in the usual way. The relay's discretion is over *which* valid blocks get published,
+never over what counts as valid.
+
+**It cannot take the proposer's stake.** There is no path from relay misbehaviour to a slashing
+condition being met by an honest proposer. The proposer's downside is a lost bid, a lost slot's
+rewards, or in the worst historical case a missed slot — not its principal.
+
+**It cannot force a proposer to use it.** Local building is always available and clients implement
+it as the fallback. The pressure to use a relay is economic.<Cite src="flashbots-mev-boost-docs" />
+
+**It cannot rewrite history.** Everything about this market operates on the block currently being
+produced. Finality, and everything you know about it, is untouched.
+
+**It cannot serve a block that misses the attestation deadline and expect it to stick.** The relay is
+racing the same clock as everyone else: a block that arrives after most attesters have voted loses
+the fork-choice race regardless of who published it, and the mainnet attestation deadline is a fixed
+fraction of the slot, not a negotiable one.<Cite src="consensus-specs-mainnet-config-gloas" /> This is why
+the late-request attack worked at all — it exploited the relay's willingness to *reveal* past the
+point where publishing was still useful, not any ability to bend the deadline.
+
+The accurate summary is narrow and still serious: the relay's power is over the *contents of the
+next block and who learns them when*, plus the ability to stop participating. That is a small
+surface, exercised roughly nine times in ten, at a chokepoint of two or three
+organisations.<Cite src="flashbots-mev-boost-docs" />
+
+<Check type="explain" concept="relay-trust-assumption">
+A proposal circulates: keep relays exactly as they are, but require every relay to publish a signed
+attestation, after each slot, stating the header it served and the body it released. Any relay that
+released a body for a block it did not publish would be provably caught. Does this remove the trust
+assumption? Say what it fixes and what it does not.
+
+<Answer>
+It converts an unaccountable failure into an accountable one, and it does not remove the trust
+assumption.
+
+What it fixes: detection. After the fact, anyone could show that a relay released a body for a block
+that never landed. In 2023 the detection problem was not the binding constraint — the attack was
+reconstructed publicly within hours — but in the general case, evidence is worth
+something.<Cite src="flashbots-relay-incident-2023-04" />
+
+What it does not fix, in order of severity:
+
+1. **The money has already moved.** The attestation is published after the slot. The bundles were
+   already leaked and the block was already proposed. Detection is not prevention, and there is no
+   mechanism here that returns anything.
+2. **The relay still signs its own homework.** The attestation is a claim by the party under
+   scrutiny. Catching a *dishonest* attestation requires an independent record of what the relay
+   actually did, which is the thing you do not have.
+3. **Censorship is untouched.** A relay that declines to serve certain blocks is not misbehaving
+   under this scheme; it is exercising the discretion the scheme leaves it. You would be attesting
+   faithfully to a filtered market.
+4. **Correlated implementation failure is untouched.** The 2022 fallback event was a bug, not
+   dishonesty. Attesting to it accurately would not have prevented it.
+
+The general lesson: adding accountability to a trusted party changes the *cost* of misbehaviour, not
+the *possibility*. Removing the trusted party changes the possibility. That is the difference between
+a better relay and an enshrined design, and it is why the next lesson is about moving the exchange
+into the state transition function rather than about improving the escrow
+agent.<Cite src="eip-7732" />
+</Answer>
+</Check>
+
+## Where this leaves the design question
+
+Two production incidents, one of them costing roughly twenty million dollars, both patched within
+hours by the people who maintain the software. That last clause is the ambiguous part: a market that
+can patch a live exploit in half a day is impressively responsive, and a system whose most
+consequential component can be changed in half a day by a handful of people is not
+trust-minimised.<Cite src="flashbots-relay-incident-2023-04" />
+
+The argument for enshrinement is not that relay operators behaved badly. On the evidence they mostly
+behaved well and quickly. It is that the property everyone wants — a fair exchange between proposer
+and builder where neither can cheat the other — is the kind of property a consensus protocol knows
+how to provide, and it is currently being provided by a service instead.<Cite src="eip-7732" /> The
+design discussions that led to EIP-7732 return to that framing repeatedly: the goal is to make the
+exchange safe by construction rather than by
+operation.<Cite src="ethresearch-epbs-threads" /><Cite src="eip-7732" />
+
+One more framing before we open the specification, because it decides how you read everything that
+follows. The escrow exists to solve a *fair exchange* problem: two parties, neither able to go first.
+The classical result is that fair exchange between two mutually distrusting parties is not achievable
+without either a trusted third party or something that plays the role of one. A blockchain's state
+transition function is unusually well suited to playing that role, because it is a thing all parties
+already agree to be bound by. So the enshrined design does not invent a cleverer escrow. It notices
+that the participants are already inside a system with a referee and moves the trade in front of
+it.<Cite src="eip-7732" />
+
+The next lesson opens the containers. You will see exactly which field leaves the beacon block, what
+replaces it, and what a second object arriving later in the same twelve seconds does to every piece
+of software that currently assumes one block means one
+payload.<Cite src="consensus-specs-mainnet-config-gloas" />

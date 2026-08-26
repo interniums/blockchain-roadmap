@@ -1,0 +1,378 @@
+---
+id: evm-transaction-types-no-single-format
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    eip-2718,
+    eip-155,
+    eip-2,
+    eip-712,
+    eip-1559,
+    eip-2930,
+    eip-4844,
+    eip-7702,
+    execution-apis,
+    reth-transaction-types,
+    ethereum-org-transactions,
+  ]
+stack: {}
+---
+
+Two bugs, six months apart, in two different companies.
+
+The first team wrote a raw-transaction decoder. Feed it a hex string, run it through the RLP decoder
+you already trust, get a list of nine items, map them onto `nonce`, `gasPrice`, `gasLimit`, `to`,
+`value`, `data`, `v`, `r`, `s`. It passed every test. It ran in production for a year. Then it started
+throwing on strings that begin `0x02`, reporting — correctly — that the input is not an RLP list.
+
+The second team learned from the first. Their decoder reads the leading byte, switches on it, and
+rejects anything outside the set of types it knows. It rejected a transaction whose first byte was
+`0xf8`, which is not a transaction type at all, and which was nevertheless a completely valid
+transaction that a node had accepted, gossiped and included.
+
+Both teams shipped the same bug: they believed there is *a* transaction format. There is not. There is
+an envelope, five things currently inside it, and a first byte whose job is to tell you which one you
+are holding.<Cite src="reth-transaction-types" /><Cite src="ethereum-org-transactions" />
+
+<Figure
+  caption="Both bugs in the opening skip the fork and let the decoder guess the field list from whatever came back."
+  alt="Raw transaction bytes are dispatched on the first byte: values 0x00 to 0x7f are typed envelopes, values 0xc0 to 0xfe are legacy RLP lists, and only after that fork is the payload decoded by the rules of its own type."
+>
+  <Flow
+    lanes={['input', 'dispatch', 'branch', 'payload']}
+    nodes={[
+      { id: 'raw', label: 'raw bytes', note: 'off a queue or a node', col: 0 },
+      { id: 'b0', label: 'first byte', note: 'the only fixed meaning', col: 1, tone: 'accent' },
+      { id: 'typed', label: '0x00 – 0x7f', note: 'typed envelope', col: 2, tone: 'accent' },
+      { id: 'legacy', label: '0xc0 – 0xfe', note: 'legacy RLP list', col: 2, tone: 'muted' },
+      { id: 'dec', label: "the type's own rules", note: 'field list, then digest', col: 3 },
+    ]}
+    edges={[
+      { from: 'raw', to: 'b0' },
+      { from: 'b0', to: 'typed', tone: 'accent' },
+      { from: 'b0', to: 'legacy', tone: 'muted' },
+      { from: 'typed', to: 'dec', tone: 'accent' },
+      { from: 'legacy', to: 'dec', tone: 'muted' },
+    ]}
+  />
+</Figure>
+
+## The envelope is one byte and a promise
+
+The mechanism is [EIP-2718](https://eips.ethereum.org/EIPS/eip-2718), and it is small enough to state
+in full. A transaction is `TransactionType || TransactionPayload`, where `||` is byte concatenation,
+`TransactionType` is an unsigned 8-bit number between `0` and `0x7f`, and `TransactionPayload` is an
+opaque byte array whose interpretation is defined entirely by the type.<Cite src="eip-2718" />
+
+Two words in that sentence carry more weight than the rest.
+
+**"Opaque."** The payload is deliberately *not* specified as RLP. The rationale is explicit: by making
+the payload opaque bytes rather than an RLP list, future transaction types can use a different
+encoding — SSZ, LEB128, a fixed-width format — without another envelope change.<Cite src="eip-2718" />
+Every type shipped so far happens to RLP-encode its payload, which is exactly why so much code gets
+away with "decode the RLP, then figure out what it was". That code is relying on a coincidence the
+specification went out of its way not to promise. The correct algorithm is the other order: **read the
+first byte, dispatch, then decode according to the type's own rules.**
+
+**"Between 0 and 0x7f."** The ceiling is not arbitrary. It exists so that a typed transaction's first
+byte can never be mistaken for the first byte of an RLP list. Recall from
+[RLP](/c/rlp) that a list encoding always begins at `0xc0` or above; the EIP states the disambiguation
+as a rule you can implement in one comparison. If the first byte is in the range `[0, 0x7f]` it is a
+typed transaction. If it is in `[0xc0, 0xfe]` it is a legacy transaction. `0xff` is described as not realistic for an
+RLP-encoded transaction and is reserved as a future extension sentinel — leaving the high bit free to
+be used later as a continuation bit if 128 types ever runs out.<Cite src="eip-2718" />
+
+That is the whole trick, and it is why adding a transaction type is a non-breaking change. Old code
+that only understands legacy transactions does not misparse a type-2 transaction into nonsense; it
+sees a first byte below `0xc0` and knows it is looking at something it does not understand. Failing
+loudly at the first byte is a much better failure than succeeding quietly on the wrong fields.
+
+<Aside kind="note">
+Compare this with how the problem was solved the last time. Before the envelope existed, a new field
+had to be smuggled into the shape of an old one. [EIP-155](/c/eip-155-chain-id-replay) bit-packed the
+chain id into the signature's `v` value, precisely because there was no other place to put it that
+older software would tolerate.<Cite src="eip-155" /> The EIP-2718 motivation cites that as the thing
+it exists to stop repeating: without an envelope, every proposed type has to be made mutually
+distinguishable from every other by payload shape alone.<Cite src="eip-2718" />
+</Aside>
+
+<Figure
+  caption="Five field lists are live at once, and no amount of looking at the payload tells you which one you have."
+  alt="The five live transaction envelopes stacked: type 0 has nine fields and no prefix byte; type 1 adds chainId and an access list; types 2, 3 and 4 share the same nine opening fields and differ only in what they append before the signature."
+>
+  <ByteLayout
+    caption="type 0 — rlp([…]), no prefix byte"
+    fields={[
+      { label: 'nonce' },
+      { label: 'gasPrice', tone: 'warn' },
+      { label: 'gasLimit' },
+      { label: 'to', size: 20 },
+      { label: 'value' },
+      { label: 'data', tone: 'muted' },
+      { label: 'v', tone: 'accent', note: 'chainId lives in here' },
+      { label: 'r, s', size: 64, tone: 'muted' },
+    ]}
+  />
+  <ByteLayout
+    caption="type 1 — 0x01 || rlp([…])"
+    fields={[
+      { label: 'type', size: 1, tone: 'accent', note: '0x01' },
+      { label: 'chainId' },
+      { label: 'nonce' },
+      { label: 'gasPrice', tone: 'warn' },
+      { label: 'gasLimit' },
+      { label: 'to', size: 20 },
+      { label: 'value' },
+      { label: 'data', tone: 'muted' },
+      { label: 'accessList', tone: 'accent' },
+      { label: 'yParity' },
+      { label: 'r, s', size: 64, tone: 'muted' },
+    ]}
+  />
+  <ByteLayout
+    caption="type 2 — 0x02 || rlp([…])"
+    fields={[
+      { label: 'type', size: 1, tone: 'accent', note: '0x02' },
+      { label: 'chainId' },
+      { label: 'nonce' },
+      { label: 'maxPriorityFee', tone: 'warn' },
+      { label: 'maxFee', tone: 'warn' },
+      { label: 'gasLimit' },
+      { label: 'to', size: 20 },
+      { label: 'value' },
+      { label: 'data', tone: 'muted' },
+      { label: 'accessList' },
+      { label: 'yParity' },
+      { label: 'r, s', size: 64, tone: 'muted' },
+    ]}
+  />
+  <ByteLayout
+    caption="type 3 — 0x03 || rlp([…])"
+    fields={[
+      { label: 'type', size: 1, tone: 'accent', note: '0x03' },
+      { label: 'chainId' },
+      { label: 'nonce' },
+      { label: 'maxPriorityFee', tone: 'warn' },
+      { label: 'maxFee', tone: 'warn' },
+      { label: 'gasLimit' },
+      { label: 'to', size: 20 },
+      { label: 'value' },
+      { label: 'data', tone: 'muted' },
+      { label: 'accessList' },
+      { label: 'maxFeePerBlobGas', tone: 'accent' },
+      { label: 'blobVersionedHashes', tone: 'accent' },
+      { label: 'yParity' },
+      { label: 'r, s', size: 64, tone: 'muted' },
+    ]}
+  />
+  <ByteLayout
+    caption="type 4 — 0x04 || rlp([…])"
+    fields={[
+      { label: 'type', size: 1, tone: 'accent', note: '0x04' },
+      { label: 'chainId' },
+      { label: 'nonce' },
+      { label: 'maxPriorityFee', tone: 'warn' },
+      { label: 'maxFee', tone: 'warn' },
+      { label: 'gasLimit' },
+      { label: 'to', size: 20 },
+      { label: 'value' },
+      { label: 'data', tone: 'muted' },
+      { label: 'accessList' },
+      { label: 'authorizationList', tone: 'accent' },
+      { label: 'yParity' },
+      { label: 'r, s', size: 64, tone: 'muted' },
+    ]}
+  />
+</Figure>
+
+## Receipts moved too, and so did the tries
+
+The envelope is not only about the transaction you sign. The same EIP redefines two of the block
+header's roots.
+
+The transactions trie maps `rlp(Index)` to `TransactionType || TransactionPayload` or to a legacy
+transaction. The receipts trie maps `rlp(Index)` to `TransactionType || ReceiptPayload` or to a legacy
+receipt, and the receipt's type byte MUST match the type of the transaction at the same
+index.<Cite src="eip-2718" /> A legacy receipt is `rlp([status, cumulativeGasUsed, logsBloom,
+logs])`.<Cite src="eip-2718" />
+
+If you have built anything on [index-keyed transaction and receipt proofs](/c/tx-and-receipt-tries-are-index-keyed),
+this is the detail that decides whether your verifier works. To prove a receipt against a header you
+have to reconstruct the exact value bytes that were inserted at that key, and for any typed
+transaction those bytes begin with the type prefix. A verifier that hashes the RLP receipt body alone
+computes a leaf that is one byte short and fails against every block holding a typed transaction, for a reason that
+looks nothing like a byte-alignment problem when you are staring at a mismatched root.
+
+<Figure
+  caption="Two shapes can sit at the same trie key, and the prefix is inside the hashed value rather than metadata about it."
+  alt="A legacy receipt is the RLP list of status, cumulativeGasUsed, logsBloom and logs. A typed receipt is the same list with the transaction's type byte prepended, and that byte is part of the value stored in the receipts trie."
+>
+  <ByteLayout
+    caption="legacy receipt — the value stored at rlp(index)"
+    fields={[
+      { label: 'status' },
+      { label: 'cumulativeGasUsed' },
+      { label: 'logsBloom', tone: 'muted' },
+      { label: 'logs', tone: 'muted' },
+    ]}
+  />
+  <ByteLayout
+    caption="typed receipt — same key, one byte longer"
+    fields={[
+      { label: 'type', size: 1, tone: 'accent', note: 'must match the tx' },
+      { label: 'status' },
+      { label: 'cumulativeGasUsed' },
+      { label: 'logsBloom', tone: 'muted' },
+      { label: 'logs', tone: 'muted' },
+    ]}
+  />
+</Figure>
+
+## The type byte is inside the signature, deliberately
+
+There is a security consideration in EIP-2718 that reads as advice and functions as a rule.
+
+New transaction types SHOULD include the transaction type as the first byte of the signed data.
+Without it, the EIP warns, a signature over one transaction type may be signature-compatible with a
+transaction of a different type.<Cite src="eip-2718" /> The wording is SHOULD rather than MUST because
+of one specific exception — a wrapped legacy transaction that must stay compatible with the legacy
+signing scheme — and because a future type might not have a signature in the traditional sense at
+all.<Cite src="eip-2718" />
+
+Every live type takes the advice. Type `0x01` signs over `keccak256(0x01 || rlp([...]))`.<Cite src="eip-2930" />
+Type `0x02` signs over `keccak256(0x02 || rlp([...]))`.<Cite src="eip-1559" /> Type `0x03` and type
+`0x04` do the same with their own prefix bytes.<Cite src="eip-4844" /><Cite src="eip-7702" />
+
+This is domain separation, and you have met it before under a different name. It is the same move as
+the `0x19` prefix and the [domain separator](/c/domain-separator) in
+[EIP-712](/c/eip-712-typed-data)<Cite src="eip-712" />: make the *meaning* of a signed message part of what
+gets hashed, so that a signature harvested in one context cannot be replayed as a different kind of
+object in another. What made it necessary here is that several of the types share a long field
+prefix. Types `0x02`, `0x03` and `0x04` all open with the same nine fields — chain id, nonce, the two
+fee ceilings, gas limit, destination, value, data, access list — and differ only in what they append
+afterwards.<Cite src="eip-1559" /><Cite src="eip-4844" /><Cite src="eip-7702" /> Without the leading
+type byte in the digest, a signature's applicability would be decided by how many elements happened to
+follow, which is a much thinner defence than a distinct preimage.
+
+## Type zero, which is not going anywhere
+
+The legacy transaction has no type byte because it predates the concept. EIP-2718 defines it, for
+disambiguation purposes, exactly as `rlp([nonce, gasPrice, gasLimit, to, value, data, v, r,
+s])`.<Cite src="eip-2718" />
+
+Nine fields, and the differences from everything that came later are all visible in the list:
+
+- **One `gasPrice`, not two ceilings.** There is no `maxFeePerGas` / `maxPriorityFeePerGas` pair. When
+  a node normalises a legacy transaction for fee accounting, it sets *both* of the 1559 fields to the
+  single `gasPrice`, which means a legacy sender is offering their entire price as tip whenever the
+  base fee is below it.<Cite src="eip-1559" />
+- **No access list.** The field does not exist, so a legacy transaction cannot pre-warm anything.
+- **No explicit chain id field.** The chain id lives inside `v`.
+
+That last one is worth slowing down on, because it is the only place in the five formats where a
+security property is encoded in an arithmetic relationship rather than a field. Under EIP-155 the
+signer hashes nine elements — the six transaction fields plus `chainid, 0, 0` — and sets
+`v = {0,1} + CHAIN_ID * 2 + 35`, where `{0,1}` is the parity of the `y` value of the curve
+point.<Cite src="eip-155" /> A verifier reading a `v` of `CHAIN_ID * 2 + 35` or `+ 36` knows to hash
+nine elements rather than six.<Cite src="eip-155" />
+
+And the sentence right after it, in the same specification: the existing scheme using `v = 27` and
+`v = 28` **remains valid and continues to operate under the same rules as it did
+previously**.<Cite src="eip-155" /> A legacy transaction signed with `v = 27` carries no chain id at
+all. It is valid on every chain that will accept it, which is the cross-chain replay exposure that
+[nonce-based replay protection](/c/nonce-replay-protection) alone does not close — the nonce stops the
+same transaction landing twice on one chain, not the same signature landing once on each of nine.
+
+<Misconception
+  belief="Legacy type-0 transactions are deprecated and gone."
+  reality="They are valid, they are still broadcast, and every client still implements them. Reth's own node documentation lists legacy as one of the five transaction types it handles, alongside 2930, 1559, 4844 and 7702."
+  why="Wallets have defaulted to type-2 for years, so from the sending side type-0 is invisible. It stays visible from the receiving side: anything that decodes, indexes, simulates or re-signs traffic meets it."
+  src="reth-transaction-types"
+/>
+
+<Misconception
+  belief="There is 'the' Ethereum transaction format — I just need to learn the current one."
+  reality="Five envelope types are live at once, and the envelope exists specifically so that more can be added without breaking anything. 'The current one' is a set, not a value."
+  why="Almost every tutorial teaches one format — usually type-2 — because that is what a wallet emits. Emitting is a one-of-five problem; accepting is a five-of-five problem."
+  src="eip-2718"
+/>
+
+## What actually breaks
+
+The abstract version of this lesson is "handle all the types". The useful version is knowing where the
+assumption hides, because it is rarely written down as an assumption.
+
+**Anything that computes a transaction hash.** The hash is over the full encoding including the type
+prefix. Recompute it as if it were legacy and you get a hash that matches nothing.
+
+**Anything that re-signs or replays a stored payload.** If you persisted decoded fields and rebuild
+the signing digest later, you must rebuild it with the right type byte and the right field list.
+Getting this wrong does not produce an error — it produces a valid signature over a different message,
+recovering to an address that is not your user.
+
+**Anything with an `if`-chain over fee fields.** Code that reads `gasPrice` finds it absent on types
+1559 and above; code that reads `maxFeePerGas` finds it absent on type 0. JSON-RPC returns the union
+of fields across types, so the missing ones come back as `undefined` rather than as an
+error.<Cite src="execution-apis" />
+
+**Anything that validates signature `s`.** [EIP-2](https://eips.ethereum.org/EIPS/eip-2) constrains
+`s` to the lower half of the curve order,<Cite src="eip-2" /> and the typed formats carry an explicit
+`yParity` of 0 or 1 instead of legacy's chain-id-encoded `v`.<Cite src="eip-2930" /> A validator that expects a `v` of 27
+or 28 rejects every typed transaction; one that expects `yParity` rejects every legacy one.
+
+<Check type="spot-bug" concept="eip-2718-envelope">
+A service receives raw signed transactions over an internal queue and needs to route them by sender.
+The relevant code is:
+
+```ts
+const items = rlpDecode(raw);          // throws if `raw` is not an RLP list
+const [nonce, gasPrice, gasLimit, to, value, data, v, r, s] = items;
+const sender = recover(keccak256(rlpEncode(items.slice(0, 6))), v, r, s);
+```
+
+Name every distinct way this fails against live mainnet traffic, and say which failures are loud and
+which are silent.
+
+<Answer>
+**Loud, and therefore the least dangerous.** `rlpDecode` throws on any typed transaction, because the
+input starts with a type byte in `[0, 0x7f]` and is not an RLP list.<Cite src="eip-2718" /> Roughly
+everything a modern wallet emits lands here. It is a total outage for typed traffic, but it is an
+outage you can see.
+
+**Silent, and the reason this exercise exists.** Suppose someone "fixes" the throw by stripping a
+leading byte below `0xc0` before decoding. Now the decode succeeds on a type-1 or type-2 payload and
+destructures the wrong fields into the wrong names — `chainId` becomes `nonce`, `nonce` becomes
+`gasPrice`, and so on down the list, because those payloads begin with an extra `chainId`
+field.<Cite src="eip-2930" /><Cite src="eip-1559" /> No exception is raised. The service routes on a
+sender it computed from a digest that was never signed.
+
+**Silent, on legacy transactions specifically.** The recovery hashes six elements. That is correct
+only for a pre-EIP-155 signature with `v` of 27 or 28. For an EIP-155 signature the signer hashed nine
+elements — the six plus `chainid, 0, 0` — so recovering from the six-element digest yields a
+syntactically valid but wrong address.<Cite src="eip-155" /> The service does not fail; it attributes
+the transaction to an address nobody controls.
+
+**The structural fix** is to branch on the first byte before touching a decoder, and to treat the
+digest construction as part of the type's definition rather than as a shared helper. The rule of thumb
+worth carrying: any code path where a decode failure is impossible is a code path where a
+misattribution is possible.
+</Answer>
+</Check>
+
+## Where this pays off
+
+Everything in the rest of this module is a payload behind a known prefix byte, so the work is now
+mostly about what each type *added* and what it added it for.
+
+The next lesson takes the three envelopes you will actually construct — `0x01`, `0x02` and `0x04` —
+and treats each as a trade rather than an upgrade, including the one where the trade is frequently a
+loss.
+
+Further out, the envelope is what makes the block-level structures tractable. When you meet
+[receipt proofs](/c/tx-and-receipt-tries-are-index-keyed) again in the context of cross-chain
+messaging, the type prefix is the byte that most implementations get wrong first. And when you reach
+the encoding roadmap, the "opaque payload" clause is the hinge: it is the reason a future
+SSZ-encoded transaction type does not require a second envelope.<Cite src="eip-2718" />

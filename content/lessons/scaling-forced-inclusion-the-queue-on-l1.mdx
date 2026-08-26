@@ -1,0 +1,329 @@
+---
+id: scaling-forced-inclusion-the-queue-on-l1
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [nitro-contracts-sequencer-inbox, nitro-contracts-abs-inbox, nitro-contracts-messages, arbitrum-tx-lifecycle-deep-dive, arbitrum-sequencer, arbitrum-nitro-whitepaper, l2beat-arbitrum-project, op-docs-forced-transaction]
+stack: {}
+---
+
+Here is the function every "users can always exit" sentence is ultimately pointing at. It lives on
+the `SequencerInbox` contract on Ethereum, and this is its whole
+signature.<Cite src="nitro-contracts-sequencer-inbox" />
+
+```solidity
+function forceInclusion(
+    uint256 _totalDelayedMessagesRead,
+    uint8 kind,
+    uint64[2] calldata l1BlockAndTime,
+    uint256 baseFeeL1,
+    address sender,
+    bytes32 messageDataHash
+) external { ... }
+```
+
+Read it as an incident responder rather than as a reader. It is `external` with no modifier, so the
+promise that anybody can call it is not rhetoric — it is the absence of an access-control check. But
+six arguments have to come from somewhere, and none of them is "your transaction". There is no
+`bytes calldata tx` parameter. Whatever this function does, it does not submit anything.
+
+That gap between the sentence and the signature is what this lesson closes. By the end you will know
+what is actually stored on L1 when you queue a message, why the forcing call needs a preimage instead
+of a payload, and where each of those six values comes from when you are the one typing the command
+at three in the morning.
+
+## Two contracts, three roles
+
+The Arbitrum-side escape path is not one contract. It is a pipeline with a deliberate split of
+authority, and the split is the design.
+
+**The `Inbox` is the entry point.** Anyone submits here. `sendL2Message(bytes calldata messageData)`
+takes a serialised child-chain transaction; `sendUnsignedTransaction(gasLimit, maxFeePerGas, nonce, to, value, data)`
+builds an unsigned one for you, signed implicitly by the fact that you are the L1
+caller.<Cite src="nitro-contracts-abs-inbox" /> Arbitrum's own documentation names `sendL2Message` as
+step two of the bypass procedure, with "wait for processing or force inclusion after 24 hours" as step
+three.<Cite src="arbitrum-tx-lifecycle-deep-dive" />
+
+**The `Bridge` holds the queue.** The Inbox does not store your message. It calls into the Bridge,
+which appends to the delayed inbox — the structure the whole mechanism is named after.
+
+Those two entry points are not interchangeable, and choosing between them under pressure is easier if
+you have thought about it beforehand. `sendL2Message` carries a fully serialised, already-signed
+child-chain transaction: you sign with the same key you always use, the nonce is the nonce you
+already have, and the transaction executes on the child chain from your ordinary account.
+`sendUnsignedTransaction` carries fields rather than a signature, and authorisation comes from the
+identity of the L1 caller instead.<Cite src="nitro-contracts-abs-inbox" /> The second is the one that
+works when the key that controls the child-chain position is not the key in your hand — and the one
+that surprises people, because the account it acts as is derived from the L1 sender rather than
+chosen. Decide which you need while you can still test it.
+
+There is also a size ceiling worth knowing before you serialise anything large. The Inbox rejects
+`messageData` longer than `maxDataSize`, which the source notes should be set to 117,964 bytes on
+L1 — ninety per cent of Geth's 128 KB transaction size limit, leaving roughly 13 KB of headroom for
+proving.<Cite src="nitro-contracts-abs-inbox" /> A forced transaction is an ordinary L1 transaction
+in every respect that constrains it.
+
+**The `SequencerInbox` holds the cursor.** It tracks `totalDelayedMessagesRead`, a count of how far
+into the delayed queue the canonical child-chain ordering has consumed. The sequencer advances that
+cursor as a side effect of posting batches. `forceInclusion` advances it without a sequencer.
+
+<Figure
+  caption="Two paths advance the same cursor, and only one of them needs the sequencer to exist."
+  alt="The Arbitrum escape pipeline: anyone calls sendL2Message on the Inbox; the Bridge appends the message to the delayed inbox as one 32-byte accumulator per position; the SequencerInbox's read cursor is advanced either by the sequencer posting a batch or by a permissionless forceInclusion call; nodes deriving the chain read up to the cursor."
+>
+  <Flow
+    lanes={['submit', 'store', 'advance the cursor', 'the child chain']}
+    nodes={[
+      { id: 'inbox', label: 'Inbox', note: 'sendL2Message — anyone', col: 0, tone: 'accent' },
+      { id: 'bridge', label: 'Bridge', note: 'delayed inbox: one accumulator per position', col: 1 },
+      { id: 'seq', label: 'sequencer batch', note: 'advances the cursor as a side effect', col: 2, tone: 'muted' },
+      { id: 'force', label: 'forceInclusion', note: 'advances it with no sequencer', col: 2, tone: 'accent' },
+      { id: 'der', label: 'derivation', note: 'nodes read up to the cursor', col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'inbox', to: 'bridge' },
+      { from: 'bridge', to: 'seq', tone: 'muted' },
+      { from: 'bridge', to: 'force', tone: 'accent' },
+      { from: 'seq', to: 'der' },
+      { from: 'force', to: 'der', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+Say that last sentence back in the form that matters operationally. **Forcing does not push your
+transaction anywhere. It moves a pointer past it.** Your transaction became part of L1 state the
+moment `sendL2Message` returned; the only thing missing is the child chain's acknowledgement that it
+has read that far.
+
+<Misconception
+  belief="forceInclusion is how you submit a transaction when the sequencer is down."
+  reality="It is how you advance the delayed-message read cursor. Submission already happened, in a separate transaction, to a different contract, possibly a day earlier."
+  why="The mechanism is described as one capability — 'force a transaction in' — so the two-transaction shape stays invisible until you try to write the runbook."
+  src="arbitrum-tx-lifecycle-deep-dive"
+/>
+
+## The queue stores a hash chain, not messages
+
+This is the part that explains the signature, and it is worth deriving rather than accepting, because
+the derivation is the reason your runbook needs an archive node.
+
+Storing every queued message's bytes in contract storage would be ruinous. What the Bridge stores
+instead is one 32-byte accumulator per queue position. Two functions define it, both
+pure.<Cite src="nitro-contracts-messages" />
+
+**Subgoal: fix what a single message commits to.** The message hash is a packed encoding of seven
+fields — no length prefixes, no padding, the `abi.encodePacked` you already know:
+
+```solidity
+messageHash = keccak256(abi.encodePacked(
+    kind,            // uint8   — 3 (L2_MSG) for an ordinary forced transaction
+    sender,          // address — the L1 address that called the Inbox
+    blockNumber,     // uint64  — the L1 block your submission landed in
+    timestamp,       // uint64  — that L1 block's timestamp
+    inboxSeqNum,     // uint256 — your position in the delayed queue
+    baseFeeL1,       // uint256 — the L1 base fee at submission
+    messageDataHash  // bytes32 — keccak256 of your serialised transaction
+));
+```
+
+**Subgoal: chain the messages so the queue has a single commitment.** Each accumulator folds the
+previous one in:
+
+```text
+acc[n] = keccak256(acc[n-1] || messageHash[n])        acc[-1] = 0x00…00
+```
+
+That is a Merkle chain rather than a Merkle tree — no branching, no sibling paths, and no way to
+prove membership of position `n` without knowing everything about position `n`. The Bridge exposes
+`delayedInboxAccs(i)`, so the chain is readable from L1, but the *preimages* are not on L1 in any form
+a contract can read.<Cite src="nitro-contracts-sequencer-inbox" /> They exist only in event logs.
+
+Compare this against the [Merkle inclusion proofs](/c/merkle-inclusion-proof) you built by hand in the
+core track and the trade is clear. A tree gives you logarithmic proofs and lets a verifier check
+position `n` while knowing nothing about the rest. A chain gives you one storage slot per position and
+constant-time appends, at the price of pushing every field of the message back onto the caller. For a
+queue whose only two operations are *append* and *advance the cursor*, the chain is the cheaper
+structure and the caller's burden is the whole cost of that choice.<Cite src="nitro-contracts-messages" />
+The `kind` byte is one of a small set of message-type constants, with `L2_MSG = 3` covering an
+ordinary forced child-chain transaction.<Cite src="nitro-contracts-abs-inbox" />
+
+**Subgoal: read the signature back off the derivation.** Now the six arguments are forced. To verify
+that you are asking it to read up to *your* message, `forceInclusion` must recompute
+`messageHash` — so you must supply `kind`, `sender`, `l1BlockAndTime`, `baseFeeL1` and
+`messageDataHash`. It reads `acc[n-2]` from the Bridge, recomputes `acc[n-1]`, and compares against
+what the Bridge stores. A mismatch reverts with
+`IncorrectMessagePreimage`.<Cite src="nitro-contracts-sequencer-inbox" /> The seventh field,
+`inboxSeqNum`, it derives itself as `_totalDelayedMessagesRead - 1`.
+
+**Subgoal: state the operational consequence.** Every one of those values is recoverable *only* from
+the L1 logs of your own submission transaction. If your runbook says "call `forceInclusion`" and does
+not say "first fetch the `InboxMessageDelivered` log and the header of the block it landed in", the
+runbook has a hole exactly where the pressure will be.
+
+<Aside kind="note">
+Notice which value is *not* in the preimage: the transaction's calldata. Only `messageDataHash`
+commits to it. So the L1 contract can confirm that some 32-byte commitment sits at queue position `n`
+without ever seeing the bytes. The bytes are needed by the child chain's derivation, which reads them
+from the L1 event log, not by the L1 contract doing the forcing. Data availability and contract
+verification are doing separate jobs here, and separating them is what keeps `forceInclusion` cheap.
+</Aside>
+
+## What the call actually does when it succeeds
+
+Read the body rather than the docs, because the body says something the docs do not.
+
+After the preimage check passes, `forceInclusion` builds an *empty* data hash and calls the same
+internal batch-adding routine the sequencer's own batch poster uses. It passes
+`newSeqMsgCount = prevSeqMsgCount`, with the comment that force inclusion should not modify the
+sequencer message count, and it emits `SequencerBatchDelivered` with a batch data location of
+`NoData`.<Cite src="nitro-contracts-sequencer-inbox" />
+
+So a forced inclusion appears on L1 as **a batch with no sequencer transactions in it and a higher
+delayed-read pointer**. Nodes deriving the chain see the pointer move and pull the corresponding
+messages out of the delayed queue. The transactions execute because derivation says they must, not
+because anyone relayed them.
+
+This is the same shape as the [derivation](/c/derivation) rules you already know from the OP Stack
+side: the canonical chain is a deterministic function of L1, and the escape hatch works by editing
+L1 into a state whose only valid derivation includes you.
+
+### The queue is FIFO, and that is not a detail
+
+`forceInclusion` opens with `if (_totalDelayedMessagesRead <= totalDelayedMessagesRead) revert DelayedBackwards();`<Cite src="nitro-contracts-sequencer-inbox" />
+The cursor is monotonic, and it names a position, not a message. You cannot force *your* message.
+You force *everything up to and including* your message.
+
+Three consequences, all of which have shown up in real runbooks as surprises:
+
+- **You cannot skip ahead.** If four thousand messages are queued in front of yours during an
+  incident, forcing yours forces all four thousand. Your call pays the gas for advancing over all of
+  them.
+- **Somebody else's call may include you for free.** If any other user forces past your position,
+  your message is included as a side effect. During a mass exit this is a genuine free-rider dynamic:
+  the first caller past position `n` pays, everyone at or below `n` is carried.
+- **Ordering among forced messages is submission order,** so the queue position you got when you
+  called `sendL2Message` is the position you will execute in.<Cite src="nitro-contracts-messages" />
+  Racing to force does not reorder anything; it only changes who pays.
+
+L2BEAT describes the same structure from the outside: users must first enqueue delayed messages in
+the delayed inbox of the Bridge contract, only authorised Inboxes may enqueue, and if the sequencer
+does not process the request within the time bound, `forceInclusion` on the `SequencerInbox` includes
+the message in the canonical chain.<Cite src="l2beat-arbitrum-project" />
+
+<Misconception
+  belief="Because forceInclusion is permissionless, somebody will call it."
+  reality="Permissionless describes who is allowed to, not who is motivated to. The call costs real L1 gas that grows with the number of queued messages it advances over, and nothing pays the caller back."
+  why="'Anyone can' is heard as 'someone does'. In the normal case the sequencer drains the queue, so the function is rarely exercised and there is no standing population of bots watching it the way there is for liquidations."
+  src="nitro-contracts-sequencer-inbox"
+/>
+
+The free-rider dynamic and the missing incentive are the same fact seen from two sides. If your exit
+depends on a stranger paying to advance a cursor past four thousand messages, the honest version of
+your runbook budgets for making that call yourself.
+
+## The deadline is a view function, not a number in a blog post
+
+The contract will tell you when you may call it. `forceInclusionDeadline(uint64 blockNumber)` returns
+the L1 block number at which a message submitted in `blockNumber` becomes
+forceable.<Cite src="nitro-contracts-sequencer-inbox" />
+
+```solidity
+function forceInclusionDeadline(uint64 blockNumber) external view returns (uint64) {
+    uint64 _delayBlocks = delayBlocks;
+    if (isDelayBufferable) {
+        uint64 _buffer = buffer.calcPendingBuffer(blockNumber);
+        _delayBlocks = delayBufferableBlocks(_buffer);
+    }
+    return blockNumber + _delayBlocks;
+}
+```
+
+Two things to take from this. First, the runbook line is a `cast call`, not a stopwatch: read the
+deadline from the deployment you are actually on. Second, `delayBufferableBlocks` returns the
+*lesser* of the buffer and `delayBlocks`, which is where the adaptive behaviour enters — the subject
+of the next lesson.<Cite src="nitro-contracts-sequencer-inbox" /> Arbitrum's documentation states
+`delayBlocks` is currently set to 24 hours, with the buffer configurable in a range of 30 minutes to
+48 hours, and is explicit that chain owners may change the defaults for their
+chain.<Cite src="arbitrum-sequencer" /> Treat those as the defaults of one chain family, not as a
+property of rollups.
+
+## The entrance can be closed; the exit cannot
+
+One more thing the source says and the prose does not. `sendL2Message` and `sendUnsignedTransaction`
+both carry `whenNotPaused onlyAllowed`. The Inbox has a `pause()` and an address allow list, and both
+are gated by `onlyRollupOrOwner` — the rollup contract or its owner.<Cite src="nitro-contracts-abs-inbox" />
+
+`forceInclusion` carries neither modifier.<Cite src="nitro-contracts-sequencer-inbox" />
+
+That asymmetry is worth holding on to, because it decides what an owner key can and cannot do to you:
+
+<Matrix
+  corner="Action"
+  cols={['Gated by']}
+  rows={[
+    { label: 'Queue a new message via the Inbox', cells: [{ v: <>pausable and allow-listable by the rollup owner<Cite src="nitro-contracts-abs-inbox" /></>, tone: 'danger' }] },
+    { label: 'Force-include an already-queued message', cells: [{ v: <>nothing<Cite src="nitro-contracts-sequencer-inbox" /></>, tone: 'good' }] },
+  ]}
+  caption="Two calls on the same escape path: one behind an owner-controlled gate, one behind no gate at all."
+  alt="Queueing a new message via the Inbox is pausable and allow-listable by the rollup owner. Force-including an already-queued message is gated by nothing."
+/>
+
+The escape hatch protects messages **already in the queue** absolutely, and protects your ability to
+*enter* the queue not at all. A team that treats "we can always force" as a standing capability is
+assuming the entrance stays open. A team that has already queued a message is relying on code with no
+authority check in front of it. Those are different risk positions, and the difference is a
+`whenNotPaused` modifier. We return to what that implies for the walkaway test in the last lesson of
+this module.
+
+<Check type="spot-bug" concept="force-include-call">
+An engineer drafts this step for the incident runbook and asks whether it will work.
+
+> **Step 4.** When the sequencer has been down for more than 24 hours, call
+> `SequencerInbox.forceInclusion` with our user's transaction bytes and their address. Any team
+> member with an L1 key can do it. Budget one call per affected user.
+
+Three of those four sentences contain an error. Name them, and say what the corrected step needs.
+
+<Answer>
+**"with our user's transaction bytes"** — wrong argument. `forceInclusion` takes no transaction bytes.
+It takes `messageDataHash`, which is `keccak256` of them, plus four other preimage fields — `kind`,
+`sender`, `l1BlockAndTime` and `baseFeeL1` — and the target cursor
+`_totalDelayedMessagesRead`.<Cite src="nitro-contracts-sequencer-inbox" /> Those come from the L1
+receipt and block header of the *submission* transaction, so the corrected step begins with a log
+fetch, and the runbook needs an archive-capable L1 endpoint listed as a dependency.
+
+**"their address"** — wrong address, subtly. `sender` in the preimage is the L1 address that called
+the Inbox, not the child-chain account the transaction is from.<Cite src="nitro-contracts-messages" />
+If your relayer submitted on the user's behalf, `sender` is the relayer. Getting this wrong reverts
+with `IncorrectMessagePreimage` and the revert is indistinguishable from getting the base fee wrong.
+
+**"one call per affected user"** — wrong cardinality, and expensively so. The cursor is monotonic and
+positional: one call naming the highest queue position covers every message at or below
+it.<Cite src="nitro-contracts-sequencer-inbox" /> Budget one call for the whole cohort. Doing it per
+user means every call after the first reverts with `DelayedBackwards`.
+
+**"Any team member with an L1 key can do it"** — this one is correct, and it is the only load-bearing
+guarantee in the step. `forceInclusion` is `external` with no access control, so the caller need not
+be the sender, need not be your team, and need not be anyone you have ever met.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The next lesson** takes the deadline you just learned to read and asks why it is a day rather than a
+block. The answer is not implementation difficulty; it is [reorg](/c/reorg) safety plus a deliberate
+concession to normal sequencing, and Arbitrum's adaptive buffer turns that concession into arithmetic
+you can run.
+
+**The lesson after that** shows the OP Stack solving the same problem with no queue and no forcing
+call at all — a deposit to the `OptimismPortal` and a derivation rule that obliges nodes to include
+it.<Cite src="op-docs-forced-transaction" /> Two mechanisms, one property, and the differences show up
+precisely in the runbook.
+
+**Your own work.** The single highest-value exercise in this module is the one nobody does: on a
+testnet, submit through `sendL2Message`, wait, and call `forceInclusion` yourself. Every question this
+lesson raised — which log, which field, whose address, which node — becomes a fact you have observed
+rather than a claim you have read. The original Nitro design set out the delayed inbox precisely so
+that this path would exist without the sequencer's cooperation.<Cite src="arbitrum-nitro-whitepaper" />
+It is worth finding out whether you can walk it.

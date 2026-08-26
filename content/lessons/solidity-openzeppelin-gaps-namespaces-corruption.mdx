@@ -1,0 +1,423 @@
+---
+id: solidity-openzeppelin-gaps-namespaces-corruption
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-7201, oz-pr-4534, oz-docs-writing-upgradeable, oz-docs-upgradeable, oz-docs-backwards-compatibility, oz-upgradeable-readme, oz-erc20-upgradeable-v570, oz-ownable-upgradeable-v570, oz-docs-upgrades-core, oz-foundry-upgrades, oz-issue-6362, oz-changelog, solidity-docs-storage-layout]
+stack: { solidity: "0.8.36", foundry: "1.7.1" }
+---
+
+For about five years, every upgradeable Solidity tutorial ended with the same line:
+
+```solidity
+uint256[50] private __gap;
+```
+
+Fifty reserved words at the bottom of a base contract, doing nothing, costing nothing, and holding
+open a space that a future version might need. It is a good idea, it worked, and OpenZeppelin stopped
+using it in its own package in October 2023.<Cite src="oz-changelog" />
+
+This lesson is why the gap existed, what replaced it, and the failure mode that sits between the two
+— a class of bug that compiles, deploys, and destroys a live contract without ever producing an
+error the compiler could have shown you.
+
+## The problem gaps solved
+
+You know how the compiler assigns [storage slots](/c/storage-slot): state variables get slots
+starting at 0, in declaration order, with bases before derived. That last part is the trouble.
+
+```solidity
+contract Base  { uint256 base1; }          // slot 0
+contract Child is Base { uint256 child; }  // slot 1
+```
+
+Ship version two of `Base` with one extra variable and `base2` takes slot 1 — the slot `child`
+occupies on the deployed contract.<Cite src="oz-docs-writing-upgradeable" /> Nobody edited `Child`.
+Nobody wrote a bug. The layout moved because a *parent* grew, and behind a proxy the old bytes stay
+where they are while the new code reads them under new names.
+
+<Figure
+  caption="Slot 1 keeps its bytes and changes its meaning — that is the entire failure."
+  alt="The storage slots of Child after Base gained one variable: base1 at slot 0, the new base2 at slot 1 where the deployed contract's child value already sits, and child pushed out to slot 2 where nothing was ever written."
+>
+  <ByteLayout
+    unit="words"
+    offsets
+    caption="Child's slots after Base grew by one variable"
+    fields={[
+      { label: 'base1', size: 1, note: 'unchanged' },
+      { label: 'base2', size: 1, tone: 'danger', note: "reads child's value" },
+      { label: 'child', size: 1, tone: 'warn', note: 'was slot 1' },
+    ]}
+  />
+</Figure>
+
+A gap converts that into arithmetic you control:
+
+```solidity
+contract Base {
+    uint256 base1;
+    uint256[49] __gap;   // reserve
+}
+```
+
+Add `base2` later, drop the array to `[48]`, and `child`'s slot never moves. The plugins recognise
+the convention: name the array `__gap` or something starting with `__gap_` and the tooling knows what
+it is for.<Cite src="oz-docs-writing-upgradeable" />
+
+It works, and it has three sharp edges. The arithmetic is manual. It interacts with packing rules —
+adding an `address` consumes a whole slot from the gap even though an address is 20 bytes, because an
+array always starts a new slot, whereas two `uint128` fields share one and cost the gap
+one.<Cite src="oz-docs-writing-upgradeable" /> And it constrains the future: the reservation is a
+guess about how much you will need, made before you know.
+
+## What replaced it
+
+ERC-7201 puts a contract's state in a struct rooted at a derived slot, annotated in source so tools
+can find it.<Cite src="eip-7201" /> OpenZeppelin adopted it for the entire upgradeable package in
+5.0.0.<Cite src="oz-changelog" /><Cite src="oz-pr-4534" /> The standard is Final, and its authors are
+OpenZeppelin engineers — this is the library standardising a pattern and then adopting its own
+standard.<Cite src="eip-7201" />
+
+The formula is one line: `erc7201(id) = keccak256(keccak256(id) - 1) & ~0xff`.<Cite src="eip-7201" />
+
+### Deriving a real root, step by step
+
+Take `openzeppelin.storage.ERC20`, the namespace id in `ERC20Upgradeable`.<Cite src="oz-erc20-upgradeable-v570" />
+
+**Subgoal 1 — hash the identifier, to get a pseudorandom starting point.**
+
+```console
+$ cast keccak "openzeppelin.storage.ERC20"
+0xb750591399365444a618527b69a54ce09476c8bde1ecff60f5aa1fe2b52605ff
+```
+
+**Subgoal 2 — subtract one, to land somewhere Solidity's own layout never puts data.** The EIP is
+explicit about why: `keccak256(id) - 1` is a location unused by Solidity, for the same reason
+[ERC-1967 slots](/c/erc-1967-slots) subtract one — no known preimage produces
+it.<Cite src="eip-7201" />
+
+```text
+0xb750591399365444a618527b69a54ce09476c8bde1ecff60f5aa1fe2b52605fe
+```
+
+**Subgoal 3 — hash again, so the whole namespace is disjoint and not just its first slot.** This is
+the step people skip when they reinvent the pattern, and the EIP states the reason plainly: a
+namespace can be larger than one slot, so it extends into `keccak256(id) + n`, and those locations
+*are* potentially used by Solidity. A second hash guarantees the namespace is completely disjoint
+from standard storage, assuming keccak-256 collision resistance and that arrays are not unreasonably
+large.<Cite src="eip-7201" />
+
+```console
+$ cast keccak $(cast to-uint256 0xb750591399365444a618527b69a54ce09476c8bde1ecff60f5aa1fe2b52605fe)
+0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bacedc
+```
+
+**Subgoal 4 — mask off the low byte, aligning the root to a multiple of 256.** The EIP gives the
+reason as a potential optimisation in anticipation of gas-schedule changes after the Verkle state
+tree migration, which may cause groups of 256 storage slots to become warm at
+once.<Cite src="eip-7201" /> It is forward-looking, not load-bearing today.
+
+```text
+0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace00
+```
+
+**Subgoal 5 — check it against the source.** That constant appears verbatim in
+`ERC20Upgradeable.sol`, alongside the comment showing the same derivation in
+Solidity.<Cite src="oz-erc20-upgradeable-v570" /> Two other roots worth having in your head, derived
+the same way and matching their files exactly:
+
+```text
+openzeppelin.storage.Ownable        0x9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300
+openzeppelin.storage.Initializable  0xf0c57e16840df040f15088dc2f81fe391c3923bec73e23a9662efc9c229c6a00
+```
+
+Every one of them ends in `00`, which is subgoal 4 showing through.<Cite src="oz-ownable-upgradeable-v570" />
+
+### Where the fields land
+
+Inside the namespace, ordinary layout rules apply from the new root. `ERC20Storage` declares
+`_balances`, `_allowances`, `_totalSupply`, `_name`, `_symbol` in that
+order.<Cite src="oz-erc20-upgradeable-v570" /> Mappings occupy a declared slot that stays empty and
+seed a hash for their contents, so:
+
+<Figure
+  caption="A parent that grows cannot move any of these, because none of them sit in the compiler's sequential range."
+  alt="The ERC-20 namespace rooted at 0x52c6 ending ce00: balances at root plus 0 and allowances at root plus 1 hold nothing themselves and seed a hash for their contents, then totalSupply, name and symbol at root plus 2, 3 and 4."
+>
+  <ByteLayout
+    unit="words"
+    offsets="hex"
+    caption="root 0x52c6…ce00 — erc7201:openzeppelin.storage.ERC20"
+    fields={[
+      { label: '_balances', size: 1, tone: 'muted', note: 'empty; data hashed' },
+      { label: '_allowances', size: 1, tone: 'muted', note: 'empty; data hashed' },
+      { label: '_totalSupply', size: 1, tone: 'accent' },
+      { label: '_name', size: 1 },
+      { label: '_symbol', size: 1 },
+    ]}
+  />
+</Figure>
+
+`_totalSupply` therefore lives at `0x52c6...ce02`, `_name` at `...ce03`, `_symbol` at `...ce04` — the
+same offsets an OpenZeppelin maintainer quotes when explaining the layout on a real
+transaction.<Cite src="oz-issue-6362" />
+
+What this buys is stated in the docs: you can add new state variables without compromising storage
+compatibility with existing deployments, and you can change the inheritance order with no impact on
+the resulting layout, as long as every inherited contract uses namespaced
+storage.<Cite src="oz-docs-upgradeable" /> The `Base`-grows-and-crushes-`Child` problem disappears
+because `Base` and `Child` no longer share a coordinate system.
+
+<Misconception
+  belief="Storage gaps are obsolete — ERC-7201 replaced them."
+  reality="OpenZeppelin's own upgradeable package moved to namespaces in 5.0. Gaps remain a documented, tool-supported convention for base contracts you write yourself, and the upgrades plugins still recognise arrays named __gap or __gap_."
+  why="The library's switch was loud and widely reported, and it is easy to read a vendor's internal decision as a deprecation of the technique."
+  src="oz-docs-writing-upgradeable"
+/>
+
+Namespaces are also not a licence to rearrange. Inside a namespace, the rules you already know still
+hold: the plugins validate each change within a namespace by the same rules as any other storage
+layout — do not reorder, do not retype, do not insert in the middle, add at the
+end.<Cite src="oz-docs-writing-upgradeable" /> The scope of what can collide shrank. The discipline
+inside each scope did not.
+
+<Aside kind="note">
+Namespaced layouts need Solidity 0.8.20 or higher for the plugins to validate them, because older
+compilers do not emit enough information about `@custom:storage-location`
+annotations.<Cite src="oz-docs-writing-upgradeable" /> Against 0.8.36 that is not a constraint, but it
+is the reason the annotation is invisible to some older tooling rather than merely unsupported.
+</Aside>
+
+### Seven edits, and what each does to the bytes
+
+The rules are the same whether your variables sit in the sequential range or inside a namespace, and
+the documentation enumerates them.<Cite src="oz-docs-writing-upgradeable" /> They are worth holding
+as a table rather than a principle, because the dangerous ones do not look dangerous in a diff.
+
+| Edit | Effect on a live proxy |
+|---|---|
+| Append a variable at the end | Safe. Takes the next free slot. |
+| Change a variable's type | Values mixed up. Old bytes reinterpreted. |
+| Reorder two declarations | Values mixed up, and it reads as a pure formatting change. |
+| Insert a variable before existing ones | Everything after it shifts by at least one slot. |
+| Remove a variable | Everything after it shifts back. |
+| Rename a variable | Slot preserved; the new name starts with the old value. |
+| Remove the last variable, then later append one | The appended variable reads the removed one's leftover value — storage is never cleared. |
+
+Two of those deserve emphasis because they involve no edit to the file you are looking at. Swapping
+the order of base contracts — `contract C is B, A` where it was `A, B` — changes where every
+inherited variable lives.<Cite src="oz-docs-writing-upgradeable" /> And adding a variable to a base
+contract whose children have variables of their own hands the new variable a slot the child was
+already using.<Cite src="oz-docs-writing-upgradeable" /> Namespaced storage removes both, which is
+precisely why the library adopted it; it does nothing for the five rows above that happen inside one
+namespace.
+
+The last row is the subtlest and the one that survives review most often. Deleting a trailing
+variable looks like cleanup and passes every test, because nothing reads it any more. Six months
+later somebody appends a field, it lands on the same slot, and it is born holding a value from a
+previous life.
+
+## The upgrade that corrupts
+
+Now put the two schemes on the same proxy.
+
+A contract deployed against OpenZeppelin 4.x has sequential storage: `Initializable._initialized` at
+slot 0, then the inherited chain's variables, then gaps. Upgrade the implementation to one compiled
+against 5.x and the new code reads its state from hashed roots that nothing ever wrote, while the old
+bytes sit untouched in the sequential range. Nothing reverts at upgrade time. The bytecode is valid.
+The storage is full of correct data that the new code cannot see.
+
+OpenZeppelin says this in its own README, without hedging: for upgradeable contracts, the storage
+layout of different major versions should be assumed incompatible — it is unsafe to upgrade from
+4.9.3 to 5.0.0.<Cite src="oz-upgradeable-readme" /> The documentation puts it more strongly still:
+it will **never** be safe for a live contract to upgrade from one major release to
+another.<Cite src="oz-docs-backwards-compatibility" />
+
+### A live contract that cannot be recovered
+
+In February 2026 a report was filed against the OpenZeppelin repository describing a UUPS proxy on
+BNB Smart Chain that had been upgraded from a 4.x implementation to a 5.x one and was permanently
+deadlocked.<Cite src="oz-issue-6362" /> The token data — balances, supply, configuration — was intact
+in storage. The contract could not be initialised, upgraded, or administered by any on-chain
+transaction.
+
+Two interlocking failures, both worth understanding separately.
+
+**The owner is nobody.** `OwnableUpgradeable` reads `_owner` from
+`0x9016d09d...199300`.<Cite src="oz-ownable-upgradeable-v570" /> The 4.x deployment never wrote that
+slot — its owner was in the sequential range — so the new code reads zero. Every `onlyOwner`
+function, including `upgradeToAndCall`, `transferOwnership` and every admin function, reverts with
+`OwnableUnauthorizedAccount` for every caller.<Cite src="oz-issue-6362" /> There is no address that
+can sign a transaction from `address(0)`, so the fact that the upgrade path would *work* if it could
+be called is no help.
+
+<Figure
+  caption="The upgrade succeeds, and takes with it the only key that could have undone it."
+  alt="A valid upgrade installs a 5.x implementation, which reads the owner from an ERC-7201 slot the 4.x deployment never wrote, so owner returns the zero address and every onlyOwner function including upgradeToAndCall reverts for every caller."
+>
+  <Flow
+    nodes={[
+      { id: 'up', label: 'upgrade lands', note: 'bytecode is valid', col: 0 },
+      { id: 'sl', label: 'owner slot unwritten', note: '0x9016d09d…199300', col: 1, tone: 'warn' },
+      { id: 'ze', label: 'owner() is address(0)', col: 2, tone: 'danger' },
+      { id: 'rv', label: 'every onlyOwner reverts', note: 'upgradeToAndCall too', col: 3, tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+**Initialising to fix it reverts with a panic.** The report's `initialize()` attempts to write a
+string into a slot that already holds `0x01`, left over from 4.x's `_initialized` flag, and reverts
+with `Panic(0x22)` before any state is written.<Cite src="oz-issue-6362" />
+
+That panic is worth deriving, because it is pure Solidity mechanics. `bytes` and `string` share an
+encoding: for data of at most 31 bytes the elements sit in the higher-order bytes and the lowest byte
+holds `length * 2`; for 32 bytes or more the main slot holds `length * 2 + 1` and the data lives at
+`keccak256(p)`. You tell them apart by the lowest bit — clear means short, set means
+long.<Cite src="solidity-docs-storage-layout" />
+
+Read `0x01` under that rule. Lowest bit set, so: a long string. Length `(1 - 1) / 2 = 0`. A long
+string of length zero is a contradiction — long means 32 bytes or more. The slot is invalidly
+encoded, and the Solidity documentation states that reading an invalidly encoded slot results in
+`Panic(0x22)` when compiling via IR.<Cite src="solidity-docs-storage-layout" /> One leftover byte
+from a flag, reinterpreted as a length prefix.
+
+<Aside kind="warn">
+**Read the thread, not the headline.** The report attributes the collision to v5's first ERC-7201
+string field landing in slot 0. An OpenZeppelin maintainer disputes exactly that in the comments —
+the ERC-7201 namespace, and its slot 0 in particular, should not contain anything from the previous
+v4 storage — and points out that `_name` in the ERC-20 namespace sits at `0x52c6...ce03`, not at slot
+0.<Cite src="oz-issue-6362" /> The deadlock and the panic are documented and reproduced. The precise
+identity of the colliding variable was never settled in the thread, and the issue was still open when
+this lesson was verified. Treat the mechanism as established and the specific diagnosis as
+contested — which is itself the lesson, because "OZ v4 to v5 puts `_initialized` in the ERC-20 name
+slot" is exactly the kind of tidy sentence that gets repeated for years.
+</Aside>
+
+What makes the case instructive is the exhaustiveness of the search for a way out. The reporter
+enumerated all 124 function selectors in the implementation's bytecode: 34 view functions that
+succeed and return zeros, 21 blocked by `onlyOwner`, two that panic, and no reinitializer, no
+ERC-2771 forwarder, no `AccessControl` roles, no `Ownable2Step` pending-owner path, no arbitrary
+`delegatecall` or `multicall`.<Cite src="oz-issue-6362" /> The maintainer's answer to "is there any
+mechanism that allows state modification without passing `onlyOwner`" was no.<Cite src="oz-issue-6362" />
+
+There is one constructive suggestion in the thread, and it is a nice closing of a circle: use the
+`TrieProof` library added in 5.6.0 to build storage proofs of the locked token's balances and
+distribute an equivalent new token to holders — with the caveat that it handles balances held by
+contracts such as AMM pairs badly.<Cite src="oz-issue-6362" /><Cite src="oz-changelog" /> The state
+is provable even when it is unreachable.
+
+<Misconception
+  belief="Bumping a deployed proxy's implementation from OpenZeppelin 4.x to 5.x is a dependency upgrade like any other."
+  reality="The storage layout model changed from sequential-plus-gaps to ERC-7201 namespaces. The new implementation compiles cleanly and reads the old bytes under a completely different interpretation. OpenZeppelin's own documentation says it will never be safe to upgrade a live contract across majors."
+  why="It compiles, and 4 to 5 reads like a routine semver bump. The compiler cannot see across two separately deployed artifacts."
+  src="oz-docs-backwards-compatibility"
+/>
+
+## The layer that actually stops you
+
+Nothing in the above is enforced by Solidity. It is enforced, if you let it be, by
+`@openzeppelin/upgrades-core` — a Node package with a `validate` command that reads compiler build
+info and refuses upgrades that would corrupt state.<Cite src="oz-docs-upgrades-core" />
+
+The most useful thing in its documentation is the argument to `--unsafeAllow`, because the list of
+validations you are allowed to switch off is, in effect, the list of validations there are. The
+errors:
+
+```text
+state-variable-assignment      state-variable-immutable    external-library-linking
+struct-definition              enum-definition             constructor
+delegatecall                   selfdestruct                missing-public-upgradeto
+internal-function-storage      missing-initializer         missing-initializer-call
+duplicate-initializer-call
+```
+
+plus one warning, `incorrect-initializer-order`.<Cite src="oz-docs-upgrades-core" /> Separately,
+`--unsafeAllowRenames` relaxes the layout check for variable renames and `--unsafeSkipStorageCheck`
+turns the layout comparison off entirely — described in the documentation as a dangerous option meant
+as a last resort.<Cite src="oz-docs-upgrades-core" />
+
+Read that list as a specification. `missing-public-upgradeto` is the
+[UUPS bricking check](/c/uups-bricking-risk). `constructor` and `state-variable-immutable` are the
+transpiler's rules applied to your code. `delegatecall` and `selfdestruct` are the
+implementation-destruction path. The four initializer entries are the linearisation problem from the
+previous lesson.
+
+In Foundry the plugin shells out to that CLI, which is why the setup is unusually
+specific:<Cite src="oz-foundry-upgrades" />
+
+```toml
+[profile.default]
+ffi = true
+ast = true
+build_info = true
+extra_output = ["storageLayout"]
+```
+
+Node.js has to be installed. The new implementation needs a
+`@custom:oz-upgrades-from <reference>` annotation naming what it is replacing, or a
+`referenceContract` option at the call site. And you must run `forge clean` first, or pass `--force`,
+because stale artifacts produce duplicate contract definitions.<Cite src="oz-foundry-upgrades" />
+
+Two things deserve to be said plainly about that. First, `ffi = true` lets your test run execute
+arbitrary external processes; you are trading a sandbox property for a safety check, and that is a
+defensible trade you should make knowingly. Second, the validator is not part of the chain, not part
+of the compiler, and not part of the library. It is a program you have to choose to run. Every
+upgrade performed with `UnsafeUpgrades`, with `unsafeSkipAllChecks`, or with a hand-written
+`upgradeToAndCall` transaction has none of these checks — and that is exactly the situation the BNB
+Smart Chain proxy was in.<Cite src="oz-foundry-upgrades" />
+
+<Check type="spot-bug" concept="oz-upgrade-unsafe-across-majors">
+A team runs an upgradeable ERC-20 behind a UUPS proxy, deployed two years ago against OpenZeppelin
+4.9. They want three things: a dependency bump to 5.7.0, one new state variable
+`uint256 public feeBps` on their own contract, and a rename of `_treasury` to `_feeRecipient`.
+
+Their plan is to bump the dependency, make both source changes, run `forge build`, and call
+`upgradeToAndCall`. Which of the three changes is dangerous, and what does the validator say about
+each?
+
+<Answer>
+**The dependency bump is the one that destroys the contract.** 4.9 lays the inherited state out
+sequentially with gaps; 5.7 reads it from ERC-7201 namespaces that were never
+written.<Cite src="oz-changelog" /> The new implementation compiles, deploys and installs. Afterwards
+`owner()` returns `address(0)`, so `upgradeToAndCall` itself is no longer callable, and the contract
+is unrecoverable by any on-chain transaction.<Cite src="oz-issue-6362" /> OpenZeppelin's own position
+is that this is never safe across majors.<Cite src="oz-docs-backwards-compatibility" /> There is no
+version of this plan that works. The proxy stays on the 4.9 line, or the state migrates to a new
+deployment.
+
+**The new variable is fine, if it goes last.** `feeBps` appended after every existing declaration in
+their own contract takes the next free slot and shifts nothing.<Cite src="oz-docs-writing-upgradeable" />
+Inserted anywhere else it is a layout change, and the validator rejects it.
+
+**The rename is fine and the validator will still stop it.** Renaming keeps the slot, so
+`_feeRecipient` starts with `_treasury`'s value — often exactly what you
+want.<Cite src="oz-docs-writing-upgradeable" /> The layout check does not know your intent, so it
+reports a change; `--unsafeAllowRenames` is the option that says "I meant that".<Cite src="oz-docs-upgrades-core" />
+Note what you are asserting when you pass it: that *every* rename in this diff is intentional, not
+just the one you were thinking of.
+
+**The step that is actually missing.** Nothing in their plan runs the validator at all. `forge build`
+does not check storage layouts, and neither does a hand-written `upgradeToAndCall`. The Foundry
+plugin needs `ffi`, `ast`, `build_info` and `extra_output = ["storageLayout"]` in `foundry.toml`,
+Node.js on the machine, a `@custom:oz-upgrades-from` annotation, and a `forge clean` before the
+run.<Cite src="oz-foundry-upgrades" /> Without that configuration there is no enforcement layer — only
+a plan and a hope.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Lesson 6** looks at where the library is spending its attention now — accounts and crosschain —
+and the `TrieProof` library that appeared in the recovery discussion above turns out to be part of
+that story.
+
+**Track 05** gives you the harness. Everything here is testable: deploy a 4.x-shaped implementation
+behind a proxy on a fork, upgrade it to a 5.x one with the checks disabled, and read a state variable
+afterwards. Watching the garbage come back is worth more than the paragraph that describes it.
+
+**The transferable rule** is about where a check can possibly live. A compiler sees one artifact. A
+storage-layout bug spans two artifacts deployed at different times, so no compiler can catch it, ever
+— which is why the check has to be a separate program that holds both, and why "it built" is not
+evidence of anything at all here.

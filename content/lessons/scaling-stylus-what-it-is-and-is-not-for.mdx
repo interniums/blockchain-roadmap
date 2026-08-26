@@ -1,0 +1,385 @@
+---
+id: scaling-stylus-what-it-is-and-is-not-for
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [arbitrum-stylus-vm-differences, arbitrum-stylus-rust-to-solidity-differences, arbitrum-stylus-gentle-intro, arbitrum-stylus-activation, arbitrum-stylus-cli-overview, arbitrum-stylus-security-best-practices, arbitrum-stylus-sdk-overview, arbitrum-stylus-gas-optimization, arbitrum-stylus-gas-metering, arbitrum-renegade-stylus-case-study, arbitrum-precompiles-reference, eip-170]
+stack: {}
+---
+
+Take a Solidity contract you have written and try to translate it line by line. Somewhere in the first
+hundred lines you will hit three constructs that have no target language to translate into.
+
+```solidity
+modifier onlyOwner() { require(msg.sender == owner, "Not owner"); _; }
+
+assembly { let x := mload(0x40) }
+
+selfdestruct(payable(treasury));
+```
+
+Arbitrum's compatibility list marks all three as absent: no inline assembly, no `selfdestruct`, no
+Solidity modifiers — and, separately, no multiple
+inheritance.<Cite src="arbitrum-stylus-vm-differences" /> That is not a gap waiting to be filled. It
+is what "a different machine, programmed in a different language" means once you stop treating it as
+a slogan.
+
+This lesson closes the module on judgement rather than mechanism: what a port actually costs, what
+the size limit really is (two Arbitrum pages currently disagree, and we are not going to pick a
+winner for them), which workloads justify the whole apparatus, and what "written in Rust" does and
+does not buy you.
+
+## What does not survive the port
+
+The replacements are all reasonable. They are also all *rewrites*.
+
+**Modifiers become ordinary functions.** Arbitrum's own translation is a private method returning
+`Result` and an explicit call at the top of each guarded
+method.<Cite src="arbitrum-stylus-rust-to-solidity-differences" /> Functionally equivalent, and
+strictly more visible — a Rust reader sees the check in the body rather than in a decorator. The cost
+is that Solidity's compiler-enforced "you cannot forget the modifier if it is in the signature" is now
+"you cannot forget to call the function", which is a weaker guarantee. Every guarded method needs the
+line, and nothing errors if one is missing.
+
+**Inline assembly has no equivalent at all.** The documented alternatives are hostio functions for
+low-level operations, Rust `unsafe` blocks where genuinely needed, and safe Rust APIs for direct
+memory work.<Cite src="arbitrum-stylus-rust-to-solidity-differences" /> Notice that none of those
+reaches EVM opcodes, because there is no EVM in the picture. If your Solidity contract has assembly in
+it, that assembly encoded knowledge about a machine that is not running your code any more.
+
+**`selfdestruct` is gone**, which the docs note is fine because it was deprecated on Ethereum
+anyway.<Cite src="arbitrum-stylus-vm-differences" />
+
+**Multiple inheritance becomes trait composition**, with `#[implements(...)]` on the contract
+`impl`.<Cite src="arbitrum-stylus-vm-differences" /><Cite src="arbitrum-stylus-rust-to-solidity-differences" />
+If your architecture leans on a diamond of OpenZeppelin base contracts, this is the change with the
+largest blast radius.
+
+And storage reads differently even though it *is* the same storage. Solidity's `value = 42;` becomes
+`self.value.set(U256::from(42))`; a mapping write becomes
+`self.balances.setter(user).set(...)`; every field carries an explicit `Storage*`
+type.<Cite src="arbitrum-stylus-rust-to-solidity-differences" /> The layout stays compatible with
+Solidity's — the [storage slots](/c/storage-slot) are the same slots — but the access idiom is
+different enough that a mechanical transliteration produces code that does not compile, and a careless
+one produces code that compiles and is wrong.
+
+One thing does get better, with a caveat attached. Contract logic can be unit-tested natively with the
+SDK's `TestVM`, using ordinary Rust `#[test]` functions and no deployment at
+all.<Cite src="arbitrum-stylus-vm-differences" /><Cite src="arbitrum-stylus-sdk-overview" /> The caveat
+is that `TestVM` exposes no gas meter — there is no `gas_left()` getter on it — so it verifies
+behaviour, not cost. Any gas comparison has to run against a dev node or a testnet and read the gas
+used from real transaction receipts.<Cite src="arbitrum-stylus-gas-optimization" /> Which is worth
+knowing before you promise anyone a benchmark by Friday.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Solidity', note: 'on the EVM' },
+    { title: 'Stylus', note: 'Rust on the WASM VM', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'How do you guard a method?', cells: ['A modifier named in the signature', 'A private method returning Result, called at the top of each guarded method'] },
+    { label: 'How do you reach a low-level operation?', cells: ['Inline assembly', { v: 'Hostio functions, unsafe blocks, or safe Rust memory APIs', tone: 'warn' }] },
+    { label: 'How do you compose shared behaviour?', cells: ['Multiple inheritance', 'Trait composition, declared with #[implements(...)]'] },
+    { label: 'How do you remove a contract?', cells: ['selfdestruct', { v: 'No equivalent — and it was deprecated on Ethereum anyway', tone: 'muted' }] },
+    { label: 'How do you write a storage field?', cells: ['value = 42;', 'self.value.set(U256::from(42)) — the same slot, a different idiom'] },
+  ]}
+  caption="Every replacement exists and every replacement is new code, which is why a port is scoped as a rewrite rather than as a translation."
+  alt="Solidity and Stylus held against the same questions: guarding a method, reaching a low-level operation, composing shared behaviour, removing a contract, and writing a storage field. Modifiers become private methods returning Result, inline assembly becomes hostios or unsafe Rust, multiple inheritance becomes trait composition, selfdestruct has no equivalent, and a storage assignment becomes an explicit setter on the same slot."
+/>
+
+<Misconception
+  belief="Porting a Solidity contract to Stylus is a translation job — same logic, different syntax."
+  reality="Modifiers, inline assembly, `selfdestruct` and multiple inheritance have no counterparts, and storage access uses a different idiom. Arbitrum's own transition advice is to think in Rust patterns rather than translating Solidity directly."
+  why="The ABI ports perfectly and the storage layout is identical, so the boundary looks like a syntax boundary when it is a language and machine boundary."
+  src="arbitrum-stylus-rust-to-solidity-differences"
+/>
+
+## The size limit: two pages, two numbers
+
+Here is a case where the honest answer is that the documentation contradicts itself, and where
+publishing a single confident figure would be worse than publishing none.
+
+**Arbitrum's gentle introduction** says that as of ArbOS 61, Stylus contracts are not bound by the
+24 KB EVM contract code limit, and that the maximum size of a Stylus contract is 96 KB — four times
+the limit for Solidity contracts — enabled by a fragment-based deployment
+model.<Cite src="arbitrum-stylus-gentle-intro" />
+
+**The VM-differences page and the activation page** say something else: the limit bounds the
+*decompressed* WASM rather than EVM bytecode, it is a chain-configurable ArbOS parameter named
+`MaxWasmSize`, it defaults to 128 KB, it is raised to 256 KB at ArbOS 61 and later, and a chain owner
+can adjust it through `ArbOwner.setWasmMaxSize`.<Cite src="arbitrum-stylus-vm-differences" /><Cite src="arbitrum-stylus-activation" /><Cite src="arbitrum-precompiles-reference" />
+
+**The CLI page** introduces a third quantity: contracts whose *compressed* WASM exceeds the 24 KB
+single-contract code limit are deployed by fragmentation, automatically, with each fragment under the
+limit and a root contract tying them together.<Cite src="arbitrum-stylus-cli-overview" />
+
+So three different measurements are in play — compressed bytes per code account, a decompressed-WASM
+ceiling, and a headline "maximum contract size" — and the first two are internally consistent while
+the third does not line up with either. It is plausible that 96 KB is a compressed-size figure and
+128 or 256 KB is the decompressed bound; the pages give no statement that says so. **Sources disagree
+on the headline, and this module is not going to invent a reconciliation.**
+
+What you can act on regardless:
+
+- The relevant ceiling is not [the EVM's 24,576-byte deployed-bytecode
+  limit](/c/code-deposit-and-size-limits).<Cite src="eip-170" /><Cite src="arbitrum-stylus-vm-differences" />
+- Whatever the ceiling is, it is a chain parameter, so it can differ on an Arbitrum chain from
+  Arbitrum One.<Cite src="arbitrum-stylus-vm-differences" />
+- Size is a *cost* well before it is a limit: activation's data fee scales with compiled program size,
+  and fragmentation adds roughly one `EXTCODEREAD` of activation cost per
+  fragment.<Cite src="arbitrum-stylus-gas-metering" /><Cite src="arbitrum-stylus-cli-overview" />
+- The operational answer is empirical. `cargo stylus check` compiles and reports the activated contract
+  size against the chain you point it at.<Cite src="arbitrum-stylus-gas-optimization" /> Run it against
+  your target chain and believe the output over any page, including this one.
+
+<Aside kind="note">
+This is the general habit, not a one-off. The Stylus documentation is actively maintained and revised;
+the ink prices carry a "subject to change" warning, the gas parameters are chain-configurable, and
+size limits move with ArbOS versions.<Cite src="arbitrum-stylus-gas-metering" /> For anything in this
+module with a number attached, the durable knowledge is the mechanism and where to read the current
+value — not the value.
+</Aside>
+
+## The decision rule, and it is short
+
+Everything from the third lesson collapses into one question: **what fraction of this component's gas
+is state access?**
+
+Arbitrum states the rule of thumb itself.<Cite src="arbitrum-stylus-gentle-intro" /> Use Stylus for
+compute-heavy logic — cryptography, math-heavy DeFi, zero-knowledge verification, in-memory
+algorithms, ports of existing Rust, C or C++ libraries. Stick with Solidity when the contract mostly
+reads and writes storage with little computation in between, because there will be no meaningful gas
+reduction. And for mixed systems, keep the storage layout in Solidity and call out to a Stylus contract
+for the compute-heavy hot paths.
+
+That third option is the one most real products land on, and the VM-differences page sketches its
+shape: a Solidity `Coordinator` that owns state, emits events and orchestrates, holding a reference to
+a Stylus `ComputeEngine` that takes an array in, does the expensive work, and returns
+results.<Cite src="arbitrum-stylus-vm-differences" /> The split falls exactly on the ABI boundary from
+the second lesson, which is why that boundary being free of ceremony matters so much: it is the seam
+your architecture is going to run along.
+
+Arbitrum's published use-case list is a fair description of where the arithmetic works
+out:<Cite src="arbitrum-stylus-gentle-intro" />
+
+- **On-chain verification of zero-knowledge proofs** — pairing checks and field arithmetic, almost
+  pure compute.
+- **DeFi instruments with custom pricing curves** — AMMs, synthetics, options, futures, including as
+  Uniswap v4 hooks.
+- **Memory- and compute-intensive applications** — on-chain games and generative art, with programs
+  able to use up to 8 MB and costs growing near-linearly with workload.
+- **Cryptographic applications** whose operations would be cost-prohibitive in Solidity.
+
+And the shapes it will not help: a standard token, an NFT, ordinary vault accounting, a registry, an
+access-control layer. Their gas is state, and state is [the same
+price](/c/compute-is-cheap-storage-is-not) in both machines.<Cite src="arbitrum-stylus-vm-differences" />
+
+<Matrix
+  corner="Workload"
+  cols={['Where the gas goes', 'Does Stylus earn its overhead?']}
+  rows={[
+    { label: 'Zero-knowledge proof verification', cells: ['Field arithmetic and pairing checks', { v: 'Yes', tone: 'good' }] },
+    { label: 'A custom pricing curve — AMM, options, synthetics', cells: ['Fixed-point maths on every call', { v: 'Yes', tone: 'good' }] },
+    { label: 'An on-chain game or generative art', cells: ['Compute, plus a large in-memory working set', { v: 'Yes', tone: 'good' }] },
+    { label: 'A port of an existing Rust or C++ library', cells: ['Compute — and a reimplementation you avoid', { v: 'Yes', tone: 'good' }] },
+    { label: 'A standard ERC-20 or NFT', cells: ['SSTORE, SLOAD and a log', { v: 'No', tone: 'danger' }] },
+    { label: 'Ordinary vault accounting', cells: ['SLOAD and SSTORE, with little between them', { v: 'No', tone: 'danger' }] },
+    { label: 'A registry or access-control layer', cells: ['One or two slots, read rarely', { v: 'No', tone: 'danger' }] },
+  ]}
+  caption="Nothing here is decided by the language — every verdict falls out of the middle column."
+  alt="Seven workloads against whether Stylus earns its overhead. Zero-knowledge verification, custom pricing curves, on-chain games and art, and ports of existing Rust or C++ libraries are compute- or memory-bound and gain. A standard token or NFT, vault accounting, and a registry or access-control layer are state-bound and do not."
+/>
+
+### One real case, read carefully
+
+Arbitrum publishes a case study on Renegade, an on-chain dark pool. The reported facts: the team spent
+around ten months building zero-knowledge verifiers elsewhere before moving to Stylus, and cites three
+reasons for the choice — gas cost, reuse of an existing Rust cryptography codebase, and the
+ecosystem.<Cite src="arbitrum-renegade-stylus-case-study" /> A founding engineer is quoted saying
+settlements come in around thirty cents, against a claim that the same computation on Ethereum L1
+would be two orders of magnitude higher.<Cite src="arbitrum-renegade-stylus-case-study" />
+
+Read that with the source label attached. It is a vendor blog post from October 2024, profiling a
+project on the vendor's own chain, quoting the project's own engineers. The thirty-cent figure has no
+independent replication and no published methodology. Do not carry it into a design document as a
+benchmark.
+
+The *transferable* part is the second reason, not the first. Renegade's off-chain infrastructure was
+already written in Rust for cryptographic computation, and Stylus let the same code run on-chain
+without reimplementing the cryptography in Solidity — which the case study argues also made audits
+faster, because the off-chain and on-chain components shared code
+paths.<Cite src="arbitrum-renegade-stylus-case-study" /> That is a structural argument, and it
+generalises: if you already maintain a Rust or C++ implementation of the exact computation you need
+on-chain, the case for Stylus includes eliminating a whole reimplementation and its divergence risk.
+If you do not, that argument is simply unavailable to you, and the decision rests on gas alone.
+
+## Rust removes memory-safety bugs. Those were never the problem.
+
+Now the part that gets waved through, and should not be.
+
+Rust's guarantees are about memory safety: no use-after-free, no data races, no buffer overruns. Go
+back through the exploits in the security track and count how many were caused by any of those. The
+answer is none — the losses come from missing access control, from oracles that could be moved, from
+reentrancy, from arithmetic, from logic that did not hold an invariant it was supposed to hold. Rust's
+type system has nothing to say about any of them.
+
+That is not an argument against Stylus. It is an argument against the specific inference "Rust,
+therefore safer contracts", which the SDK's own documentation does not make.
+
+### The arithmetic default runs backwards
+
+This is the sharpest reversal in the module, and the one most likely to bite a team that has been
+writing Solidity since 0.8.
+
+Solidity has checked arithmetic by default: an overflow reverts, and you have to opt out with an
+`unchecked` block. Rust does not behave that way in the build you ship. Arbitrum's security page states
+it in one clause: while Rust prevents overflows in debug mode, use explicit checks for
+production.<Cite src="arbitrum-stylus-security-best-practices" /> [Release builds wrap
+silently](/c/rust-overflow-not-automatic) unless overflow checks are explicitly enabled.
+
+So a `+` that would have reverted in Solidity can silently wrap in Rust, and your unit tests — which
+run in debug — will panic on exactly the input that production would wrap on, which is the worst
+possible arrangement for noticing. The documented practice is checked arithmetic at every site:
+`checked_add`, `checked_mul`, `saturating_add` where a cap is the right semantics, and validation
+before the operation where a bound is
+known.<Cite src="arbitrum-stylus-security-best-practices" />
+
+<Misconception
+  belief="Rust is a safer language, so contracts written in it are safer contracts."
+  reality="Rust removes a bug class that has never caused a significant on-chain loss, and on arithmetic its default is *less* safe than Solidity 0.8's — release builds wrap where Solidity would revert. Access control, oracle manipulation and invariant violations are entirely unaffected."
+  why="Rust's safety reputation is real and well earned, and it transfers by association into a domain whose failure modes it does not cover."
+  src="arbitrum-stylus-security-best-practices"
+/>
+
+### What the SDK's reentrancy handling actually claims
+
+Read this one exactly, because both over- and under-reading it are common.
+
+As of SDK 0.10.5, the `reentrant` feature flag and the `deny_reentrant` entrypoint guard are
+deprecated. The reason given is that the high-level call functions automatically flush the storage
+cache before every external call, so any state written before a call is observed by a reentrant call —
+which makes the old guard redundant. The page then says what remains true: checks-effects-interactions,
+updating state before the external call, is still the correct way to write reentrancy-safe
+contracts.<Cite src="arbitrum-stylus-security-best-practices" /><Cite src="arbitrum-stylus-sdk-overview" />
+
+Parse the scope of that guarantee. It says the *cache cannot lie to a reentrant call*. The storage
+cache from the third lesson is an optimisation, and an optimisation that survived across an external
+call would be a genuine new footgun — a reentrant call reading a stale cached value that the outer
+frame had already changed. Flushing removes that. It is a fix for a hazard the caching introduced, not
+a fix for [classic reentrancy](/c/reentrancy-classic).
+
+If you call out before updating a balance, the reentrant call sees the un-updated balance — accurately,
+from real storage — and drains you exactly as it would in Solidity. That is why the same page shows a
+vulnerable `withdraw_bad` transferring ETH before the state update, and a correct `withdraw_good`
+applying [checks-effects-interactions](/c/checks-effects-interactions) with an optional
+application-level lock on top.<Cite src="arbitrum-stylus-security-best-practices" />
+
+### Everything else is unchanged
+
+[Missing access control](/c/access-control-failure) is missing access control. The Stylus security page
+teaches the same owner check you would write in Solidity, in Rust
+syntax.<Cite src="arbitrum-stylus-security-best-practices" /> [Oracle
+manipulation](/c/oracle-manipulation) is untouched by the language, because it is an economic attack on
+a data source. Front-running, denial of service, storage collisions in proxy arrangements, unchecked
+external call results — the page's own vulnerability list reads like a Solidity security curriculum,
+which is the point.<Cite src="arbitrum-stylus-security-best-practices" />
+
+Two Stylus-specific additions are worth knowing. First, **build reproducibility**: compiling Rust to
+WASM is not inherently deterministic, since non-determinism comes from OS-level features such as the
+system clock, file system and networking. The Stylus VM does not expose those at runtime so they cannot
+affect execution, but keeping *builds* reproducible means avoiding build scripts and dependencies that
+read the clock or the network at compile time, and pinning the toolchain via
+`rust-toolchain.toml`.<Cite src="arbitrum-stylus-security-best-practices" /> Second, **the audit
+surface is thinner**. The SDK itself has been audited by OpenZeppelin — an initial review in September
+2024, a v0.10 review in December 2025, and a further review of pull request 370 that same
+month.<Cite src="arbitrum-stylus-sdk-overview" /> That is meaningful and it is also not about your
+contract. An audited framework is not an audited application, and the population of auditors fluent in
+both WASM contract semantics and Rust is smaller than the Solidity equivalent. Treat the review cost of
+a Stylus component as higher, not lower, and price it into the decision alongside the gas.
+
+<Aside kind="warn">
+One honest gap, stated plainly because the alternative is implying knowledge nobody has: this module
+found no reliable public data on how many Stylus contracts run on mainnet or how much value they
+secure. Arbitrum publishes use cases and a case study; nobody publishes a census. If you are weighing
+Stylus for something that holds funds, that absence is itself an input to the decision.
+</Aside>
+
+## One more constraint, easy to forget
+
+Stylus is an Arbitrum-family feature. The documentation scopes it as an upgrade to the stack powering
+Arbitrum One, Arbitrum Nova and Arbitrum chains.<Cite src="arbitrum-stylus-gentle-intro" /> Rust
+contracts you write for it do not move to an unrelated L2 the way a Solidity contract moves between
+EVM-equivalent chains. If multi-chain deployment is on the roadmap, the Stylus half of your system is
+the half that does not travel — which is another argument for keeping the split at the ABI boundary,
+where a Solidity reimplementation of one component is a bounded piece of work rather than a rewrite of
+the product.
+
+<Check type="explain" concept="stylus-use-case-shape">
+A team is building a lending market with a novel interest-rate model: rates are set by a curve that
+requires several fixed-point exponentiations per accrual, evaluated over a windowed history of
+utilisation. Alongside it are a standard ERC-20 share token, per-user position accounting, and an
+admin module.
+
+They propose: "Rust for everything, because it is faster and safer."
+
+Rewrite the proposal. Say what goes where and why, name the operational cost the Stylus part adds, and
+name the one security claim in their sentence that is false.
+
+<Answer>
+**The curve goes in Stylus; nothing else does.** The rate model is repeated fixed-point exponentiation
+over a window — pure arithmetic on values held in memory, which is the regime Arbitrum's optimisation
+guide describes as roughly 50-100x for compute-heavy loops, and the windowed history is a working set
+that page-based memory prices near-linearly instead of
+quadratically.<Cite src="arbitrum-stylus-gas-optimization" /><Cite src="arbitrum-stylus-gas-metering" />
+The share token, the position accounting and the admin module are state: `SLOAD`, `SSTORE` and events,
+all of which cost the same gas in both VMs.<Cite src="arbitrum-stylus-vm-differences" /> Porting them
+buys nothing measurable and adds a per-call init cost of 8,832 gas uncached or 352 gas cached to every
+transfer.<Cite src="arbitrum-stylus-gas-metering" />
+
+**The shape is Arbitrum's own hybrid recommendation**: keep the storage layout in Solidity and call out
+to Stylus for the compute-heavy hot path — a Solidity coordinator holding a reference to a Stylus
+compute engine.<Cite src="arbitrum-stylus-gentle-intro" /><Cite src="arbitrum-stylus-vm-differences" />
+The seam is an ordinary ABI call, so the accounting contract calls the rate engine exactly as it would
+call any other contract, and the rate engine can be replaced later without touching its callers.
+
+**Operational cost of the Stylus half.** Deployment becomes two transactions, with activation carrying
+a fixed 1,659,168-gas computation charge plus a data fee paid in
+ETH.<Cite src="arbitrum-stylus-gas-metering" /><Cite src="arbitrum-stylus-activation" /> Activation then
+expires — `ExpiryDays` defaults to 365 — so `programTimeLeft` monitoring and scheduled
+`codehashKeepalive` go into the runbook, and reactivation is also required after Stylus chain
+upgrades.<Cite src="arbitrum-stylus-activation" /><Cite src="arbitrum-stylus-gentle-intro" /> If the
+engine is called often enough for the 8,832-versus-352 gap to matter, add maintaining a position in the
+`CacheManager` auction. A lending market whose rate engine becomes uncallable cannot accrue interest or
+liquidate, so this is a solvency-adjacent obligation, not a hygiene one.
+
+**The false claim is "safer".** Rust eliminates memory-safety bugs, which are not the cause of lending
+market losses. On the axis that actually matters for this product it runs the wrong way: Solidity 0.8
+reverts on overflow by default, while Rust release builds wrap silently unless you use checked
+arithmetic — and a rate curve doing repeated exponentiation is precisely where an overflow would
+occur.<Cite src="arbitrum-stylus-security-best-practices" /> Meanwhile the risks that do empty lending
+markets — oracle manipulation feeding the utilisation input, missing access control on the admin
+module, an accrual path that violates its own solvency invariant — are identical in both languages.
+"Faster" is defensible for the curve and false for the rest. "Safer" is not defensible anywhere.
+</Answer>
+</Check>
+
+## What this unlocks
+
+The module's whole argument fits in four sentences. Stylus is a second, coequal WASM VM on Arbitrum's
+shared state, selected by four bytes at the head of a contract's code. It interoperates with Solidity
+through an ordinary ABI call, so adoption is per-component rather than per-project. It makes
+computation and memory dramatically cheaper while leaving storage untouched, which means the decision
+is decided by workload shape and not by language preference. And it adds a maintenance obligation —
+activation, expiry, reactivation — that no Solidity contract has.
+
+You are now equipped for the two things that follow this module. **The practice** asks you to measure
+the compute-versus-storage split on a real workload rather than accept a vendor multiplier, which is
+the habit this module has been arguing for throughout. **The reflection prompt** asks you to take a
+product with a custom pricing curve and a standard token and decide which half, if either, belongs in
+Stylus — justified by cost profile rather than language preference, and with the operational cost of
+the Stylus half stated explicitly in your deployment runbook.
+
+If your answer to that prompt is "the curve, and only the curve, and here is who gets paged when
+`programTimeLeft` drops below thirty days" — the module has done its job.

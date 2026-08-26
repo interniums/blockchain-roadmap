@@ -1,0 +1,402 @@
+---
+id: protocol-statelessness-one-key-space
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [eip-7864, eip-8297, eip-6800, eip-4762, eip-2929, measured-gas-constants, dedaub-locality, stateless-fyi-data-encoding, stateless-fyi-gas-costs, stateless-fyi-tree-shape, stateless-fyi-active-projects, eip7864-magicians, eip-8037, eip-8038]
+stack: {}
+---
+
+Two of the simplest functions on Ethereum are the Uniswap V2 router's `WETH()` and `factory()`
+getters. They read an immutable and return it.
+
+Under the cost model the new state tree brings, Dedaub measured the gas attributable to code
+chunking on those getters as **an order of magnitude larger than the gas to execute the
+function**.<Cite src="dedaub-locality" />
+
+Nothing about the function changed. What changed is that a verifier now has to be handed the code it
+runs, in pieces, and pay for each piece — and `solc` scattered that tiny function's control flow
+across four separate regions of the bytecode, because under today's pricing jumps are free and
+sharing instruction sequences is a pure code-size win.<Cite src="dedaub-locality" />
+
+This lesson is about what happens when the state tree stops being a client implementation detail.
+One key space instead of a tree of tries, 256 related values under a shared stem, and a gas model
+where **where** you put data starts to matter as much as how much of it there is.
+
+## One tree, and the storage trie disappears
+
+Today an account's storage lives in its own trie, reachable only through the `storageRoot` in that
+account's leaf. Proving a storage slot means two descents with different semantics: one through the
+account trie, one through the storage trie.
+
+Both proposals collapse that into a single key-value space. EIP-7864 puts the storage *type* in the
+first byte of the key:<Cite src="eip-7864" />
+
+```text
+HEADER_SUBTREE    0
+CODE_SUBTREE      1
+STORAGE_SUBTREE   255
+```
+
+EIP-8297 formalises the same idea as **zones**, with the space between them reserved:<Cite src="eip-8297" />
+
+<Matrix
+  corner="Zone"
+  cols={['First byte of the key']}
+  rows={[
+    { label: 'Account headers', cells: [{ v: '0x00', tone: 'accent' }] },
+    { label: 'Code chunks (content-addressed)', cells: [{ v: '0x01', tone: 'accent' }] },
+    { label: 'Reserved for future categories', cells: [{ v: '0x02 - 0xFE', tone: 'muted' }] },
+    { label: 'Storage', cells: [{ v: '0xFF', tone: 'accent' }] },
+  ]}
+  caption="One key space, partitioned by its first byte — and almost all of that byte is deliberately left empty."
+  alt="The zone byte in EIP-8297: 0x00 for account headers, 0x01 for content-addressed code chunks, 0x02 through 0xFE reserved for future categories, and 0xFF for storage."
+/>
+
+The rationale for prefixing by type is not aesthetic. It is **separate syncability** — a node can
+sync, prove or expire one category without touching the others — and extensibility, since a node
+could store some types differently or not at all without the need to maintain sister nodes for
+another category interfering.<Cite src="eip-7864" /><Cite src="eip-8297" />
+
+The consequences of losing the per-account storage trie are worth naming, because not all of them
+are wins. EIP-8297's rationale gives the benefit: with no leaf storing a `storageRoot`, an account's
+nonce and one of its slots become *independent* writes that meet only near the root, which admits
+parallelism across zones, across accounts, and across stems within an
+account.<Cite src="eip-8297" />
+
+The cost showed up immediately in review. A Geth developer objected in the EIP-7864 thread that with
+a two-layer structure "the storage slots associated with a specific account can be iterated, which
+is not possible with the new structure", and that this matters concretely: snap sync relies on
+traversing entries within a trie so that most nodes can be reconstructed locally rather than fetched
+over the network.<Cite src="eip7864-magicians" /> The reply does not dispute it — it argues that a
+node needing to sync the whole state is itself the thing being designed away, while conceding "there
+might be a temporal period where we still need a reasonable good solution until that future fully
+kicks in".<Cite src="eip7864-magicians" />
+
+<Aside kind="note">
+**EIP-8297 partly walks that back.** Where EIP-7864 spreads an account's storage uniformly across
+the whole storage key space, EIP-8297 gives each account **its own storage bucket** rooted at
+`key_hash(address)`, on the stated reasoning that the bucket "is the unit later expiry and
+partial-statefulness schemes can prune or sync".<Cite src="eip-8297" /> The iterability the reviewer
+asked for comes back, at the level of a key-space region rather than a distinct sub-trie. A design
+review objection, visible in a public thread, visible again in the successor's rationale eighteen
+months later.
+</Aside>
+
+## Stem and suffix, worked
+
+A key splits into a **stem** and a one-byte **suffix**. Everything sharing a stem sits in one
+256-value group and shares a single branch opening.
+
+EIP-8297 publishes test vectors, which are the clearest way to see it. `H(x)` is a full 32-byte
+digest; `A` is a 32-byte address, `C` a code hash:<Cite src="eip-8297" />
+
+```text
+basic data of A        0x00 || H(A) || 0x00                   34 bytes
+delegation of A        0x00 || H(A) || 0x02                   34 bytes
+storage slot 5         0x00 || H(A) || 0x45                   34 bytes
+storage slot 1000      0xFF || H(A) || H(A || 3) || 0xE8      66 bytes
+code chunk 5 of C      0x01 || H(C || 0) || 0x05              34 bytes
+code chunk 300 of C    0x01 || H(C || 1) || 0x2C              34 bytes
+```
+
+Read slot 5 and slot 1000 together. Slot 5 is below `HEADER_STORAGE_OFFSET`, which is 64, so it
+lives at sub-index `64 + 5 = 69` **in the account's own header stem**, alongside the balance and the
+nonce.<Cite src="eip-8297" /> Slot 1000 is not, so it goes to the storage zone at
+`tree_index = 1000 // 256 = 3`, sub-index `1000 % 256 = 232`.<Cite src="eip-8297" />
+
+<Figure
+  caption="Everything to the left of the final byte is the stem; the suffix is the only part that moves between neighbouring slots."
+  alt="The 66-byte key for storage slot 1000 of account A, split into four parts: the zone byte 0xFF marking storage, H(A) identifying the account's own storage bucket, H(A || 3) selecting the group for tree index 1000 divided by 256, and the suffix byte 0xE8, which is 1000 modulo 256, or 232."
+>
+  <Anatomy
+    value="0xFF || H(A) || H(A || 3) || 0xE8"
+    parts={[
+      { from: 0, to: 4, label: 'zone', note: 'storage', tone: 'accent' },
+      { from: 8, to: 12, label: 'account bucket', note: 'binds the group to the address' },
+      { from: 16, to: 25, label: 'group', note: '1000 // 256 = 3' },
+      { from: 29, to: 33, label: 'suffix', note: '1000 % 256 = 232', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+Three properties fall out, and each is load-bearing.
+
+**An account's hot data shares one branch.** Balance, nonce, code size, code hash and the first 64
+storage slots are one stem. A witness proving several of them opens one path, not five.
+
+**Adjacent slots share a stem by construction.** Slots 1000 and 1001 differ only in their suffix
+byte. Reading both costs one branch opening plus two leaves.
+
+**The address is hashed into the group key, deliberately.** EIP-7864 states the reason: it "ensures
+that storage keys that get 'grinded' to be close to each other cannot be reused between different
+contracts, mitigating a DoS vector."<Cite src="eip-7864" /> EIP-8297 says the same about binding
+the group digest to the address — a ground slot set "is random in every other"
+contract.<Cite src="eip-8297" />
+
+<Aside kind="warn">
+**These constants disagree across current sources. Do not memorise a number.** EIP-7864's parameter
+table, read on **26 August 2026**, gives `HEADER_STORAGE_OFFSET` 20, `CODE_OFFSET` 4,
+`CODE_CHUNKS_IN_HEADER` 16 and `STORAGE_CHUNKS_IN_HEADER` 4.<Cite src="eip-7864" /> Prose earlier in
+the same section of the same document describes the account stem as holding "accounts basic data,
+first 64-storage slots, and first 128-code chunks".<Cite src="eip-7864" /> The Stateless Book says
+`HEADER_STORAGE_OFFSET` "currently is 64".<Cite src="stateless-fyi-data-encoding" /> Dedaub's
+analysis uses 64 and 128.<Cite src="dedaub-locality" /> EIP-6800, the Verkle predecessor, has 64 and
+128.<Cite src="eip-6800" /> EIP-8297 settles on `HEADER_STORAGE_OFFSET` 64 and
+`HEADER_STORAGE_SLOTS` 64, with code removed from the header
+entirely.<Cite src="eip-8297" />
+
+There is a tell for which side is stale. EIP-7864 states a required invariant —
+`STEM_SUBTREE_WIDTH > CODE_OFFSET > HEADER_STORAGE_OFFSET` — that its own table violates, since
+`4 > 20` is false.<Cite src="eip-7864" /> The invariant holds for EIP-6800's 128 and
+64.<Cite src="eip-6800" /> Learn the shape: *a fixed-size hot region co-located with the account
+header*. Read the table on the day you need the number.
+</Aside>
+
+## The cost model that follows
+
+Once a witness rides with the block, gas has to price witness growth or an attacker constructs
+transactions whose witnesses saturate the network at execution prices.<Cite src="dedaub-locality" />
+
+EIP-4762 is the proposal that does it, and its constants describe a two-tier model:<Cite src="eip-4762" />
+
+| Constant | Value | Charged when |
+|---|---|---|
+| `WITNESS_BRANCH_COST` | 1,900 | first touch of a stem in this transaction |
+| `WITNESS_CHUNK_COST` | 200 | first touch of a leaf in an already-touched stem |
+| `SUBTREE_EDIT_COST` | 3,000 | first write to a stem |
+| `CHUNK_EDIT_COST` | 500 | first write to a leaf |
+| `CHUNK_FILL_COST` | 6,200 | writing a previously-empty leaf |
+
+Composed, the read side reads:<Cite src="dedaub-locality" />
+
+<Matrix
+  numeric
+  corner="Witness cost of a read"
+  cols={['Branch', 'Chunk', 'Total']}
+  rows={[
+    { label: 'first leaf, fresh stem', cells: ['1,900', '200', { v: '2,100 gas', tone: 'warn' }] },
+    { label: 'another leaf, same stem', cells: ['—', '200', { v: '200 gas', tone: 'good' }] },
+    { label: 're-read of a leaf already paid', cells: ['—', '—', { v: '0 gas at the witness layer', tone: 'good' }] },
+  ]}
+  caption="Locality is the whole cost model: the same read costs 2,100 or 200 depending only on where the leaf sits."
+  alt="Composed witness costs for a read under EIP-4762: the first leaf in a fresh stem pays a 1,900 branch cost plus a 200 chunk cost, totalling 2,100 gas; another leaf in the same stem pays only the 200 chunk cost; and re-reading a leaf already paid for costs nothing at the witness layer."
+/>
+
+That first line is not a coincidence. Measured on this project's own toolchain, a cold `SLOAD` costs
+**2,100** gas today.<Cite src="measured-gas-constants" /> EIP-4762 was built to leave the common case
+roughly where it is, and its own rationale lists the intended movements: cost for accessing adjacent
+slots in the same group falls from 2,100 to 200 for every slot after the first, and slots in the hot
+header region fall to 200 including the first — while a new charge of 200 gas per 31-byte code chunk
+appears, estimated to raise average gas usage by **6-12%**.<Cite src="eip-4762" />
+
+The code charge is the one with no analogue. Under EIP-2929, once the `CALL` is paid for, executing
+bytecode costs nothing extra for touching more of it.<Cite src="eip-2929" /> Under a witness model,
+every fresh 31-byte chunk the EVM enters is a leaf someone has to prove.<Cite src="dedaub-locality" />
+
+<Aside kind="warn">
+**EIP-4762's constants were tuned for a different tree.** The Stateless Book states flatly that the
+EIP "is currently designed for the Verkle Trees proposal", and that for binary trees "the execution
+witness is not entirely clear today".<Cite src="stateless-fyi-gas-costs" /> Dedaub explains why that
+matters structurally rather than cosmetically: Verkle branch proofs are essentially constant-size so
+the per-leaf chunk cost dominates, whereas binary branch proofs are `O(log n)` hashes and
+substantively larger per branch — so the relative weight of the two constants is different from what
+EIP-4762 was calibrated for.<Cite src="dedaub-locality" /> EIP-7864's author, quoted in that
+write-up, expects the approach to survive and the numbers to move: "Gas remodeling is EIP-4762. It
+might need constant adjustments, but the overall approach would be the
+same."<Cite src="dedaub-locality" /><Cite src="eip7864-magicians" /> EIP-8297 does not touch the gas
+schedule at all.<Cite src="eip-8297" /> Treat 1,900 and 200 as a **shape**: pay per stem entered,
+pay per leaf touched, re-traverse free.
+</Aside>
+
+### Two repricings, aimed at different things, landing on the same opcodes
+
+It is easy to conflate the witness repricing with the state-growth repricing, and they are separate
+proposals with separate motivations that happen to touch the same instructions.
+
+**EIP-4762** prices *bandwidth*: how many bytes your access adds to a witness the whole network must
+carry.<Cite src="eip-4762" /> **EIP-8038** prices *latency*: how long a state access actually takes
+on a database the size mainnet has grown to, benchmarked on a snapshot the size of mainnet in March
+2026 against a target of 100 Mgas/s.<Cite src="eip-8038" /> They disagree about which direction
+storage reads should move — EIP-4762 makes grouped reads dramatically cheaper, EIP-8038 leaves cold
+storage access at 2,100 and raises writes sharply.<Cite src="eip-4762" /><Cite src="eip-8038" />
+
+That is not a contradiction, because they assume different worlds. One assumes a tree that has not
+shipped; the other assumes today's. But it does mean that any statement of the form "state access
+will cost X after the repricing" needs to say *which* repricing, and the two are on very different
+timelines: EIP-8038 is in Review, with a companion in EIP-8037 covering state
+creation<Cite src="eip-8038" /><Cite src="eip-8037" />, while EIP-4762 has been Draft since 2022 and
+is calibrated for a cancelled tree.<Cite src="eip-4762" />
+
+## What this does to code already deployed
+
+In 2021 the Ethereum Foundation commissioned Dedaub to measure the impact on real contracts. Dedaub
+ran it two ways: a path-sensitive static analysis over every public function of every mainnet
+contract that had transacted in the prior fortnight, and a modified Erigon client re-executing
+historical transactions under the new semantics.<Cite src="dedaub-locality" />
+
+The headline results:<Cite src="dedaub-locality" />
+
+- **~26%** average gas cost increase across replayed internal transactions.
+- **~96%** of internal transactions were worse off.
+- The distribution was approximately normal — "no isolated cliffs, just a broad systemic shift".
+- Dominated by **code chunking**, not by storage repricing.
+
+A 2026 re-check found the locality assumption does not hold in practice, and gives the numbers:
+**~85%** of smart contract calls touched at least one storage slot beyond the first 64, and only
+**~56%** touched the first 64 slots at all; **~60%** of executions extend beyond the first 128 code
+chunks.<Cite src="dedaub-locality" />
+
+### Why, specifically
+
+The uncomfortable finding is that mainstream Solidity conventions burn exactly the region the design
+makes cheap.<Cite src="dedaub-locality" />
+
+**Mappings.** `mapping(address => uint256) balances` gets slot `p`, and `p` stores nothing. Values
+live at `keccak256(h(k) . p)`, scattered uniformly. Two adjacent users are in unrelated stems, every
+mapping read is a cold cross-stem access, and the hot slot reserved for the mapping is wasted. This
+is the same effect the tree-shape analysis measures from the other side: ~92% of storage-slot groups
+on mainnet hold exactly one non-zero value, attributed directly to Solidity mapping
+usage.<Cite src="stateless-fyi-tree-shape" />
+
+**Dynamic arrays.** Slot `p` holds only the length; elements start at `keccak256(p)`. Even a
+one-element `uint256[]` pays the indirection — `bytes` and `string` have a short-inline mode for
+values of 31 bytes or fewer, but `T[]` does not.<Cite src="dedaub-locality" />
+
+**Upgradeability.** OpenZeppelin's storage gaps reserve slots that are intentionally never used —
+`uint256[45] private __gap` occupies slots 5 to 49 of the hot region. And ERC-1967 places the
+implementation and admin pointers at hash-derived slots chosen specifically not to
+collide.<Cite src="dedaub-locality" />
+
+That last one is the worst case and worth stating precisely: the implementation slot is read on
+**every single proxy invocation**, because every call must look up where to `delegatecall`. Under
+the new model that is a guaranteed cold cross-stem read on every call to a proxy, before any of the
+implementation's code has been touched.<Cite src="dedaub-locality" />
+
+None of these are mistakes. Each is a rational choice under today's pricing, where the slot address
+space is free and unguessability is a security property.
+
+<Misconception
+  belief="Changing the state tree is a client implementation detail, invisible to contract developers."
+  reality="A shared stem makes nearby leaves cheap to prove together and everything else expensive, so storage layout and code layout become cost decisions. Measured against real mainnet traffic, the repricing moved average internal-transaction gas by about 26% with about 96% of internal transactions worse off — dominated by code chunking rather than storage."
+  why="Trie shape is below the EVM, and contracts address storage by 256-bit slot number and never see a tree key."
+  src="dedaub-locality"
+/>
+
+<Misconception
+  belief="A 26% increase means my contract's gas bill goes up 26% when this ships."
+  reality="It is a one-time upper-bound repricing of bytecode written with zero awareness of locality, measured in 2021 against constants calibrated for a different tree, and no proposal carrying it is assigned to a fork. Dedaub's own conclusion is that the steady state is much smaller, because the least optimal patterns are also the most optimisable."
+  why="A single percentage with a large denominator is memorable, and the qualifiers around it are not."
+  src="dedaub-locality"
+/>
+
+## The fixes are mostly compiler work
+
+The reason this is a cost model rather than a catastrophe is that almost every pathological case has
+a mechanical fix above the protocol.<Cite src="dedaub-locality" />
+
+**Loop-based selector dispatch.** Modern Solidity emits an unrolled binary search over selectors,
+because jumps are practically free. On a per-chunk-metered VM that reasoning inverts. A loop that
+walks a sorted in-bytecode selector table with `CODECOPY` touches roughly `log2(N)` chunks and can
+keep the loop, the table and the jump targets in about one chunk. Dedaub's verdict is that even a
+naive loop beats the unrolled binary search, "because the cost of loading a fresh code chunk is
+orders of magnitude higher than the optimisation return from sharing instruction
+sequences".<Cite src="dedaub-locality" />
+
+**Superinstructions and hot-path layout.** Mine bytecode for frequent short sequences, emit them as
+helpers inside the hot region. Two jumps cost about 20 gas; loading another chunk costs about 200.
+Relegate revert branches out of the hot region.<Cite src="dedaub-locality" />
+
+**Standard-library primitives.** An `InlineArray<T, N>` that keeps the first N elements at the
+array's own slot and spills only the tail. Shared library deployments so common routines pay their
+chunk cost once.<Cite src="dedaub-locality" />
+
+There is also a live proposal aimed squarely at the mapping problem: **ERC-8147, a
+locality-preserving storage layout**, described as a compiler-level change with no new opcodes so
+that mapping keys for the same address land on the same leaf page.<Cite src="stateless-fyi-active-projects" />
+Read on 26 August 2026, `eips.ethereum.org` returned 404 for that number, so it is cited here as the
+Stateless Book lists it and not as a published EIP.
+
+<Aside kind="note">
+**One fix fights an upgrade already in flight.** Mixing static data tables into the code section
+lets a loaded chunk do double duty — a well-trodden technique on constrained hardware. Dedaub notes
+that the EVM Object Format will likely make this harder or impossible, because EOF formalises a
+clean separation between code and data sections: "desirable for verification and analysis," and not
+ideal "if you need data and the code that consumes it to share a
+stem."<Cite src="dedaub-locality" /> Two good designs, optimising against different cost models,
+arriving at the same time.
+</Aside>
+
+### And the layout under EIP-8297 is different again
+
+Everything above about *code* locality is written against EIP-7864, where the first 128 code chunks
+live in the account's header stem.<Cite src="dedaub-locality" /> EIP-8297 removes code from the
+header entirely and content-addresses it by `code_hash`, so all contracts with identical bytecode
+share leaves — "most deployed contracts repeat a small number of templates", and a block witness
+therefore contains at most one copy of a shared chunk however many contracts touch
+it.<Cite src="eip-8297" />
+
+For a factory-deployed clone, that is a large win that Dedaub's 2021 measurement could not have
+captured. For a proxy, the implementation-slot read is unchanged. Storage locality advice survives
+the change; code locality advice has to be re-derived against whichever layout is current.
+
+<Check type="explain" concept="stem-and-suffix">
+You maintain an upgradeable ERC-20 behind an ERC-1967 proxy. Someone asks you to "make it ready for
+the new state tree". Rank what you would actually change, and name what you would refuse to change
+and why.
+
+<Answer>
+**First, refuse the framing.** Neither EIP-7864 nor EIP-8297 is assigned to a fork, EIP-4762's
+constants were calibrated for a tree that is no longer the plan, and EIP-8297 does not change the
+gas schedule at all.<Cite src="eip-8297" /><Cite src="stateless-fyi-gas-costs" /> Rewriting storage
+layout for an unscheduled cost model is trading a certain migration risk for a speculative saving.
+
+**What is worth doing anyway, because it is free or already correct:**
+
+1. *Nothing about the ERC-1967 slots.* The implementation pointer is read on every call and is a
+   guaranteed cold cross-stem read under the new model.<Cite src="dedaub-locality" /> It is also
+   deliberately at an unguessable, collision-proof location, which is a security property that has
+   held up. Moving it to slot 3 to save a branch opening trades a real invariant for a hypothetical
+   discount. Refuse.
+2. *Reconsider `__gap` size at the next planned upgrade, not before.* Forty-five reserved slots
+   occupy the cheapest region with values nobody reads.<Cite src="dedaub-locality" /> But shrinking
+   a gap on a deployed upgradeable contract is exactly the operation that causes storage collisions,
+   so this is a next-major-version decision, not a retrofit.
+3. *Put genuinely hot scalars low.* `totalSupply`, `paused`, `owner`, a fee parameter — single
+   variables read on most calls. These already tend to land in low slots, and keeping them under 64
+   costs nothing.
+
+**What cannot be fixed at the contract level:**
+
+The balances mapping. Values live at `keccak256(h(k) . p)` by language definition, and no layout
+choice moves them.<Cite src="dedaub-locality" /> Roughly 92% of storage-slot groups on mainnet hold
+one non-zero value, and this is why.<Cite src="stateless-fyi-tree-shape" /> The fix is a compiler or
+standard-library change — ERC-8147's locality-preserving layout is the proposal aimed at exactly
+this<Cite src="stateless-fyi-active-projects" /> — not something a token contract can do to itself.
+
+**What I would actually ship today:** a note in the repo recording that this contract's cost profile
+is sensitive to a proposed state-tree repricing, naming EIP-7864, EIP-8297 and EIP-4762 with the
+date I read them, and what would trigger revisiting — a fork assignment, or EIP-4762 being replaced
+by a binary-tree-calibrated successor. That is the deliverable. The code change is premature; the
+recorded dependency is not.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**The next lesson** is about getting from here to there: hundreds of gigabytes of existing state,
+committed under one tree, needing to end up committed under another, without stopping the chain. The
+plan for that has itself been replaced.
+
+**The last lesson** puts this route next to its competitor. If blocks come with validity proofs, a
+verifier needs neither the state nor a large witness — and the two approaches turn out to need the
+same tree change for different reasons.
+
+**In your own work**, the transferable idea is that a pricing model is an API. EIP-4762 does not
+forbid scattered storage; it prices it, and every compiler heuristic tuned against the old prices
+becomes wrong at once. Dedaub's sharpest line is about unrolling: the intuition that it is always
+faster is "a faithful inheritance from CPUs with branch predictors and i-caches", and on a
+per-chunk-metered VM it is simply wrong.<Cite src="dedaub-locality" /> Optimisations encode a cost
+model. When the model moves, they invert — and the ones that inverted hardest were the ones everyone
+agreed on.

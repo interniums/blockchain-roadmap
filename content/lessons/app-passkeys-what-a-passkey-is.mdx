@@ -1,0 +1,330 @@
+---
+id: app-passkeys-what-a-passkey-is
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [webauthn-l2, webauthn-l3, yubico-webauthn-guide, certik-passkey-wallets, viem-webauthn-account, nist-sp-800-186, eip-7951]
+stack: { viem: "2.x" }
+---
+
+Call `navigator.credentials.create()` in a browser, complete the prompt with a fingerprint, and look
+at what comes back. There is no private key in it. There is no key material of any kind you could
+store, back up, print, or lose. What you get is a credential id — an opaque byte string the
+authenticator chose — and a public key encoded as a COSE key, plus an attestation blob you will
+probably ignore.
+
+That is the whole shape of the thing. A passkey is not a secret you receive and then guard. It is a
+keypair that was generated somewhere you cannot reach, on behalf of a domain you named, which will
+sign things for you later if the person holding the device proves they are there.
+
+Everything in this module follows from the gap between that shape and the shape of an Ethereum key.
+This lesson establishes the shape precisely, because the next seven lessons are about closing the
+gap, and every closing move is a consequence of a detail here.
+
+<Figure
+  caption="Nothing on this path is done for you by the device: every gap a WebAuthn credential opens is closed by code you deploy."
+  alt="A downward chain of the module's six pieces: a WebAuthn credential, the curve gap that forces the account to be a contract, the payload gap, digest reconstruction and verification, the domain the credential is bound to, and an account with no operator who can restore it."
+>
+  <Flow
+    dir="down"
+    nodes={[
+      { id: 'cred', label: 'a WebAuthn credential', note: 'a P-256 keypair inside an authenticator', col: 0, tone: 'accent' },
+      { id: 'curve', label: 'the curve gap', note: 'no Ethereum address, no ecrecover', col: 1 },
+      { id: 'acct', label: 'so the account is a contract', note: 'validation logic you deploy', col: 2 },
+      { id: 'payload', label: 'the payload gap', note: 'the device signs its own structures, not your hash', col: 3 },
+      { id: 'verify', label: 'rebuild, then verify', note: 'the contract reconstructs what was signed', col: 4 },
+      { id: 'domain', label: 'bound to one domain', note: 'the origin is part of the custody model', col: 5, tone: 'warn' },
+      { id: 'recover', label: 'and no operator', note: 'the account accepts only keys it already holds', col: 6, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+## The definition, with the details that matter
+
+A passkey is a **WebAuthn credential**. WebAuthn is a W3C standard; Level 2 became a Recommendation
+in 2021 and Level 3 became a W3C Recommendation on 25 August 2026.<Cite src="webauthn-l2" /><Cite src="webauthn-l3" />
+Four properties of that credential do work later.
+
+**It is a keypair generated inside an authenticator.** The authenticator may be built into the
+device — a Secure Enclave, an Android Keystore — or it may be a separate object you plug in or tap.
+EIP-7951's motivation names exactly this population: "Apple Secure Enclave, Android Keystore, HSMs,
+TEEs, and FIDO2/WebAuthn authenticators".<Cite src="eip-7951" />
+
+**The curve is not automatic.** The relying party — you — asks for an algorithm by COSE identifier in
+`pubKeyCredParams`. WebAuthn guarantees that keys with algorithm **ES256 (-7)** specify **P-256** as
+the curve and must not use the compressed point form.<Cite src="webauthn-l2" /> P-256 is the NIST
+name for the curve; SEC 2 calls it secp256r1 and OpenSSL calls it prime256v1, and NIST SP 800-186 is
+the normative source for its parameters.<Cite src="nist-sp-800-186" /><Cite src="eip-7951" /> But
+ES256 is not the only option. If `pubKeyCredParams` is empty, the client defaults to a list
+containing both ES256 (-7) and **RS256 (-257)**, which is RSA.<Cite src="webauthn-l2" /> Yubico's
+worked example requests both.<Cite src="yubico-webauthn-guide" />
+
+That last detail is the first thing a product engineer needs to act on, and it is invisible in every
+"add passkeys in five minutes" tutorial. **A WebAuthn credential is not necessarily a P-256
+credential.** If your on-chain verifier only knows P-256 and your registration flow accepted RS256,
+you have enrolled a user with a credential their account cannot verify, and you will find out at the
+first transaction rather than at registration.
+
+**The private key is not exportable by the application.** The API has no method that returns it. The
+platform returns a signed assertion instead. This is a design property enforced by the
+authenticator's hardware and firmware, and it is worth being precise about how strong that property
+is: CertiK's survey of passkey wallet security calls non-extractability "a design property, not an
+absolute guarantee", pointing at EUCLEAK (CVE-2024-45678), which showed electromagnetic side-channel
+leakage during ECDSA operations on YubiKey 5-series devices and others using the same Infineon
+cryptographic library.<Cite src="certik-passkey-wallets" /> Those attacks need physical possession
+and equipment. They are not the threat to your consumer product. They are the reason not to write
+"the key cannot be extracted" in your threat model without a qualifier.
+
+**Signing requires a user gesture, and the gesture has two different strengths.** The
+`authenticatorData` in every assertion carries a flags byte. Bit 0 is **User Present (UP)** — someone
+interacted with the authenticator. Bit 2 is **User Verified (UV)** — local verification happened, a
+biometric or a PIN.<Cite src="webauthn-l2" /> A tap is UP. A fingerprint is UP and UV.
+
+## Who decides whether the biometric happened
+
+This is the part that reliably surprises people, and it is a genuine security-relevant control flow
+rather than a piece of trivia.
+
+You express a preference in the request, via `userVerification`, which takes `required`, `preferred`
+or `discouraged`. **The default is `preferred`.**<Cite src="yubico-webauthn-guide" /> Only `required`
+instructs the client to refuse an assertion where user verification was not performed.<Cite src="certik-passkey-wallets" />
+The authenticator then decides what it actually does and sets the UV bit to match what it actually
+did — the specification is explicit that the UV flag is set if and only if the authenticator
+performed user verification.<Cite src="webauthn-l2" />
+
+So there are three layers, and CertiK's analysis names them as three layers that drift apart in
+practice: the relying party's request, the authenticator's behaviour, and the verifier's
+enforcement.<Cite src="certik-passkey-wallets" /> With `preferred`, an authenticator that cannot do
+user verification can still return a UP-only assertion, and it is a perfectly valid assertion. If
+your verifier only checks UP, it accepts it.
+
+<Figure
+  caption="Three layers, and only the last one is yours: you express a preference, the authenticator decides, the account chooses what to require."
+  alt="Three layers in order: the relying party's userVerification request, which defaults to preferred; the authenticator, which decides what it actually does and sets the UV bit to match; and the account's own verifier, which decides whether that bit is required."
+>
+  <Flow
+    lanes={['the request', 'the authenticator', 'the verifier']}
+    nodes={[
+      { id: 'req', label: 'userVerification', note: "defaults to 'preferred' — a preference", col: 0 },
+      { id: 'auth', label: 'the authenticator', note: 'does what it can, sets UV to match', col: 1, tone: 'accent' },
+      { id: 'ver', label: 'your account', note: 'decides whether UV is required', col: 2, tone: 'good' },
+    ]}
+  />
+</Figure>
+
+For a login, a UV downgrade weakens authentication. For a wallet, it weakens an authorisation to move
+money. That difference is the reason this module keeps returning to flags, and the reason a verifier
+that checks "is the signature valid" and stops is not finished.
+
+<Misconception
+  belief="The biometric is the key — the fingerprint unlocks a wallet the way a password would."
+  reality="The biometric never leaves the device and is never sent to you. It unlocks the authenticator's use of a private key; what you receive is a signature plus a flag bit claiming verification occurred."
+  why="Consumer messaging says 'sign in with your face', which frames the face as the credential. The credential is a P-256 keypair; the face is an access-control gate in front of it, and the only evidence you get that the gate was passed is a single bit in a structure the authenticator signed."
+  src="webauthn-l2"
+/>
+
+## The ceremony, in one pass
+
+The mechanics get a full lesson later. The outline now, so the vocabulary is loaded.
+
+**Registration** — the relying party builds request options containing a challenge and its own
+identifier; the client calls `create()`; the authenticator generates a keypair, stores it against
+that relying party, and returns a credential id and a public key. You store both.
+
+**Authentication** — the relying party builds request options containing a fresh challenge and,
+optionally, a list of acceptable credential ids; the client calls `get()`; the authenticator finds a
+credential matching the relying party identifier, prompts the user, and returns an
+assertion.<Cite src="yubico-webauthn-guide" />
+
+Two things about the challenge, both normative. It **must be randomly generated by the relying party
+in an environment it trusts**, and it should be at least 16 bytes long, because the entire replay
+resistance of the protocol rests on it being unguessable.<Cite src="webauthn-l2" /> And the returned
+challenge must be checked against what was generated — the specification says plainly that tolerating
+a mismatch compromises the protocol.<Cite src="webauthn-l2" />
+
+Hold that sentence. In a web login, the relying party is a server with a session table, and "generate
+a challenge, store it, compare it later" is a five-line function. In a wallet, the relying party is a
+contract, the challenge is going to be the hash of a transaction, and there is no session table.
+Lesson three is about what that changes.
+
+### The relying party moved, and that is the whole story
+
+Web2 and Web3 use the same protocol with the verifier in a different place, and naming the difference
+now saves confusion in four later lessons.
+
+In a web login, the relying party is your server. It holds the public key in its own database, it
+holds the challenge it issued in its own session store, and it compares the two in a process it
+controls. If the check fails it retries, logs, alerts a human, or falls back to email. The verifier is
+soft, stateful, and forgiving.
+
+In a passkey wallet, CertiK puts the relocation exactly: the relying party is the user's on-chain
+account itself, and the public key lives in the contract that guards the user's assets, in the slot
+that records who is allowed to authorise transactions.<Cite src="certik-passkey-wallets" /> The
+verifier is a function you deployed, running on a machine that will not be persuaded, with no session
+store and no operator.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'A web login', note: 'the relying party is your server' },
+    { title: 'A passkey wallet', note: "the relying party is the user's account", tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'Where does the public key live?',
+      cells: [
+        'A row in a database you administer',
+        <>The slot of the contract that guards the assets<Cite src="certik-passkey-wallets" /></>,
+      ],
+    },
+    {
+      label: 'Where does the challenge come from?',
+      cells: [
+        <>A random value the relying party generated and stored<Cite src="webauthn-l2" /></>,
+        'A value the contract can recompute from the operation in front of it',
+      ],
+    },
+    {
+      label: 'What happens when a check fails?',
+      cells: [
+        'Retry, log, alert a human, fall back to email',
+        'Nothing. Accepting a fallback would mean accepting something other than the credential',
+      ],
+    },
+    {
+      label: 'Who can re-enrol a lost credential?',
+      cells: [
+        'An operator, out of band, on the strength of a passport photo',
+        "Only the parties the account's own code already names",
+      ],
+    },
+  ]}
+  caption="Four questions with routine answers on a server; the same four are the hardest problems in this module once the verifier is a contract."
+  alt="A web login and a passkey wallet compared on where the public key lives, where the challenge comes from, what happens when a check fails, and who can re-enrol a lost credential."
+/>
+
+Three consequences drop straight out, and each becomes a lesson:
+
+- **The challenge cannot be "a random value we stored";** the contract has nowhere to store it and
+  nobody to ask. It has to be a value the contract can recompute from the operation in front of it.
+- **The check cannot be "and if it looks wrong, fall back";** there is no fallback that a contract will
+  accept, because accepting one would mean accepting something other than the credential.
+- **Re-enrolment cannot be a support action.** A server can re-enrol a user out of band on the strength
+  of a passport photo. A contract will listen to exactly the parties its own code says it will listen
+  to, and a user with no working credential is not one of them.
+
+<Aside kind="note">
+This is the first place the core tracks pay off in an unusual direction. You already know that a
+contract's authorisation logic is just code and storage, and that nothing outside it has standing. That
+fact is normally a *safety* property — nobody can seize the account. Here it is simultaneously the
+source of the hardest problem in the module, because the same property means nobody can rescue it
+either. The rest of this module is, in one sentence, the consequences of putting a consumer
+authentication protocol behind a verifier with no operator.
+</Aside>
+
+## What a product actually gains
+
+The case for passkeys in a consumer wallet is not aesthetic. It removes two specific steps that
+destroy onboarding funnels, and it adds one property that seed phrases do not have.
+
+**No extension.** A browser that supports WebAuthn is every browser your users already have. Nothing
+to install, no store listing, no desktop-only path.
+
+**No seed phrase.** The single hardest instruction in consumer crypto — "write down these twelve
+words, we cannot recover them, and anyone who reads them owns your money" — disappears from the
+first-run experience. CertiK frames the trade precisely: a seed-phrase wallet concentrates all
+asset-control authority into one derivable secret the user alone must safeguard, while a passkey
+wallet distributes that authority across the authenticator, the application, the challenge protocol,
+the account-abstraction infrastructure, the on-chain validator, and the cloud sync and recovery
+surfaces behind them — **each of which is its own security boundary and each of which has to be
+audited as one**.<Cite src="certik-passkey-wallets" />
+
+**Per-action confirmation the user already performs.** A biometric prompt is a gesture your users
+make several times a day for other reasons. It arrives with existing trust and no explanation.
+
+**Phishing resistance that comes from the protocol, not from the user's judgement.** Every credential
+is scoped to a relying party identifier, and the authenticator will only produce assertions for that
+identifier.<Cite src="webauthn-l2" /> A lookalike domain does not get a usable assertion — not because
+the user noticed, but because the authenticator has no credential for that identifier to offer. This
+is the property with no equivalent in a seed-phrase wallet, where the entire defence against a
+malicious signature prompt is a human reading a hex string.
+
+And the cost, stated once so it is not a surprise in lesson eight: **recovery stops being a phrase in
+a drawer and becomes a design problem you have to solve before your first user exists.** The authority
+did not disappear when the seed phrase did. It moved.
+
+<Misconception
+  belief="Passkeys eliminate the 'lose your key, lose your money' problem, because they are backed up to the cloud."
+  reality="They relocate it. A synced credential makes the user's OS or cloud account the recovery authority; a device-bound credential is gone with the device. Either way, an account controlled by exactly one credential with nothing else authorised has no exit."
+  why="'Backed up to iCloud' is marketed as recovery, and for a login it nearly is — a service can re-enrol you out of band. A contract cannot, because there is no party outside the account it is willing to listen to."
+  src="certik-passkey-wallets"
+/>
+
+## The credential id is a name, not a secret
+
+One more field, because it is the one that ends up in your database schema.
+
+The credential id identifies which credential to use. You pass it back in `allowCredentials` on
+subsequent authentications, and the authenticator uses it to find the right key.<Cite src="yubico-webauthn-guide" />
+It is chosen by the authenticator, it is opaque, and it is not secret — it travels in request options
+that anyone watching the network sees.
+
+Treat it as a lookup key and nothing more. It tells you which public key to verify against. It
+proves nothing on its own, and it is not a second factor.
+
+<Check type="explain" concept="passkey-definition">
+Your registration endpoint stores, for each user, the credential id and the public key returned by
+`create()`. A colleague proposes two changes to reduce support load:
+
+1. Also store the `authenticatorData` from registration so support can "look up which device the user
+   registered on" when they call in.
+2. Set `userVerification: 'discouraged'` on the authentication request, because a few users complained
+   the biometric prompt appears too often.
+
+For each, say what it actually does and whether it is safe for a wallet.
+
+<Answer>
+**1 — mostly harmless, and it does not do what your colleague thinks.** The `authenticatorData` from
+registration contains the relying-party hash, a flags byte, a signature counter and, when the AT bit
+is set, the attested credential data.<Cite src="webauthn-l2" /> None of that is a device identity you
+can present to a user. Identifying the authenticator model requires the attestation statement, and
+attestation is a separate opt-in with its own privacy trade-offs — the specification is explicit that
+an attestation statement on its own gives no assurance that the object came from the authenticator the
+user intended rather than from an attacker sitting in the middle.<Cite src="webauthn-l2" /> Store it if
+you like; do not build a support workflow on the belief that it names a device.
+
+**2 — unsafe, and worse than it looks.** `discouraged` asks the authenticator not to perform user
+verification.<Cite src="certik-passkey-wallets" /> The likely result is assertions with UP set and UV
+clear: someone touched the device, and nothing established that it was the owner. For a login that is a
+weaker session. For a wallet it means a phone in an attacker's hand — borrowed, snatched, unlocked and
+handed over — can authorise transfers, because the only gate left is a tap.
+
+The deeper point is the layering. Changing the request does not, on its own, change what the account
+accepts. If the on-chain verifier requires the UV bit, `discouraged` produces assertions the account
+rejects and you have built an outage. If the verifier does not require it, you have removed a control
+that the user believed was there. Both layers have to move together and deliberately, and the decision
+belongs in the account's validation logic, which is the only layer an attacker cannot reconfigure.
+
+**The correct fix for the complaint** is not to weaken verification. It is either platform-level — the
+OS already caches verification for a short window on most platforms — or it is a scoped delegation with
+its own policy, which is what [session keys](/c/session-key-definition) are for, and which is a
+different module because it is a different trust decision.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** takes the one fact this lesson stated quietly — that the curve is P-256 — and
+turns it into the constraint that shapes the whole product. viem's own type system already encodes
+the conclusion: a WebAuthn account "cannot sign transactions" and "does not have an Ethereum
+address".<Cite src="viem-webauthn-account" /> Those two sentences are not a library limitation. They
+are arithmetic, and the next lesson shows why.
+
+**The flags byte** comes back twice: once when you build the on-chain verifier and have to decide what
+UP and UV mean to your contract, and once when you discover that two of its bits tell you whether the
+credential can survive the loss of the device holding it.
+
+**The challenge** is the field you control, and it turns out to be the only one. Everything the
+signature must be bound to has to be inside it, which is why lesson three spends its length on a
+single JSON string.

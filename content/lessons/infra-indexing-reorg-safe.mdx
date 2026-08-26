@@ -1,0 +1,376 @@
+---
+id: infra-indexing-reorg-safe
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [envio-reorgs, envio-indexing-and-reorgs, ponder-indexing-overview, bilinear-indexing-events, quicknode-reorg, eth-pos-finality, envio-hypersync-overview, sentio-obib]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The ticket is three weeks old and has been reopened twice. A user's referral rewards balance in your
+app reads 1,240 points. The contract, read directly, says 1,200. Support has re-checked the maths
+twice and it is your number that is wrong.
+
+There is no error in any log. No alert fired. The indexer never restarted, never fell behind, never
+threw. Every row in the rewards table has a plausible block number, a plausible transaction hash, and
+a plausible timestamp. One of them describes a transaction that is not in the chain.
+
+This lesson is about that failure: why it happens, why nothing catches it, what the frameworks now do
+about it, and — the part that has become the actually dangerous part in 2026 — precisely where their
+protection stops.
+
+## The mechanism, in the terms the fold gave you
+
+You already know [what a reorg is](/c/reorg) and roughly
+[how deep they run in practice](/c/reorg-depth-in-practice) from the ledgers track. Restate it as an
+input to a fold and the consequence becomes obvious.
+
+Your indexer consumes an ordered sequence. At the tip, that sequence is not append-only: a block you
+already processed can be replaced by a different block at the same height.<Cite src="quicknode-reorg" />
+Three things can happen to a transaction that was in the replaced block:
+
+- It is **gone**. It was never included on the branch that survived.
+- It is **still there, at a different position** — different block number, different block hash,
+  different transaction index, different log index.
+- It is **still there, with different results**, because it executed against different preceding state.
+
+An indexer that only ever appends handles the first case by keeping a row for something that did not
+happen, the second by keeping two rows for something that happened once, and the third by keeping the
+wrong values. In all three cases it also keeps writing correct rows around them. The corrupted rows
+are not marked, not separable, and not detectable by any constraint you would have thought to write —
+they have valid foreign keys, valid types and plausible values.
+
+<Aside kind="warn">
+This is the only failure in indexing whose signature is *the complete absence of a signature*. A
+crashed process pages you. A stalled cursor shows up as lag. A schema violation throws. A reorg
+handled badly produces a database that passes every check you have and disagrees with the chain, and
+the disagreement is discovered by a user or an auditor, months later, on a number nobody can explain.
+</Aside>
+
+## Undoing a fold is harder than doing one
+
+The correct response has four steps, and Ponder's documentation lists them in exactly this order:
+evict the non-canonical data from the RPC cache, roll the database back to the common ancestor block
+height, fetch the new canonical data, and re-run the indexing functions over
+it.<Cite src="ponder-indexing-overview" />
+
+<Figure
+  caption="A correct rollback is the fold running backwards to the common ancestor and forwards again — the mechanism working, not a failure."
+  alt="An indexer folds forward from the common ancestor, the branch it folded is replaced, and the engine returns to the common ancestor to fold the canonical branch instead."
+>
+  <Flow
+    nodes={[
+      { id: 'anc', label: 'common ancestor', note: 'the last shared block', col: 0 },
+      { id: 'fold', label: 'fold forward', note: 'rows written at the tip', col: 1, tone: 'warn' },
+      { id: 'gone', label: 'branch replaced', note: 'those blocks are not canonical', col: 2, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'anc', to: 'fold' },
+      { from: 'fold', to: 'gone' },
+      { from: 'gone', to: 'anc', label: 'roll back, then re-fold', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+Step two is the one that does not follow from anything you have written.
+
+Consider three transitions and ask what "undo" means for each:
+
+**`balance = balance + value`.** Invertible, if you know which addition to reverse. Subtract the same
+value.
+
+**`peak = max(peak, size)`.** Not invertible. Once you have overwritten 100 with 150, the 100 is gone
+and the row cannot tell you what to restore.
+
+**`if (row === null) row.firstSeenBlock = event.block.number`.** Not invertible, and worse: the branch
+taken depended on state that has itself been changed since.
+
+So the fold has to be made reversible artificially, and there are two ways to do it. Both are now
+shipped by the mainstream frameworks, which is the largest change in this topic since the core
+curriculum's earlier material was written.
+
+**Keep a change log.** Ponder records every insert, update and delete to every table defined in the
+schema using a trigger-based transaction log, and rolls back to the common ancestor using that
+log.<Cite src="ponder-indexing-overview" /> The log is a redo/undo journal, in the database sense, and
+the engine periodically drops entries for blocks that are finalized so it does not grow without
+bound.<Cite src="ponder-indexing-overview" />
+
+**Keep versioned entity state.** Envio keeps entity-state history for the unfinalized range and
+reverts to the prior version on a reorg.<Cite src="envio-reorgs" /><Cite src="envio-indexing-and-reorgs" />
+
+The same machinery buys crash recovery for free, which is a nice structural point: if the process dies
+and restarts with identical configuration, Ponder rolls back the *entire* transaction log — every
+unfinalized change — and resumes from the finalized block.<Cite src="ponder-indexing-overview" /> A
+crash is just a reorg whose common ancestor is the last finalized block.
+
+<Misconception
+  belief="Reorg handling means writing rollback logic in your handlers."
+  reality="In 2026 the mainstream frameworks do it beneath the handler, and doing it by hand is an anti-pattern. Ponder states that indexing functions need no reorg-specific logic; Envio enables rollback by default."
+  why="Older material — including most of what is written about building an indexer from scratch — predates this, and a from-scratch pipeline genuinely does have to implement it. If you are writing the ingester yourself, the work is still yours."
+  src="ponder-indexing-overview"
+/>
+
+### The configuration you should actually read
+
+Automatic does not mean unbounded, and the bounds are configurable, which means they are also
+defaultable — and defaults are what you ship if you do not read them.
+
+Envio's reorg support is controlled by `rollback_on_reorg` in `config.yaml`, enabled by default, with
+disabling described as not recommended for production.<Cite src="envio-reorgs" /> Alongside it,
+`max_reorg_depth` sets how many blocks below the head are treated as safe from reorganisation. The
+docs state that all chains currently default to a threshold of 200 blocks, that the field was renamed
+from V2's `confirmed_block_threshold`, and — this is the sentence to underline — that **any reorg
+deeper than this threshold will not trigger a rollback in your indexer**.<Cite src="envio-reorgs" />
+
+```yaml
+rollback_on_reorg: true
+chains:
+  - id: 1          # Ethereum mainnet
+    max_reorg_depth: 250
+  - id: 137        # Polygon
+    max_reorg_depth: 150
+```
+
+Read that as a contract with a stated limit rather than a guarantee. Inside the window, the framework
+restores correctness. Outside it, you are back to the silent-corruption case with no error and no
+marker — the same failure, just rarer.
+
+There is a second stated limit worth carrying. Envio documents reorg detection as **guaranteed when
+HyperSync is the data source**, and notes that with a custom RPC endpoint there are edge cases where
+reorgs may go undetected, depending on the provider's implementation and your indexing
+pattern.<Cite src="envio-reorgs" /> That is a rare and welcome piece of vendor documentation: it draws
+the boundary of its own guarantee. The mechanism underneath, if you use HyperSync directly rather than
+through the indexer, is a rollback guard — you compare the `first_parent_hash` on each response
+against the hash you stored from the previous one, and a difference means a reorg occurred and you
+re-fetch the affected range.<Cite src="envio-reorgs" /> That guard exists because HyperSync is a
+purpose-built data retrieval layer rather than a node,<Cite src="envio-hypersync-overview" /> so the
+parent-hash chain that a client would otherwise verify itself has to be exposed deliberately in the
+response.
+
+<Aside kind="note">
+On frequency and depth, this lesson deliberately gives you no number. Post-Merge shallow rewrites at
+the tip are routine and deep ones are rare, but the specific figures that circulate — "one to two
+blocks", "a few times a week" — were not verified against a beacon-chain analytics source for this
+curriculum, and a stale reorg-frequency statistic is exactly the kind of number that gets quoted for
+years. What you can act on without a frequency estimate: the framework default is 200 blocks, the
+failure outside the window is silent, and the cost of the correct design does not depend on how often
+it fires.
+</Aside>
+
+## Where the protection stops, and why that is now the real risk
+
+Here is the part that has moved. Reorg handling used to be the hard problem because nobody implemented
+it. It is now implemented for you, which means the hard problem has relocated downstream — and the
+downstream part is not automatic, not documented in your framework's happy path, and not visible in
+any test.
+
+Envio's documentation is unusually explicit about the boundary. Rolled back during a reorg: all
+entities defined in your schema, and all data your handlers read or write to the database. **Not**
+rolled back: side effects in your handler code such as API calls to external services, custom caching
+mechanisms outside the indexer, and logs or external files your handlers
+wrote.<Cite src="envio-reorgs" />
+
+Translate that list into things a product actually does:
+
+- The email that told a user their deposit landed.
+- The push notification about a liquidation.
+- The Slack alert to the ops channel.
+- The row you copied into your analytics warehouse.
+- The webhook you fired at a partner's endpoint.
+- The fiat payout you initiated.
+- The cache you populated in Redis because Postgres was slow.
+
+Every one of those escaped before the rollback, and the rollback cannot reach any of them. The
+indexer's tables are now perfectly consistent with the canonical chain, and your system is not.
+
+<Misconception
+  belief="My indexer handles reorgs, therefore my pipeline handles reorgs."
+  reality="The rollback covers the indexer's own tables. Anything replicated downstream, cached elsewhere, or already sent to a human or a third party is untouched by it — and those are precisely the irreversible parts."
+  why="The framework documentation says 'automatic', which is true and complete about the thing it describes. Readers stop at the word and generalise it to the system, because the framework is the part they were reading about."
+  src="envio-reorgs"
+/>
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Inside the rollback', note: "the indexer's own tables", tone: 'good' },
+    { title: 'Outside it', note: 'everything a handler reached', tone: 'danger' },
+  ]}
+  rows={[
+    { label: 'What does it hold?', cells: [
+      <>All entities defined in your schema, and all data your handlers read or write to the database<Cite src="envio-reorgs" /></>,
+      <>API calls to external services, custom caching outside the indexer, and logs or files your handlers wrote<Cite src="envio-reorgs" /></>,
+    ] },
+    { label: 'Is it restored on a reorg?', cells: [
+      { v: <>Yes — <code>rollback_on_reorg</code> is enabled by default<Cite src="envio-reorgs" /></>, tone: 'good' },
+      { v: 'No. It left before the rollback and there is no undo for it', tone: 'danger' },
+    ] },
+    { label: 'How deep does the guarantee reach?', cells: [
+      { v: <><code>max_reorg_depth</code>, defaulting to 200 blocks on all chains; a deeper reorg triggers no rollback at all<Cite src="envio-reorgs" /></>, tone: 'warn' },
+      'No depth applies — the action is already outside the system',
+    ] },
+    { label: 'When is detection guaranteed?', cells: [
+      { v: <>With HyperSync as the data source; on a custom RPC endpoint reorgs may go undetected<Cite src="envio-reorgs" /></>, tone: 'warn' },
+      'Not applicable — nothing here is being watched for revision',
+    ] },
+    { label: 'What does correctness ask of you?', cells: [
+      'Reading the defaults you shipped rather than the word "automatic"',
+      <>Gating the irreversible action on the finalized checkpoint<Cite src="eth-pos-finality" /></>,
+    ] },
+  ]}
+  caption="The guarantee has a documented edge, and the irreversible half of a product sits on the other side of it."
+  alt="Envio's documented rollback boundary compared with everything outside it: what each holds, whether a reorg restores it, how deep the guarantee reaches, when detection is guaranteed, and what each side asks of the engineer."
+/>
+
+The discipline that follows is a boundary, not a setting: **reads may use the tip; irreversible
+actions wait for finality.** [Where finality sits on the spectrum](/c/finality-is-a-spectrum) and
+[what the finalized checkpoint actually is](/c/head-vs-justified-vs-finalized) you already have from
+the core track — post-Merge Ethereum has an explicit finalized checkpoint rather than a confirmation
+count.<Cite src="eth-pos-finality" /> The product pattern that expresses it is a two-tier read model:
+an optimistic view fed from the tip, labelled as pending in the interface, and a settled table that
+only advances past finality and is what payouts, exports and accounting read. The event-pipelines
+module builds it — [side effects are unrollbackable](/c/side-effects-are-unrollbackable) and
+[the two-tier read model](/c/two-tier-read-model) are its concepts, not this one's. What belongs here
+is knowing *why* they exist, which is that the indexer's guarantee has an edge and your product sits
+on the other side of it.
+
+### The tempting non-solution
+
+The obvious workaround is to index N blocks behind the head and never see a reorg at all — a tradeoff
+practitioners write up explicitly.<Cite src="bilinear-indexing-events" /> It is worth naming why it is
+not a general answer.
+
+It converts a correctness problem into a latency tax that you pay **continuously**, for the rare event
+it protects against. Every user of your product waits N block times for every update, forever, so that
+a rewrite that may happen occasionally does not reach your tables. And it does not remove the
+failure — it moves the boundary. A reorg deeper than N still corrupts you, silently, exactly as
+before. You have bought a smaller window at the cost of a permanently slower product, which is a
+reasonable trade for a settlement system and a bad one for a trading interface.
+
+The two-tier model gets you both: the tip for reads, finality for consequences, and no global latency
+tax on anything that can be revised.
+
+### Finding the damage you already have
+
+If you inherited a pipeline written before the frameworks did this, the question is not "how do I
+prevent it" but "how much of my table is already wrong". There is a technique, and it is the same one
+the open indexer benchmark uses to judge platforms: **verify against an expected record count rather
+than against the absence of errors.**<Cite src="sentio-obib" />
+
+Two checks, both cheap, both able to run against a live table:
+
+**Block-hash reconciliation.** For a sample of the block numbers in your table, ask the node for the
+canonical block hash at that height and compare it with the hash you stored. If you did not store the
+block hash, that is the first thing to fix, because without it there is no way to ask this question at
+all — and storing it costs 32 bytes per row.
+
+**Independent recount over a bounded range.** Re-derive one narrow slice — a single day, a single
+contract — from scratch into a scratch table, and full-outer-join it against production on the natural
+key. Rows present only in production are the fossils of abandoned branches. Rows present only in the
+recount are gaps. The join tells you both, and unlike a spot check it tells you the *count*, which is
+what you need to decide whether the fix is a repair or a rebuild.
+
+Neither check is exotic. What makes them rare is that nobody runs them until a user has already
+produced the discrepancy by hand, which is a late and expensive way to learn the number.
+
+## Worked example: forcing a reorg on purpose
+
+You cannot trust a rollback path you have never executed. Here is how to execute it, with the subgoals
+naming what each step is for.
+
+**Subgoal — get a chain you can rewrite.** A local [Anvil instance](/c/anvil-fork) can be snapshotted
+and reverted, which is the only practical way to produce a reorg on demand. Mine blocks, take a
+snapshot, and keep the identifier.
+
+**Subgoal — write history the indexer will fold.** With the indexer pointed at the local node, submit
+transactions that produce the events you care about — ideally including one with a non-invertible
+transition, such as a "first seen" field or a running maximum, because those are where a naive undo
+breaks.
+
+**Subgoal — capture the ground truth before the rewrite.** Dump the derived tables. This is the
+artifact you will compare against, and taking it *before* rather than reconstructing it after is what
+makes the test a test.
+
+**Subgoal — replace the branch.** Revert to the snapshot and mine a different sequence: some of the
+same transactions in a different order, one omitted entirely, one new. The omission is the important
+one — that is the row that must disappear.
+
+**Subgoal — assert on the table, not on the logs.** After the indexer settles, the derived tables must
+match a fold over the *surviving* branch exactly. Not approximately, and not "the recent rows look
+right". Row-for-row, on the natural key — [the composite key](/c/log-natural-key) is what makes that
+comparison meaningful, because a transaction hash appears on both branches.
+
+**Subgoal — check the thing the framework told you it would not do.** Wire a side effect into a
+handler: append a line to a file, or increment a counter in a separate store. After the reorg, that
+artifact still contains the abandoned branch's entry. This is not a bug you fix in the handler; it is
+the boundary made visible, and seeing it once is worth more than reading it three times.
+
+**Subgoal — go past the window.** Set `max_reorg_depth` to a small value, then produce a reorg deeper
+than it. Observe that nothing is raised and the tables are now wrong. That is the documented
+behaviour,<Cite src="envio-reorgs" /> and it is the fact you want in your head when someone proposes
+lowering the threshold to save memory.
+
+<Check type="predict" concept="reorg-safe-indexing">
+A team ships a notification service. Their indexer is Envio with default settings. A handler on
+`DepositConfirmed` writes a row to the `deposits` table and calls their email provider's API to send
+"your deposit of 5 ETH has arrived".
+
+A two-block reorg occurs. The transaction that emitted `DepositConfirmed` is not on the surviving
+branch.
+
+What does the `deposits` table look like afterwards, what does the user's inbox look like, and what is
+the smallest change that fixes this?
+
+<Answer>
+**The table is correct.** `rollback_on_reorg` is enabled by default, and a two-block rewrite is well
+inside the 200-block default window, so the engine rolls the entity state back past the abandoned
+blocks and reapplies the canonical ones.<Cite src="envio-reorgs" /> The row is gone. Nothing in the
+database records that it was ever there.
+
+**The inbox is wrong, permanently.** The API call to the email provider is a side effect in handler
+code, which the documentation lists explicitly among the things that are *not* rolled
+back.<Cite src="envio-reorgs" /> The email left the building before the rollback and there is no undo
+for it. The user has been told about a deposit that did not happen — and if the product acted on the
+same signal in any other way, so has everything else downstream.
+
+**The failure shape is worth naming.** Nothing errored. The indexer worked exactly as documented, and
+the framework's guarantee was honoured in full. The bug is entirely in the assumption that the
+guarantee extended to the whole system.
+
+**The smallest fix is not in the handler.** Do not try to make the send reversible or add a
+"cancellation email" — that is patching an outcome. Move the trigger. The handler writes the row; a
+separate process reads rows whose block has passed the finalized checkpoint and sends from
+there.<Cite src="eth-pos-finality" /> The indexing path becomes purely a database write, which is the
+only kind of operation the rollback can cover, and the irreversible operation is gated on the one
+boundary the chain will not revise.
+
+**The cost is honest and small.** The email now arrives minutes later rather than seconds. For a
+notification about money, that is not a regression — a bank does the same thing and calls it settled
+versus pending. The interface can still show the deposit immediately, marked pending, from the same
+row. That split is the two-tier read model, and this is the case that motivates it.
+
+**One trap in the "fix".** The separate process must be idempotent on the deposit's natural key, or a
+restart re-sends every email it already sent. Reorg safety and delivery safety are two different
+properties, and solving one does not solve the other.
+</Answer>
+</Check>
+
+## Where this goes
+
+Three things follow.
+
+**Selection now has a capability axis you can articulate.** "Does it handle reorgs" has become "what
+is its retained window, is detection guaranteed for my data source, and what does it explicitly not
+cover" — three questions with published answers you can compare.
+
+**The regime distinction has a correctness half.** The previous lesson separated backfill and live tail
+on performance. This lesson gives the deeper reason they differ: backfill's input is immutable and
+live tail's is not, and every asymmetry between them descends from that.
+
+**And the pipeline module inherits the boundary.** Natural keys, idempotent writes, cursor
+checkpointing in the same transaction as the rows, gating irreversible actions on finality — those all
+exist because of what you just watched a rollback fail to reach.
+
+The next lesson steps back out to the whole landscape: what happens when the chain is not an EVM chain
+at all, and how to run a selection process that does not begin with a benchmark headline.

@@ -1,0 +1,301 @@
+---
+id: solidity-token-standards-a-token-is-a-mapping
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-20, eip-721, eip-1155, oz-erc20-source, oz-safe-erc20-source, weird-erc20, eip-7702, measured-gas-constants]
+stack: { solidity: "0.8.36" }
+---
+
+A wallet shows `1,250.00 USDC`. Somebody asks where that number is stored, and the honest answer
+is: not in the account the wallet is showing it for.
+
+You know an account's record has four fields, and you know exactly which four. One of them is a
+balance, and it counts wei of the native currency and nothing else. There is no fifth field, no
+per-token sub-ledger, no list of assets. The account that "holds" 1,250 USDC stores, on the subject
+of USDC, precisely nothing.
+
+The number lives in one storage slot of one contract that somebody else deployed and controls. The
+wallet found it by calling that contract. Everything difficult about token integration is a
+consequence of that sentence, so this lesson makes it concrete enough to compute.
+
+<Figure
+  caption="Every standard in this module is the same object with a different key: a mapping inside a contract you did not deploy."
+  alt="A tree rooted at one token contract's storage. ERC-20 branches into a balances mapping keyed by holder and an allowances mapping keyed by owner then spender. ERC-721 keys an owner address by token id. ERC-1155 and ERC-6909 key an amount by holder and id."
+>
+  <Tree
+    root={{
+      label: "the token contract's storage",
+      tone: 'accent',
+      children: [
+        {
+          label: 'ERC-20',
+          note: 'one number per holder',
+          children: [
+            { label: 'balances', note: 'holder → amount' },
+            { label: 'allowances', note: 'owner → spender → amount', tone: 'warn' },
+          ],
+        },
+        { label: 'ERC-721', note: 'id → owner' },
+        { label: 'ERC-1155', note: '(holder, id) → amount' },
+        { label: 'ERC-6909', note: '(holder, id) → amount' },
+      ],
+    }}
+  />
+</Figure>
+
+## Locate the number
+
+ERC-20 defines six required functions, three optional metadata functions and two events, and the
+state behind all of them is not part of the standard at all.<Cite src="eip-20" /> The specification says what `balanceOf` returns; it does not
+say where the value is kept, and it could not, because that is an implementation choice.
+
+In practice most tokens inherit one implementation, so the layout is knowable. OpenZeppelin's
+`ERC20` declares its state in this order:<Cite src="oz-erc20-source" />
+
+```solidity
+mapping(address account => uint256) private _balances;
+mapping(address account => mapping(address spender => uint256)) private _allowances;
+uint256 private _totalSupply;
+string private _name;
+string private _symbol;
+```
+
+For a contract that inherits nothing else carrying storage, `_balances` is declaration slot 0,
+`_allowances` is 1, `_totalSupply` is 2. Now walk from a holder's address to the word that holds
+their balance. You have done this arithmetic before; the point here is what it tells you when the
+mapping belongs to someone else.
+
+**Subgoal: turn "which mapping" into a number.** A mapping occupies no data at its declaration
+slot. Slot 0 for `_balances` is a namespace, not a location.
+
+**Subgoal: bind the key to that namespace.** The slot for one entry is
+`keccak256(h(key) . p(slot))` — the key left-padded to 32 bytes, concatenated with the declaration
+slot padded to 32 bytes. For the holder `0x...00A1`:
+
+```text
+preimage (64 bytes)
+  00000000000000000000000000000000000000000000000000000000000000a1   holder, padded
+  0000000000000000000000000000000000000000000000000000000000000000   declaration slot 0
+
+keccak256 -> 0xa46c9a5e42ee711d67cec634bfb278f07133f8b3c236b826c53d763ec9766625
+```
+
+**Subgoal: read the word.** That slot, in the token contract's storage, is the balance. Reading it
+from another contract costs a cold account access to the token plus a cold storage read inside it —
+2,600 and 2,100 gas respectively on the first touch, 100 each after, measured on forge 1.7.1 with
+solc 0.8.36.<Cite src="measured-gas-constants" /><Cite src="eip-20" /> A `balanceOf` call is not
+free, it is not local, and the cost changes depending on whether anything in this transaction has
+already touched that token.
+
+The allowance is the same construction one level deeper. Hash the owner against declaration slot 1
+to get an inner namespace, then hash the spender against *that*:
+
+```text
+keccak256( pad(owner)   . pad(1) )              -> 0xf1c66c…0e1db2     the owner's sub-mapping
+keccak256( pad(spender) . 0xf1c66c…0e1db2 )     -> 0xe697c9…76cd568    the allowance word
+```
+
+Nothing in either derivation mentions the spender's storage, the holder's storage, or the
+application that asked for the approval. Both words are inside the token.
+
+## What "transfer" actually is
+
+`transfer(address,uint256)` — selector `0xa9059cbb`, the first four bytes of its keccak-256 hash —
+decrements one word and increments another, inside a single contract's storage, and emits a
+log.<Cite src="eip-20" /> No value moves at the
+protocol level. No account's native balance changes. The sender's account record is byte-identical
+before and after, except for the nonce and the gas it paid.
+
+Three consequences fall straight out, and each of them is a bug somebody has shipped.
+
+**The token contract is the only authority on your balance.** Not your node's account state, not an
+indexer, not the last `Transfer` event you saw. If the contract decides your balance is zero — a
+blocklist, a pause, an upgrade — it is zero, and there is no appeal to a lower layer, because
+there is no lower layer holding a copy.
+
+**Every property you rely on is that contract's choice.** The metadata functions `name`, `symbol`
+and `decimals` are marked OPTIONAL in the standard, with an explicit instruction that other
+contracts MUST NOT expect them to be present.<Cite src="eip-20" /> This is not hypothetical
+pedantry: OpenZeppelin's `SafeERC20` ships a `tryGetDecimals` helper that `staticcall`s
+`decimals()`, checks that at least 32 bytes came back, and falls back rather than assuming the
+function exists.<Cite src="oz-safe-erc20-source" />
+
+**Zero-value transfers are transfers.** The standard is explicit that transfers of 0 MUST be
+treated as normal transfers and MUST fire the event.<Cite src="eip-20" /> Some deployed tokens
+revert on them anyway, which breaks any loop that pays out a possibly-empty amount.<Cite src="weird-erc20" />
+
+<Misconception
+  belief="A wallet holds tokens the way it holds ETH."
+  reality="It holds ETH in its account record. For every token, a wallet holds nothing at all — it queries each token contract, one call per token, and displays what comes back."
+  why="Both appear as rows in the same list with the same visual weight, and the word 'balance' is used for both. The interface is a join across N contracts presented as a single object."
+  src="eip-20"
+/>
+
+## Two views of the same ledger, and only one of them is enforced
+
+There are two ways to learn a balance: read the mapping, or replay the `Transfer` events. Products
+use both — the first for a live figure, the second for history, portfolio charts and accounting
+exports.
+
+ERC-20 does not require them to agree.
+
+The specification says `Transfer` MUST trigger when tokens are transferred, and that a contract
+minting new tokens SHOULD trigger a `Transfer` with `_from` set to `0x0`.<Cite src="eip-20" /> Note
+the downgrade in the second clause, and note what is absent from both: there is no rule that the
+mapping may change *only* through a path that emits. A token that adjusts balances by some other
+mechanism is not violating ERC-20; it is exercising a freedom the standard never removed.
+
+Compare with ERC-1155, which closed exactly this hole and says so out loud: an external viewer MUST
+be able to query the balance and it MUST be identical to the balance determined by the transfer
+events alone.<Cite src="eip-1155" /> One standard makes event-derived accounting a guarantee. The
+older one leaves it a hope.
+
+This is not an abstract gap. Rebasing tokens change every holder's balance on a schedule with no
+per-holder transfer, which is lesson five's subject.<Cite src="weird-erc20" /> And there is a
+stranger case: some proxied tokens are reachable at more than one address, so an integration that
+keys its bookkeeping on "the token address" can be handed two addresses that share one balance
+mapping — the catalogue's worked example is a `rescueFunds` guard that checks a
+`isPoolToken[token]` flag and can be walked straight past.<Cite src="weird-erc20" />
+
+The rule to carry: **the mapping is the ledger; the events are a description of it that the token
+chooses to publish.** When the two disagree, an indexer is wrong and a `balanceOf` call is right,
+and you will find out during a withdrawal.
+
+## The allowance is a standing authorisation, and it lives in the token
+
+A contract cannot reach into your storage — there is no such operation — so it cannot move your
+tokens by acting on you. It moves them by calling the token and being recognised. That recognition
+is a number.
+
+`approve(spender, value)` writes `value` into the allowance word derived above.
+`transferFrom(from, to, value)` is called by the spender, and the token checks that word before
+editing balances.<Cite src="eip-20" /> Two transactions, two contracts, one shared piece of state
+that belongs to neither the user nor the application.
+
+Read the specification's wording on `approve` carefully, because two clauses in it produce most of
+the next lesson: it allows the spender to withdraw from your account *multiple times*, up to the
+value, and if called again it *overwrites* the current allowance rather than adding to
+it.<Cite src="eip-20" />
+
+Multiple times. Overwrites. Hold both.
+
+There is one more piece of behaviour that is convention rather than specification. OpenZeppelin's
+`_spendAllowance` does not decrement when the allowance is `type(uint256).max`; it treats that
+value as infinite and leaves the word untouched.<Cite src="oz-erc20-source" /> That is why an
+"unlimited approval" costs the spender nothing per use, and why it never decays toward zero on its
+own. It is a gas optimisation with a security consequence, and it is not in the standard, so a
+token you did not read may not do it.
+
+Now the part that surprises people in incident review.
+
+- **Deleting the application does not revoke anything.** The allowance is in the token. If the
+  front end disappears, the number is still there and `transferFrom` still works.
+- **The application cannot revoke it for you.** Only the owner can call `approve` on the token.
+  A "disconnect wallet" button revokes nothing.
+- **The allowance outlives your reason for granting it.** It has no expiry field. The standard
+  offers no way to express "for this swap only".
+- **It is per (owner, spender) — not per intent.** One number covers every future call the spender
+  makes, for any purpose, forever.
+
+<Figure
+  caption="Neither transaction is sent by the application, and neither is sent to it."
+  alt="A flow in four columns. The owner sends approve, which writes the allowance word held in the token's storage. Later the spender sends transferFrom to the same token; the token reads that word and then edits two balance words. The application front end sits in the first column with no edges attached to it."
+>
+  <Flow
+    lanes={['transaction 1', "the token's storage", 'transaction 2', 'effect']}
+    nodes={[
+      { id: 'ap', label: 'approve(spender, v)', note: 'the owner sends this', col: 0, tone: 'accent' },
+      { id: 'fe', label: 'the front end', note: 'not on the path', col: 0, tone: 'muted', dashed: true },
+      { id: 'w', label: 'allowance word', note: "in the token's storage", col: 1, tone: 'accent' },
+      { id: 'tf', label: 'transferFrom(…)', note: 'the spender sends this', col: 2, tone: 'warn' },
+      { id: 'bal', label: 'two balance words', note: 'same contract', col: 3 },
+    ]}
+    edges={[
+      { from: 'ap', to: 'w', label: 'writes' },
+      { from: 'w', to: 'tf', label: 'read', tone: 'warn' },
+      { from: 'tf', to: 'bal' },
+    ]}
+  />
+</Figure>
+
+That list is why the two lessons after this one exist. The mitigations for the approve race are
+about the *value* in that word; signature-based approvals are about not leaving a value in it at
+all.
+
+<Misconception
+  belief="approve then transferFrom is the token moving itself on the user's behalf."
+  reality="The token contract only ever edits its own mappings. The approval is a number in the token's storage that a spender later spends, and the spender is the one who initiates."
+  why="Wallet copy says 'give this app permission to access your tokens', which reads like a filesystem permission on an object you own. Nothing here is an object and nothing here is yours."
+  src="eip-20"
+/>
+
+## The return value is part of the interface, and it is load-bearing
+
+`transfer` and `transferFrom` are declared to return `bool`. The specification's notes section is
+unusually blunt about it: callers MUST handle `false`, and callers MUST NOT assume that `false` is
+never returned.<Cite src="eip-20" />
+
+Every word of that is doing work. A token is permitted to report failure by returning `false`
+rather than reverting, and some deployed tokens do exactly that.<Cite src="weird-erc20" /> A caller
+that ignores the return value therefore treats a refused transfer as a completed one — and unlike a
+revert, nothing unwinds. Lesson four is about the other half of this problem, the tokens that
+return nothing at all.
+
+## One more thing that changed under you
+
+The line between "an address with code" and "a contract" used to be the same line. Since Pectra it
+is not: an account with a [delegation designator](/c/delegation-designator) has 23 bytes of code
+while being, in every other sense, an externally owned account.<Cite src="eip-7702" />
+
+Token code cares about this in more places than you would guess — receiver-hook decisions, airdrop
+eligibility, "no contracts" mint gates. ERC-721 and ERC-1155 both specify their receiver hook as
+firing when the recipient's code size is greater than zero, which is now a different question from
+"is the recipient a contract".<Cite src="eip-721" /><Cite src="eip-1155" /> Hold the observation
+now; it comes back concretely in lessons four and six, where a code-length check is what decides
+whether your transfer succeeds.
+
+<Check type="explain" concept="erc20-allowance-model">
+A user connects to a lending app, approves it for an unlimited amount of USDC, and uses it for a
+month. The team then shuts the product down: the front end is taken offline, the domain lapses, and
+the deployer key is discarded.
+
+The user asks whether their approval is still a risk. Answer them precisely — and say which single
+action actually reduces the risk, and where that action has to be sent.
+
+<Answer>
+**Yes, and nothing about the shutdown changed it.** The approval is a `uint256` at
+`keccak256(pad(spender) . keccak256(pad(user) . pad(1)))` in the *USDC contract's* storage. The
+lending app's deployment, front end and domain are all irrelevant to it. Discarding the deployer key
+does not help either; the allowance authorises the *spender contract*, and that contract's code is
+still deployed and still callable by anyone the code permits.
+
+**The risk is exactly "whatever that contract's code can be made to do".** If the spender contract
+has an unprotected path that calls `transferFrom(user, attacker, amount)`, or is upgradeable and the
+upgrade key is compromised, the standing allowance is drained. Because OpenZeppelin's
+`_spendAllowance` short-circuits at `type(uint256).max`, an unlimited approval is not consumed by
+use and never gets smaller.
+
+**The only action that reduces the risk is `approve(spender, 0)`, sent to the USDC contract, signed
+by the user.** Not to the lending app. Not through the app's UI, which no longer exists. It costs a
+transaction, and it is the only mechanism ERC-20 provides.
+
+The generalisation worth carrying: an allowance is a capability held by a contract address, stored
+in a third contract, revocable only by the grantor. None of the three parties can clean it up
+unilaterally except the one who is least likely to remember it exists.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next two lessons** are both about that one storage word: what an attacker can do while you
+are changing it, and how to authorise a spend without leaving a standing value in it.
+
+**Lesson four** takes the return value seriously and shows why a correct-looking
+`IERC20(t).transfer(...)` reverts against the third-largest token by supply.
+
+**ERC-721, ERC-1155 and ERC-6909** are all variations on today's structure: a different key shape
+into a mapping the token owns. Once you see a token as a ledger in someone else's contract, the
+differences between the standards reduce to three questions — what the key is, who may edit it, and
+whether editing it calls you back.

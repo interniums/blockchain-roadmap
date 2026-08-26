@@ -1,0 +1,339 @@
+---
+id: scaling-rollup-stages-the-property-that-makes-it-escapable
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [arbitrum-sequencer, op-docs-forced-transaction, op-docs-sequencer-outages, l2beat-arbitrum-project, l2beat-zksync-era-project, l2beat-linea-project, l2beat-taiko-project, l2beat-stages-edge-cases, eip-1559, ethereum-org-pos]
+stack: {}
+---
+
+03:14. The L2 your product runs on stopped producing blocks eleven minutes ago. The status page says
+"investigating". Your users hold about four million dollars of balances on that chain, and the
+support queue has started.
+
+Write down step one of the runbook.
+
+Most teams cannot, and the reason is not laziness. The escape path is documented, but it is
+documented as a *capability* — "users can always bypass the sequencer" — and a capability is not a
+runbook. This lesson turns it into one, and then shows why the runbook has three more steps than
+almost anyone expects and why the last one is the one that fails.
+
+## Two chains, two mechanisms, same idea
+
+The idea is identical on both major stacks: put your L2 transaction into an L1 contract, and make the
+L2's own derivation rules oblige it to appear. The implementations differ in ways that matter
+operationally.
+
+**Arbitrum.** Messages submitted on the parent chain land in the Delayed Inbox, and the sequencer is
+expected to drain them into the feed. When it does not, `forceInclusion` on the `SequencerInbox` is
+the way past it. The threshold is not one number: Arbitrum's documentation states the force-inclusion
+window is the lesser of `delayBuffer` and `delayBlocks`, where `delayBlocks` is a constant currently
+set to 24 hours and `delayBuffer` ranges from 30 minutes to 48
+hours.<Cite src="arbitrum-sequencer" />
+
+**OP Stack.** Users send the transaction directly to the `OptimismPortal` contract on L1 as an
+ordinary deposit transaction. The relevant constants are a **12-hour rolling sequencing window** and a
+**30-minute max time drift**; deposits are normally included within thirty minutes, and after the
+sequencing window expires nodes begin generating blocks deterministically, incorporating only the
+forced-included transactions.<Cite src="op-docs-forced-transaction" />
+
+That last clause deserves emphasis. On an OP Stack chain with a dead sequencer, the chain does not
+stop. It produces **deposit-only blocks** — real blocks containing only the traffic that came through
+L1. The sequencer, when it returns, enters a catch-up phase in which the normal 6:1 ratio of L2 blocks
+to L1 origins switches to 1:1 until it is back inside the drift
+window.<Cite src="op-docs-forced-transaction" />
+
+<Misconception
+  belief="If the sequencer censors me I can immediately go to L1 and get out."
+  reality="You can queue immediately. Forcing only becomes possible after the delay elapses — 24 hours on Arbitrum One's default delayBlocks, up to 12 hours of sequencing window on OP Stack."
+  why="'Escape hatch' names something you pull in an emergency and it opens. The mechanism is closer to a court filing with a statutory waiting period."
+  src="arbitrum-sequencer"
+/>
+
+### The buffer that shrinks when you need it
+
+Arbitrum's Censorship Timeout is the one piece of this machinery that behaves counter-intuitively in
+a good way, and its arithmetic is worth working because it tells you how the escape path behaves
+during a *long* outage rather than a short one.
+
+**Subgoal: state the drain rule.** `delayBuffer` is decremented by the amount a delayed message
+exceeded the threshold. The documentation's own example: with a threshold of 30 minutes and a message
+delayed by 32 minutes, the buffer is decremented by 2 minutes.<Cite src="arbitrum-sequencer" />
+
+**Subgoal: state the refill rule and convert it to a rate.** The buffer replenishes linearly at one
+minute for every twenty minutes in which no message is delayed beyond the threshold — a 5%
+rate.<Cite src="arbitrum-sequencer" />
+
+```text
+1 minute gained per 20 minutes clean  =  5%
+1 day of buffer consumed  →  20 days of clean operation to restore it
+```
+
+**Subgoal: read the effect on the window.** The proposed parameters for Arbitrum One are a delay
+buffer of 14,400 parent-chain blocks — two days — with a 30-minute threshold; Arbitrum Nova uses a
+one-hour threshold.<Cite src="arbitrum-sequencer" /> Because the force window is the *lesser* of
+buffer and `delayBlocks`, a sustained outage drains the buffer below the 24-hour constant, and the
+escape hatch gets faster the longer the censorship runs. That is the stated design intent: lower the
+threshold exactly when delays look like censorship or an outage.<Cite src="arbitrum-sequencer" />
+
+**Subgoal: see the problem it was built for.** Arbitrum's docs give the motivating case in
+multiplication. For a chain settling to Arbitrum One, every challenge move that has to bypass the L2
+sequencer waits 24 hours, so resolution takes `24 hours × number of moves`; at fifty sequential
+moves, fifty days.<Cite src="arbitrum-sequencer" /> An escape hatch used once is a delay. An escape
+hatch used in a loop is a denial-of-service against the proof system itself.
+
+### Two kinds of outage, and only one of them looks like an outage
+
+Before reaching for the escape path, work out which failure you are in. OP Stack's documentation
+splits sequencer outages into two categories that present completely
+differently.<Cite src="op-docs-sequencer-outages" />
+
+**Sequencer downtime.** The sequencer cannot receive or process transactions at all. Users see a
+complete inability to submit, and the network appears stuck at a particular block
+height.<Cite src="op-docs-sequencer-outages" /> This is the visible one. Alerts fire, the status page
+goes red, and everyone knows.
+
+**Transaction submission outage.** The sequencer is still accepting and ordering transactions
+normally, but cannot publish them to L1. Users generally notice nothing. The tell is in the block
+tags: the safe and finalized heights stall while the unsafe height keeps
+climbing.<Cite src="op-docs-sequencer-outages" />
+
+The second is the dangerous one for anything that credits balances, because everything downstream of
+the sequencer keeps looking healthy while the thing that makes those confirmations durable has
+stopped. If your monitoring watches `latest` and not the gap between `latest` and `safe`, this
+failure is invisible to you for as long as it lasts, and its consequences arrive later as a reorg
+rather than as an incident. Both outage types can be circumvented through the L1 portal, with
+caveats — but you have to notice the second one first.<Cite src="op-docs-sequencer-outages" />
+
+## Forced inclusion unblocks one of four chokepoints
+
+Here is the step everyone misses. Getting your transaction ordered is the *first* of four things that
+must happen before money reaches L1:
+
+1. **Included** — your transaction enters the canonical L2 ordering.
+2. **Posted** — a batch containing it reaches L1.
+3. **Proposed** — a state root covering it is published to the L1 bridge.
+4. **Claimed** — the proof or challenge window completes and you execute the withdrawal on L1.
+
+Forced inclusion addresses step 1 and nothing else. Steps 2, 3 and 4 each have their own party and
+their own failure. Step 3 is the one with teeth, because on many chains only whitelisted addresses
+may propose state roots — and a withdrawal is a claim against a root that does not exist yet.
+
+<Figure
+  caption="Money reaches L1 only after four separate parties have each done their job, in this order."
+  alt="Four gates in sequence between a transaction and money on L1: included in the canonical L2 ordering, posted in a batch that reaches L1, proposed as a state root published to the L1 bridge, and claimed once the proof or challenge window completes."
+>
+  <Flow
+    lanes={['ordering', 'data', 'the claim', 'the payout']}
+    nodes={[
+      { id: 'inc', label: 'included', note: 'enters the canonical L2 ordering', col: 0, tone: 'good' },
+      { id: 'post', label: 'posted', note: 'a batch containing it reaches L1', col: 1, tone: 'warn' },
+      { id: 'prop', label: 'proposed', note: 'a state root covering it reaches the bridge', col: 2, tone: 'danger' },
+      { id: 'claim', label: 'claimed', note: 'the window completes, you execute on L1', col: 3, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+L2BEAT grades those two failures separately, and the live rows on 26 August 2026 show how far apart
+real chains sit.
+
+**Sequencer failure — can you complete inclusion yourself?**
+
+- **Arbitrum One: self sequence.** Users can force transactions in by sending them to L1, with up to a
+  one-day delay on the operation.<Cite src="l2beat-arbitrum-project" />
+- **ZKsync Era: enqueue via L1.** Users can submit transactions to an L1 queue but cannot force them.
+  The sequencers cannot selectively skip transactions but can stop processing the queue
+  entirely.<Cite src="l2beat-zksync-era-project" />
+- **Linea: no mechanism.** There is no mechanism to have transactions included if the sequencer is
+  down or censoring; only after six months of no finalised blocks does the Operator role become
+  public.<Cite src="l2beat-linea-project" />
+- **Taiko Alethia: enqueue via L1**, with an interesting twist — an inclusion becomes due after
+  9 minutes 36 seconds, after which a whitelisted proposer cannot publish another proposal without
+  processing up to ten due inclusions.<Cite src="l2beat-taiko-project" />
+
+That Taiko figure is worth a moment: 9 min 36 s is 576 seconds, which at Ethereum's 12-second slots
+is exactly 48 slots.<Cite src="ethereum-org-pos" /> Forced-inclusion deadlines are almost always
+slot counts wearing wall-clock clothes.
+
+**Proposer failure — can withdrawals proceed without the operator?**
+
+- **Arbitrum One: self propose.** Anyone can be a proposer and publish new roots to the L1
+  bridge.<Cite src="l2beat-arbitrum-project" />
+- **ZKsync Era: replace proposer.** Only whitelisted proposers can publish state roots, so on failure
+  withdrawals are frozen; governance can attempt to change proposers via an
+  upgrade.<Cite src="l2beat-zksync-era-project" />
+- **Linea and Taiko Alethia: cannot withdraw.** Only whitelisted proposers may publish, so on failure
+  withdrawals freeze.<Cite src="l2beat-linea-project" /><Cite src="l2beat-taiko-project" />
+
+<Matrix
+  corner="Chain"
+  cols={['Sequencer failure', 'Proposer failure']}
+  rows={[
+    {
+      label: 'Arbitrum One',
+      cells: [
+        { v: <>Self sequence — force transactions in via L1, with up to a one-day delay<Cite src="l2beat-arbitrum-project" /></>, tone: 'good' },
+        { v: <>Self propose — anyone can be a proposer and publish new roots<Cite src="l2beat-arbitrum-project" /></>, tone: 'good' },
+      ],
+    },
+    {
+      label: 'ZKsync Era',
+      cells: [
+        { v: <>Enqueue via L1 — users cannot force; the sequencers can stop processing the queue<Cite src="l2beat-zksync-era-project" /></>, tone: 'warn' },
+        { v: <>Replace proposer — whitelisted, so withdrawals freeze; governance can attempt a swap via an upgrade<Cite src="l2beat-zksync-era-project" /></>, tone: 'warn' },
+      ],
+    },
+    {
+      label: 'Linea',
+      cells: [
+        { v: <>No mechanism — the Operator role becomes public only after six months of no finalised blocks<Cite src="l2beat-linea-project" /></>, tone: 'danger' },
+        { v: <>Cannot withdraw — only whitelisted proposers may publish<Cite src="l2beat-linea-project" /></>, tone: 'danger' },
+      ],
+    },
+    {
+      label: 'Taiko Alethia',
+      cells: [
+        { v: <>Enqueue via L1 — an inclusion becomes due after 9 minutes 36 seconds<Cite src="l2beat-taiko-project" /></>, tone: 'warn' },
+        { v: <>Cannot withdraw — only whitelisted proposers may publish<Cite src="l2beat-taiko-project" /></>, tone: 'danger' },
+      ],
+    },
+  ]}
+  caption="Two independent chokepoints, graded separately: on these rows, read 26 August 2026, only Arbitrum One lets you act alone at both."
+  alt="Four chains against two L2BEAT risk rows. Arbitrum One is rated self sequence and self propose. ZKsync Era is enqueue via L1 and replace proposer. Linea has no sequencing mechanism and cannot withdraw. Taiko Alethia is enqueue via L1 and cannot withdraw."
+/>
+
+<Misconception
+  belief="Every rollup has an escape hatch, because they all have a delayed inbox or a portal contract."
+  reality="Having a queue on L1 is not the same as having a path you can complete alone, and the state-root proposer is a second, independent chokepoint that freezes withdrawals regardless of inclusion."
+  why="Sequencer failure and proposer failure are taught as one risk called 'the operator goes away', and only one of them has a well-known fix."
+  src="l2beat-arbitrum-project"
+/>
+
+### The delay is a bound only if somebody bounded it
+
+The two headline numbers — 12 hours on OP Stack, 24 hours on Orbit chains — are attractive because
+they are numbers. L2BEAT's own specification notes that not every mechanism has one. Its edge-cases
+document raises the forced-transaction delay upper bound as an open question and gives Taiko's
+mechanism as the awkward case: in the worst case a forced transaction is processed from the queue
+every 255 batches, but if the queue is long enough, the delay for a specific forced transaction can
+be much longer.<Cite src="l2beat-stages-edge-cases" />
+
+That is the difference between a **parameter** and a **bound**. A parameter tells you what happens
+under normal load. A bound tells you what happens when everyone is doing it at once, which is the
+only load the escape path was built for. L2BEAT goes on to argue that because forced-transaction
+delays act as a temporary pause from a censored user's point of view, their upper bound arguably
+ought to be aligned with the liveness-failure bound used for sequencing.<Cite src="l2beat-stages-edge-cases" />
+
+When you read a chain's forced-inclusion documentation, the question to hold is not "how long is the
+delay" but "is this delay a constant, or is it a queue position?" Those two answers have the same
+units and completely different worst cases.
+
+## The hatch and the crowd
+
+There is a fifth constraint that no chain's documentation frames as a risk, because it is not a
+property of the chain: **every step of the escape path costs L1 gas and requires L1 inclusion.** The
+mechanism is designed for one censored user. A chain-wide loss of confidence is not one censored user.
+
+**Subgoal: express exit capacity in the only unit that matters.** Ethereum produces one block per
+12-second slot, so 7,200 blocks a day.<Cite src="ethereum-org-pos" /> If a forced exit costs `c` gas
+and the block gas limit is `G`, then daily exit capacity is `7,200 × G / c` transactions. Measure `c`
+on your chain rather than taking anyone's figure; it differs by an order of magnitude between a bare
+deposit and a full prove-and-finalise withdrawal.
+
+**Subgoal: add the price response.** Ethereum's base fee rises by at most one eighth per block, so a
+crowd all bidding for the same blocks compounds the price at 12.5% per block until demand
+clears.<Cite src="eip-1559" /> From the previous lesson's arithmetic, forty blocks — about eight
+minutes — is enough for a hundredfold increase.
+
+**Subgoal: state the consequence honestly.** The escape hatch is at its least usable during exactly
+the event that makes everyone want to use it. This is not an argument against having one. It is an
+argument for knowing that "users can always exit" describes an individual right, not a system-wide
+capacity, and for sizing your own product's exposure accordingly.
+
+<Aside kind="warn">
+There is a gap in the evidence here that is worth stating rather than papering over. **How many
+forced inclusions have actually been executed on mainnet L2s is not established.** The mechanisms are
+specified, the contracts are deployed, and the research behind this module found no verified account
+of a mainnet L2 sequencer outage in which users successfully forced their way out at scale. An
+untested escape hatch is a claim about code, not an observed property of a system. Testing it on a
+testnet — actually submitting through the L1 path and watching the transaction land — is a
+two-afternoon exercise that converts the claim into knowledge.
+</Aside>
+
+## What forcing does not get you
+
+Two final constraints, both of which have cost people money.
+
+**Inclusion is not execution.** Forcing puts your transaction into the ordering. It does not put it
+into the ordering *at a favourable position*. By the time your forced liquidation-avoidance
+transaction executes, twelve hours of price movement may have happened and the position may already
+be gone. The transaction can also simply revert.
+
+**An escape hatch does not protect you from an upgrade.** This is the connection to the next lesson,
+and it is worth stating in its final form now. L2BEAT's own risk row for Arbitrum One — a Stage 1
+chain — reads: exit window **none** for the emergency upgrade path, ten days for the regular one,
+with the explanatory note that there is no window for users to exit in case of an unwanted upgrade
+since contracts are instantly upgradable.<Cite src="l2beat-arbitrum-project" /> Linea's row is
+shorter: exit window **none**.<Cite src="l2beat-linea-project" />
+
+An exit path with a 24-hour delay is worth nothing against a contract change that takes effect in one
+block.
+
+<Check type="spot-bug" concept="escape-hatch">
+A team writes this incident runbook for their L2-based custody product and asks you to review it.
+
+> **If the sequencer goes down:**
+> 1. Post a status notice.
+> 2. Submit each affected user's withdrawal to the L1 inbox contract.
+> 3. After the force-inclusion delay, call the permissionless force-include function.
+> 4. Withdrawals will then finalise normally through the bridge.
+> **Expected worst case: 24 hours plus the normal withdrawal window.**
+
+Find the errors. There are at least three.
+
+<Answer>
+**Error 1 — step 3 assumes a capability the chain may not have.** "Call the permissionless
+force-include function" is true on Arbitrum One, where L2BEAT rates sequencer failure as *self
+sequence*. On ZKsync Era it is false: users can enqueue but cannot force.<Cite src="l2beat-zksync-era-project" />
+On Linea there is no mechanism at all.<Cite src="l2beat-linea-project" /> The runbook must name the
+chain and the actual contract function, and step 3 must be replaced by "wait for the operator" on
+chains where that is the truth.
+
+**Error 2 — step 4 skips the proposer.** "Withdrawals will then finalise normally" assumes someone is
+still publishing state roots. On Linea and Taiko Alethia, proposing is whitelisted and its failure
+freezes withdrawals independently of
+inclusion.<Cite src="l2beat-linea-project" /><Cite src="l2beat-taiko-project" /> A sequencer outage
+and a proposer outage frequently have the same root cause — one company's infrastructure — so
+treating step 3 as sufficient is exactly the correlated-failure assumption the runbook exists to
+avoid.
+
+**Error 3 — the worst case is not a worst case.** It omits L1 congestion entirely. If the outage is
+newsworthy, every other product on that chain is executing the same runbook into the same blocks, and
+the base fee compounds at 12.5% per block.<Cite src="eip-1559" /> It also omits the possibility that
+the outage is accompanied by an upgrade, against which a delayed exit is worthless on a chain whose
+exit window is none.<Cite src="l2beat-arbitrum-project" />
+
+**A fourth, if you want it.** Step 2 says "submit each affected user's withdrawal", which quietly
+assumes your service holds the authority to move user funds. If it does, your product is a custodian
+and the sequencer is not your largest risk. If it does not, the runbook's real step 2 is "publish
+instructions users can follow themselves", which is a completely different piece of work and needs to
+exist before the incident.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** is where the module's argument lands. Three of the four errors above trace back to
+the same missing question — not "can I get out?" but "who can change the rules while I am getting
+out?"
+
+**The stage lesson** after it turns exactly these rows into a grading scheme, and you will find that
+the things L2BEAT counts are the things you just used to break that runbook.
+
+**The sequencer module** takes the outage in the opening scene and makes it precise: what a hostile
+or absent operator can actually do to you, and the surprisingly short list of things it cannot.
+
+**Your own systems.** Open your chain's L2BEAT project page and read two rows: sequencer failure and
+proposer failure. If they do not both say you can act alone, your incident runbook has a step in it
+that ends with "wait".

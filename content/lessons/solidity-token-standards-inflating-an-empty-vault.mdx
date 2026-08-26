@@ -1,0 +1,345 @@
+---
+id: solidity-token-standards-inflating-an-empty-vault
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [oz-erc4626-inflation-defense, oz-erc4626-docs, oz-erc4626-source, eip-20, uniswap-v2-pair-source]
+stack: { solidity: "0.8.36" }
+---
+
+A vault has one share outstanding and holds 100 tokens. Its price per share is therefore 100 tokens.
+
+Nothing about that is a bug. It is arithmetic on two numbers, both of which are true. The bug is
+that an attacker chose both numbers, one of them without calling the vault at all, and the person
+who is about to deposit 100 tokens is going to receive zero shares for them.
+
+This lesson builds that state step by step, then shows why it is not a property of empty vaults
+specifically.
+
+## The donation surface
+
+Recall the default from the previous lesson. OpenZeppelin's reference `totalAssets()` is:<Cite src="oz-erc4626-source" />
+
+```solidity
+function totalAssets() public view virtual returns (uint256) {
+    return IERC20(asset()).balanceOf(address(this));
+}
+```
+
+The vault's view of its own holdings is a call to the asset token, asking what the token's mapping
+says. Which means: **anyone who can change that mapping entry can change the vault's accounting**,
+and lesson one established exactly who can do that — anybody holding the token, by calling
+`transfer(vaultAddress, amount)`.
+
+Enumerate what such a transfer requires:
+
+- No call to the vault. `deposit` is not invoked, `Deposit` is not emitted, no shares are minted.
+- No privilege. `transfer` is permissionless by construction.<Cite src="eip-20" />
+- No flash loan, no oracle, no MEV bundle, no reentrancy.
+- No notification. A plain ERC-20 transfer executes entirely inside the token contract; the vault's
+  code does not run, so it cannot observe, reject or react.
+
+That last point is the one that makes this different from every other attack in this module. There
+is nothing to guard, because there is no call to guard. The vault finds out the next time somebody
+reads `totalAssets()`, which is to say: during the victim's deposit.
+
+<Misconception
+  belief="The donation attack needs a flash loan or some special capability."
+  reality="It needs an ERC-20 transfer to the target's address. The whole mechanism is that a contract computing a ratio from balanceOf(address(this)) has made that ratio writable by anyone holding the asset."
+  why="Exploits are assumed to require exotic tools. This one requires the single most common operation on the chain."
+  src="oz-erc4626-inflation-defense"
+/>
+
+## The naive conversion, and where it breaks
+
+A vault written without the mitigations computes shares like this:
+
+```solidity
+function _toShares(uint256 assets) internal view returns (uint256) {
+    uint256 supply = totalSupply();
+    return supply == 0 ? assets : assets * supply / totalAssets();
+}
+```
+
+Two branches, and the first one is the tell. When supply is zero there is no rate to compute — zero
+over zero — so the code invents one: one share per asset. That special case is not arbitrary; it is
+the only thing you can do without a defined rate. It is also a promise that whoever deposits first
+gets to set the rate.
+
+## Worked example: the full attack
+
+The asset has 18 decimals. The vault is freshly deployed and empty. A victim is about to deposit
+100 tokens, which is `100e18` in the token's units, and their transaction is in the public mempool.
+
+**Subgoal: take 100% of the share supply for a price of nothing.** The attacker front-runs with a
+deposit of **1 wei**.
+
+```text
+  supply == 0, so shares = assets = 1
+  totalSupply()  = 1
+  totalAssets()  = 1
+  attacker holds 1 of 1 shares
+```
+
+They now own the entire vault. The cost was one wei plus gas, and OpenZeppelin's write-up notes the
+same thing: front-running the initial deposit with even 1 wei garners a 100% share of the
+pool.<Cite src="oz-erc4626-inflation-defense" />
+
+**Subgoal: move the price without minting anything.** The attacker sends `100e18` of the asset
+directly to the vault's address.
+
+```text
+  totalSupply()  = 1                (unchanged — no deposit call)
+  totalAssets()  = 100e18 + 1       (the token's mapping says so)
+  price per share = 100e18 + 1
+```
+
+**Subgoal: round the victim's deposit to zero.** The victim's `deposit(100e18)` now executes.
+
+```text
+  shares = 100e18 * totalSupply() / totalAssets()
+         = 100e18 * 1 / (100e18 + 1)
+         = 0                        (integer division, floor)
+```
+
+The victim's assets are transferred in. They receive **zero shares**. No revert, no warning — the
+deposit succeeded, and the receipt they hold is a balance of nothing. OpenZeppelin's article
+describes the identical outcome in round numbers: the deposit's share calculation comes out at zero
+because of how shares are calculated against the donated
+balance.<Cite src="oz-erc4626-inflation-defense" />
+
+<Matrix
+  numeric
+  corner="After"
+  cols={['totalSupply()', 'totalAssets()', 'Attacker shares', 'Victim shares']}
+  rows={[
+    { label: 'deployment', cells: ['0', '0', '0', '0'] },
+    { label: 'attacker deposits 1 wei', cells: ['1', '1', { v: '1', tone: 'danger' }, '0'] },
+    { label: 'attacker donates 100e18', cells: ['1', '100e18 + 1', { v: '1', tone: 'danger' }, '0'] },
+    { label: 'victim deposits 100e18', cells: ['1', '200e18 + 1', { v: '1', tone: 'danger' }, { v: '0', tone: 'danger' }] },
+  ]}
+  caption="Three transactions, and the only share in existence is a claim on both deposits."
+  alt="Vault state after each step: empty at deployment; after the attacker's 1 wei deposit, supply 1 and assets 1 with the attacker holding the only share; after a 100e18 donation, supply still 1 and assets 100e18 plus 1; after the victim deposits 100e18, supply still 1, assets 200e18 plus 1, and the victim holds zero shares."
+/>
+
+**Subgoal: redeem the only share.** The vault now holds `200e18 + 1` against a supply of 1.
+
+```text
+  assets = 1 * totalAssets() / totalSupply()
+         = 1 * (200e18 + 1) / 1
+         = 200e18 + 1
+```
+
+Settle the ledger:
+
+```text
+  attacker paid       1 wei  +  100e18 (the donation)
+  attacker received   200e18 + 1 wei
+  attacker net        +100e18, minus gas
+  victim  paid        100e18
+  victim  received    nothing
+```
+
+The donation was never a gift. It was working capital, returned in full alongside the victim's
+deposit, because the attacker held every share that existed.
+
+## It is a front-running attack, not an opportunistic one
+
+The attacker does not deploy this and wait. They watch for the first deposit and size the donation
+against it. OpenZeppelin states both halves: an attacker would typically wait for a user to make the
+first deposit and front-run that operation, and the size of the donation required to manipulate the
+vault is equivalent to the size of the deposit being
+attacked.<Cite src="oz-erc4626-docs" />
+
+Two things follow that people get wrong in opposite directions.
+
+**It is not free.** The attacker must hold and risk an amount comparable to the victim's deposit for
+the duration of one transaction. Against a small first deposit the attack is cheap; against a large
+one it needs capital.
+
+**It is not confined to the first deposit.** OpenZeppelin's own framing is that this is essentially a
+problem of slippage, and that new vaults are at the *greatest* risk rather than the only
+risk.<Cite src="oz-erc4626-source" /><Cite src="oz-erc4626-inflation-defense" /> Which brings us to
+the generalisation that matters most.
+
+## The real precondition is scale, not emptiness
+
+Look again at the division that produced zero:
+
+```text
+  shares = assets * totalSupply() / totalAssets()
+```
+
+This floors to zero whenever `assets * totalSupply()` is smaller than `totalAssets()` — that is,
+whenever the deposit is worth **less than one share**. Emptiness is one way to get there. A high
+price per share is another, and the price per share is exactly what a donation moves.
+
+Work an example with no empty vault anywhere in it. A vault holds `1e21` assets against `1e3`
+shares, so one share costs `1e18`:
+
+<Matrix
+  corner="Deposit"
+  cols={['assets * totalSupply() / totalAssets()', 'What the depositor gets']}
+  rows={[
+    { label: '5e17', cells: ['5e17 * 1e3 / 1e21 = 0.5', { v: 'floors to 0 — nothing minted', tone: 'danger' }] },
+    { label: '1e18', cells: ['1e18 * 1e3 / 1e21 = 1', { v: '1 share, exact', tone: 'good' }] },
+    { label: '15e17', cells: ['15e17 * 1e3 / 1e21 = 1.5', { v: 'floors to 1 — 33% lost to rounding', tone: 'warn' }] },
+  ]}
+  caption="One share costs 1e18 here, and every deposit that is not a whole multiple of it leaves its remainder in the pool."
+  alt="In a vault holding 1e21 assets against 1e3 shares, a deposit of 5e17 computes to 0.5 and mints nothing, 1e18 computes to exactly 1 share, and 15e17 computes to 1.5 and floors to 1, losing 33% to rounding."
+/>
+
+Anything under `1e18` gets nothing. Anything not an exact multiple loses the remainder. That is the
+same defect as the headline attack, with the vault holding a million tokens and a healthy-looking
+history.
+
+OpenZeppelin's guide gives the general rule in user-facing terms: deposit `1e9` shares' worth and the
+rounding costs at most a millionth of a percent, deposit 10 shares' worth and you could lose 10%,
+and deposit less than one share's worth and you get zero shares — "you basically made a
+donation".<Cite src="oz-erc4626-docs" />
+
+So the mitigation "seed the vault with a first deposit" needs to be read carefully. It raises the
+cost of the specific opening move. It does not remove the mechanism, because the mechanism is that a
+sufficiently high price per share rounds small deposits to nothing, and a donation is still
+available to raise it.
+
+<Misconception
+  belief="Seeding the vault with an initial deposit solves the inflation attack."
+  reality="It raises the attack's cost by making the required donation larger. The mechanism — small deposits rounding to zero shares against a manipulable price per share — is untouched."
+  why="Every published walkthrough of the attack starts with an empty vault, so filling it looks like removing the precondition. Emptiness is a sufficient condition, not a necessary one."
+  src="oz-erc4626-inflation-defense"
+/>
+
+## The four mitigations, with their costs
+
+OpenZeppelin evaluated the ecosystem's options before designing theirs, and the write-up is unusually
+honest about the drawbacks of each.<Cite src="oz-erc4626-inflation-defense" />
+
+**A router with slippage checks.** The user goes through a wrapper that takes custody and verifies
+the shares received. Straightforward, and OpenZeppelin's own assessment is that it may only
+circumvent the issue rather than address it: it costs more gas because the router takes custody
+first, and it introduces an additional trust assumption, since the router becomes a critical
+component with permission to spend user tokens.<Cite src="oz-erc4626-inflation-defense" /> The
+reference implementation's caution points users at exactly this class of wrapper as *their* defence,
+independent of what the vault does.<Cite src="oz-erc4626-source" />
+
+**Internal accounting.** Track assets in the vault's own variable so donated tokens are never
+counted. OpenZeppelin's assessment: it removes the inflation risk completely and the logic is easy to
+understand.<Cite src="oz-erc4626-inflation-defense" /> The cost is a different problem, and it is
+lesson eleven's second half.
+
+**Dead shares or an initial deposit.** Morpho DAO's approach is to deposit assets at initialisation
+and mint the corresponding shares to the vault itself, which functions as a non-operational address —
+so the loss is borne by the project rather than by a user, and the more that is deposited the harder
+the attack becomes.<Cite src="oz-erc4626-inflation-defense" /> The drawbacks OpenZeppelin lists are
+concrete: it does not completely resolve the issue, attacks remain possible at reduced profit, the
+required amount has to be decided case by case, it discourages legitimate early liquidity providers,
+and it locks a fraction of the assets permanently.<Cite src="oz-erc4626-inflation-defense" /> There is
+also a deployment wrinkle — the vault's address has to be precomputed and approval granted in advance
+of deployment.<Cite src="oz-erc4626-inflation-defense" />
+
+**Virtual shares and assets.** YieldBox's design adds a virtual quantity of shares and assets to the
+conversion, which mirrors dead shares without having to burn any tokens to mint
+them.<Cite src="oz-erc4626-inflation-defense" /> This is what OpenZeppelin built on, and it is the
+next lesson.
+
+Note the pattern across all four. Two of them (the router, the seed) make the attack more expensive.
+Two of them (internal accounting, virtual shares) change what the arithmetic reads. Only the second
+pair addresses the mechanism, and each pays for it somewhere.
+
+### The mitigation that shipped in 2020
+
+Dead shares are not a 4626-era invention. Uniswap V2's pair contract has carried this since 2020:<Cite src="uniswap-v2-pair-source" />
+
+```solidity
+uint public constant MINIMUM_LIQUIDITY = 10**3;
+// ...on the first mint only:
+liquidity = Math.sqrt(amount0.mul(amount1)).sub(MINIMUM_LIQUIDITY);
+_mint(address(0), MINIMUM_LIQUIDITY);   // permanently lock the first MINIMUM_LIQUIDITY tokens
+```
+
+The first liquidity provider gets 1,000 fewer LP tokens than the formula gives, and those 1,000 are
+minted to the zero address where nobody can redeem them. Total supply can therefore never return to
+zero, and one LP token can never be made worth an arbitrary amount, because there is always a floor
+of 1,000 shares diluting any donation.<Cite src="uniswap-v2-pair-source" />
+
+Two things to take from it. The mechanism was understood and mitigated in an AMM years before
+ERC-4626 existed, and the fix cost the first depositor a small, permanent, disclosed amount — which
+is exactly the tradeoff OpenZeppelin lists against dead
+shares.<Cite src="oz-erc4626-inflation-defense" /> If you have wondered why the first LP in a pool
+gets slightly fewer tokens than the square root suggests, this is the reason.
+
+### Recognising it in code you did not write
+
+The audit pattern is short enough to run over any vault, lending market or pool in a few minutes.
+
+**Search for `balanceOf(address(this))`.** Every hit is a quantity somebody else can change with a
+transfer. If the result feeds a ratio, a price, a reward rate or a share calculation, you have found
+the surface.
+
+**Read the zero-supply branch.** `supply == 0 ? assets : ...` is the special case that lets the first
+depositor define the rate. Its presence means there is no virtual offset.
+
+**Check the offset if the implementation is OpenZeppelin's.** `_decimalsOffset()` returning 0 is the
+default, which is not the same as absent — the next lesson explains what the default still
+buys.<Cite src="oz-erc4626-source" />
+
+**Ask what happens at one share's worth.** Compute `totalAssets / totalSupply` for the live contract
+and ask whether a realistic user deposit is above or below it. That single number tells you how much
+of the deposit range rounds to zero.
+
+**Look for the seed and check it is still there.** A vault seeded at deployment is protected only
+while the seed shares exist. If they are redeemable by anyone, they are not dead shares — they are a
+deposit.
+
+<Check type="predict" concept="inflation-first-depositor-attack">
+A team ships a vault with no virtual offset and no internal accounting, but they seed it at
+deployment: the deployer deposits 1,000 tokens (`1000e18`) and receives `1000e18` shares, which they
+keep. They consider the first-depositor attack handled.
+
+A user is about to deposit 50 tokens (`50e18`). Predict what an attacker can do, and give the number
+that decides whether it is worth doing.
+
+<Answer>
+**The attacker donates to raise the price per share until the victim's deposit rounds down, and takes
+the remainder.** The seed changes the arithmetic but not its shape. Start from
+`totalSupply = 1000e18`, `totalAssets = 1000e18`, so the price per share is 1.
+
+For the victim's `50e18` to mint zero shares, the attacker needs
+`50e18 * totalSupply / totalAssets` to floor to zero, which means `totalAssets` must exceed
+`50e18 * 1000e18`. That is `5e40` — an absurd donation. **The seed has made total rounding-to-zero
+economically impossible**, and that much is a genuine win.
+
+**But zero is the wrong bar.** The attacker does not need the victim to receive nothing; they need
+the victim to receive *less than they paid for*, with the difference accruing to existing
+shareholders — which is to say, mostly to the deployer's `1000e18` shares and to whatever the
+attacker holds. Any donation raises the price per share, and every subsequent deposit that is not an
+exact multiple of the new price loses its remainder to the pool. The attack degrades from theft to a
+tax, and the tax is paid by every depositor rather than one.
+
+**The number that decides it** is the attacker's share of total supply. A donation of `D` raises the
+pool by `D`; the attacker recovers `D * theirShares / totalSupply` of it. With the deployer holding
+`1000e18` of the shares, an attacker holding a small fraction recovers a small fraction — they lose
+money. That is the real defence the seed provides, and it is the same argument the next lesson's
+virtual shares make, except that here it depends on the deployer never selling.
+
+**So: better than nothing, and not a fix.** It is a capital commitment that must stay committed, it
+does not survive the deployer's shares being redeemed, and the mechanism is still that price per
+share is writable by anyone with the asset.<Cite src="oz-erc4626-inflation-defense" />
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** removes the special case entirely: give an empty vault a defined exchange rate,
+and make donations captured rather than compounded. Both mitigations, with the arithmetic and the
+tradeoffs.
+
+**The security track** treats donation and first-depositor findings as a family. The recognition
+pattern generalises well past vaults: any contract computing a ratio from `balanceOf(address(this))`
+has published a write interface to that ratio.
+
+**Invariant testing** on the Foundry track has this as its best worked example — the property "no
+user can extract more than they deposited plus their share of yield" is checkable by a fuzz campaign
+that includes plain transfers to the vault among its actions.

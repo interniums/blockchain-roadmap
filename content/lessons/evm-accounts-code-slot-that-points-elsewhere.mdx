@@ -1,0 +1,302 @@
+---
+id: evm-accounts-code-slot-that-points-elsewhere
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [eip-7702, eip-3541, eip-2718, eip-2930, eip-4844, eip-1559, eip-3529, eip-2929, measured-gas-constants, nethermind-7702-attack-surfaces]
+stack: {}
+---
+
+A wallet shows a one-line prompt — batch your approve and your swap into a single confirmation —
+and you accept it. No contract is deployed. Your address does not change. Your balance does not
+move.
+
+Then you call `eth_getCode` on your own address, an address that has returned `0x` for as long as
+it has existed, and get back 23 bytes.
+
+Those 23 bytes are the whole mechanism. This lesson is what they are, how they got there, and what
+the EVM does when a call arrives at an account holding them.
+
+## The 23 bytes
+
+A **delegation designator** is the byte string `0xef0100` followed by a 20-byte address. Three
+bytes of prefix plus twenty bytes of address is twenty-three bytes, stored in the account's code
+field like any other code, which is why installing one changes the account's code hash.<Cite
+src="eip-7702" />
+
+<Figure
+  caption="The account holds a pointer, not a program: three bytes that can never be code, then an address."
+  alt="The 23-byte delegation designator broken into its two parts — a three-byte 0xef0100 tag and the 20-byte address of the delegate whose code will run."
+>
+  <Anatomy
+    value="0xef01001234567890abcdef1234567890abcdef12345678"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 8, label: 'tag', note: '3 bytes, never valid code', tone: 'accent' },
+      { from: 8, to: 48, label: 'delegate', note: '20 bytes — the code that runs', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+The prefix is not decoration. EIP-3541 disallowed the deployment of new code whose first byte is
+`0xEF`, and it recorded why that byte was safe to reserve: an analysis in May 2021 over 18,084,433
+contracts then in state found zero existing contracts starting with `0xEF`.<Cite src="eip-3541" />
+The byte was reserved for the EVM Object Format, and EIP-3541 wrote down the alternative in
+advance: should that proposal not be deployed, the reserved prefix can be used by other features
+depending on versioning.<Cite src="eip-3541" /> EIP-7702 is one of those other
+features.<Cite src="eip-7702" />
+
+That prefix is what makes a designator unambiguous. `0xEF` is an undefined instruction — it pops
+nothing, pushes nothing, and causes an exceptional abort when executed — so no ordinary runtime
+code can begin with it and mean anything.<Cite src="eip-3541" /> Twenty-three bytes starting
+`0xef0100` are a pointer, and cannot be mistaken for a program.
+
+<Aside kind="note">
+EIP-3541 bans *new* deployments beginning with `0xEF`; it states that code already in the account
+trie starting with that byte is not affected semantically.<Cite src="eip-3541" /> The May 2021
+count of such contracts was zero, which is why the reservation was clean rather than merely
+mostly clean.<Cite src="eip-3541" />
+</Aside>
+
+## What the EVM does with them
+
+When execution reaches an account whose code is a designator, the EVM loads the code at the named
+address and runs it **in the designating account's context**. Not the delegate's storage — yours.
+Not the delegate's balance — yours. `address(this)` is your address.
+
+The spec lists the operations that follow a designator: `CALL`, `CALLCODE`, `DELEGATECALL`,
+`STATICCALL`, and any transaction whose destination is an account with a designator
+present.<Cite src="eip-7702" />
+
+If you have met [`DELEGATECALL` as the proxy primitive](/c/delegatecall-is-the-proxy-primitive),
+the shape is familiar: borrowed code, local storage, local identity. The difference is where the
+decision lives. A proxy contains a `DELEGATECALL` because its author wrote one. A delegated account
+follows the pointer because the *protocol* does, before any of your code gets a say.
+
+<Misconception
+  belief="A delegated account stores a copy of the delegate's code."
+  reality="It stores 23 bytes that name an address. What executes is whatever code lives at that address when the call happens — the account holds a pointer, not a program."
+  why="'Setting code on an EOA' is how the change is usually described, and setting code sounds like copying code in."
+  src="eip-7702"
+/>
+
+That distinction matters more than it looks. The account's own code hash commits to the *pointer*,
+not to the pointed-at behaviour. If the delegate address holds a plain immutable contract, the
+behaviour is fixed. If the delegate is itself an upgradeable proxy, then the code your account runs
+can be replaced by whoever controls that proxy's upgrade path, without any further signature from
+you and without your account's record changing by one byte.
+
+The EIP chose pointers deliberately. The authors' comparison: the smallest useful proxy is around
+50 bytes and an address is 20, and the 30-byte difference "will be inefficiently replicated
+billions of times" for no additional functionality.<Cite src="eip-7702" />
+
+## The transaction that writes them
+
+Designators are written by one transaction type and nothing else.
+
+**Type `0x04`**, the set-code transaction, is a typed envelope in the EIP-2718 sense, and its
+payload is the [RLP serialization](/c/rlp) of the EIP-1559 field set plus one new
+field:<Cite src="eip-7702" /><Cite src="eip-2718" /><Cite src="eip-1559" />
+
+```text
+rlp([chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas, gas_limit,
+     destination, value, data, access_list, authorization_list,
+     signature_y_parity, signature_r, signature_s])
+```
+
+The shared fields carry the same semantics as in EIP-4844, which implies something small and quiet:
+**a null destination is not valid**, so a type-4 transaction cannot deploy a
+contract.<Cite src="eip-7702" /><Cite src="eip-4844" /> It also carries no blobs. The authors'
+reasoning was that transaction types are specialized tools rather than one format that does
+everything.<Cite src="eip-7702" />
+
+The `authorization_list` is a list of tuples. **The transaction is invalid if that list is
+empty**, which is a deliberate anti-pattern guard: without it, wallets would reach for type 4 as a
+generic transaction format, and type 4 has different implications for the transaction pool than an
+EIP-1559 transaction does.<Cite src="eip-7702" />
+
+The next lesson is entirely about what is inside a tuple and who can sign one. What matters here is
+*when* they are applied.
+
+### Ordering, and why one transaction is enough
+
+The authorization list is processed **after the sender's nonce is incremented and before the
+execution portion of the transaction begins**.<Cite src="eip-7702" />
+
+Read that twice, because a lot follows from it. By the time the transaction's own call runs, the
+designators are already installed. So a single type-4 transaction can install a delegation on the
+sender's own account and then immediately call into it — the "delegate and use it" flow works in
+one shot, with no second transaction and no window in which the account is delegated but unused.
+
+<Misconception
+  belief="You need one transaction to install a delegation and a second one to use it."
+  reality="Authorizations are applied before the transaction's call executes, so a single type-4 transaction can delegate an account and then exercise the delegate in the same transaction."
+  why="Two-phase setup is the norm everywhere else — approve then transfer, permit then spend — so the sequential model transfers by habit."
+  src="eip-7702"
+/>
+
+### Who is allowed to be delegated
+
+One validation step in the tuple-processing loop is worth pulling out now: the code of the account
+being delegated must be **empty or already a delegation**.<Cite src="eip-7702" />
+
+A contract account can therefore never be delegated. Delegation is not a general "point any account
+at any code" primitive; it applies to accounts that have no code of their own, plus accounts that
+are already delegated and are being re-pointed. Re-delegation is permitted and expected — the same
+address can be plain, then delegated to wallet A, then delegated to wallet B, over its
+lifetime.<Cite src="nethermind-7702-attack-surfaces" />
+
+## No initcode runs, and what that costs you
+
+A normal deployment runs initcode: the constructor executes, sets storage, and returns the runtime
+bytes. Installing a designator does none of that. The EIP is explicit that running initcode was
+rejected, partly because it creates a new mode of execution to test and partly on cost — the
+authors estimated a minimal copy-from-an-address initcode at nearly 500 additional gas, and 1200 or
+more if not copying.<Cite src="eip-7702" />
+
+Two consequences follow, and both have produced real bugs.
+
+**The delegate's constructor never runs in your account.** If a wallet implementation sets a value
+in its constructor, that value is set in *the delegate's* storage at *its* deployment, and your
+account sees none of it. Your account's storage after delegation is whatever it was before —
+usually nothing.<Cite src="nethermind-7702-attack-surfaces" />
+
+**Initialization is therefore a separate call, and separate calls can be front-run.** If a wallet
+uses the proxy-style `initialize()` pattern, and a user delegates in one transaction and
+initializes in the next, an observer can call `initialize()` first and take control of the
+account.<Cite src="nethermind-7702-attack-surfaces" /> The spec's own guidance is that a delegate
+must require the setup calldata to be signed by the account's key and verified with `ecrecover`, so
+that only the owner's chosen initial values can be applied.<Cite src="eip-7702" />
+
+<Aside kind="warn">
+This is the same class of failure as an uninitialized proxy, with one difference that makes it
+worse: a proxy is deployed by its author, who can bundle initialization into the deployment. A
+delegation is installed by an authorization tuple that carries no calldata at all, so there is
+nothing to bundle. The atomicity has to be re-created by putting the initialization call in the
+same type-4 transaction, or by making the delegate refuse to be initialized without a signature.
+</Aside>
+
+## The gas, and the two constants
+
+Two named constants govern the cost.<Cite src="eip-7702" />
+
+- `PER_AUTH_BASE_COST` = **12,500**<Cite src="eip-7702" />
+- `PER_EMPTY_ACCOUNT_COST` = **25,000**<Cite src="eip-7702" />
+
+The way they combine is not obvious. The transaction's intrinsic cost is inherited from EIP-2930
+and then charged `PER_EMPTY_ACCOUNT_COST` for *every* authorization in the list — the worst case,
+upfront.<Cite src="eip-7702" /><Cite src="eip-2930" /> Later, while processing each tuple, if the
+authority already exists in state, `PER_EMPTY_ACCOUNT_COST - PER_AUTH_BASE_COST` is added to the
+global refund counter.<Cite src="eip-7702" />
+
+The reason for that shape is stated plainly: charging maximum upfront avoids a state lookup per
+authorization while computing intrinsic gas, so validity can be determined from a lookup on the
+sender's account alone.<Cite src="eip-7702" />
+
+Two things follow that catch people out.
+
+**The 12,500 figure is a net, not a price.** You are charged 25,000 and credited 12,500 back — and
+credits land in the global refund counter, which is capped.<Cite src="eip-3529" /> A transaction
+that does little else may not have enough gas used to absorb the full refund.
+
+**The sender pays for every tuple regardless of validity or duplication.**<Cite src="eip-7702" />
+An authorization that fails validation still cost the transaction its upfront charge. This is the
+technical root of the relayer griefing problem in the next lesson.
+
+For the curious, the authors itemised how 12,500 was derived — this is their 2024 impact
+assessment, not a live price list:<Cite src="eip-7702" />
+
+- 1,616 to ferry 101 bytes of calldata
+- 3,000 to recover the authority address
+- 2,600 to read the nonce and code of the authority
+- 200 to store values in an already-warm account
+- 4,600 to deposit 23 bytes of code<Cite src="eip-7702" />
+
+That totals 12,016 of comparable computation, rounded up to 12,500 for the work of moving the data
+around.<Cite src="eip-7702" />
+
+Separately, when a code-executing instruction resolves a delegation and touches a **cold** account
+in the process, an extra 2,600 is charged and the delegate address is added to the accessed set;
+otherwise the warm cost of 100 applies.<Cite src="eip-7702" /> Those are the ordinary
+[cold and warm account access](/c/cold-vs-warm-access) prices from EIP-2929, and they were
+confirmed by direct measurement — cold account access 2,600, warm 100.<Cite src="eip-2929" /><Cite
+src="measured-gas-constants" />
+
+## The failure mode nobody expects
+
+One line in the spec deserves its own section.
+
+If the transaction's execution fails — reverts, runs out of gas, aborts — **the processed
+delegation indicators are not rolled back**.<Cite src="eip-7702" />
+
+The authorizations are applied before execution, and they survive execution's failure. So a
+transaction that says "delegate me to this wallet, then do these three things" can leave you
+delegated with none of the three things done. Your account is now a different kind of account, and
+the receipt says `status: 0`.
+
+<Figure
+  caption="The designator is written outside the call frame, so reverting the call cannot take it back."
+  alt="Inside one type-4 transaction: the sender's nonce increments, then the authorization list is applied and writes the code field, then the call executes and reverts; the call's effects are undone while the delegation remains installed."
+>
+  <Flow
+    nodes={[
+      { id: 'n', label: 'nonce++', note: "the sender's", col: 0 },
+      { id: 'a', label: 'authorizations', note: 'code field written', col: 1, tone: 'accent' },
+      { id: 'x', label: 'the call runs', note: 'and reverts', col: 2, tone: 'danger' },
+      { id: 'r', label: 'call effects undone', col: 3, tone: 'muted' },
+      { id: 'd', label: 'delegation stands', note: 'status: 0 all the same', col: 3, tone: 'accent' },
+    ]}
+    edges={[
+      { from: 'n', to: 'a' },
+      { from: 'a', to: 'x' },
+      { from: 'x', to: 'r' },
+      { from: 'x', to: 'd', tone: 'accent' },
+    ]}
+  />
+</Figure>
+
+Any client, indexer or support flow that reads a reverted transaction as "nothing happened" is
+wrong about type-4 transactions specifically. The nonce moved and the code field moved.
+
+<Check type="predict" concept="set-code-transaction">
+Alice sends one type-4 transaction. It carries a single authorization delegating her own account to
+wallet contract `W`, and its call data invokes a batch on her now-delegated account that performs
+a token approval followed by a swap. The swap reverts on slippage, so the whole call frame
+reverts and the transaction's status is failure.
+
+What is the state of Alice's account afterwards? Name four things.
+
+<Answer>
+**1 — Alice is delegated to `W`.** The authorization was processed before execution began, and
+processed delegation indicators are not rolled back when execution fails. `eth_getCode` on her
+address now returns `0xef0100` followed by `W`.
+
+**2 — Her nonce advanced twice.** Once for the transaction itself, once for the authorization she
+signed. Any client that computes her next nonce by counting transactions is now off by one.
+
+**3 — Neither the approval nor the swap happened.** Everything inside the reverted call frame was
+undone. The delegation is the only part that persisted, because it was never inside that frame.
+
+**4 — She paid.** The intrinsic charge included `PER_EMPTY_ACCOUNT_COST` for the authorization, and
+gas was burned executing up to the revert.
+
+The instructive part is the asymmetry. Delegation and execution look like one atomic unit in the
+wallet's confirmation dialog, and they are not one unit in the state transition. "The transaction
+failed, so nothing changed" is a reasonable default for every transaction type except this one.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The authorization tuple** is the next lesson: the six fields, the digest that keeps an
+authorization from ever being replayed as a transaction, and the chain-id wildcard that makes one
+signature valid everywhere.
+
+**Delegation as total control** follows from the context rule stated here — your storage, your
+balance, your identity — and is what makes the choice of delegate a key-level decision rather than
+an approval-level one.
+
+**The outside and inside views** of a delegated account disagree precisely because the 23 bytes are
+what the account holds and the delegate's code is what runs. Once you have the pointer clearly in
+mind, that asymmetry stops being surprising and becomes predictable.

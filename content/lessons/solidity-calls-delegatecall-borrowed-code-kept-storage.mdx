@@ -1,0 +1,425 @@
+---
+id: solidity-calls-delegatecall-borrowed-code-kept-storage
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    eip-7,
+    solidity-docs-global-vars,
+    solidity-docs-storage-layout,
+    solidity-docs-contracts,
+    solidity-abi-spec,
+    eip-1967,
+    eip-7201,
+    oz-issue-6362,
+    sok-root-cause-losses,
+    arxiv-audit-gap-2026,
+    solidity-changelog,
+  ]
+stack: { solidity: "0.8.36" }
+---
+
+Here is a code review that passed.
+
+```solidity
+// V1Storage.sol — unchanged for eleven months
+contract V1Storage {
+    address public owner;          // slot 0
+    uint256 public totalDeposits;  // slot 1
+    mapping(address => uint256) public balances;  // slot 2
+}
+```
+
+The change under review adds a pause switch. The author puts it where it reads best:
+
+```solidity
+contract V2Storage {
+    address public owner;          // slot 0
+    bool public paused;            // slot 0, byte 20
+    uint256 public totalDeposits;  // slot 1
+    mapping(address => uint256) public balances;  // slot 2
+}
+```
+
+Two reviewers approve. The diff is three words. Every test passes, because the tests deploy `V2Storage`
+fresh and it is internally consistent.
+
+It is deployed as the new implementation behind a live proxy holding forty million dollars, and
+`paused` is now sharing slot 0 with `owner` — reading the twenty-first byte of a slot that has held
+an address since the day the proxy was deployed. Whether the protocol is now permanently paused
+depends on a byte of an address nobody chose.
+
+Nothing in that diff is wrong. `V2Storage` compiles to a correct contract. The bug lives in the
+relationship between two files that never import each other, and the instruction that creates that
+relationship is `DELEGATECALL`.
+
+## What the instruction promises, in language terms
+
+You know the opcode semantics from [Track 03](/c/delegatecall-is-the-proxy-primitive). EIP-7 states
+the identity half in one sentence: `CALLER` and `VALUE` behave exactly in the callee's environment
+as they do in the caller's environment.<Cite src="eip-7" /> The specification-level facts are
+settled. What is not settled, for most people who have read them, is what they mean *inside a
+Solidity file*.
+
+Translated into the language, a delegatecalled implementation is code that has been handed a set of
+variables it has never seen, addressed only by number, with no way to check that the numbers mean
+what it thinks they mean.
+
+Six language-level consequences follow, and they are worth stating separately because engineers
+routinely get four of them right and two wrong.
+
+**`address(this)` is the proxy.** So are `address(this).balance`, the address that appears on every
+emitted log, the address a `CREATE` derives from, and the address the counterparty sees as
+`msg.sender` when your borrowed code makes an onward call. The implementation's own account exists,
+has a balance and has a storage root, and none of them are ever touched.
+
+**`msg.sender` is whoever called the proxy.** Not the proxy. This is the one that makes proxies
+usable at all: `onlyOwner` inside the implementation compares against the user who sent the
+transaction, exactly as it would in a non-upgradeable contract.
+
+**`msg.value` is a report, not a receipt.** It is the value the *outer* frame received, propagated
+unchanged, and no ether moves as part of the instruction.<Cite src="eip-7" /> Read once, this is
+correct. Read once per iteration of a loop, it is a mint function.
+
+**Storage is the proxy's, addressed by slot number.** The language docs are direct: if state
+variables are accessed via a low-level `delegatecall`, the storage layout of the two contracts must
+align in order for the called contract to correctly access the storage variables of the calling
+contract.<Cite src="solidity-docs-global-vars" /> "Must align" is doing enormous work in that
+sentence, and the rest of this lesson is about what it actually requires.
+
+**Transient storage follows storage.** When transient storage is used in the context of
+`DELEGATECALL`, the owning contract of the transient storage is the contract that issued the
+instruction — the caller — as with persistent storage.<Cite src="solidity-docs-contracts" /> So a
+transient reentrancy guard set inside an implementation lives in the proxy, which is what you want,
+and two implementations that disagree about transient layout collide exactly the way they would in
+storage.
+
+**Immutables and constants do *not* follow storage.** This is the one almost nobody has thought
+through, and it gets its own section below.
+
+<Misconception
+  belief="delegatecall is dangerous because the callee can steal your Ether."
+  reality="The callee executes as your account and writes your storage — including the slot holding your implementation address and the slot holding your owner. The Ether follows from owning the storage; it is the second-order effect, not the first."
+  why="The word 'call' makes value transfer the first thing anyone thinks about, and the instruction does not even take a value argument."
+  src="eip-7"
+/>
+
+## The layout rules, restated as a diff review
+
+Slots are assigned by the compiler in declaration order, and for contracts that use inheritance the
+ordering of state variables is determined by the C3-linearized order of contracts starting with the
+most base-ward contract; state variables from different contracts do share the same storage slot
+where the packing rules allow.<Cite src="solidity-docs-storage-layout" /> Structs and array data
+always start a new slot, and items following struct or array data always start a new
+slot.<Cite src="solidity-docs-storage-layout" />
+
+You know those rules. The useful form for this module is not the rules but their contrapositive: a
+checklist of source edits, sorted by whether they can move a slot.
+
+**Safe under delegatecall — cannot move any slot:**
+
+- Renaming a variable. Names never cross the boundary. `owner` and `admin` at slot 0 are the same
+  variable to the machine.
+- Changing a variable's visibility, or adding or removing its generated getter.
+- Adding, removing or changing `constant` and `immutable` values — they are stored in code, not in
+  storage, and have no effect on the storage layout.<Cite src="solidity-docs-storage-layout" />
+- Adding, removing or reordering `transient` variables. Transient storage has a completely
+  independent address space, so the order of transient state variables does not affect the layout of
+  storage state variables and vice versa.<Cite src="solidity-docs-contracts" />
+- Adding functions, events, errors, modifiers.
+- Appending a new state variable *after* every existing one, in the most-derived contract, if the
+  last existing variable already fills its slot.
+
+**Unsafe — silently redirects at least one write:**
+
+- Inserting a variable anywhere but the end.
+- Removing a variable.
+- Reordering two variables.
+- Widening or narrowing a type in a way that changes packing: `uint128, uint128, uint256` occupies
+  two slots and `uint128, uint256, uint128` occupies three, from the same three
+  declarations.<Cite src="solidity-docs-storage-layout" />
+- Adding a state variable to a *base* contract. Every derived variable shifts.
+- Changing the inheritance list, or the order within it. C3 linearization determines the ordering,
+  so `contract C is A, B` and `contract C is B, A` lay out differently.<Cite src="solidity-docs-storage-layout" />
+- Changing a `struct` member list, when instances of that struct are stored.
+
+The opening example is item four on the second list. `bool paused` is one byte, `address owner` is
+twenty, and twenty plus one fits in thirty-two — so the packing rules put them in the same slot and
+the compiler did precisely what it is documented to do.
+
+<Aside kind="warn">
+Notice what is *not* on either list: anything the compiler can warn about. Both contracts compile
+cleanly in isolation, and neither compilation unit has any way to see the other. The compiler tracks
+selector collisions inside one contract and refuses them; it has never had a mechanism for
+cross-contract layout agreement, because there is no point in the pipeline where both layouts exist
+at once. This is a tooling job — the upgrade-safety plugins, a stored `storageLayout` artefact
+diffed in CI — and not a language job.
+</Aside>
+
+## Logs belong to the proxy, and the ABI belongs to the implementation
+
+One more thing crosses the boundary in a direction people rarely trace: events.
+
+`emit Transfer(from, to, amount)` compiles to a `LOG` whose address field is the account of the
+executing frame — the proxy. The topic hash and the data layout, however, come from the event
+declaration in the *implementation's* source. So an indexer sees one stable address emitting logs
+forever, which is precisely the property that makes upgradeability usable, and it decodes those logs
+against an ABI that can change on any upgrade without the address changing.
+
+The failure this produces is quiet. Add an `indexed` qualifier to a parameter, or reorder two
+parameters of the same type, and the topic hash changes or the fields move — the canonical event
+signature is a hash of the name and parameter types, exactly like a function
+selector.<Cite src="solidity-abi-spec" /> A subgraph pinned to the old signature simply stops
+matching, and a subgraph matching on the old *shape* starts decoding new logs into the wrong fields.
+Neither produces an error on chain. "Which version of the code emitted this log" is a question the
+chain does not answer, because the chain records the address and the address did not change.
+
+## The one that is not storage: immutables under delegatecall
+
+Consider an implementation that does the obviously careful thing:
+
+```solidity
+contract Vault {
+    IERC20 public immutable asset;
+
+    constructor(IERC20 asset_) { asset = asset_; }
+
+    function withdraw(uint256 amt) external {
+        balances[msg.sender] -= amt;
+        asset.transfer(msg.sender, amt);
+    }
+}
+```
+
+`immutable` was chosen over a storage variable for the usual reason: it cannot be changed after
+construction, so it cannot be repointed by a compromised admin, and reading it costs no `SLOAD`.
+
+Behind a proxy, both halves of that reasoning invert.
+
+An `immutable` is inlined into the contract's deployed bytecode at construction time; the docs group
+`constant` and `immutable` together as stored in separate locations from storage, with no effect on
+the storage layout.<Cite src="solidity-docs-storage-layout" /> Under `DELEGATECALL` the executing
+code is the *implementation's* code, so `asset` reads the value baked into the implementation the
+proxy currently points at.
+
+Which means: the value is not part of the proxy's state at all. It did not survive from the proxy's
+own construction, because the proxy's constructor never ran this code. It is not visible in any
+storage dump, so `cast storage` will not show it and a storage-layout diff will not catch a change
+to it. And an upgrade that deploys a new implementation with a different constructor argument
+changes it — silently, invisibly, and with none of the immutability the keyword advertises.
+
+The same reasoning applies to `constant`, to the compiler's `type(C).creationCode`, and to anything
+else that lives in code rather than in the state trie. The rule to carry: **under delegatecall,
+"immutable" means immutable for as long as this implementation is the one being pointed at.** If the
+value must survive an upgrade, it belongs in storage — at a slot both sides agree on — or in the
+proxy's own initcode.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'A storage variable', note: 'lives in the state trie', tone: 'good' },
+    { title: 'An immutable', note: 'lives in code', tone: 'warn' },
+  ]}
+  rows={[
+    { label: 'Whose bytes are read under delegatecall?', cells: ['The proxy that owns the frame', 'The implementation currently pointed at'] },
+    { label: 'Does an upgrade change the value?', cells: ['Only if the layout moved under it', 'Whenever the new implementation was built with a different argument'] },
+    { label: 'Does a storage dump show it?', cells: ['Yes', 'No — it is not in storage'] },
+    { label: 'Does a storage-layout diff catch a change to it?', cells: ['Yes', 'No'] },
+  ]}
+  caption="The keyword that promises permanence is the one a proxy can replace without leaving a trace in state."
+  alt="A storage variable and an immutable compared under delegatecall on whose bytes are read, whether an upgrade changes the value, whether a storage dump shows it, and whether a storage-layout diff catches a change."
+/>
+
+## Worked collision: watching one `SSTORE` land in the wrong place
+
+Take the simplest possible mismatch and follow the bytes.
+
+```solidity
+contract Proxy {
+    address implementation;  // slot 0
+    address admin;           // slot 1
+}
+
+contract Logic {
+    uint256 totalSupply;                        // slot 0
+    mapping(address => uint256) balances;       // slot 1
+}
+```
+
+<Matrix
+  corner="Slot"
+  cols={['Proxy declares', 'Logic declares']}
+  rows={[
+    { label: '0', cells: [{ v: 'implementation — address', tone: 'danger' }, { v: 'totalSupply — uint256', tone: 'danger' }] },
+    { label: '1', cells: ['admin — address', 'balances — mapping seed, never written'] },
+  ]}
+  caption="Two contracts compiled months apart in different repositories agree on nothing except the numbering."
+  alt="Slots 0 and 1 as the proxy declares them and as the logic contract declares them. Slot 0 is an implementation address to one and a total supply to the other; slot 1 is an admin address to one and a mapping seed to the other."
+/>
+
+**Subgoal — fix the two slot maps independently, because that is how they were produced.** The proxy
+was compiled alone: `implementation` gets slot 0, `admin` gets slot 1. The logic contract was
+compiled alone, in a different repository, in a different month: `totalSupply` gets slot 0, and
+`balances` reserves slot 1 without storing anything in it.<Cite src="solidity-docs-storage-layout" />
+Neither compilation had any information about the other.
+
+**Subgoal — pick an entirely ordinary operation and reduce it to an opcode.** A user mints one
+million tokens. The logic contract executes `totalSupply += 1_000_000`, which compiles to
+`SLOAD(0)`, an addition, `SSTORE(0, 1000000)`. There is no proxy-specific code involved; this is the
+same instruction sequence the contract would emit if it were deployed directly.
+
+**Subgoal — decide which account that `SSTORE` writes to.** It executes in a frame whose account is
+the proxy, because `DELEGATECALL` sets the target to the current
+contract.<Cite src="eip-7" /> Slot 0 of the *proxy* now holds `0x00000000000000000000000000000000000000000000000000000000000f4240`.
+
+**Subgoal — read that word back as the type the proxy thinks lives there.** The proxy's next call
+loads slot 0 and takes the low twenty bytes as an address. One million in hex is `0xf4240`, so the
+implementation address is now `0x00000000000000000000000000000000000f4240`. No contract has ever
+been deployed there.
+
+**Subgoal — state the failure mode precisely, because it is not what people expect.** The proxy now
+delegatecalls an account with no code. That is not an error at the EVM level: an empty program runs
+to completion, the instruction pushes success, and the return-data buffer is empty. The proxy's
+fallback returns those zero bytes. Every function on the proxy now reports success and returns
+nothing — including the upgrade function that would have fixed it. The next lesson is about that
+single fact, because it converts a corrupted pointer into an unrecoverable one.
+
+**Subgoal — check the variable that did *not* get corrupted, and understand why.** `balances[x]`
+lives at `keccak256(x ‖ 1)`, not at slot 1, because a mapping's declared slot stays empty and exists
+only to seed the derivation.<Cite src="solidity-docs-storage-layout" /> So writes to `balances` land
+in the hashed range and cannot hit `admin` at slot 1. Swap the mapping for a dynamic array and that
+protection disappears — a dynamic array stores its *length* in its declared slot, so
+`items.push(...)` writes an ordinary integer to slot 1 and overwrites the admin
+address.<Cite src="solidity-docs-storage-layout" /> Which of your variables can reach a proxy's
+control slots is a property of their *types*, not only of their positions.
+
+## Why this class costs real money
+
+It is tempting to file this under "exotic". The loss data does not support that. Systematic analysis
+of real-world smart contract attacks puts access-control failure far ahead of the reentrancy bugs that
+dominate curricula, and leads the ranking among contract-vulnerability
+categories.<Cite src="sok-root-cause-losses" /> Widen the count to every documented incident,
+including operational compromise that never touched a contract bug, and stolen keys and phishing both
+rank above it — but it still costs several times what reentrancy
+does.<Cite src="arxiv-audit-gap-2026" /> Which category sits at the very top is a question about what
+a study admits; the gap over reentrancy is not in dispute.
+A storage collision that overwrites an owner slot or an implementation pointer *is* an access-control
+failure; it simply arrives through a route no `require` statement is watching.
+
+And the failure is not confined to bad code. OpenZeppelin's own issue tracker carries a live case
+where upgrading a UUPS proxy from a version using sequential storage to a version using ERC-7201
+namespaces left the contract permanently deadlocked — unable to be initialised, upgraded or
+administered by any on-chain transaction — because an initialisation flag from the old layout landed
+in the same slot as the new layout's first field and violated an encoding
+invariant.<Cite src="oz-issue-6362" /> Two well-reviewed libraries, one migration, no recovery. The
+proxies module later in this track works that incident through slot by slot.
+
+<Misconception
+  belief="Storage variables are matched by name across a delegatecall, the way struct fields are matched in a serialisation format."
+  reality="They are matched by slot number and nothing else. Renaming is free; reordering, inserting or repacking silently redirects a write to a different variable."
+  why="Solidity source shows named fields on both sides of the boundary, and every other cross-process data format anyone has used — JSON, protobuf, a database schema — carries names or tags. This one carries integers."
+  src="solidity-docs-global-vars"
+/>
+
+## Two questions the language cannot answer for you
+
+**"Am I currently being delegatecalled?"** There is no keyword. The only mechanism available is to
+compare `address(this)` against a value recorded at construction time — which is exactly what
+Solidity itself does for libraries, and what UUPS implementations do to refuse direct calls. The last
+lesson in this module shows the compiler's version, down to the push instruction.
+
+**"Do these two layouts agree?"** Also no keyword, and this is where the tooling has actually moved.
+Since 0.8.35 the compiler ships an `erc7201(string memory id) returns (uint)` builtin that computes a
+namespace base slot at compile time, and a contract can declare `layout at` a chosen base
+slot.<Cite src="solidity-changelog" /><Cite src="solidity-docs-contracts" /> Neither *checks*
+agreement — they let you put a layout somewhere a sequential compiler will never reach, which
+converts "must agree" into "cannot collide". That is the subject of this module's last lesson, and
+it is the reason ERC-1967 and ERC-7201 exist.<Cite src="eip-1967" /><Cite src="eip-7201" />
+
+<Check type="spot-bug" concept="delegatecall-storage-is-the-risk">
+A team runs an upgradeable protocol. The current implementation is:
+
+```solidity
+contract PoolV1 is Ownable {
+    uint256 public feeBps;
+    uint256 public totalShares;
+    mapping(address => uint256) public shares;
+}
+```
+
+`Ownable` declares exactly one state variable, `address _owner`. The proxy uses ERC-1967 slots, so
+there is no proxy-versus-implementation collision.
+
+The upgrade to `PoolV2` makes three changes, each with a stated justification:
+
+1. `feeBps` is widened from `uint256` to `uint256` — unchanged — but renamed to `protocolFeeBps`,
+   "for clarity".
+2. A new `uint64 public lastFeeUpdate` is inserted directly after `protocolFeeBps`, "because it
+   belongs with the fee".
+3. `PoolV2` now inherits `Ownable, Pausable` instead of just `Ownable`, and `Pausable` declares one
+   `bool _paused`.
+
+Say which of the three changes are safe, which are not, and — for each unsafe one — name the
+variable whose value is now wrong and what it is now holding.
+
+<Answer>
+**Change 1 is safe. Changes 2 and 3 are both unsafe, and 3 is worse than it looks.**
+
+**Change 1 — rename.** Free. Names do not cross the boundary; the slot number does. `protocolFeeBps`
+reads slot 1 exactly as `feeBps` did.<Cite src="solidity-docs-global-vars" />
+
+**Change 2 — insertion.** `PoolV1`'s layout is `_owner` at slot 0 (from the base contract, which is
+laid out first under C3 linearization), `feeBps` at 1, `totalShares` at 2, `shares` reserving
+3.<Cite src="solidity-docs-storage-layout" /> Inserting `uint64 lastFeeUpdate` after the fee puts it
+at slot 2 — and because a `uint64` is eight bytes it packs into the low bytes of slot 2 rather than
+taking a slot of its own. Slot 2 currently holds `totalShares`. So `lastFeeUpdate` now reads the low
+eight bytes of the live total share count, and `totalShares` has moved to slot 3, where it reads the
+mapping's seed slot, which is zero. The protocol believes it has zero shares outstanding, and the
+first person to notice can mint against an empty denominator.
+
+**Change 3 — inheritance.** This is the one that gets waved through in review, because the diff is a
+single identifier on the contract header. Adding `Pausable` to the inheritance list adds
+`bool _paused` to the *base-ward* portion of the layout. Under C3 linearization the base contracts
+are laid out first, so `_paused` lands at slot 0, byte 20 — packed with `_owner`, which is twenty
+bytes.<Cite src="solidity-docs-storage-layout" /> The owner is untouched, and `_paused` now reads
+byte 20 of slot 0. That byte has never been written by anything, so on this particular pair it reads
+zero and the contract appears unpaused. Change `Ownable` for a base with a 32-byte first variable and
+the same edit reads a live value instead.
+
+**The finding to state in the review, though, is not any of the three.** It is that all three changes
+were justified by how the *source* reads, and none of them was checked against how the *storage*
+reads. The question "does this diff move a slot" has a mechanical answer — compile both versions,
+emit the `storageLayout` artefact, diff it — and no amount of careful reading substitutes for it.
+Change 3 in particular is invisible to a reviewer who is diffing the state-variable block, because it
+does not touch the state-variable block.
+
+**The safe version of all three.** Rename freely. Append `lastFeeUpdate` after `shares` rather than
+after the fee. Add `Pausable` to the *most-derived* position and accept the extra slot, or better,
+move the whole implementation onto a namespaced layout so that adding a base contract cannot shift
+anything — which is the subject of this module's last lesson.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Immediately next:** why a delegatecall to an address holding no code reports success, why Solidity
+protects you from that in one syntactic form and not in another, and why `this.f()` is a full
+message call with a rewritten `msg.sender`.
+
+**Two lessons on:** `STATICCALL` is the mirror image of this instruction — instead of borrowing code
+into your context, it lends your call a restriction that no frame beneath it can shed.
+
+**This module's last lesson** answers the question this one leaves open: where does a proxy put its
+own state so that no implementation can reach it, and what does the compiler now give you for that
+in 0.8.36.
+
+**The proxies module** turns the mechanism into patterns — transparent, UUPS, beacon — each of which
+is this instruction plus one decision about where the implementation pointer lives and who may change
+it.
+
+And when you next read an upgradeable protocol's repository, the first artefact to look for is not
+the implementation contract. It is whatever the team stores that pins the layout: a `storageLayout`
+JSON in CI, a `__gap` array, an ERC-7201 annotation. If there is nothing, the layout is being
+maintained by memory, and the review that approved the opening example was doing its honest best.

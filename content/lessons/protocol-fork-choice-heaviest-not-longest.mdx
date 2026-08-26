@@ -1,0 +1,344 @@
+---
+id: protocol-fork-choice-heaviest-not-longest
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [fork-choice-spec, fc-phase0-beacon-chain-v161, fc-electra-beacon-chain-v161, fc-gloas-fork-choice-v161, eth2book-fork-choice, neu-tas-tse-two-attacks, monnot-reorg-post]
+stack: {}
+---
+
+A branch of four blocks loses to a branch of one block. Not because of a tie-break, not because of a
+timing rule, and not because anything went wrong: because the one-block branch has more stake voting
+for it, and the number of blocks was never an input.
+
+If that sentence produced a small jolt, the Bitcoin rule is still installed. This lesson replaces it
+with the actual arithmetic, which is short enough to read in full, and then works out the second
+half of the rule — the part that decides *which* votes are still counting for you right now. That
+second half is where several of the attacks in this module get their leverage, so it earns more
+space than its size suggests.
+
+## The sum, in full
+
+Here is the entire weight computation from the spec. Every word of the rest of this lesson is an
+unpacking of it.
+
+```python
+def get_weight(store: Store, root: Root) -> Gwei:
+    state = store.checkpoint_states[store.justified_checkpoint]
+    unslashed_and_active_indices = [
+        i
+        for i in get_active_validator_indices(state, get_current_epoch(state))
+        if not state.validators[i].slashed
+    ]
+    attestation_score = Gwei(
+        sum(
+            state.validators[i].effective_balance
+            for i in unslashed_and_active_indices
+            if (
+                i in store.latest_messages
+                and i not in store.equivocating_indices
+                and get_ancestor(store, store.latest_messages[i].root, store.blocks[root].slot)
+                == root
+            )
+        )
+    )
+    ...
+```
+
+<Cite src="fork-choice-spec" />
+
+Five separate design decisions are visible in that expression, and each one is a place where an
+intuition imported from Bitcoin gives the wrong answer.
+
+**The summand is `effective_balance`, not one.** Validators are weighted by stake, not counted. A
+validator with more effective balance moves the head further than one with less.
+
+**The membership test is `get_ancestor(...) == root`.** A validator's vote counts toward a block if
+the block it voted for is that block *or any descendant of it*. This is the "greediest heaviest
+observed **subtree**" part: weight flows upward from wherever it landed, so a vote for a
+great-grandchild is also a vote for the great-grandparent.
+
+**The iteration is over `store.latest_messages`,** a dictionary with at most one entry per validator.
+Not a list of attestations. Not a history. One current opinion each.
+
+**The filter set is the *justified* checkpoint state,** not the head state — active-validator
+membership and effective balances are read as of the justified checkpoint, which keeps the
+denominator stable while the tip is contested.
+
+**Slashed and equivocating validators contribute nothing.** `slashed` validators are excluded from
+the candidate set, and any index in `store.equivocating_indices` is dropped from the
+sum.<Cite src="fork-choice-spec" /> The second exclusion is a whole lesson on its own; lesson five
+takes it apart.
+
+Those last two are two different sets and the difference is worth holding now, because it decides how
+fast each defence acts. `validators[i].slashed` is a flag in the beacon state, so it only becomes true
+once a slashing has been processed *in a block* on the branch whose state you are reading.
+`store.equivocating_indices` is a set held in the fork-choice store, populated by `on_attester_slashing`
+— which the spec says should run immediately upon receiving a new `AttesterSlashing` from either
+within a block or **directly on the wire**.<Cite src="fork-choice-spec" /> One defence waits for
+inclusion; the other does not. When an attack turns on timing measured in seconds, that distinction is
+the difference between a mitigation that engages during the attack and one that engages after it.
+
+## Weight is stake, and stake is not uniform
+
+Two numbers make the "not one vote each" point concrete, and both come from the spec rather than
+from an article.
+
+Phase 0 set `MAX_EFFECTIVE_BALANCE` at 32 ETH, so every active validator carried identical weight in
+fork choice regardless of how much was actually deposited above that
+ceiling.<Cite src="fc-phase0-beacon-chain-v161" /> Electra changed that. `MIN_ACTIVATION_BALANCE`
+remains 32 ETH — the entry ticket did not move — while `MAX_EFFECTIVE_BALANCE_ELECTRA` is 2048 ETH
+for a compounding validator.<Cite src="fc-electra-beacon-chain-v161" />
+
+So the ratio between the heaviest and the lightest possible validator in the weight sum is 64 to 1.
+A single consolidated validator index can carry as much fork-choice weight as sixty-four minimum
+validators. That is not a rounding concern; it is a change in what "a validator" means as a unit of
+consensus influence, and it is why any reasoning of the form "N validators voted for it" is
+underdetermined without knowing their balances.
+
+<Aside kind="note">
+This also changes what a *committee* weighs, and the spec is careful about which committee it means.
+`calculate_committee_fraction` computes `get_total_active_balance(state) // SLOTS_PER_EPOCH` — the
+total active balance divided by 32 slots.<Cite src="fork-choice-spec" /> That is the weight of
+*every* validator assigned to one slot, not one of the up-to-`MAX_COMMITTEES_PER_SLOT` = 64 committees
+within a slot.<Cite src="fc-phase0-beacon-chain-v161" /> When the next lesson talks about a bonus
+sized as a percentage of "one committee's weight", this is the quantity: one slot's worth of the
+validator set, roughly 1/32 of all stake. Getting this wrong by a factor of 64 makes every cost
+calculation in the attack lessons meaningless.
+</Aside>
+
+### Why the subtree, and not the tip
+
+The `get_ancestor` test is the difference between GHOST and a rule that only counts votes landing
+exactly on a block, and it is not a convenience.
+
+Consider a fork at block `P` with two children, `A` and `B`. Under a tip-counting rule, weight that
+lands on `A`'s children does nothing for `A`; the comparison would be between whatever votes landed
+precisely on `A` and precisely on `B`. Under GHOST, everything below `A` counts for `A`. The
+consequence is that the rule is stable against later blocks splitting the vote: a branch that has
+been extended three times does not lose weight because its supporters have moved on to newer blocks.
+
+The same property is the attack surface. Neu, Tas and Tse's first attack is precisely an exploitation
+of it: proof of stake lets an adversary with a vanishing amount of stake produce an unlimited number
+of equivocating blocks, and although most are orphaned, those orphaned uncle blocks still influence
+fork choice under the GHOST paradigm.<Cite src="neu-tas-tse-two-attacks" /> Their paper's framing is
+worth quoting for its bluntness: they describe this as suggesting a fundamental conceptual
+incompatibility between proof of stake and the GHOST paradigm.<Cite src="neu-tas-tse-two-attacks" />
+
+Be precise about what that does and does not say about Ethereum today. The paper is explicit that
+the latest-message-driven aspect of current proof-of-stake Ethereum prevents a straightforward
+application of that first attack — and then shows a second attack that exploits LMD
+specifically.<Cite src="neu-tas-tse-two-attacks" /> One property blocks one attack and opens
+another. That trade, not either half of it, is the shape of this whole module.
+
+<Misconception
+  belief="Ethereum proof of stake follows the longest chain."
+  reality="It follows the subtree carrying the greatest attesting stake weight, within the branch descending from the last justified checkpoint. Block count is not an input to any comparison in the rule."
+  why="Bitcoin's rule is the default mental model for anyone who learned consensus from Bitcoin first, and 'longest chain' is a phrase that survives in explainers about Ethereum written by people who never read `get_weight`."
+  src="eth2book-fork-choice"
+/>
+
+## Latest message only, read exactly
+
+Now the second half, and the half that is almost always paraphrased into something false.
+
+The store keeps `latest_messages: Dict[ValidatorIndex, LatestMessage]`, and `LatestMessage` is a pair
+of an epoch and a block root.<Cite src="fork-choice-spec" /> One entry per validator. Weight is not
+accumulated across a validator's voting history; it sits in exactly one place and *moves* when the
+entry is replaced.
+
+Two consequences follow immediately, and one of them is not what most descriptions imply.
+
+**The memory bound is the obvious one.** A node holds one entry per validator regardless of how long
+the chain has run. Without this, fork choice would need every attestation ever seen, and the rule
+would not be computable on a home machine.
+
+**The relocation property is the load-bearing one.** When a validator re-votes, its weight leaves the
+old block silently. Nothing is revoked, no message says "I withdraw my support", and the old block's
+weight simply drops. A block that looked well-supported can be drained without any event that a
+monitor could alert on.
+
+### The detail that the paraphrase loses
+
+"Only a validator's latest attestation counts" is close enough to be useful and wrong in a way that
+matters. Read the update:
+
+```python
+def update_latest_messages(
+    store: Store, attesting_indices: Sequence[ValidatorIndex], attestation: Attestation
+) -> None:
+    target = attestation.data.target
+    beacon_block_root = attestation.data.beacon_block_root
+    non_equivocating_attesting_indices = [
+        i for i in attesting_indices if i not in store.equivocating_indices
+    ]
+    for i in non_equivocating_attesting_indices:
+        if i not in store.latest_messages or target.epoch > store.latest_messages[i].epoch:
+            store.latest_messages[i] = LatestMessage(epoch=target.epoch, root=beacon_block_root)
+```
+
+<Cite src="fork-choice-spec" />
+
+The replacement condition is `target.epoch > store.latest_messages[i].epoch` — **strictly greater
+target epoch**, not later slot and not later arrival. Within a single epoch, the first attestation a
+node accepts from a given validator for that target epoch is the one that stays. A second
+attestation from the same validator with the same target epoch does not replace it, whatever its
+block root and whenever it arrives.
+
+Why is that safe? Because an honest validator attests once per epoch. The Gloas fork-choice spec
+states the reasoning explicitly while changing the rule to track slots instead of epochs: validators
+cannot attest twice in the same epoch without equivocating.<Cite src="fc-gloas-fork-choice-v161" />
+The epoch-granular rule is only correct under the assumption that a second same-epoch vote is
+misbehaviour rather than an update.
+
+Why does it matter? Because it converts "which vote counts" from a property of the messages into a
+property of *arrival order at each node*. For an equivocating validator, the vote that counts at your
+node is whichever conflicting attestation reached you first — and an adversary with influence over
+propagation gets to choose that, per node. Hold that thought; it is the entire mechanism of lesson
+five, and the reason the concept is called `equivocation-handling` rather than "ignore duplicates".
+
+<Misconception
+  belief="More attestations under a block always means the block is safer."
+  reality="Only one message per validator counts, and that weight relocates when the validator votes for something else. A block's weight can fall as validators re-vote, so an attestation count is a snapshot of opinion, not an accumulating confirmation depth."
+  why="Attestation counts are displayed the way Bitcoin confirmation counts are displayed, and both go up. The difference is that a confirmation is work already spent and an attestation is an opinion currently held."
+  src="eth2book-fork-choice"
+/>
+
+## Working the arithmetic once
+
+Do this once by hand and the rule stops being a formula.
+
+**Setup.** Take a validator set whose total active balance is 32,000,000 ETH. One slot's committee
+weight is `32,000,000 / 32` = 1,000,000 ETH, by
+`calculate_committee_fraction`.<Cite src="fork-choice-spec" /> A fork exists at block `P`. Branch
+`A` is four blocks deep. Branch `B` is one block.
+
+**Subgoal 1 — count what each branch actually holds, in the unit the rule uses.** Suppose branch `A`
+was built during three quiet slots in which many attesters were offline, so its subtree holds
+700,000 ETH of latest messages in total. Branch `B` is a single block published in a slot with full
+participation and holds 900,000 ETH.
+
+**Subgoal 2 — apply the comparison the spec makes, and only that comparison.** `get_head` compares
+children of `P` by `get_weight`.<Cite src="fork-choice-spec" /> 900,000 exceeds 700,000. `B` is the
+head. The depths — four versus one — appear nowhere in the computation.
+
+**Subgoal 3 — check that the subtree rule is doing what you expect.** The 700,000 on branch `A` need
+not sit on `A` itself. If every one of those votes landed on `A`'s great-grandchild, the
+`get_ancestor` test still attributes all of it to `A`, because `A` is that block's ancestor at `A`'s
+slot.<Cite src="fork-choice-spec" /> Depth does not dilute weight. It also does not add any.
+
+<Figure
+  caption="Four blocks lose to one. get_head compares the children of P by the stake sitting in their subtrees, and neither depth nor block count is a term in that comparison."
+  alt="A fork at block P. The left child A begins a chain four blocks deep whose subtree holds 700,000 ETH of latest messages, all of them landing on the deepest block. The right child B is a single block whose subtree holds 900,000 ETH, and B is the head."
+>
+  <Tree root={{ label: 'P', note: 'fork point', children: [
+    { label: 'A', tone: 'muted', note: 'subtree holds 700,000 ETH', children: [
+      { label: 'A+1', tone: 'muted', children: [
+        { label: 'A+2', tone: 'muted', children: [
+          { label: 'A+3', tone: 'muted', note: 'where the votes landed' },
+        ] },
+      ] },
+    ] },
+    { label: 'B', tone: 'accent', note: 'subtree holds 900,000 ETH' },
+  ] }} />
+</Figure>
+
+**Subgoal 4 — now move one validator and watch the weight move rather than grow.** A validator with
+2048 ETH of effective balance, previously voting for a block in branch `A`, votes for `B` in a new
+epoch. Branch `A` falls to 697,952 and branch `B` rises to 902,048. The 2048 was not added to a
+total; it was picked up from one place and put down in another.<Cite src="fork-choice-spec" />
+
+**Subgoal 5 — state what you have just proved, and its limit.** You have shown that a shallower
+branch can be canonical and that per-validator weight is fungible across the fork. You have *not*
+shown anything about cost: nothing here says how expensive it is to arrange the 200,000 ETH gap. The
+next four lessons are entirely about that question, and the answer is repeatedly "less than you
+would guess".
+
+<Matrix
+  numeric
+  corner="Branch"
+  cols={['Before the re-vote', 'After the re-vote', 'Change']}
+  rows={[
+    { label: 'A — four blocks deep', cells: ['700,000 ETH', { v: '697,952 ETH', tone: 'danger' }, { v: '−2,048', tone: 'danger' }] },
+    { label: 'B — one block', cells: ['900,000 ETH', { v: '902,048 ETH', tone: 'good' }, { v: '+2,048', tone: 'good' }] },
+    { label: 'Sum over the fork', cells: ['1,600,000 ETH', '1,600,000 ETH', { v: '0', tone: 'muted' }] }
+  ]}
+  caption="Weight is conserved across a re-vote. One validator's 2,048 ETH is subtracted from one branch and added to the other, and the total over the fork never moves — which is why a branch can be drained with no message that says so."
+  alt="A table of the two branches before and after a single 2,048 ETH validator re-votes: branch A falls from 700,000 to 697,952 ETH, branch B rises from 900,000 to 902,048 ETH, and the sum over both stays at 1,600,000 ETH."
+/>
+
+<Check type="predict" concept="latest-message-only">
+A block at slot `n` has attestations from validators holding 600,000 ETH, and the competing block at
+slot `n` has 100,000 ETH. Your monitoring reads those two numbers at four seconds into slot `n+1`
+and, seeing a six-to-one margin, marks the first block as effectively settled.
+
+Two slots later the first block is no longer in the canonical chain, and no validator was slashed.
+Explain how the weight went away, and say what — if anything — the monitor could have read instead
+that would have been a real signal.
+
+<Answer>
+**Nothing had to be taken away, because nothing had been accumulated.** Fork choice holds one latest
+message per validator, and re-voting relocates that validator's weight rather than adding a second
+entry.<Cite src="fork-choice-spec" /> The 600,000 ETH figure was never a deposit into the block; it
+was a count of validators whose current opinion happened to point there. Opinions are the storage,
+and the storage is mutable.
+
+**Three ordinary ways the number falls, none of which is an attack.**
+
+*A new epoch begins.* Replacement requires a strictly greater target epoch, so at the epoch boundary
+every one of those validators becomes free to re-point, and each one attests to whatever its own
+fork choice returns at that moment.<Cite src="fork-choice-spec" />
+
+*The subtree stops being an ancestor of where the votes go.* Weight counts for a block only while
+`get_ancestor` of the voted root at that block's slot equals the block.<Cite src="fork-choice-spec" />
+Votes that move to a sibling branch stop counting for this block instantly — there is no decay curve
+and no partial credit.
+
+*A later proposer builds elsewhere.* One proposer choosing the other branch pulls the following
+slot's attesters with it, because they attest to the head their own rule returns, and their rule now
+sees a heavier competitor. Weight leaves in slot-sized chunks, not gradually.
+
+**Why the absence of slashing is the diagnostic, not the reassurance.** Slashing punishes provably
+contradictory *signatures* — a double vote or a surround vote. Re-pointing a latest message in a new
+epoch is the protocol working exactly as specified. A reorg with no slashing is the normal case, and
+it is exactly the case a seven-block mainnet reorg fell into in May 2022, where the chain rewrote
+seven blocks without a loss of finality and without misbehaviour by any
+participant.<Cite src="monnot-reorg-post" />
+
+**What the monitor should read instead.**
+
+*For "will this survive", read the justified and finalized checkpoints,* not attestation counts.
+Those are the values that carry a cost of reversal. Weight is the input to a decision that is still
+being made; justification is a decision that has been made.
+
+*For "is this block in trouble right now", read the competing sibling's weight, not the block's own.*
+The rule is a comparison. An absolute number tells you nothing without the number it is being
+compared against, and a six-to-one margin against a sibling that is about to receive a full slot's
+committee weight is not the margin it appears to be.
+
+*For "how confident can I be in seconds rather than minutes", there is a real answer* and it is not
+a weight threshold you invent. It is the fast confirmation rule, which states its adversarial
+assumption explicitly — the last lesson in this module.
+
+**The one-line version.** An attestation count is an opinion poll with no closing date. Reading it
+as a confirmation count imports a guarantee from a different protocol.
+</Answer>
+</Check>
+
+## What this unlocks
+
+- **Every cost in the next four lessons is denominated in one slot's committee weight** — total
+  active balance divided by 32.<Cite src="fork-choice-spec" /> When an attack is described as needing
+  "a fraction of a committee", that fraction is of roughly 1/32 of all stake, and you can now convert
+  it into ETH without trusting anyone's arithmetic.
+- **Two levers, and every attack pulls one of them.** An adversary can add weight to its own branch
+  or remove weight from yours, and because weight relocates rather than accumulates, removal is often
+  the cheaper move. Watch which lever each attack uses.
+- **The arrival-order dependency is now visible.** You have seen that for a validator voting twice in
+  one epoch, the vote that counts is the one that arrived first at each node
+  individually.<Cite src="fork-choice-spec" /> Lesson five is built entirely on that sentence.
+- **Next: the thumb on the scale.** The rule as you have now read it has a known weakness, which is
+  that a freshly published honest block starts at zero weight against an adversary that may have
+  been saving votes. The fix is a temporary bonus with a spec constant attached, and the constant has
+  already been changed once because the first value was wrong in the other direction.

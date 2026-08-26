@@ -1,0 +1,461 @@
+---
+id: infra-event-pipelines-rollback-stops-here
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [envio-reorgs, envio-indexing-and-reorgs, ponder-indexing-overview, ponder-observability, execution-apis-block-tags, viem-get-block, op-transaction-statuses, quicknode-streams-reorgs, alchemy-notify-webhooks, eth-pos-finality, postgres-insert, postgres-transactions, monad-ponder-team, bilinear-indexing-events]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+At 07:41 the chain replaced two blocks. The indexer noticed within a second, rolled its tables back to
+the common ancestor, re-fetched, and reapplied. By 07:42 the database was correct. The framework did
+exactly what its documentation says it does, on the first try, in production, without anyone waking up.
+
+By then thirty-eight push notifications had been delivered saying "your deposit has arrived", four
+partner webhooks had fired, one nightly export had already been written to the warehouse bucket, and a
+fiat payout of just over four thousand dollars had been submitted to a payment processor that does not
+support reversal.
+
+Nothing was broken. That is the uncomfortable part. Every component behaved as designed, the rollback
+worked, and the company still had to email thirty-eight people and write off four thousand dollars.
+
+**Reorg handling moved into the frameworks, which moved the interesting failure one layer downstream.**
+This lesson is about that layer: where the rollback's guarantee actually ends, what lives past the
+edge, and the read-model shape that makes the boundary a design decision instead of a discovery.
+
+<Figure
+  caption="Every component behaved as designed; the only difference is which half of the fan-out could be taken back."
+  alt="A reorg at 07:41 fans out into two paths. The indexer's own tables are rolled back to the common ancestor and restored by 07:42. The notifications, partner webhooks, warehouse export and fiat payout that had already been delivered have no rollback path at all."
+>
+  <Flow
+    lanes={['07:41', 'the fan-out', 'one minute later']}
+    nodes={[
+      { id: 'reorg', label: 'two blocks replaced', col: 0, tone: 'warn' },
+      { id: 'db', label: 'indexer tables', note: 'rows the framework owns', col: 1 },
+      { id: 'sent', label: 'already delivered', note: 'pushes, webhooks, a payout', col: 1, tone: 'danger' },
+      { id: 'ok', label: 'restored', note: 'rolled back, reapplied', col: 2, tone: 'good' },
+      { id: 'stuck', label: 'nothing to roll back', note: 'it is in someone else’s inbox', col: 2, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'reorg', to: 'db' },
+      { from: 'reorg', to: 'sent' },
+      { from: 'db', to: 'ok' },
+      { from: 'sent', to: 'stuck', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+## Part 1 — the rollback's scope, stated by the people who wrote it
+
+Both major TypeScript frameworks handle reorgs by default now, and both are explicit that handler code
+should not contain reorg logic. Ponder's documentation says the indexing engine handles reorgs
+automatically and that you do not need to adjust your indexing function logic to handle
+them.<Cite src="ponder-indexing-overview" /> Envio's says reorg handling is enabled by default to
+protect data integrity, controlled by the `rollback_on_reorg` flag.<Cite src="envio-reorgs" />
+
+Hand-written reorg branches inside handlers are therefore an anti-pattern in 2026 — not because they
+are hard, but because the framework already did it more carefully than a handler can, having recorded
+the change log the handler does not have access to.
+
+The important sentence is the next one. Envio's documentation contains a section titled *Scope of
+Rollbacks*, and it is a two-column list:<Cite src="envio-reorgs" />
+
+**Rolled back:**
+
+- All entities defined in your schema.
+- All data your handlers read or write to the database.
+
+**Not rolled back:**
+
+- Side effects in your handler code — API calls, external services.
+- Custom caching mechanisms outside of HyperIndex.
+- Logs or external files written by your handlers.
+
+That is a vendor telling you, in their own reorg documentation, that their reorg handling covers their
+database and nothing else. Ponder's mechanism draws the same line from the other side: its
+trigger-based transaction log records all changes to each table defined in `ponder.schema.ts`, and the
+rollback replays that log to the common ancestor.<Cite src="ponder-indexing-overview" /> A table it
+does not have triggers on is a table it cannot roll back. A network call has no triggers at all.
+
+<Misconception
+  belief="My indexer handles reorgs, so my pipeline handles reorgs."
+  reality="The rollback covers rows in the indexer's own database. Replicas, warehouse exports, caches, downstream services and anything already sent are outside it, and both frameworks say so in the same page that promises the rollback."
+  why="The documentation says 'automatic' and 'enabled by default', which reads like a solved problem, and there is no obvious reason to keep reading to the section that lists what is excluded."
+  src="envio-reorgs"
+/>
+
+### Draw the boundary on your own architecture
+
+Take a pen to the diagram and mark one line. Inside it: the indexer's tables. Outside it, in the
+typical product:
+
+<Matrix
+  corner="Thing outside the boundary"
+  cols={['Why it is outside', 'What a reorg does to it']}
+  rows={[
+    { label: 'Read replica or logical-replication target', cells: ['A copy the framework does not know exists', { v: <>Diverges silently; the rollback is not replicated as a rollback of <em>your</em> derived rows</>, tone: 'warn' }] },
+    { label: 'Warehouse table or S3/Parquet export', cells: ['Written by a job, not by a handler', { v: 'Retains rows for an abandoned branch until the next full rebuild', tone: 'warn' }] },
+    { label: 'Redis or CDN cache', cells: [<>Explicitly excluded<Cite src="envio-reorgs" /></>, { v: 'Serves the pre-reorg value until TTL', tone: 'warn' }] },
+    { label: 'Search index', cells: ['Same category as a cache', { v: 'Returns results for events that no longer exist', tone: 'warn' }] },
+    { label: 'Email, push, SMS, Slack', cells: ['Delivered, therefore final', { v: 'Nothing. It happened.', tone: 'danger' }] },
+    { label: 'Fiat payout, on-chain transaction you sent', cells: ['Delivered, therefore final', { v: 'Nothing, and it cost money', tone: 'danger' }] },
+    { label: 'Partner webhook or third-party API call', cells: ["Someone else's database now", { v: 'Nothing you control', tone: 'danger' }] },
+  ]}
+  caption="Every row here is a copy the indexer does not know exists."
+  alt="Seven places outside the indexer's rollback boundary — replicas, warehouse exports, caches, search indexes, notifications, payouts and partner API calls — with why each is outside and what a reorg does to it."
+/>
+
+The first four are *recoverable but not automatically recovered* — they need a reconciliation path you
+build. The last three are not recoverable at all, which is Part 2.
+
+<Aside kind="note">
+The frameworks' reorg mechanisms and their retention windows are the fastest-moving part of this
+module. Envio documents a configurable `max_reorg_depth`, currently defaulting to 200 blocks across all
+chains, with the note that any reorg deeper than the threshold will not trigger a
+rollback.<Cite src="envio-reorgs" /> Ponder drops finalized data from its transaction log periodically
+to avoid bloat.<Cite src="ponder-indexing-overview" /> Both statements are about *the version
+documented today*. Check them against the version you run, and re-check after upgrades — Ponder in
+particular has a new steward since its three-person team joined the Monad Foundation in February 2026,
+with the project continuing as open source.<Cite src="monad-ponder-team" />
+</Aside>
+
+### Why the rollback is hard at all: stateless versus stateful
+
+Envio's engineering write-up on the subject makes a distinction that explains why this is a framework
+feature rather than a helper function, and it is worth carrying into your own downstream systems.
+
+**Independent — or stateless — data** is data that does not require the previous state in order to
+process the current state: in an indexer, create-only operations. If your handlers only write entities,
+reorg handling is straightforward — delete all entities from orphaned blocks and re-ingest them with
+the canonical block's data — and it parallelises, because nothing depends on
+order.<Cite src="envio-indexing-and-reorgs" />
+
+**Stateful data** depends on previous state — updates and deletes. Here you cannot simply replace
+orphaned data; you have to revert previous operations, which requires tracking the history of changes
+to each entity so that a reorg can accurately undo or adjust state based on the canonical
+chain.<Cite src="envio-indexing-and-reorgs" /> That history can be pruned to retain only the changes
+relevant to unfinalized blocks.<Cite src="envio-indexing-and-reorgs" />
+
+That is the whole argument for keeping raw event rows and deriving from them: **a raw event table is
+stateless data**, so its correction is a delete-and-re-ingest, while a balance table is stateful and
+needs history. The same test sorts your downstream copies. A warehouse table of raw events can be
+corrected by deleting a block range and re-exporting. A warehouse table of daily aggregates cannot,
+because you no longer have the inputs to subtract.
+
+And the multichain wrinkle, which lands properly in the last lesson of this module: when several chains
+update the same entity state, a reorg on one chain requires rolling back to a known correct point and
+reprocessing events from *all* chains that touched that state
+afterwards.<Cite src="envio-indexing-and-reorgs" /> A cross-chain aggregate is stateful data with more
+than one mutable input.
+
+## Part 2 — you cannot unsend an email
+
+A database rollback restores rows. Enumerate what it does not restore, because the list is longer than
+people expect and every item on it is something a product does routinely:
+
+- An email that has been accepted by the recipient's mail server.
+- A push notification on a locked phone.
+- An SMS.
+- A message in a Slack or Discord channel, where deletion is itself an event other people see.
+- A fiat payout, an ACH debit, a card capture.
+- An on-chain transaction your service signed and broadcast.
+- A call to a partner's API, which is now a row in a database you have no access to.
+- A webhook you sent, which the recipient's own retry logic may still be redelivering.
+- A file written to object storage that a customer has already downloaded.
+- An analytics event, which is why your funnel numbers will not match your ledger.
+
+The asymmetry that falls out of this list is the module's central rule, and it is worth stating in
+both directions because getting it wrong in either direction is a real cost:
+
+**Reads may be optimistic, because a revised number is recoverable.** A balance that shows 4.2 and
+becomes 4.1 ninety seconds later is a UI update. Making the interface wait thirteen
+minutes<Cite src="eth-pos-finality" /> to avoid that is a product you have made worse for a problem
+users would not have noticed.
+
+**Irreversible actions must wait for finality, because a revised action is not recoverable.** A payout
+that goes out and should not have is a loss, an apology, and in a regulated context a filing.
+
+Applying one latency to both is the mistake, whichever value you pick. Thirteen minutes everywhere
+makes the interface feel broken; zero everywhere makes the payouts wrong.
+
+### The test that sorts an action into the right bucket
+
+Ask one question: **if this had to be undone, who finds out?**
+
+- Nobody, because it is a row I control → optimistic is fine.
+- The user, because they already saw it → gate it.
+- A third party, a regulator, or a bank → gate it, and gate it on `finalized` rather than on a
+  confirmation count.<Cite src="execution-apis-block-tags" />
+
+That question resolves cases that "is this important?" does not. A large internal analytics
+aggregation is important and fully recoverable. A one-line push notification about a five-dollar
+transfer is trivial and completely irreversible.
+
+## Part 3 — the two-tier read model
+
+The way to have both low latency and correctness is to stop pretending they are the same requirement.
+Maintain two read paths over the same ingested rows.
+
+**Tier 1 — the optimistic view.** Computed from the tip. Fast, may be revised, and **labelled as not
+yet settled everywhere it is rendered**. This is what interfaces read.
+
+**Tier 2 — the finalized table.** Rows appear only once the block containing them is at or below the
+finalized boundary, read directly from the chain rather than guessed
+at.<Cite src="execution-apis-block-tags" /><Cite src="viem-get-block" /> This is what notification
+jobs, exports, accounting and payouts read.
+
+Every consumer declares, in code, which tier it reads. That declaration is the architecture.
+
+<Compare
+  columns={[
+    { title: 'Tier 1', note: 'the optimistic view' },
+    { title: 'Tier 2', note: 'the finalized table' },
+  ]}
+  rows={[
+    { label: 'Computed from what?', cells: ['The tip', 'Blocks at or below the finalized boundary'] },
+    { label: 'Can a value change afterwards?', cells: [{ v: 'Yes — so it must be labelled wherever it renders', tone: 'warn' }, { v: 'No', tone: 'good' }] },
+    { label: 'Who reads it?', cells: ['Interfaces', 'Notification jobs, exports, accounting, payouts'] },
+    { label: 'Safe to replicate, export or cache from?', cells: [{ v: 'No', tone: 'danger' }, { v: 'Yes', tone: 'good' }] },
+  ]}
+  caption="The latency argument only exists while both requirements are being served by one table."
+  alt="The optimistic tier and the finalized tier compared on what they are computed from, whether a value can change afterwards, which consumers read them, and whether they are safe to replicate downstream."
+/>
+
+### Two ways to build tier 2, and the trade between them
+
+**A view over the raw table.** One extra predicate:
+
+```sql
+CREATE VIEW transfer_event_final AS
+SELECT e.*
+FROM transfer_event e
+JOIN finality_cursor f
+  ON f.chain_id = e.chain_id
+WHERE e.block_number <= f.finalized_block;
+```
+
+Cheap, impossible to get out of sync, and it inherits any correction the ingester makes to the
+underlying rows automatically. The cost is that "has this row crossed the boundary" is evaluated at
+read time, so a consumer that wants to act *once, when a row crosses* has to poll and remember what it
+has already seen.
+
+**A materialised table with an explicit advance step.** A job moves rows across as the boundary
+advances, inserting into `transfer_event_final` with `ON CONFLICT ... DO NOTHING` on the natural
+key<Cite src="postgres-insert" /> and updating the finalized cursor **in the same
+transaction**<Cite src="postgres-transactions" /> — the identical pattern as the ingest cursor, one
+tier up.
+
+The materialised version costs a job and buys three things worth having: an auditable advance, a
+natural place to fire "this row is now final" side effects exactly once, and and a table that is safe to
+replicate downstream because nothing in it can ever change again.
+
+**Take the materialised version if anything irreversible reads it.** Take the view if tier 2 exists
+only to make reports correct.
+
+### The rule that fixes the copies, in one line
+
+Everything in the table of things-outside-the-boundary above has the same fix, and it is not a
+reconciliation job:
+
+**Replicate, export and cache from tier 2 only.**
+
+A warehouse fed from the finalized table cannot contain a reorged-out row, because the row never
+entered the finalized table. A cache populated from tier 2 can have an infinite TTL for historical
+keys. A partner webhook fired from tier 2 never has to be retracted. The reconciliation job you were
+about to build for your replica is replaced by a `WHERE` clause on the thing that feeds it.
+
+This is also the answer for streaming products that push into your storage directly. QuickNode's
+Streams offers a "Latest Block Delay" feature that lets you stream data a specified number of blocks
+behind the tip precisely to reduce the chance of processing blocks that may not survive, and its
+guidance for PostgreSQL destinations is to implement an upsert strategy such as
+`ON CONFLICT ... DO UPDATE` because re-streamed blocks will conflict with existing
+rows.<Cite src="quicknode-streams-reorgs" /> Both of those are tier-2 thinking applied at the
+transport: a delay, plus a write that survives correction.
+
+### The outbox: how a side effect gets a natural key
+
+Tier 2 tells you *when* an irreversible action is allowed to fire. It does not tell you how to fire it
+exactly once, and that is a separate problem with a standard shape.
+
+The difficulty is structural: a database transaction and a network call cannot be made
+atomic.<Cite src="postgres-transactions" /> Whichever order you put them in, a crash between them
+either sends without recording or records without sending. The resolution is to make the *decision to
+send* a database write, and the send itself a separate, retryable, idempotent step.
+
+```sql
+CREATE TABLE notification_outbox (
+  chain_id          integer NOT NULL,
+  block_number      bigint  NOT NULL,
+  transaction_index integer NOT NULL,
+  log_index         integer NOT NULL,
+  channel           text    NOT NULL,       -- 'email' | 'push' | 'payout'
+  sent_at           timestamptz,            -- NULL until delivered
+  PRIMARY KEY (chain_id, block_number, transaction_index, log_index, channel)
+);
+```
+
+**Subgoal: write the intent in the same transaction that promotes the row to tier 2**, so an event can
+never become final without its notification being owed. One `INSERT ... ON CONFLICT DO NOTHING` on the
+composite key<Cite src="postgres-insert" />, in the same `BEGIN`/`COMMIT` as the promotion.
+
+**Subgoal: give the send its own idempotency key, which is the same natural key one column wider.**
+The `channel` column is what lets one event owe an email and a push without the two colliding. A worker
+claims rows where `sent_at IS NULL`, sends, and sets `sent_at`. A redelivery finds `sent_at` populated
+and does nothing.
+
+**Subgoal: accept at-least-once at the edge and make the recipient's dedupe possible.** You cannot
+prevent the case where the send succeeded and the process died before marking it. What you can do is
+pass the natural key as the message's idempotency key so the downstream provider suppresses the
+duplicate — every payment API and most notification APIs accept one, and this is exactly the shape
+inbound providers already use on you: Alchemy's webhooks retry on any non-200 with exponential
+backoff<Cite src="alchemy-notify-webhooks" />, which is the same contract in the opposite direction.
+
+The outbox is worth building once, in one place, rather than per feature. It is roughly a hundred
+lines, and it converts "did we double-notify" from an incident question into a `SELECT`.
+
+### Reconciling the copies you already have
+
+"Replicate from tier 2 only" is the right end state and it is not always available this quarter — the
+warehouse is fed by a tool you do not control, or the cache is populated by a service another team
+owns. Two interim measures, in order of cost.
+
+**Bound the exposure with a delay.** Anything reading the tip can be made to read a lag instead. This
+is what streaming products expose as a setting — QuickNode's "Latest Block Delay" streams data a chosen
+number of blocks behind the tip specifically to reduce the chance of processing blocks that may not
+survive<Cite src="quicknode-streams-reorgs" /> — and it is a configuration change rather than a
+rewrite. It reduces the probability; it does not remove it.
+
+**Run a scheduled diff against the source of truth.** For each block range in the copy, compare a
+checksum against the same range in tier 2, and re-export any range that disagrees. This works because
+tier 2 is immutable below the boundary, so a disagreement is always the copy's fault and the repair is
+always "overwrite from tier 2". Keep the diff window at least as wide as your reorg
+window<Cite src="envio-reorgs" /> and run it from outside the pipeline process.
+
+Neither is as good as the `WHERE` clause. Both are much better than finding out from a customer.
+
+### Labelling is not a detail
+
+A pending value rendered as though it were settled is how a correct architecture still produces a
+support ticket. The person who reads "Deposit received: 4.2 ETH" and then sees 4.1 has been lied to by
+a system that was internally consistent throughout.
+
+The L2 case makes this vivid, because the gap is large and documented. OP Mainnet's own guidance for
+applications is that a transaction at the sequencer-confirmed stage can still be excluded if the
+sequencer fails to publish within the Sequencing Window of approximately 12 hours, and that
+applications should consider this possibility when displaying information about transactions in that
+state.<Cite src="op-transaction-statuses" /> That is a documentation page telling product engineers to
+change their UI copy.
+
+Three labels cover almost everything, and they map onto the rungs the chain publishes:
+
+- **Detected** — seen at the tip. Revisable.
+- **Confirmed** — at or below `safe`: safe from re-orgs under honest majority and certain synchronicity
+  assumptions.<Cite src="execution-apis-block-tags" />
+- **Settled** — at or below `finalized`. Irreversible actions have fired.
+
+<Misconception
+  belief="Gating on finality means the product feels thirteen minutes slow."
+  reality="Only the irreversible actions wait. The interface renders from the tip immediately, labelled, and the label is the feature — it is what lets the number change later without anyone feeling deceived."
+  why="The gate is usually discussed as a single latency for 'the pipeline', so the choice looks like fast-and-wrong versus slow-and-right rather than a per-consumer property."
+  src="op-transaction-statuses"
+/>
+
+<Check type="spot-bug" concept="side-effects-are-unrollbackable">
+A team adopts the two-tier model. Their notification service now reads only from the finalized table,
+which is materialised by a job that runs every 30 seconds:
+
+```ts
+// runs every 30s
+const finalized = await client.getBlock({ blockTag: 'finalized' });   // viem 2.x
+
+await db.transaction(async (tx) => {
+  const moved = await tx.copyRowsBelow(finalized.number);   // INSERT ... ON CONFLICT DO NOTHING
+  await tx.setFinalityCursor(finalized.number);
+});
+
+for (const row of moved) {
+  await notify(row);          // email + push
+}
+```
+
+The team is confident this can no longer notify about a reorged-out event, and they are right about
+that. They still get paged twice in the first month, for two different reasons. Name both, and fix
+them.
+
+<Answer>
+**Bug 1 — duplicate notifications, because the side effect is outside the transaction.** If the process
+dies after `COMMIT` and before the loop finishes, the rows are marked as moved and some notifications
+never sent. If it dies *inside* the loop and the job is retried from the copy step, the rows are
+already present so `ON CONFLICT DO NOTHING` returns nothing and those users are never
+notified<Cite src="postgres-insert" /> — or, with a slightly different implementation that recomputes
+`moved` by scanning the table, everyone gets notified again. Either way the notification is at-most-once
+or at-least-once depending on an accident of implementation, and it is never exactly-once, because a
+network call cannot join a database transaction.<Cite src="postgres-transactions" />
+
+*Fix:* make the notification's own delivery idempotent, on a key the notifier owns. Write an outbox row
+inside the same transaction — `(chain_id, block_number, transaction_index, log_index, channel)` with a
+`sent_at` — and have a separate worker claim, send, and mark. Redelivery then finds `sent_at` populated
+and does nothing. This is the same natural-key idempotency from lesson two, applied to a side effect
+instead of a row, and it is the only shape that works because the transport is at-least-once by
+nature — Alchemy's webhooks retry with exponential backoff on any non-200, up to 10 minutes on Free and
+Pay-As-You-Go and up to 1 hour on Enterprise, and your own outbound sends have the same
+character.<Cite src="alchemy-notify-webhooks" />
+
+**Bug 2 — the cursor is a claim about a boundary, not about the rows.** `copyRowsBelow(finalized.number)`
+copies what is *currently ingested* below the finalized block. If ingestion is lagging — the tailer
+crashed, the provider is rate-limiting, the backfill of a redeployed pod has not caught up — then some
+blocks below `finalized.number` have not been ingested yet. The job copies what exists, advances the
+finality cursor past the boundary anyway, and those blocks' events are **never** promoted to tier 2.
+Nobody is ever notified about them, and no error is produced. This is precisely the permanent-gap
+failure from lesson three, rebuilt one tier higher.
+
+*Fix:* the finality cursor must advance to the minimum of the finalized block and the ingest cursor,
+never to the finalized block alone:
+
+```ts
+const target = min(finalized.number, await readIngestCursor());
+```
+
+and, better, to the largest contiguous ingested block below finality, using the range table rather than
+a scalar. Contiguity, not the boundary, is the gate — the same rule as the ordering guarantee, because
+it is the same failure.
+
+**What the team got right, and why it still was not enough.** Reading only from tier 2 genuinely
+eliminates notifying about a reorged-out event, which was the original incident. Both remaining bugs
+are about the *promotion step* rather than the boundary, and both are the module's earlier lessons
+reappearing at a higher altitude: a side effect needs idempotency on a natural key, and a cursor must
+be derived from what was consumed rather than from a second observation.
+
+**The monitoring that would have caught bug 2 before the page.** Graph `finalized.number` minus the
+ingest cursor. On a healthy pipeline that number is roughly the finality distance and stable. When
+ingestion lags, it grows, and it grows before anything user-visible breaks. Ponder exposes the raw
+material for the equivalent check — a `/status` endpoint reporting the most recently indexed block
+number and timestamp per chain, `null` while the backfill is incomplete — which is exactly the input a
+lag alert needs.<Cite src="ponder-observability" />
+</Answer>
+</Check>
+
+## What this unlocks
+
+This is the lesson the module was built to reach, and it changes two things about how you read the
+rest of your own system.
+
+**Every architecture diagram now has a line on it.** Inside: what the framework will restore. Outside:
+what you will have to restore, or apologise for. Drawing that line is a twenty-minute exercise and it
+is the single highest-value thing in this module.
+
+**Every consumer now has a declared tier.** Once "which tier does this read" is a property you can
+grep for, adding a feature stops being a judgement call about reorg risk and becomes a lookup.
+
+What remains is two operational realities. **Schema changes** re-run the fold, which means tier 2 gets
+rebuilt too, and the duration of that rebuild is a product constraint rather than a deployment detail —
+that is the next lesson. And **none of this is self-verifying**: a pipeline that has quietly stopped
+advancing has a healthy process, a healthy cursor, and no data, which is where the module ends.
+
+The thing to do this week is the reflection prompt for this module, and it is deliberately
+uncomfortable: list every irreversible thing your product does in response to an on-chain event, and
+for each one write down which rung it currently fires from. Bilinear's three positions — at the head,
+a few blocks behind, or only finalized<Cite src="bilinear-indexing-events" /> — are the only answers
+available, and most teams find at least one item on their list sitting at the head by default because
+nobody ever chose.

@@ -1,0 +1,326 @@
+---
+id: defi-concentrated-liquidity-v3-is-v2-piecewise
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [uniswap-v3-whitepaper, uniswap-v3-core-pool, uniswap-v3-core-tickbitmap, uniswap-v3-core-sqrtpricemath, rareskills-v3-concentrated-liquidity, mixbytes-v3-ticks, elsts-v3-liquidity-math, measured-gas-constants, uniswap-v2-whitepaper]
+stack: {}
+---
+
+Open `UniswapV2Pair.sol` and the swap is a comparison. Reserves in, reserves out, check that the
+product did not shrink, done — no loop, no branch on price.<Cite src="uniswap-v2-whitepaper" />
+
+Open `UniswapV3Pool.sol` and the swap is a `while` loop that runs until the requested amount is
+exhausted or a price limit is hit, and each pass through it fetches the next initialised tick,
+computes a step, and possibly crosses.<Cite src="uniswap-v3-core-pool" />
+
+That difference is the whole of v3, and it is smaller than it looks. **The loop body is v2.** Each
+iteration is a constant-product swap at a fixed liquidity. The loop exists because the liquidity
+changes between iterations, and it changes at exactly the prices where LPs chose to put their range
+bounds.
+
+This lesson makes that claim precise, then shows that the three parts of the codebase people find
+hardest — the swap loop, the tick bitmap, the fee accounting — are consequences of it rather than
+separate ideas.
+
+## The claim, stated exactly
+
+Between two adjacent initialised ticks, a v3 pool **is** a constant-product pool with a fixed `L`.
+Nothing about its behaviour in that interval differs from v2 with virtual reserves `L / sqrt(P)` and
+`L * sqrt(P)`.<Cite src="uniswap-v3-whitepaper" />
+
+At an initialised tick, the pool applies the net liquidity of every position that begins or ends
+there and continues on a new constant-product segment with a new `L`. The whitepaper is exact about
+the mechanism: whenever the price crosses an initialised tick, virtual liquidity is kicked in or
+out.<Cite src="uniswap-v3-whitepaper" />
+
+So the pool is a **chain of v2 curves joined at ticks**, and everything else is the bookkeeping
+needed to (a) know which link you are on, and (b) pay each LP only for the swaps that happened while
+their bar covered the price.<Cite src="rareskills-v3-concentrated-liquidity" />
+
+<Misconception
+  belief="Uniswap v3 replaced the constant-product curve with a new invariant."
+  reality="The invariant is unchanged. What changed is that the constant in x*y=k is now a function of price rather than a single value for the whole pool."
+  why="The v3 codebase looks nothing like the v2 codebase — thousands of lines against a few hundred, with fixed-point libraries, bitmaps and accumulators — so the maths is assumed to have changed too. Almost all of that code is representation and bookkeeping, not market making."
+  src="rareskills-v3-concentrated-liquidity"
+/>
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Uniswap v2', note: 'one curve' },
+    { title: 'Uniswap v3', note: 'one curve per segment', tone: 'accent' },
+  ]}
+  rows={[
+    { label: 'What is the invariant?', cells: ['x · y = k', 'x · y = k'] },
+    { label: 'Is k one number for the whole pool?', cells: ['Yes, from zero to infinity', <>No — L changes at every initialised tick<Cite src="uniswap-v3-whitepaper" /></>] },
+    { label: 'What does a swap do?', cells: [<>One comparison: check the product did not shrink<Cite src="uniswap-v2-whitepaper" /></>, <>A loop: one constant-product step per segment<Cite src="uniswap-v3-core-pool" /></>] },
+    { label: 'What sets the gas cost?', cells: ['Fixed — no loop, no branch on price', 'How far the price travels, not the notional'] },
+    { label: "What is the pool's depth?", cells: ['One number, the same at every price', <>A step function over price: the sum of the active bars<Cite src="mixbytes-v3-ticks" /></>] },
+  ]}
+  caption="The only row naming an invariant reads the same in both columns. Every other row is about where the liquidity sits and what it costs to walk through it."
+  alt="Uniswap v2 and v3 compared on the invariant they enforce, whether k is a single number for the pool, what a swap executes, what drives gas cost, and what the pool's depth means."
+/>
+
+## The swap loop, read as the framing
+
+Here is the loop's structure, stripped to the parts that carry the argument. The real thing is in
+`UniswapV3Pool.swap`.<Cite src="uniswap-v3-core-pool" />
+
+```text
+while amount remaining is non-zero and price limit not reached:
+    find the next initialised tick in the direction of travel
+    target = min(that tick's price, the caller's price limit)
+    do ONE constant-product swap step from the current price toward target,
+        using the CURRENT liquidity
+    charge the fee and add it to the global per-unit-liquidity accumulator
+    if the step reached the target and the target was an initialised tick:
+        cross it: liquidity += liquidityNet, flip the fee-growth-outside values
+```
+
+Read it as four claims.
+
+**Claim 1 — the inner step is v2.** `SwapMath.computeSwapStep` takes a start price, a target price,
+one liquidity value and an amount, and returns how far the price moved and what was
+exchanged.<Cite src="uniswap-v3-core-pool" /> It has no notion of ticks, positions or ranges. It is
+the constant-product arithmetic of the first lesson, expressed in the integers of the
+second.<Cite src="uniswap-v3-core-sqrtpricemath" />
+
+**Claim 2 — the loop only exists because `L` changes.** If `L` never changed, the first iteration
+would always finish the swap. Every extra iteration corresponds to one boundary where somebody's
+range began or ended.
+
+**Claim 3 — the price limit is a first-class stopping condition, not slippage protection bolted on.**
+The loop terminates on either exhausting the amount or reaching `sqrtPriceLimitX96`. A swap that
+would move the price past the caller's limit stops early and returns a partial fill, which is a
+different failure mode from a revert and one that routers have to handle explicitly.
+
+**Claim 4 — the loop's cost is the number of segments, not the size of the trade.** Two trades of
+wildly different notional cost about the same gas if they traverse the same number of segments, and
+this follows from claims 1 and 2 rather than being an empirical observation.
+
+<Figure
+  caption="Every extra pass through this loop is one price at which somebody's range began or ended."
+  alt="The v3 swap loop drawn as a cycle: find the next initialised tick, take the target as that tick or the caller's price limit, perform one constant-product swap step at the current liquidity, then either finish because the amount is exhausted or cross the tick, apply its net liquidity, and go round again."
+>
+  <Flow
+    nodes={[
+      { id: 'next', label: 'next initialised tick', note: 'found in the tick bitmap', col: 0 },
+      { id: 'target', label: 'target price', note: "that tick, or the caller's limit", col: 1 },
+      { id: 'step', label: 'one v2 swap step', note: 'constant product at the current L', col: 2, tone: 'accent' },
+      { id: 'cross', label: 'cross the tick', note: 'liquidity += liquidityNet', col: 3, tone: 'warn' },
+      { id: 'done', label: 'done', note: 'amount exhausted, or limit reached', col: 3, tone: 'good', dashed: true },
+    ]}
+    edges={[
+      { from: 'next', to: 'target' },
+      { from: 'target', to: 'step' },
+      { from: 'step', to: 'cross' },
+      { from: 'step', to: 'done', dashed: true, tone: 'good' },
+      { from: 'cross', to: 'next', label: 'amount remaining', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+### One honest complication
+
+The loop does not step segment by segment in the tidy way the framing suggests. It calls
+`nextInitializedTickWithinOneWord`, which searches only inside the current 256-bit word of the tick
+bitmap.<Cite src="uniswap-v3-core-pool" /><Cite src="uniswap-v3-core-tickbitmap" /> If there is no
+initialised tick in that word, it returns the word boundary anyway, and the loop takes an iteration
+that crosses nothing.
+
+This bounds each iteration's work to one storage word, which is what makes the search cheap — and it
+means **iteration count is not the same as ticks crossed**. A swap through a long empty stretch still
+pays one loop pass per 256 tick-spacings, so a trace will disagree with any model that counts only
+crossings.
+
+<Aside kind="note">
+A shape worth recognising in on-chain search structures: the data structure is sized to the machine,
+not to the problem. 256 ticks per word because a word is 256 bits; one search per word because a cold
+`SLOAD` is the expensive operation. The leak into the gas profile is deliberate.
+</Aside>
+
+## Crossing a tick: two numbers, one of which is a trick
+
+When the price crosses an initialised tick, exactly two kinds of state update happen.
+
+**The liquidity delta.** Each tick tracks `liquidityNet` — the amount of liquidity added, or if
+negative removed, when the tick is crossed going left to right. The whitepaper notes the value does
+not need to be updated when the tick is crossed, only when a position with a bound there is
+modified.<Cite src="uniswap-v3-whitepaper" /> Crossing right-to-left applies the negation. Because
+positions ending and positions beginning at the same tick are netted in advance, a tick with a
+hundred positions costs the same to cross as a tick with one — which is the whitepaper's stated
+property that the gas cost of an initialised tick crossing does not depend on how many positions are
+kicked in or out there.<Cite src="uniswap-v3-whitepaper" />
+
+Netting creates one problem the design has to solve: a tick whose net is zero might still be
+referenced by live positions, so it cannot be un-initialised. The pool therefore also keeps
+`liquidityGross`, a gross tally whose only job is to answer "is this tick referenced at all", which
+is what tells the contract whether to flip the bit in the tick bitmap.<Cite src="uniswap-v3-whitepaper" />
+
+**The fee-growth flip.** This is the trick, and it is the most elegant thing in the contract.
+
+### Deriving the fee accounting
+
+The problem: a position must be paid for exactly the fees generated while the price was inside its
+range, and the contract must compute that in constant time, without iterating positions, and without
+touching a position's storage on every swap.
+
+**Subgoal 1 — accumulate globally, per unit of liquidity.** The pool keeps `feeGrowthGlobal0X128` and
+`feeGrowthGlobal1X128`: the total fees earned **per unit of virtual liquidity** over the contract's
+whole history, as unsigned 128x128 fixed point. The whitepaper suggests thinking of them as what one
+unit of unbounded liquidity deposited at initialisation would have
+earned.<Cite src="uniswap-v3-whitepaper" /> A swap step adds `feeAmount / liquidity` to the relevant
+accumulator, and does so **only when liquidity is non-zero**.<Cite src="uniswap-v3-core-pool" />
+
+**Subgoal 2 — store, per tick, the fees that accrued on the far side.** Each initialised tick keeps
+`feeGrowthOutside`, meaning the growth that happened on the other side of that tick from the current
+price. "Other side" is relative to where the price is *now*, which is why it must be maintained on
+crossings.
+
+**Subgoal 3 — get above and below from one stored number.** Given the global `f_g`, the tick's stored
+`f_o(i)`, and the current tick `i_c`:<Cite src="uniswap-v3-whitepaper" />
+
+```text
+fees above tick i:   f_a(i) = f_g - f_o(i)   if i_c >= i,  else f_o(i)
+fees below tick i:   f_b(i) = f_o(i)         if i_c >= i,  else f_g - f_o(i)
+```
+
+**Subgoal 4 — subtract the two ends.** The fees per unit of liquidity accrued *inside* a range with
+bounds `i_l` and `i_u` is the global total minus what happened below the lower bound minus what
+happened above the upper bound:<Cite src="uniswap-v3-whitepaper" />
+
+```text
+f_r = f_g - f_b(i_l) - f_a(i_u)
+```
+
+**Subgoal 5 — make maintenance a single operation.** When a tick is crossed in either direction, its
+stored value is replaced by `f_o := f_g - f_o`.<Cite src="uniswap-v3-whitepaper" /> One subtraction.
+"Outside" swapped sides, so the complement is exactly the new value.
+
+**Subgoal 6 — notice what this buys, and what it costs.** A position's earnings are
+`L * (f_r_now - f_r_at_last_touch)`: computable on demand, and no swap ever writes to a position. The
+cost is that `f_o` is meaningful only *relative to the current price*, and because a tick's `f_o` is
+initialised lazily — by convention as if all fees to date had occurred below it — the whitepaper warns
+that comparisons of `f_o` between ticks are not meaningful and not guaranteed
+consistent.<Cite src="uniswap-v3-whitepaper" />
+
+That warning is the practical takeaway for anyone building on this. **`feeGrowthOutside` is not a
+quantity. It is one term of a difference**, and reading it in isolation — in an indexer, a dashboard,
+a subgraph mapping — produces a number that looks plausible and means nothing.
+
+<Misconception
+  belief="feeGrowthOutside at a tick tells you how many fees were earned beyond that tick."
+  reality="It is a bookkeeping complement whose meaning depends on where the price is now and on when the tick was first initialised. Only the differences the whitepaper's formulas take are well defined."
+  why="The name reads like a measurement, and the value is monotone-looking and non-negative, so it survives a sanity check. The whitepaper states explicitly that cross-tick comparisons of this value are not meaningful."
+  src="uniswap-v3-whitepaper"
+/>
+
+## What the framing predicts
+
+A model earns its keep by making predictions you would not otherwise make. This one makes four.
+
+**Depth is a step function of price.** The liquidity histogram over ticks *is* the depth profile, and
+a pool can be extremely deep at the current price and near-empty two per cent
+away.<Cite src="mixbytes-v3-ticks" /> A quote computed from a single "pool liquidity" number errs by
+an amount set by the distribution, not by your trade size alone. It follows that **two pools with the
+same TVL are not substitutes** — TVL is area under the histogram, execution depends on height at the
+price.
+
+**Gas is a function of distance travelled in price space**, not notional. A large trade in a deep
+pool may cross nothing; a small trade in a fragmented pool may cross many segments. Each crossing
+touches tick storage the transaction has not touched before, and a first touch of a slot costs 2,100
+gas against 100 for a warm one on the configuration this curriculum
+measures<Cite src="measured-gas-constants" /> — the shape of the cost, not the total, since the total
+depends on what the transaction has already visited. See
+[cold versus warm access](/c/cold-vs-warm-access).
+
+**Liquidity can be supplied for one block.** If depth is the sum of active bars, anyone can add a
+very large bar spanning one tick spacing immediately before a known large swap and remove it
+immediately after, capturing most of that swap's fees with almost no price risk. Just-in-time
+liquidity is not an exploit; it is what a step-function depth profile with permissionless
+instantaneous mint and burn permits by construction. It is also one of the first things v4 hooks were
+used to penalise.
+
+## Where the framing stops being literally true
+
+Two limits, both worth stating because carrying the model past them produces confident wrong answers.
+
+**The contract does not evaluate a piecewise invariant.** You can write down a piecewise formula for
+the whole curve, and it is a good picture — RareSkills works exactly that formula and then heads a
+section with the warning that it is for illustration
+only.<Cite src="rareskills-v3-concentrated-liquidity" /> The implementation iterates. It never has the
+whole curve in hand, holds no per-segment reserves, and stores no aggregate `k`. What it stores is
+one price, one active `L`, and the deltas needed to reconstruct the rest.
+
+**The segments belong to the pool, not to a position.** Everything about a *position* — the bar, the
+two offsets, the amount formulas — is per-position. The piecewise chain of curves is an aggregate
+over all positions. It is easy to slide from one to the other and end up computing a swap against a
+single LP's virtual reserves, which will be wrong by however much other liquidity is
+active.<Cite src="elsts-v3-liquidity-math" />
+
+<Check type="spot-bug" concept="v3-is-v2-piecewise">
+A quoting service estimates output for a v3 swap like this:
+
+```text
+1. read slot0.sqrtPriceX96 and the pool's `liquidity`
+2. treat the pool as constant product with virtual reserves
+      x = liquidity / sqrtP        y = liquidity * sqrtP
+3. apply the v2 output formula with the pool's fee tier
+4. cache the result for 12 seconds
+```
+
+It is accurate to a basis point on the 0.05% USDC/USDT pool and badly wrong on a 1% pool for a
+long-tail token, in a direction that always favours the quote. Explain both, and say what a correct
+estimate has to do differently.
+
+<Answer>
+**Why the stable pool looks fine.** Step 2 is a valid model *while the price stays inside the current
+segment*. In a tightly pegged pair the liquidity is piled into a few spacings around the peg with a
+nearly flat profile, so a normal trade never leaves a region of near-constant `L`. The assumption
+happens to hold; it was never tested.
+
+**Why the long-tail pool is wrong.** Two independent failures compound.
+
+1. *The active `liquidity` is only this segment's.* The 1% tier has tick spacing 200, about 2.02 per
+   cent between initialisable ticks.<Cite src="uniswap-v3-whitepaper" /> A trade of any size in a
+   thin pool crosses those boundaries, and beyond the first one the real `L` is different — usually
+   smaller, because concentrated positions cluster near the price. Using the current `L` for the
+   whole trade assumes depth continues that never existed.
+2. *It always errs the same way.* Assuming liquidity persists beyond where it stops can only
+   **overstate** output. The error cannot be negative, which is why "it is usually within a basis
+   point" was never evidence of correctness — the residual is one-directional, exactly the signature
+   of a modelling assumption rather than noise.
+
+**The 12-second cache is a third bug.** Any mint or burn reshapes the histogram, and both are
+permissionless and instantaneous. A cached quote is a claim about a past block's histogram — and in
+the JIT case that histogram is *deliberately* different for one block.
+
+**What a correct estimator does.** Reproduce the loop: walk the tick bitmap in the direction of
+travel, take a constant-product step to each initialised tick, apply that tick's `liquidityNet`, and
+continue until the amount is consumed.<Cite src="uniswap-v3-core-pool" /> That needs tick data, not
+just `slot0`, which is why accurate v3 quoting requires an on-chain quoter that simulates or an
+indexer that maintains the tick table. The absence of a closed form is a consequence of the design.
+
+**The generalisable lesson.** When a model's error is small *and* always signed the same way, that is
+not accuracy with noise. It is a systematic bias, and the sign usually names the assumption you made.
+</Answer>
+</Check>
+
+## What this unlocks
+
+The module's claim is now complete: **v3 is v2 with the liquidity switched on and off at ticks, plus
+the accounting needed to charge and pay for that correctly.** Three payoffs.
+
+**Reading the contract.** The bitmap, `liquidityNet` and `feeGrowthOutside` are each answers to one
+question the piecewise design forces: where is the next boundary, what changes there, and who was in
+range while it happened.
+
+**Reasoning about execution.** Depth is a distribution, gas tracks distance, a stale quote is a stale
+histogram. Those cover most of the surprises a router or market-making integration will meet.
+
+**The next module.** Uniswap v4 keeps this maths entirely and changes the container: every pool
+inside one contract, balances netted across a whole sequence of operations, and a per-pool hook
+contract called at fixed lifecycle points. Segments and accumulators still apply. What becomes
+negotiable is who runs code inside a swap — a security question rather than a mathematical one.

@@ -1,0 +1,458 @@
+---
+id: app-passkeys-what-gets-signed
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [webauthn-l2, webauthn-l3, webauthn-sol, certik-passkey-wallets, eip-4337, eip-7951, nist-fips-180-4, yubico-webauthn-guide]
+stack: { viem: "2.x" }
+---
+
+Here is a complete WebAuthn assertion, taken from the public test vector in Coinbase's `webauthn-sol`
+README.<Cite src="webauthn-sol" /> Two byte strings and a pair of integers:
+
+```
+authenticatorData
+  0x49960de5880e8c687434170f6476605b8fe4aeb9a28632c7995cf3ba831d97630500000101
+
+clientDataJSON
+  {"type":"webauthn.get","challenge":"9jEFijuhEWrM4SOW-tChJbUEHEP44VcjcJ-Bqo1fTM8","origin":"http://localhost:3005"}
+
+r  43684192885701841787131392247364253107519555363555461570655060745499568693242
+s  22655632649588629308599201066602670461698485748654492451178007896016452673579
+```
+
+The application that requested this assertion passed in a 32-byte challenge:
+`0xf631058a3ba1116acce12396fad0a125b5041c43f8e15723709f81aa8d5f4ccf`.<Cite src="webauthn-sol" />
+
+Find that value in what was signed.
+
+It is not in `authenticatorData` — those 37 bytes contain a hash of a domain name, one flags byte and
+a counter. It is not the digest either. It is in the middle of a JSON string, base64url-encoded, as
+`9jEFijuhEWrM4SOW-tChJbUEHEP44VcjcJ-Bqo1fTM8`, forty-three characters that do not look like the hex
+you passed in.
+
+**A passkey does not sign your hash.** It signs a structure that contains a hash of a structure that
+contains a text encoding of your hash. Every other signing flow you know on Ethereum — a raw
+transaction, `personal_sign`, [EIP-712 typed data](/c/eip-712-typed-data) — signs a digest you can
+compute directly. This one does not, and the whole of the next lesson exists because of it.
+
+## The signature base
+
+The normative sentence is in the assertion verification procedure, and it is two steps long:
+
+> Let `hash` be the result of computing a hash over the `cData` using SHA-256.
+>
+> Using `credentialPublicKey`, verify that `sig` is a valid signature over the binary concatenation
+> of `authData` and `hash`.<Cite src="webauthn-l2" />
+
+So the message is:
+
+```
+message = authenticatorData ‖ SHA-256(clientDataJSON)
+```
+
+And because the credential's algorithm is ES256 — ECDSA with SHA-256 — the value actually fed to the
+elliptic-curve arithmetic is `SHA-256(message)`.<Cite src="webauthn-l2" /><Cite src="nist-fips-180-4" />
+
+That is **two** SHA-256 invocations, applied to different things, and the order is not negotiable:
+
+```
+h = SHA-256( authenticatorData ‖ SHA-256(clientDataJSON) )
+```
+
+`h` is what a P-256 verifier needs. EIP-7951's precompile input takes "32 bytes: message hash `h`" as
+its first word, and `h` means this value and nothing else.<Cite src="eip-7951" />
+
+<Figure
+  caption="Your challenge appears nowhere in these 69 bytes: the second half is a hash of the document it is buried in."
+  alt="The 69-byte signature base: 37 bytes of authenticatorData followed by the 32-byte SHA-256 of clientDataJSON, the whole of which is hashed again to produce the value a P-256 verifier consumes."
+>
+  <ByteLayout
+    offsets
+    proportional
+    total={69}
+    caption="h = SHA-256( authenticatorData ‖ SHA-256(clientDataJSON) )"
+    fields={[
+      { label: 'authenticatorData', size: 37, note: 'signed as-is' },
+      { label: 'SHA-256(clientDataJSON)', size: 32, tone: 'accent', note: 'the document itself never reaches the curve' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="A passkey signs your transaction hash, so the contract can hand the hash straight to a P-256 verifier."
+  reality="It signs authenticatorData concatenated with SHA-256 of clientDataJSON, and your hash is only a base64url string inside that JSON. The contract must rebuild both structures and hash twice before it has anything a verifier will accept."
+  why="Every other Ethereum signing flow signs the digest directly, so 'signature over hash' is the assumed shape. WebAuthn was designed for logins, where the relying party is a server that already holds both structures and never has to think about the cost of transmitting them."
+  src="webauthn-l2"
+/>
+
+## Half one: `authenticatorData`
+
+37 bytes or more, with a fixed prefix.<Cite src="webauthn-l2" /> Split the vector:
+
+<Figure
+  caption="Thirty-seven bytes with no room for your data in them: a domain hash, one byte of flags, and a counter."
+  alt="The authenticatorData from the test vector split into three fields: bytes 0 to 31 are the SHA-256 of the relying party id, byte 32 is the flags byte 0x05, and bytes 33 to 36 are the signature counter 0x00000101, which is 257."
+>
+  <Anatomy
+    value="0x49960de5880e8c687434170f6476605b8fe4aeb9a28632c7995cf3ba831d97630500000101"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 66, label: 'rpIdHash', note: 'bytes 0–31 · SHA-256 of the relying party id', tone: 'accent' },
+      { from: 66, to: 68, label: 'flags', note: 'byte 32 · 0b00000101, decoded below', tone: 'warn' },
+      { from: 68, to: 76, label: 'signCount', note: 'bytes 33–36 · 257' },
+    ]}
+  />
+</Figure>
+
+The relying-party hash is exactly what it says: `SHA-256("localhost")` for this vector, which you can
+check in one line. The authenticator computed it, the authenticator signed it, and the authenticator
+validated during the ceremony that the credential's own relying party id matched the one the client
+supplied.<Cite src="webauthn-l2" /> That is where phishing resistance physically lives.
+
+The flags byte, bit 0 being least significant, is defined by Level 3 as:<Cite src="webauthn-l3" />
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 | UP | User Present |
+| 1 | RFU1 | reserved |
+| 2 | UV | User Verified |
+| 3 | BE | Backup Eligibility |
+| 4 | BS | Backup State |
+| 5 | RFU2 | reserved |
+| 6 | AT | Attested credential data included |
+| 7 | ED | Extension data included |
+
+Level 2 left bits 3 to 5 as reserved; Level 3 assigns bits 3 and 4 to the backup flags, which lesson
+seven builds a recovery design on.<Cite src="webauthn-l2" /><Cite src="webauthn-l3" />
+
+So `0x05` decodes to UP set, UV set, everything else clear. Someone was present and local verification
+occurred; no attested credential data, no extensions, not backup-eligible.
+
+### The counter that stopped counting
+
+`signCount` is a 32-bit big-endian integer, and the specification gives it a job: store the last value
+you saw, and if the new one is less than or equal to the stored one, that is a signal the authenticator
+may have been cloned — two copies of the private key in parallel use.<Cite src="webauthn-l2" />
+
+For a passkey wallet, retire that check before you write it. CertiK's analysis states the reason
+plainly: **iCloud Keychain keeps `signCount` at 0, because a monotonic counter cannot survive
+multi-device sync**, so any wallet relying on `signCount` to spot cloned credentials should drop that
+assumption.<Cite src="certik-passkey-wallets" /> The specification anticipates the case — it only asks
+for the comparison when either value is nonzero — but the shape of the outcome is worth internalising:
+the field that exists to detect key duplication is disabled by the feature that duplicates keys.
+
+## Half two: `clientDataJSON`
+
+The second half is a JSON document, and its most important property is who builds it. **Not you.** The
+WebAuthn client assembles it — the browser process on the web, the operating system on
+mobile.<Cite src="certik-passkey-wallets" /> Your application supplies the challenge and the request
+options; the client supplies everything else and controls the exact bytes.
+
+<Figure
+  caption="By the time your challenge is signed it is text, at an offset, inside a document a browser serialised."
+  alt="The 114-byte clientDataJSON from the test vector, bracketed: the type member at offset 1, the challenge label at offset 23, the base64url challenge occupying 43 characters from offset 36, and the origin member written by the client."
+>
+  <Anatomy
+    value={'{"type":"webauthn.get","challenge":"9jEFijuhEWrM4SOW-tChJbUEHEP44VcjcJ-Bqo1fTM8","origin":"http://localhost:3005"}'}
+    parts={[
+      { from: 1, to: 22, label: 'the ceremony type', note: 'offset 1', tone: 'muted' },
+      { from: 23, to: 36, label: 'the label', note: 'offset 23', tone: 'muted' },
+      { from: 36, to: 79, label: 'your challenge', note: '43 characters, base64url, no padding', tone: 'accent' },
+      { from: 81, to: 113, label: 'the origin', note: 'the client wrote this, not you' },
+    ]}
+  />
+</Figure>
+
+The dictionary has four members that matter, in a fixed serialization order:<Cite src="webauthn-l3" />
+
+- **`type`** — `"webauthn.create"` during registration, `"webauthn.get"` during authentication. The
+  specification states its purpose directly: to prevent signature confusion attacks, where an attacker
+  substitutes one legitimate signature for another.<Cite src="webauthn-l2" />
+- **`challenge`** — the **base64url encoding** of the challenge bytes you supplied.<Cite src="webauthn-l2" />
+- **`origin`** — the fully qualified origin of the requester.<Cite src="webauthn-l2" />
+- **`crossOrigin`** — the inverse of same-origin-with-ancestors. Level 3 makes this member optional and
+  adds **`topOrigin`**, present only when the call came from a context that is not same-origin with its
+  ancestors.<Cite src="webauthn-l3" />
+
+Two spec facts about parsing, which pull in opposite directions and both bind you:
+
+**Be tolerant.** The dictionary may be extended in future, so the specification says it is critical when
+parsing to tolerate unknown keys and any reordering of the keys.<Cite src="webauthn-l2" />
+
+**Preserve exactly.** The exact JSON serialization must be preserved, because the hash was computed over
+it.<Cite src="webauthn-l2" /> You cannot normalise, re-serialise, or strip whitespace and still verify.
+
+And one promise that makes on-chain verification possible at all. Because the specification defines a
+"limited verification algorithm" for verifiers that cannot run a JSON parser, it commits to serialization
+stability: future versions must not remove `type`, `challenge`, `origin`, `crossOrigin` or `topOrigin`,
+must not change the order in which those fields are serialized, and must not insert new fields between
+them.<Cite src="webauthn-l3" /> A contract that locates the challenge by byte offset is depending on that
+promise. It is a real promise, made deliberately, and it is worth knowing you are leaning on it.
+
+### Two bindings to a domain, written by two different parties
+
+`authenticatorData` carries `rpIdHash`. `clientDataJSON` carries `origin`. Both are about where the
+ceremony happened, and they are not redundant, because they have different authors and different
+trust.
+
+`rpIdHash` is computed and signed by the **authenticator**, which independently validated during the
+assertion operation that the credential's own relying party id exactly matches the one the client
+supplied.<Cite src="webauthn-l2" /> An authenticator will not produce an assertion for a credential
+scoped elsewhere. This binding survives a compromised page.
+
+`origin` is written by the **client**, and it is a fully qualified origin including scheme and
+port.<Cite src="webauthn-l2" /> It is finer-grained than the relying party id — `rpIdHash` cannot
+distinguish `https://app.example.com` from `https://staging.example.com` when both use the relying
+party id `example.com`, and `origin` can.
+
+The practical consequence for a contract: checking `rpIdHash` is the cheap and structurally strong
+check, because it is a single 32-byte comparison against a constant you set at deployment.
+Checking `origin` is a string comparison inside the JSON, it costs calldata and gas, and it buys you
+sub-domain granularity that you may or may not need. Decide which you need; do not silently get
+neither.
+
+<Aside kind="note">
+There is a boundary here worth stating explicitly, because it limits what any of this can protect
+against. The relying-party binding stops an assertion being produced for the *wrong* origin. It does
+nothing once an attacker can run script under the *right* origin. CertiK cites 2025 research showing
+exactly that: once an attacker can execute in the target origin, the rpId and origin binding no longer
+protects the flow, because the malicious call comes from the correct domain.<Cite src="certik-passkey-wallets" />
+Phishing resistance is resistance to being *elsewhere*. It is not resistance to cross-site scripting,
+to a malicious extension, or to a compromised bundle.
+</Aside>
+
+## Who counts as "the client"
+
+`clientDataJSON` is assembled by whatever software sits between your code and the authenticator, and
+the answer to "what software is that" changes with the surface. CertiK enumerates three:<Cite src="certik-passkey-wallets" />
+
+- **A browser-based application** — the client is the browser process, and anything that can inject
+  script into it. A malicious extension is inside the client.
+- **A native mobile wallet calling the OS WebAuthn API** — the client is the platform itself, which is
+  as strong a boundary as you get.
+- **An in-app or hybrid WebView** — the client is whatever JavaScript runtime loaded the page, which is
+  a boundary you or a partner configured, often without treating it as a security boundary.
+
+That third row is where products drift. A native wallet with a native signing path has a strong client;
+the same wallet also ships a dApp browser, a support WebView, and a deep-link handler, and each of those
+is a second client with different properties, calling the same API against the same credential.
+
+CertiK's conclusion is the one to carry into design review: the frontend is part of the authorisation
+path, not a display layer, and an audit has to cover the conditions under which the signature was
+produced, not only the on-chain verifier.<Cite src="certik-passkey-wallets" />
+
+The corollary for the contract is bracing and useful. **You cannot verify who built the JSON.** You can
+only verify what it says and that the authenticator signed it. So the contract's job is to be maximally
+suspicious of the fields it can check, and your product's job is to control the surfaces where those
+fields get written.
+
+## The worked example, end to end
+
+Reproduce the digest from the vector. Every intermediate value below is computed, not quoted, and you can
+check each one with a hash function and a base64 encoder.
+
+**Subgoal 1 — encode the challenge the way the client will.** The challenge is 32 raw bytes. The client
+base64url-encodes them without padding, producing 43 characters:
+
+```
+0xf631058a3ba1116acce12396fad0a125b5041c43f8e15723709f81aa8d5f4ccf
+  → 9jEFijuhEWrM4SOW-tChJbUEHEP44VcjcJ-Bqo1fTM8
+```
+
+Note `-` and `_` rather than `+` and `/`, and no `=` padding. This is the point at which a hash stops
+being bytes and becomes text, and it is where most reconstruction bugs are born.
+
+**Subgoal 2 — read the exact serialization the client produced.** 114 bytes:
+
+```json
+{"type":"webauthn.get","challenge":"9jEFijuhEWrM4SOW-tChJbUEHEP44VcjcJ-Bqo1fTM8","origin":"http://localhost:3005"}
+```
+
+The `webauthn-sol` vector records `typeIndex: 1` and `challengeIndex: 23`, and both fall out of counting
+bytes: `"type"` opens at offset 1, and `"challenge"` opens at offset 23, immediately after the closing
+quote and comma of the type value.<Cite src="webauthn-sol" /> The offsets are stable for this ceremony
+type because `"webauthn.get"` is a fixed-length string — which is a fact about this particular value, not
+a general guarantee, and lesson four is careful about the difference.
+
+**Subgoal 3 — hash the client data.** One SHA-256 over those 114 bytes:
+
+```
+SHA-256(clientDataJSON) = 0x3797b7682ee57597b046f87c814f1f47da907dfa0d0266dba159f9d5fa02bdf6
+```
+
+**Subgoal 4 — concatenate, in the specified order.** 37 bytes of `authenticatorData`, then the 32-byte
+hash from step 3. 69 bytes total. `authenticatorData` first. Reversing them produces a valid-looking
+69-byte string that verifies against nothing.
+
+**Subgoal 5 — hash again to get the value the verifier wants.**
+
+```
+h = SHA-256(authenticatorData ‖ SHA-256(clientDataJSON))
+  = 0xb37c3db21c403e48a07623adc55f56148ea950015dea86d18a84a8087856e977
+```
+
+That 32-byte value, with `r`, `s`, and the credential's public key coordinates, is the 160-byte input to
+the secp256r1 verifier.<Cite src="eip-7951" />
+
+**Subgoal 6 — notice what the digest does not tell you.** Verification against `h` proves the holder of
+that private key signed *these two structures*. It says nothing about whether the structures say what you
+want. The challenge inside them could be for a different operation, the type could be
+`"webauthn.create"`, the origin could be someone else's. Those are separate checks on separate fields,
+and they are the subject of lesson four.
+
+### The encoding step that eats an afternoon
+
+Step 1 is one line of code and the source of most of the debugging in this area, so it deserves naming
+separately.
+
+Your challenge is bytes. The client writes it into JSON as **base64url without padding**.<Cite src="webauthn-l2" />
+Three separate mistakes are available, and all three produce a digest that verifies against nothing with
+no diagnostic:
+
+**Encoding the hex string instead of the bytes.** Passing the 66-character string `"0xf631…"` as a
+challenge produces a 66-byte challenge whose base64url encoding is 88 characters. It is a valid ceremony.
+It commits to the text of your hash rather than to your hash, and it will never match a contract that
+encodes the bytes.
+
+**Using standard base64 rather than base64url.** The alphabet differs in two characters, `+`/`/` versus
+`-`/`_`. In this vector the encoded challenge contains a `-` at position 17 and again at position 35, so
+the two encodings differ and the comparison fails — but for roughly one challenge in a hundred no
+substitution is needed and both encodings agree. A bug that passes one per cent of the time is harder to
+find than one that never works.
+
+**Leaving the padding on.** Trailing `=` characters make the string longer than the client's, so a
+length-sensitive comparison fails and an offset-based extraction reads past the end.
+
+The defence is a round-trip assertion in your test suite rather than careful reading: encode the
+challenge, decode the string from a real `clientDataJSON`, and assert byte equality against the original.
+Do it once, in a unit test, on the same helper both your frontend and your relayer use.
+
+The same discipline applies one level up, to the credential id. You pass it back in `allowCredentials`
+so the authenticator can find the right key, and it is a binary value that your database, your API and
+your frontend will each be tempted to encode differently.<Cite src="yubico-webauthn-guide" /> Pick one
+encoding at the boundary of your system and convert exactly once.
+
+## The only field you control
+
+Step back and count what a relying party gets to influence in the signed bytes.
+
+`authenticatorData` is built by the authenticator. `type`, `origin`, `crossOrigin` and `topOrigin` are
+built by the client. Whitespace, ordering and future fields are the client's too.
+
+**The challenge is the only application-controlled value in the entire signed payload.** Everything the
+signature must be bound to has to be inside it, because there is nowhere else to put it.
+
+For a login, that requirement is easy — a random value, stored server-side, compared on return, discarded.
+For a wallet it is the design decision the whole account rests on, and the standard answer is to make the
+challenge the fingerprint of the exact operation being authorised.
+
+ERC-4337 supplies that fingerprint. `userOpHash` is a hash over the user operation excluding the
+signature, plus the EntryPoint address and the chain id.<Cite src="eip-4337" /> CertiK enumerates what
+that actually covers: sender, nonce, `callData`, gas fields, paymaster data, the factory call that first
+deploys the account, the EntryPoint, and `chainId` — with v0.7 repacking the fields while binding the same
+surface.<Cite src="certik-passkey-wallets" />
+
+Set `challenge = userOpHash` and one assertion authorises one operation, on one chain, at one nonce, from
+one account, through one EntryPoint. Change any of it and the hash changes, and the assertion no longer
+matches.
+
+### What a weaker challenge buys an attacker
+
+Walk down the ladder, because each rung is a real design someone shipped.
+
+**A random nonce.** Proves that some passkey signed something recently. It does not name an operation, so
+whoever holds the assertion can present it as authorisation for whatever the contract will accept alongside
+it. CertiK's framing is the one to remember: a random challenge behaves like a transferable, replayable
+credential rather than a single-use authorisation.<Cite src="certik-passkey-wallets" />
+
+**A hash of the calldata only.** Names the action, not the actor, the chain, or the sequence. The same
+assertion authorises the same call from the same account on every chain where the account exists — the
+cross-chain replay you already know from [chain-id scoping](/c/chain-id-scoping), reappearing one layer up
+because the binding moved out of the transaction envelope and into a JSON field.
+
+**A hash of calldata and nonce, but not chain id.** Better, and still cross-chain, because nonces on two
+chains are independent and will collide by construction on the first operation of each.
+
+**A hash of everything except the paymaster data.** This one is subtle enough to be worth naming. If the
+sponsor's blob is outside the fingerprint, whoever relays the operation can swap it, and the user's
+signature covers a transaction whose gas economics they never saw. That coverage is precisely what makes a
+tampered paymaster blob detectable downstream.<Cite src="certik-passkey-wallets" />
+
+<Aside kind="warn">
+One check does not fit inside the challenge and therefore has to be made separately: the `type` field. It
+lives in `clientDataJSON` and is not part of `userOpHash`.<Cite src="certik-passkey-wallets" /> A
+registration assertion and an authorisation assertion are structurally identical apart from that string,
+so a verifier that binds the challenge perfectly and ignores `type` will accept a `"webauthn.create"`
+assertion as a transfer authorisation, provided an attacker can arrange for a registration ceremony to
+carry the right challenge. Bind the challenge *and* check the ceremony.
+</Aside>
+
+<Check type="spot-bug" concept="webauthn-challenge-binding">
+A wallet team builds its challenge like this, reasoning that the user operation is not fully known until
+the bundler quotes gas, so they sign earlier and fill the rest in afterwards:
+
+```ts
+const challenge = keccak256(
+  encodeAbiParameters(
+    [{ type: 'address' }, { type: 'bytes' }, { type: 'uint256' }],
+    [account, callData, nonce],
+  ),
+)
+const assertion = await navigator.credentials.get({
+  publicKey: { challenge: hexToBytes(challenge), rpId: 'wallet.example' },
+})
+```
+
+The account contract verifies the assertion, extracts the challenge, recomputes the same hash from the
+operation it is validating, and requires them to match. Name every authorisation the user did not intend
+to give, and say which one is worst.
+
+<Answer>
+**Cross-chain replay.** The fingerprint has no chain id. The account address is derived by CREATE2 and is
+therefore the same on every chain, and nonces start at zero independently on each. So the first operation
+a user signs on one chain is bit-identical, as a fingerprint, to the first operation on every other chain
+where that account exists. One assertion, harvested once, replays everywhere. This is the same failure
+[EIP-155 chain-id scoping](/c/eip-155-chain-id-replay) fixed for transactions, reintroduced by hand.
+
+**EntryPoint substitution.** `userOpHash` includes the EntryPoint address for a reason.<Cite src="eip-4337" />
+This fingerprint does not, so the same authorisation is valid against any EntryPoint the account trusts —
+including a newer version with different semantics that the account was upgraded to accept.
+
+**Unbounded gas.** `verificationGasLimit`, `callGasLimit`, `preVerificationGas`, `maxFeePerGas` and
+`maxPriorityFeePerGas` are all outside the fingerprint. The user signed "do this thing"; the relayer
+chooses what it costs. On a congested block that is a real transfer of value out of the user's account,
+and it looks like normal operation in every log.
+
+**Free paymaster substitution.** `paymasterAndData` is unbound, so the sponsorship arrangement the user
+saw is not the one that executes.
+
+**No commitment to first deployment.** For an account that does not exist yet, the factory call that
+deploys it — and therefore the owner set it is deployed with — is unbound. The user signs a transfer; the
+operation that executes also chooses who owns the account from then on.
+
+**The worst is the last one**, and not because of its blast radius on any single operation. The others cost
+the user this transaction. That one costs them the account, permanently, in the same operation that looked
+like a transfer, and it is the least likely to be caught by review because "the account gets deployed" reads
+as infrastructure rather than as authorisation.
+
+**The fix is not to add fields to this hash.** It is to stop building a bespoke fingerprint. Use
+`userOpHash`, which already commits to all of the above, and solve the sequencing problem the team actually
+had — that gas is not known at signing time — by quoting gas *before* requesting the assertion. The
+authenticator prompt is the last step in the flow, not the first, precisely because everything it commits to
+must already be decided.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next lesson** takes the six subgoals above and moves them inside a contract, where `clientDataJSON`
+is a string in calldata you are paying for by the byte, and where "parse the JSON" is not available.
+
+**The flags** you decoded here become policy: your account decides whether UV must be set, and that
+decision is the only layer of the three that an attacker cannot reconfigure.
+
+**The challenge** is the field every later lesson leans on. Recovery flows, credential registration and
+signer rotation are all operations, they all need authorising, and they are all authorised the same way —
+by putting the fingerprint of the state change into the one field of the payload that you own.

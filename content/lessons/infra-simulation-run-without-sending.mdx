@@ -1,0 +1,396 @@
+---
+id: infra-simulation-run-without-sending
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [measured-simulation-2026-08-26, execution-apis-execute-methods, eth-simulatev1-spec, geth-ns-eth, eip-2930, alchemy-compute-units, viem-simulate-calls]
+stack: { viem: "2.x" }
+---
+
+One transfer. Three methods. Three different answers, all correct.
+
+The call is a plain `transfer` of 400,000 DAI from an address that does not have 400,000 DAI, sent to
+a public mainnet endpoint on 26 August 2026. Nothing was broadcast; there is no transaction and no
+fee.<Cite src="measured-simulation-2026-08-26" />
+
+<Compare
+  columns={[
+    { title: <code>eth_call</code> },
+    { title: <code>eth_estimateGas</code> },
+    { title: <code>eth_simulateV1</code>, tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'What came back?',
+      cells: [
+        { v: 'error 3: execution reverted: Dai/insufficient-balance', tone: 'danger' },
+        { v: 'error 3: execution reverted: Dai/insufficient-balance', tone: 'danger' },
+        { v: <>status <code>0x1</code>, gasUsed <code>0xca6a</code></>, tone: 'good' },
+      ],
+    },
+    {
+      label: 'Against which state?',
+      cells: [
+        'mainnet, unmodified',
+        'mainnet, unmodified',
+        { v: 'mainnet, with one storage slot overridden', tone: 'accent' },
+      ],
+    },
+    {
+      label: 'What entered a mempool?',
+      cells: ['nothing', 'nothing', 'nothing'],
+    },
+  ]}
+  caption="The three methods differ less in what they execute than in how much of the state they were allowed to move first."
+  alt="One plain DAI transfer sent to three methods on a public mainnet endpoint. eth_call and eth_estimateGas both return error 3, execution reverted, Dai/insufficient-balance against unmodified mainnet state. eth_simulateV1 returns status 0x1 and gasUsed 0xca6a with one storage slot overridden. None of the three put anything in a mempool."
+/>
+
+The third one succeeded because it was allowed to change the world first: a single storage slot,
+set so the sender held the tokens. The first two were not asked to do that, and correctly reported
+the revert that the real chain would have produced.
+
+That is the whole subject in one screen. **Simulation is executing a message against a chain state
+you choose, and then throwing the result away.** Everything else — bundles, overrides, forks, hosted
+testnets, wallet asset diffs — is a variation on which state you get to choose, how many messages you
+get to chain, and how much of the answer is decoded for you.
+
+You have already done this without calling it that. Every `view` function your frontend reads is a
+simulation. Every gas estimate your wallet shows is a simulation, several of them. The move this
+module asks you to make is to stop treating it as a read and start treating it as a **rehearsal** —
+the thing you do before an action nobody can undo.
+
+## The primitive: one message, one block, discarded
+
+`eth_call` executes a new message call immediately without creating a transaction on the block
+chain.<Cite src="execution-apis-execute-methods" /> That sentence from the spec is worth reading
+twice, because every word in it is a constraint.
+
+**One message.** The parameter is a single transaction object. There is no way to express "and then,
+against the state that produced, do this second thing".
+
+**Immediately.** It runs on the node, in the node's process, against the node's state. Nothing enters
+a mempool. Nothing is signed. There is no sender authentication at all — you can put any address in
+`from` and the node will not ask you to prove it.
+
+**Without creating a transaction.** The state changes it produces exist for the duration of the call
+and are then discarded. The node's database is untouched.
+
+The return value is the return data of the executed contract call, and the only error the spec
+defines for it is code `3`, `execution reverted`, carrying the raw EVM revert data.<Cite src="execution-apis-execute-methods" />
+That revert data is why the measurement above is legible: `Dai/insufficient-balance` is a
+[revert string that the client ABI-decoded](/c/revert-data-is-abi-encoded) out of the returned
+bytes for you.
+
+So what does `eth_call` *not* give you? Be precise about this, because knowing exactly where the
+primitive runs out is what tells you when to reach for something else — and that point arrives much
+earlier than most people expect.
+
+- **No sequence.** Approve then swap is two messages. `eth_call` is one.
+- **No trace.** You get return data or revert data. You do not get the internal calls, the logs, or
+  the storage slots that changed.
+- **No balance changes.** Nothing tells you which assets moved. You would have to read every balance
+  before and after, and there is no "after" to read.
+- **No control of the block context.** Timestamp, number, base fee and coinbase are whatever the node
+  says they are for the block you named.
+
+<Aside kind="note">
+The standard signature of `eth_call` takes two parameters: a transaction and a block.<Cite src="execution-apis-execute-methods" />
+Geth documents two more — an optional state override set and an optional block override
+set — as client extensions to the standard namespace.<Cite src="geth-ns-eth" /> Both public mainnet
+endpoints tried on 26 August 2026 accepted a third state-override parameter and returned success
+where the un-overridden call reverted.<Cite src="measured-simulation-2026-08-26" /> Treat that as a
+capability to probe rather than one to assume: it is not in the method's standard shape, so an
+endpoint that refuses it is not broken.
+</Aside>
+
+## Choosing the state is half the method
+
+Every one of these methods takes a block parameter, and it is not decoration. The spec allows a block
+number, a block hash, or one of five tags, and the tags are defined with unusual care:<Cite src="eth-simulatev1-spec" />
+
+- `earliest` — the lowest numbered block the client has available.
+- `finalized` — the most recent crypto-economically secure block, which cannot be reorged out
+  without manual community-coordinated intervention.
+- `safe` — the most recent block safe from reorgs under honest-majority and synchronicity
+  assumptions.
+- `latest` — the most recent block in the canonical chain the client has observed, **which may be
+  reorged out even under healthy conditions**.
+- `pending` — a sample next block the client builds on top of `latest`, usually from its local
+  mempool.
+
+Those definitions are the difference between a simulation you can act on and one you cannot. A
+result computed against `latest` is a claim about a block that might not survive. A result computed
+against `pending` is a claim about one client's guess at the next block, which no other client shares.
+And `earliest` on a pruned node is not genesis — it is the oldest state that node still holds, which
+is why simulating against an old block often fails with "missing trie node" on anything but an
+archive node.
+
+The habit worth forming now: **whenever you record a simulation result, record the block it ran
+against.** Not the tag — the number. A tag is a moving reference, and a result annotated with a
+moving reference is not reproducible by anyone, including you tomorrow.
+
+## Gas estimation is not a measurement
+
+`eth_estimateGas` generates and returns an estimate of how much gas is necessary to allow the
+transaction to complete.<Cite src="execution-apis-execute-methods" /> Read that as it is written —
+*necessary to allow the transaction to complete*, not *consumed by the transaction*. The spec states
+what the method returns, not how; in practice clients arrive at it by
+[searching rather than measuring](/c/estimategas-is-a-search), executing the message repeatedly at
+different gas limits until they converge on the smallest one that succeeds.
+
+Three consequences follow, and all three bite in production.
+
+### It answers a different question than you asked
+
+The same DAI transfer, with the same storage override, run two ways against the same endpoint at the
+same head:<Cite src="measured-simulation-2026-08-26" />
+
+<Matrix
+  numeric
+  corner="Method"
+  cols={['Returned', 'Gas']}
+  rows={[
+    { label: <code>eth_estimateGas</code>, cells: [<code>0xcbf4</code>, '52,212'] },
+    { label: <><code>eth_simulateV1</code> gasUsed</>, cells: [<code>0xca6a</code>, '51,818'] },
+    { label: 'daylight between them', cells: ['—', { v: '394', tone: 'warn' }] },
+  ]}
+  caption="394 gas apart on the simplest transfer there is, before any state-dependent branch has had a chance to widen it."
+  alt="eth_estimateGas returned 0xcbf4, 52,212 gas. eth_simulateV1 reported gasUsed 0xca6a, 51,818 gas. The difference is 394 gas."
+/>
+
+Neither number is wrong. `eth_simulateV1` reported what the execution actually consumed. The
+estimator reported a limit at which the execution completes. The gap is the estimator's own search
+granularity plus whatever headroom the client adds, and you should expect it to exist rather than
+treat it as a rounding artefact. If you are displaying "this will cost X" to a user, you are
+displaying the wrong one of these two numbers.
+
+### The answer is state-dependent, and the state moves
+
+The reason the two numbers cannot be reconciled once and for all is that gas is a function of state,
+not only of code. [Cold and warm access pricing](/c/cold-vs-warm-access) means the same call costs
+different amounts depending on what an earlier transaction in the same block already touched. A
+first-ever write to a slot costs more than an overwrite. An estimate made against the current state
+is a claim about the current state.
+
+This is the same trap you met as [test warmth bias](/c/test-warmth-bias) in the toolchain track,
+arriving from the other direction: there, your harness made things artificially warm; here, the chain
+does it to you between the estimate and the inclusion.
+
+### It fails loudly, which is accidentally the most useful thing about it
+
+Because the estimator has to find a limit at which the transaction *succeeds*, a transaction that
+reverts at every limit has no answer, and the method errors instead of returning a number. The error
+carries the revert data:<Cite src="measured-simulation-2026-08-26" />
+
+```text
+{"code":3,"message":"execution reverted: Dai/insufficient-balance",
+ "data":"0x08c379a0…4461692f696e73756666696369656e742d62616c616e6365…"}
+```
+
+Every wallet and every library already calls this method before sending, to fill in the gas limit.
+That means every send path in your product already contains a free pre-flight revert check, whether
+or not anyone designed it that way. When a user reports "the wallet wouldn't let me submit", this is
+usually what happened, and the revert reason is sitting in the error object nobody surfaced.
+
+<Misconception
+  belief="eth_estimateGas returns the gas the transaction will use."
+  reality="It searches for a gas limit at which the transaction completes against the current state. The measured gap on one plain ERC-20 transfer was 394 gas, and state-dependent branches — a cold slot that will be warm by inclusion, a first-time storage write — move the real figure further."
+  why="The method is named after the thing you wanted, and the number it returns has the shape of a measurement."
+  src="measured-simulation-2026-08-26"
+/>
+
+## The third simulation, which nobody calls one
+
+`eth_createAccessList` generates an access list for a transaction: the addresses and storage keys the
+transaction reads and writes, plus the gas consumed if that list is
+attached.<Cite src="execution-apis-execute-methods" /> It exists because
+[EIP-2930](/c/access-list) made access lists an optional part of a transaction,<Cite src="eip-2930" />
+and someone has to produce them.
+
+It is a simulation. It executes the message to find out what it touches. Geth's own documentation
+puts the caveat in the same terms as the estimator: like `eth_estimateGas` this is an estimation, and
+the list could change when the transaction is actually mined — and adding an access list does not
+necessarily reduce gas.<Cite src="geth-ns-eth" />
+
+Worth knowing for two reasons. It is the cheapest way to ask "what does this transaction touch?"
+without a tracer. And it is the clearest small example of the pattern this whole module is about: a
+method whose *output* is a fact about the future, produced by executing against the present, and
+therefore only as good as the distance between the two.
+
+## What the ladder costs
+
+Simulation is not free, and the price list is a surprisingly good map of what each rung is worth.
+Alchemy publishes per-method compute-unit costs; these are that provider's numbers, not a protocol
+constant, and other providers meter differently.<Cite src="alchemy-compute-units" />
+
+| Method | Compute units |
+|---|---|
+| `eth_createAccessList` | 10 |
+| `eth_estimateGas` | 20 |
+| `eth_call` | 26 |
+| `eth_simulateV1` | 40 |
+| `eth_callBundle` | 40 |
+| `debug_traceCall` | 40 |
+| `alchemy_simulateExecution` | 2,500 |
+| `alchemy_simulateAssetChangesBundle` | 4,500 |
+
+<Cite src="alchemy-compute-units" />
+
+Two things in that table are worth stopping on.
+
+**`eth_estimateGas` is priced below `eth_call`,** even though it performs many executions to `eth_call`'s
+one. A provider's price list reflects what the provider wants to charge for, not what the node had to
+do. Do not reason about node cost from vendor pricing, in either direction.
+
+**The decoded products cost sixty to a hundred times the raw method.** That ratio is the honest
+price of decoding: turning `0x08c379a0…` into `Dai/insufficient-balance`, turning storage deltas into
+"you will send 400,000 DAI and receive 399,850 USDC", turning a call tree into something a
+non-engineer can evaluate. That work is real, and later in this module you will decide, twice,
+whether to buy it or build it.
+
+<Aside kind="warn">
+Wall-clock time is a bad proxy for any of this from where you sit. Twenty sequential `eth_call`
+requests to a public endpoint took 3.48 seconds; twenty `eth_estimateGas` requests to the same
+endpoint took 3.16 seconds.<Cite src="measured-simulation-2026-08-26" /> The estimator is doing
+strictly more work per request, and over the network that fact is completely buried under round-trip
+latency. If you want to see the difference, you have to measure at the node, not at the client — and
+if you are rate-limited or metered, latency is not the resource you are short of anyway.
+</Aside>
+
+## Worked example: turning a failed send into a diagnosis
+
+A user reports that a withdrawal "just doesn't work". Your backend has the transaction fields it
+would have sent. You are not going to send them.
+
+**Subgoal — establish whether it reverts at all, and get the reason bytes.** Call `eth_call` with the
+exact `from`, `to`, `value` and `data`. If it returns data, the message succeeds against current
+state and your problem is elsewhere — signing, nonce, fee, or the user's wallet. If it errors with
+code `3`, you have the revert data.<Cite src="execution-apis-execute-methods" />
+
+**Subgoal — decode the reason before you theorise.** The bytes are ABI-encoded. A `0x08c379a0` prefix
+is an `Error(string)`; a `0x4e487b71` prefix is a
+[panic, which means a bug rather than a rejection](/c/panic-means-bug); anything else is a custom
+error whose selector you match against the ABI. Do this first, because the number of wrong theories
+you can build from "it reverts" is unbounded.
+
+<Figure
+  caption="The reason is sitting in the returned bytes as ASCII; getting it out is a lookup, not an investigation."
+  alt="The revert data begins 0x, then the four-byte selector 08c379a0 identifying Error(string), then elided encoding words, then the hex bytes 4461692f696e73756666696369656e742d62616c616e6365 which spell Dai/insufficient-balance."
+>
+  <Anatomy
+    value="0x08c379a0…4461692f696e73756666696369656e742d62616c616e6365…"
+    parts={[
+      { from: 0, to: 2, label: '0x', tone: 'muted' },
+      { from: 2, to: 10, label: 'selector', note: 'Error(string)', tone: 'accent' },
+      { from: 11, to: 59, label: 'the reason, as bytes', note: 'Dai/insufficient-balance', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+**Subgoal — separate "would revert" from "would not fit".** If `eth_call` succeeds but
+`eth_estimateGas` errors, you are usually looking at a gas-limit interaction rather than a logic
+failure — the classic being the [63/64 rule](/c/63-64-rule) starving an inner call at a limit the
+outer call survives. These are different bugs with different fixes.
+
+**Subgoal — decide whether the state is the problem.** Re-run the same `eth_call` against an earlier
+block. If it succeeded then and fails now, something changed on chain: an allowance was spent, a pool
+drained, a pause flag flipped, a role was revoked. That is a different incident than "our encoding is
+wrong", and the two-block comparison separates them in about ten seconds.
+
+**Subgoal — only then reach for a bigger tool.** If the answer is "it depends on something that has
+not happened yet", or "it needs a balance this account does not have", you have outgrown the
+primitive, and the next lesson is where you go.
+
+<Check type="predict" concept="estimategas-is-a-simulation">
+Your product lets a user swap tokens. Before enabling the button you call `eth_estimateGas` with the
+user's exact calldata; it returns a number, so you enable the button and use that number as the
+transaction's gas limit.
+
+Two failures show up in support tickets. The first: users occasionally see "out of gas" on chain
+even though the estimate succeeded seconds earlier. The second: a user with a fresh account is
+permanently blocked — the button never enables, and the error says `execution reverted` with no
+string.
+
+Name the mechanism behind each, and say what you would change.
+
+<Answer>
+**Failure one is state drift plus the wrong number.** The estimate was a limit that worked against
+the state at the moment you asked. By inclusion, the transaction ahead of the user's changed which
+slots are warm, or pushed the swap down a longer branch, and the limit no longer covers it. Two
+things are wrong with the design:
+
+*You used a limit as if it were a measurement.* The estimator's answer is the smallest limit that
+completed at that state — measured 394 gas above what the execution actually consumed on one plain
+ERC-20 transfer.<Cite src="measured-simulation-2026-08-26" /> It is a floor with almost no headroom,
+not a budget.
+
+*You made it the transaction's gas limit with no margin.* Gas limit is a ceiling you prepay for and
+get refunded on, so setting it generously costs the user nothing except a higher balance requirement
+at send time. Add a buffer, and re-estimate close to send rather than at button-enable time.
+
+**Failure two is a revert, not an estimation problem.** `eth_estimateGas` fails loudly when the
+transaction would revert at any limit,<Cite src="execution-apis-execute-methods" /> so the button
+never enabling is the estimator correctly reporting that the swap cannot succeed. A fresh account is
+the giveaway: no token allowance yet. The swap needs an `approve` to have happened first, and it has
+not.
+
+The fix is not in the estimator, it is in the shape of the question. A single message cannot express
+"approve, then swap", so a single estimate can never answer "would this flow work". You need the
+sequence simulated as a sequence, which is the next lesson.
+
+**And a product point that is easy to miss.** You already had the revert data in the error object —
+the `data` field carries the raw EVM revert bytes.<Cite src="execution-apis-execute-methods" /> A
+support ticket that says "the button doesn't work" instead of "you need to approve first" is an
+error surface you threw away, not information you lacked.
+</Answer>
+</Check>
+
+## What library code is actually calling
+
+You will meet this through a library rather than raw JSON-RPC, and the naming does not always make
+the underlying method obvious. In viem 2.x, `simulateCalls` documents itself as internally using the
+`eth_simulateV1` JSON-RPC method.<Cite src="viem-simulate-calls" /> That is the thing to check when
+you are reading someone else's simulation code, or when a call works against one endpoint and fails
+against another: find out which RPC method it lands on, then find out whether your endpoint serves
+it.
+
+<Misconception
+  belief="Simulation is a product you buy."
+  reality="Multi-call simulation with state and block overrides is a standard method in the Ethereum execution APIs, answered by two different public mainnet endpoints when tried on 26 August 2026 — and a local forked node gives you an entire chain to rehearse on for the price of running it."
+  why="Vendor tooling has owned the search results for this topic since long before the method was standardised, and every tutorial written before it landed says you need an account somewhere."
+  src="measured-simulation-2026-08-26"
+/>
+
+## What this unlocks
+
+You now have the primitive and its exact edges: one message, one state, no sequence, no trace, and a
+gas estimator that is a search rather than a ruler.
+
+Every remaining lesson in this module is about escaping one of those limits, in roughly the order the
+limits start to hurt.
+
+<Figure
+  caption="The module runs top to bottom: the cheapest rung answers one question once, the last one answers it again every day."
+  alt="A vertical ladder of four rungs. eth_call executes one message against one state and discards it. eth_simulateV1 executes a sequence of calls across blocks with state overrides. Forks and hosted forks give a whole chain other people can reach. The standing check re-runs the same rehearsal against the chain as it is now."
+>
+  <Flow
+    dir="down"
+    lanes={['one request', 'one request', 'a place', 'a schedule']}
+    nodes={[
+      { id: 'call', label: 'eth_call', note: 'one message, one state, discarded', col: 0, tone: 'accent' },
+      { id: 'sim', label: 'eth_simulateV1', note: 'a sequence of calls, across blocks, with overrides', col: 1 },
+      { id: 'fork', label: 'forks and hosted forks', note: 'a whole chain other people can reach', col: 2 },
+      { id: 'std', label: 'the standing check', note: 'the same rehearsal, against the chain as it is now', col: 3 },
+    ]}
+  />
+</Figure>
+
+**Next**, the standardised method that takes a *sequence* of calls across a *sequence* of blocks and
+lets you lie to the EVM about balances, code and individual storage slots before any of it runs.
+That is where "what if this user already had the tokens" and "what if this proxy already pointed at
+the new implementation" become answerable questions rather than deployments.
+
+Then the harder half: what a green result does and does not entitle you to claim, four environments
+to rehearse in and what each one adds, and the two rehearsals that pay for the whole practice —
+an upgrade against live storage, and a governance action nobody can take back.

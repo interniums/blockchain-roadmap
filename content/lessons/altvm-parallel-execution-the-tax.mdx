@@ -1,0 +1,255 @@
+---
+id: altvm-parallel-execution-the-tax
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [solana-docs-transaction-structure, simd-0406, solana-docs-transactions, simd-0296, solana-docs-compute-budget, anza-compute-units]
+stack: {}
+---
+
+A lending protocol needs to liquidate an unhealthy position. In Solidity the health check is four
+lines: read the borrower's collateral list, loop over it, price each asset through the oracle it
+points to, compare against debt.
+
+Every one of those steps is a pointer followed at runtime. The collateral list is a dynamic array in
+the borrower's struct. The oracle address comes out of a mapping keyed by the asset you just read.
+Nothing about which storage the function touches is known before it runs.
+
+On Solana none of that is expressible. Not "harder", not "less efficient" — the runtime cannot give an
+instruction an account nobody named, and the instruction has no vocabulary for naming one. So the
+loop has to happen somewhere else: the *client* reads the borrower's position, works out which
+collateral accounts and which oracle accounts the liquidation will need, and writes them into the
+transaction before signing it.
+
+That relocation is the tax. This lesson is about what it costs, where the hard walls are, and why
+much of the Solana tooling you are about to meet exists to pay it on your behalf.
+
+## The restriction, stated exactly
+
+An instruction receives a slice of accounts, chosen by the client, in an order the client
+decided.<Cite src="solana-docs-transaction-structure" /> Inside the program you can read any of them,
+check any of them, reject any of them. What you cannot do is obtain a new one. There is no
+`ACCOUNT_AT(address)` opcode, no lazy load, no fault-in-on-access. A program that discovers mid-flight
+that it needs account `X` has exactly one option: fail, and let the client rebuild the transaction
+with `X` included.
+
+Three consequences follow immediately, and each one has a name in Solana codebases.
+
+**Every address must be derivable off-chain.** This is why [program derived addresses](/c/pda) matter
+far more here than the analogous idea does on Ethereum. State at an address derived from a fixed seed
+and the user's key costs the client nothing to locate. State at an address stored *inside another
+account* costs a read first — a step in your critical path with its own staleness window.
+
+**Iteration becomes a client-side plan.** A program cannot walk a linked list. It can be handed a list
+the client walked and verify that what it was handed is right — verification you now write by hand, in
+the program, on every instruction.
+
+**Authorization checks move earlier.** With the account set fixed before execution, "which account am
+I allowed to touch" is answered against accounts already in front of you rather than by looking one
+up. Track 12's security module is largely about the ways this goes wrong.
+
+<Misconception
+  belief="You can work around the declaration requirement by passing a variable-length tail of accounts and picking the ones you need at runtime."
+  reality="That pattern is real and widely used, but it does not lift the restriction — it only moves the choice from 'which account exists' to 'which of the accounts the client already supplied'. The client still had to know every candidate in advance, and every one of them still occupies space in the transaction and is still locked by the scheduler."
+  why="The pattern looks like dynamic dispatch from inside the program, so it reads as an escape hatch. It is a convention for passing a list, not a way to reach outside the list."
+  src="solana-docs-transaction-structure"
+/>
+
+## Where the hard walls are
+
+The tax would be merely annoying if the transaction could grow to fit. It cannot. Four separate
+limits bound how much declaration you can afford, and they bind in different places.
+
+**Total transaction size: 1,232 bytes.** This is `PACKET_DATA_SIZE`, and its derivation is worth
+carrying because it explains why the number is so specific: 1,280 bytes, the IPv6 minimum MTU, minus
+48 bytes of network headers (40 bytes IPv6 plus an 8-byte fragment header).<Cite src="solana-docs-transaction-structure" />
+The 1,232 covers the signatures array *and* the message.<Cite src="solana-docs-transaction-structure" />
+
+**Addresses that fit in the message.** Each `account_keys` entry is a 32-byte public key and each
+signature is 64 bytes.<Cite src="solana-docs-transaction-structure" /> Budget one signature, three
+header bytes, a 32-byte blockhash and the array lengths, and roughly 1,130 bytes remain — about
+thirty-five keys with nothing left for arguments. SIMD-0406 states it directly: **a maximum of 35
+account keys in the legacy message format and 256 in the v0 format**.<Cite src="simd-0406" />
+
+<Figure
+  caption="Nothing in this packet grows. The 1,232 bytes are an IPv6 MTU minus network headers, and keys consume nearly all of them."
+  alt="A legacy transaction drawn to scale against the 1,232-byte packet limit: one 64-byte signature, a 3-byte header and a 32-byte blockhash together take under a tenth of it, thirty-five account keys at 32 bytes each take 1,120 bytes, and instruction data gets whatever remains."
+>
+  <ByteLayout
+    proportional
+    total={1232}
+    caption="a legacy transaction against PACKET_DATA_SIZE"
+    fields={[
+      { label: 'sig', size: 64, tone: 'muted' },
+      { label: 'hdr', size: 3, tone: 'muted' },
+      { label: 'hash', size: 32, tone: 'muted' },
+      { label: '35 keys', size: 1120, tone: 'accent', note: '32 bytes each' },
+      { label: 'args', variable: true, tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+**Accounts you may actually lock: 64.** Separate limit, different mechanism. The documented cap on
+accounts per transaction is 64, with a note that it becomes 128 when the
+`increase_tx_account_lock_limit` feature activates — recorded there as currently
+inactive.<Cite src="solana-docs-transactions" /> So a v0 transaction can *name* up to 256 addresses
+and still be rejected for locking too many.<Cite src="simd-0406" /><Cite src="solana-docs-transactions" />
+
+**Instructions executed: 64, counting CPIs.** The trace-length cap covers top-level instructions and
+every cross-program invocation beneath them.<Cite src="solana-docs-transactions" /> Batching your way
+around the account limit runs into this one. A related cap sits on signatures: at most 12 per
+packet.<Cite src="solana-docs-transactions" />
+
+One further limit is instructive because it is so loose. An instruction may declare up to 65,535
+account references while the message holds at most 256 keys, so anything past 256 is necessarily
+*aliasing* the same keys and forcing the validator to deduplicate references that cannot point
+anywhere new — which is what SIMD-0406 exists to close.<Cite src="simd-0406" /> Read it as the tax
+stated as an identity: an instruction cannot reference more distinct accounts than the message
+declares, however long its index list is.
+
+<Aside kind="note">
+Address lookup tables are the standard workaround for the address limit: a v0 transaction references
+addresses stored in an on-chain table rather than inlining 32 bytes each. They buy address *space*,
+not lock capacity, and they cost a round trip and an on-chain object to maintain. SIMD-0296 proposes
+raising the transaction size to 4,096 bytes on the strength of QUIC no longer requiring the
+conservative IPv6-MTU sizing, and it argues explicitly that a larger transaction "would also help
+remove the need for address lookup tables, which have been a source of complexity on the validator
+client as well as a frictional developer experience".<Cite src="simd-0296" /> The proposal's own front
+matter records its status as Review with the feature key unfilled, so read it as direction of travel
+and check activation yourself before designing around it.<Cite src="simd-0296" />
+</Aside>
+
+## Declaration is metered, not just constrained
+
+Here is the part that surprises people who assumed the account list was free bookkeeping. The leader's
+cost model charges for it, in compute units, before your program runs a single instruction.
+
+A transaction's *cost* — the figure the scheduler uses to decide whether you fit in the block — is the
+sum of five components: signature cost, write lock cost, instruction data cost, program execution
+cost, and loaded accounts data size cost.<Cite src="solana-docs-compute-budget" /> Three of those five
+are charges on your declaration:
+
+<Matrix
+  corner="Component"
+  cols={['Constant', 'What it prices']}
+  rows={[
+    { label: <code>SIGNATURE_COST</code>, cells: ['720 CU per signature', 'verifying who signed'] },
+    { label: <code>WRITE_LOCK_UNITS</code>, cells: [{ v: '300 CU per writable account', tone: 'warn' }, 'taking the write lock'] },
+    { label: <code>INSTRUCTION_DATA_BYTES_COST</code>, cells: ['4', 'the bytes of the message itself'] },
+  ]}
+  caption="Every one of these is a charge on the shape of your transaction, not on anything it computes."
+  alt="Three components of the leader's pre-execution cost model, all denominated in compute units: SIGNATURE_COST at 720 compute units per signature, pricing signature verification; WRITE_LOCK_UNITS at 300 compute units per writable account, pricing the write lock; and INSTRUCTION_DATA_BYTES_COST at 4, pricing the bytes of the message itself."
+/>
+
+<Cite src="solana-docs-compute-budget" />
+
+Add the fourth: every transaction defaults to declaring it may load the maximum account data, and the
+loaded-account-data charge is 8 CU per 32 KiB, which at the 64 MiB default works out to a flat
+**16,000 CU of overhead you did not ask for**.<Cite src="anza-compute-units" /> Anza's own worked
+example is blunt about the effect: a basic token transfer might need only about 6,000 execution CU,
+but leaving the data-size limit unset adds roughly 16,000 more, so the transaction's total cost jumps
+to about 22,000 CU — "diluting your effective priority fee per CU, potentially lowering your
+transaction's priority".<Cite src="anza-compute-units" />
+
+Read that as a design rule. **Nine writable accounts cost 2,700 CU of scheduling weight before
+anything executes**, at 300 CU each.<Cite src="solana-docs-compute-budget" /> A wide account list is
+not free even when every account is small and every lock is uncontended. It makes you heavier, and
+weight is the denominator of the priority the leader ranks you by — which is lesson four.
+
+The declaration is *also* something you are expected to bound explicitly. The maximum account data a
+transaction may load is 64 MiB — `MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES` is
+67,108,864 — and unless you include a `SetLoadedAccountsDataSizeLimit` instruction, that maximum is
+what the cost model assumes about you.<Cite src="solana-docs-compute-budget" /> Anza frames adopting
+that instruction as preparation rather than optimisation: developers who do not bound their account
+data usage should expect worsening prioritisation and rising rejection rates as block limits and
+throughput grow.<Cite src="anza-compute-units" />
+
+<Misconception
+  belief="Extra accounts in the transaction are harmless if the program does not write to them."
+  reality="Read-only accounts avoid the 300 CU write-lock charge and do not exclude other threads, but they still consume message bytes against the 1,232-byte limit, still count toward the account-lock cap, and still add to the loaded-account-data size that the cost model charges for."
+  why="On the EVM, unused calldata is merely wasted gas you paid for once. Here the account list is simultaneously a size budget, a lock budget, a data-loading budget and a scheduling-weight budget, and the four bind at different thresholds."
+  src="solana-docs-compute-budget"
+/>
+
+## Who pays it in practice
+
+Look at what the ecosystem's tooling actually spends its complexity on, and the tax explains most of
+it.
+
+**IDLs exist to describe the account list.** A program's interface is not "function name plus argument
+types" — it is that, plus which accounts each instruction expects, in which order, with which
+mutability, and how the derived ones are derived. Machine-readable, or every client hand-codes it.
+
+**Anchor's account-constraint system exists to check it**, stating once the relationships a program
+would otherwise verify by hand on every instruction, and emitting them into the IDL so clients can
+build valid account lists without reading the program.
+
+**Simulation is load-bearing.** A missing account fails the whole transaction, and the compute limit
+you request should come from a measurement. You met the general principle as
+[simulate then broadcast](/c/simulate-then-broadcast); here it is closer to mandatory.
+
+The through-line: **the EVM lets a program discover state and makes the runtime pay for it; Solana
+makes the client discover state and makes the developer pay for it.** The runtime's job gets small
+enough to parallelise. Yours gets an extra layer — address derivation, list construction, staleness
+handling — with no EVM analogue, because on Ethereum the machine does it inside a call frame you never
+had to think about.
+
+<Check type="explain" concept="declared-access-is-a-tax">
+You are porting an ERC-20-style airdrop claim. On Ethereum, `claim()` reads a Merkle root from
+storage, verifies a proof supplied in calldata, marks a bit in a claimed-bitmap, and transfers tokens
+from the contract's own balance.
+
+Which parts of that port are cheap, which are expensive, and what specifically forces a redesign?
+
+<Answer>
+**Cheap: the proof verification.** It is pure computation over calldata — instruction data on Solana —
+with no state access at all. It ports essentially unchanged, subject only to the compute budget.
+
+**Cheap: the Merkle root.** One account, read-only, address known in advance or derived from a fixed
+seed. Read-only means no 300 CU write-lock charge and no exclusion of other
+threads.<Cite src="solana-docs-compute-budget" />
+
+**Expensive, and the reason for the redesign: the claimed-bitmap.** A single account holding one bit
+per claimant is one writable key, so every claim in the airdrop write-locks the same
+account.<Cite src="solana-docs-transaction-structure" /> Under the scheduler that is not a failure —
+they all get placed on whichever worker holds the lock and run one after another — but it is total
+serialization of the entire airdrop, and it puts every claim under one per-account compute ceiling.
+
+**The redesign, and its cost.** Give each claimant a small PDA-backed marker account derived from a
+fixed seed plus their own key, created on first claim. Now every claim writes a *different* account
+and they schedule freely. What you pay for it:
+
+- **Rent.** Every marker is a real account with a [rent-exemption](/c/rent-exemption) deposit. A bitmap
+  is a few bytes per user; an account is a minimum-sized allocation per user, and somebody funds it.
+- **Client work.** The claimant's client must derive the marker address before signing, because the
+  program cannot derive-and-fetch it at runtime.
+- **A verification obligation.** The program must confirm the marker it was handed is the one derived
+  from *this* signer, not one the caller substituted. That check is now yours to write, and forgetting
+  it is a whole vulnerability class in this track's security module.
+
+**The transferable rule.** *Shared mutable state is the unit of contention, and on Solana the only way
+to remove contention is to stop sharing the state — which converts a storage-layout question into an
+account-creation question with real lamport costs and real client-side derivation work.* That is the
+tax, priced. It is also why the reflection prompt for this module asks you to find the one account
+every user must write: on Ethereum that account is invisible because it is a storage slot inside a
+contract, and here it is a key with a ceiling underneath it.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Next**, where the declaration is consumed. The account list is read by exactly one machine at a
+time — the current leader — and there is no gossiped pool where your transaction waits its turn. That
+changes what "pending" means and what your retry loop has to do.
+
+**Two lessons out**, the write-lock charge reappears as an economic quantity rather than a scheduling
+one: 300 CU per writable account is part of the cost that divides your reward when the leader ranks
+what to include.<Cite src="solana-docs-compute-budget" />
+
+**And carry the question, not the limits.** The numbers here — 1,232 bytes, 35 keys, 64 locks — are
+the current settlement of a moving argument; SIMD-0296 alone would change two of
+them.<Cite src="simd-0296" /> What survives every revision is the question you now ask of any Solana
+design before writing code: *can the client compute every address this instruction needs, before the
+user signs?* If the answer is no, the design does not work, and no amount of program-side cleverness
+will make it work.

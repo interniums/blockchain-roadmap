@@ -1,0 +1,335 @@
+---
+id: infra-event-pipelines-prove-data-arrives
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [ponder-observability, ponder-self-hosting, ponder-config-reference, ponder-isolated-indexing, postgres-srf, postgres-transactions, bilinear-indexing-events, envio-indexing-and-reorgs, envio-reorgs, execution-apis-block-tags, op-transaction-statuses, viem-get-block, quicknode-streams-reorgs]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The pipeline had been green for nine days. Uptime 100%, no restarts, no error logs, CPU flat, memory
+flat, and the health check — an HTTP endpoint that returned `{"ok": true}` when the process was
+running — passing every fifteen seconds from three regions.
+
+The last row in the events table was from nine days earlier. A WebSocket had dropped during a
+provider maintenance window, the reconnect had succeeded, and the resubscribe had attached to the
+stream from that moment forward without anyone asking what happened in the two minutes it was gone. Or
+rather, the reconnect had succeeded once, and then the subscription had gone quiet, and a quiet
+subscription and a chain with no matching events look identical from inside the process.
+
+**A running process is not evidence that data is arriving.** This lesson is the two invariants that
+make it evidence, where to run them, and then the second half of the problem: what any of this means
+when there are four chains and no shared clock.
+
+## Why the default health check cannot see this
+
+Every deployment platform hands you liveness as a default, and liveness answers exactly one question:
+is the process still there. The failures in an event pipeline that matter are all compatible with
+"yes":
+
+- A stalled cursor. Everything works; nothing advances.
+- A silently dropped block range. The chunk failed, the retry budget expired, the code logged a warning
+  nobody routes, and the cursor moved on.
+- A reconnect past a gap. The exact scene above.
+- A provider serving a stale view. Requests succeed, at a height that stopped moving.
+- A backfill that finished into an empty range because the contract address had a typo.
+
+None of these produce an exception. Every one of them produces `200 OK`. So the check has to assert
+something about the *data*, and there are two assertions worth making.
+
+## Invariant 1 — contiguity
+
+**Claim: there are no missing block numbers between the first and last block in the ingested range.**
+
+If you took the range table from the cursor lesson, this is a query rather than a service.
+PostgreSQL's `generate_series` produces a series of values from start to stop with a step defaulting to
+1<Cite src="postgres-srf" />, which is exactly the expected set to compare against:
+
+```sql
+-- every block in the ingested window that no completed range covers
+SELECT g.n AS missing_block
+FROM generate_series(
+       (SELECT min(start_block) FROM ingest_range WHERE chain_id = 1),
+       (SELECT max(end_block)   FROM ingest_range WHERE chain_id = 1)
+     ) AS g(n)
+WHERE NOT EXISTS (
+  SELECT 1 FROM ingest_range r
+  WHERE r.chain_id = 1 AND g.n BETWEEN r.start_block AND r.end_block
+);
+```
+
+**Subgoal: make the healthy result be zero rows, so the alert rule is trivial and cannot rot.** A check
+whose healthy output is a number you have to interpret becomes a graph nobody reads. A check whose
+healthy output is empty becomes an alert rule of the form "fire if this returns anything", and that
+rule survives staff changes.
+
+**Subgoal: bound the scan, because this query grows with your history.** Run it over a sliding window —
+the last few hundred thousand blocks — on a short schedule, and over the full range on a slow one. The
+full-range version is the one that catches a gap from six months ago that nobody has looked at since.
+
+**Subgoal: assert the same property on the transport, not only on the store.** The database-level query
+catches a gap after it has been written. The cheap in-process version catches it as it happens:
+Bilinear's write-up recommends constantly verifying that the next block is the previous one plus one,
+and notes that this alone catches a large class of bugs and guarantees you are not missing
+blocks.<Cite src="bilinear-indexing-events" /> Pair it with the hash check — a reorg is identified when
+a new block's parent hash does not match the hash of the previous block
+processed<Cite src="quicknode-streams-reorgs" /> — and one comparison covers both "I skipped" and "the
+chain moved".
+
+<Misconception
+  belief="If the indexer process is running and not logging errors, data is arriving."
+  reality="A stalled cursor, a silently dropped range and a subscription that reconnected past a gap all present as a healthy process with no errors. Contiguity and freshness have to be asserted explicitly, against the data."
+  why="Process liveness is the default health check every deployment platform hands you, and it is genuinely sufficient for a request-response service, which is what most engineers' instincts were formed on."
+  src="bilinear-indexing-events"
+/>
+
+## Invariant 2 — freshness
+
+**Claim: the cursor's distance behind the chain head is under a threshold I chose deliberately.**
+
+Two numbers, one subtraction:
+
+```ts
+// viem 2.x
+const head = await client.getBlockNumber();
+const lag  = head - (await readIngestCursor());
+```
+
+The frameworks expose the raw material. Ponder's `/status` endpoint returns, per chain, the chain id
+and the most recently indexed block's number and timestamp, or `null` if the backfill is not
+complete.<Cite src="ponder-observability" /> The same information is available through the GraphQL
+`_meta { status }` field, and the documented use is to confirm that a specific block number has been
+ingested before refetching a query client-side.<Cite src="ponder-observability" /> Separately,
+`/ready` returns 200 once indexing progress has reached realtime across all chains and 503 during the
+backfill, while `/health` returns 200 once the process starts.<Cite src="ponder-self-hosting" /> Those
+are two different questions and the naming makes the distinction available to your orchestrator: use
+`/health` for restarts and `/ready` for traffic.
+
+Prometheus metrics cover the numeric side — `ponder_realtime_latest_block_number` and
+`ponder_realtime_latest_block_timestamp` for the synced head, `ponder_realtime_is_connected` as a
+0-or-1 for the realtime sync service, `ponder_realtime_reorg_total` counting reorgs, and
+`ponder_indexing_completed_timestamp` for the timestamp through which all events have been
+completed.<Cite src="ponder-observability" />
+
+<Aside kind="warn">
+Read the caveat attached to that metrics table: metrics are not part of the public API, they are
+subject to change without notice, and the documentation says not to rely on them for anything
+important yet.<Cite src="ponder-observability" /> That is a reason to alert on `/status` and your own
+data, and to treat the metrics as diagnostics rather than as the contract. It is also a good habit
+generally — the numbers you page on should come from something with a stability promise.
+</Aside>
+
+### Choosing the threshold, which nobody can choose for you
+
+The threshold is not a constant you can copy, because "acceptable lag" is a product statement. Three
+inputs:
+
+**Block time.** A lag of 50 blocks is ten minutes on Ethereum and under two minutes on a fast L2. Any
+threshold expressed in blocks is chain-specific by construction; a threshold expressed in *seconds*
+transfers better, and the block timestamp Ponder reports alongside the block
+number<Cite src="ponder-observability" /> is what makes that expressible.
+
+**What the lag breaks.** If your interface renders from the tip, a two-minute lag is user-visible. If
+everything irreversible reads the finalized tier, a two-minute lag is invisible until it approaches
+the finality distance.
+
+**Your normal.** Measure the distribution for a week before picking a number. A threshold set above
+every value you have ever observed never fires; one set at the median fires nightly and gets muted.
+
+There is a fourth signal worth graphing alongside it, and it is the one that catches a whole different
+class of problem: **`latest` minus `finalized`**.<Cite src="execution-apis-block-tags" /><Cite src="viem-get-block" />
+That gap is normally stable. When it grows, finality is not arriving, and every finality-gated action
+in your product is about to stall — which is correct behaviour and still something a human should know
+about before the support queue does.
+
+### The check that looks tempting and is not one
+
+Somebody always proposes "alert if today's row count drops more than X% below yesterday's". It is
+appealing because it needs no new plumbing, and it is a bad primary check for one reason: **it has no
+healthy state you can state in advance.** On-chain activity is genuinely spiky, so the threshold is
+either loose enough to miss a half-day stall or tight enough to fire on a quiet Sunday, and a check
+that fires on quiet Sundays gets muted within a month.
+
+Contiguity and freshness are different in kind. Both have a healthy value that is known before you
+observe anything — zero missing blocks, lag under a chosen number of seconds — so neither depends on
+what the chain happened to do. Keep the volume comparison if you like it, on a low-severity channel,
+as a signal that something upstream changed: a contract redeployed, an event signature moved, a filter
+stopped matching. That is real information. It is just not the thing that pages someone.
+
+<Compare
+  columns={[
+    { title: 'Contiguity' },
+    { title: 'Freshness' },
+    { title: 'Volume drop', tone: 'warn' },
+  ]}
+  rows={[
+    { label: 'What does it assert?', cells: ['No missing block numbers in the ingested range', 'The cursor is within a chosen distance of the head', "Today's row count is close to yesterday's"] },
+    { label: 'Is the healthy value known before you look?', cells: [{ v: 'Yes — zero rows', tone: 'good' }, { v: 'Yes — under the chosen threshold', tone: 'good' }, { v: 'No', tone: 'danger' }] },
+    { label: 'What does the answer depend on?', cells: ['Your own range table', 'Your own cursor and the head', { v: 'Whatever the chain happened to do', tone: 'warn' }] },
+    { label: 'Where does it belong?', cells: ['It pages', 'It pages', 'A low-severity channel'] },
+  ]}
+  caption="Tier a check by whether its healthy answer is knowable in advance; the volume comparison never gets there."
+  alt="Contiguity, freshness and a volume-drop comparison held against what each asserts, whether the healthy value is known before observing anything, what the answer depends on, and which channel each belongs on."
+/>
+
+### Run the checks from outside the process
+
+**A check that dies with the thing it is checking is not a check.** The nine-day outage above was
+invisible partly because the health endpoint was served by the same process that had stopped ingesting.
+Both invariants should run from a separate scheduled job — a cron, a monitoring service, a small worker
+with its own deployment — that connects to the database and to an RPC endpoint independently.
+
+The corollary is that the checking job needs its own dead-man's switch. A cron that stopped running is
+also silent. Have it emit a heartbeat on every successful run and alert on the absence of the
+heartbeat, which is the one alert in the system that fires on *nothing happening*.
+
+## The second half: several chains, no shared clock
+
+Every number above was per chain, and that was not an accident of phrasing.
+
+Two chains have no shared clock and no shared ordering. Their heads advance independently, their
+finality boundaries arrive at different rates — L1's checkpoint mechanism versus an L2's ladder from
+sequencer-confirmed through safe to finalized, which OP Mainnet documents as typically 15 to 30 minutes
+and up to 12 hours<Cite src="op-transaction-statuses" /> — and one can reorg while the other does not.
+
+So a read model that merges events from several chains into one timeline has to make a choice, and the
+failure of not choosing is a table that looks unified, orders rows by a timestamp nobody guarantees,
+and is subtly wrong in exactly the moments the two chains disagree.
+
+### The choice, surfaced as configuration
+
+Ponder makes it a setting with a documented guarantee table. The `ordering` option takes
+`"omnichain"`, `"multichain"` or `"experimental_isolated"`, and the default is
+`"multichain"`.<Cite src="ponder-config-reference" />
+
+<Matrix
+  cols={['Omnichain', 'Multichain (default)', 'Isolated (experimental)']}
+  rows={[
+    { label: 'Order within one chain', cells: ['Deterministic, by EVM execution', 'Deterministic, by EVM execution', 'Deterministic, by EVM execution'] },
+    { label: 'Order across chains', cells: [{ v: 'Deterministic, by block timestamp, chain ID, block number', tone: 'good' }, { v: 'Non-deterministic, no guarantee', tone: 'warn' }, { v: 'Non-deterministic, no guarantee', tone: 'warn' }] },
+    { label: 'Live latency', cells: [{ v: 'Medium-high; must wait for the slowest chain', tone: 'warn' }, 'Low; each chain indexes as blocks arrive', 'Low; each chain processed independently'] },
+    { label: 'Constraint on your logic', cells: [{ v: 'None', tone: 'good' }, { v: 'Avoid cross-chain writes, or use commutative logic', tone: 'warn' }, { v: 'Cross-chain reads and writes are not possible', tone: 'warn' }] },
+    { label: 'Intended for', cells: ['Bridges, cross-chain calls, global constraints', 'Same protocol on several chains', 'Same protocol on several chains'] },
+  ]}
+  caption="Every mode says the same thing about one chain; the setting only decides what happens between them."
+  alt="Ponder's three ordering modes compared on order within one chain, order across chains, live latency, the constraint each places on your logic, and what each is intended for."
+/>
+
+That table is the whole concept in one place.<Cite src="ponder-config-reference" /> Three observations
+that are easy to miss reading it quickly.
+
+**The default is the non-deterministic one.** A team that never opened this page is running with no
+cross-chain ordering guarantee and a documented requirement to avoid cross-chain writes or use
+commutative logic — a requirement nobody told them about.<Cite src="ponder-config-reference" />
+
+**Determinism across chains costs latency, and the mechanism is explicit.** Omnichain must wait for the
+slowest chain to maintain its guarantee.<Cite src="ponder-config-reference" /> If one of your chains
+has a slow or flaky provider, that provider now sets the latency of your whole read model. This is a
+real operational coupling, not a theoretical one.
+
+**Isolated makes the constraint structural.** Every table must carry `chainId` in its composite primary
+key or the build fails, and under the hood that lets Ponder use partitioned tables with one partition
+per chain, avoiding contention between concurrent writers.<Cite src="ponder-isolated-indexing" /> It is
+marked experimental and currently uses a maximum of four
+threads.<Cite src="ponder-isolated-indexing" /><Cite src="ponder-config-reference" />
+
+### Why a merged reorg is worse than two reorgs
+
+Envio's write-up names the compounding problem directly: with several chains updating the same entity
+state, a reorg on one chain requires rolling back to a known correct point and reprocessing events from
+*all* chains that affected that state afterwards.<Cite src="envio-indexing-and-reorgs" /> A cross-chain
+aggregate is stateful data with more than one mutable input, so the rollback is not local to the chain
+that moved.
+
+Combine that with the fact that reorg exposure is chain-specific — the same piece contrasts OP Stack
+chains as largely reorg-resistant against Polygon experiencing deeper
+ones<Cite src="envio-indexing-and-reorgs" /> — and the practical rule follows: **a unified aggregate
+inherits the worst reorg behaviour of every chain feeding it**, and per-chain reorg windows must be
+configured per chain, which is why Envio exposes `max_reorg_depth` that way rather than
+globally.<Cite src="envio-reorgs" />
+
+<Check type="explain" concept="gap-detection-monitoring">
+You run one pipeline over four chains: Ethereum, Base, Arbitrum and Polygon. Your monitoring is a single
+alert: "page if the indexer's lag exceeds 100 blocks." It has never fired. Your dashboard shows one
+number, the average lag across all four chains.
+
+Name three distinct failures this setup cannot see, and describe what you would replace it with.
+
+<Answer>
+**Failure 1 — one chain stalled completely, hidden by the average.** Three chains at lag 2 and one at
+lag 400 averages to about 100. Averaging across chains destroys the signal you are monitoring for,
+because the thing you care about is a maximum, not a mean. Worse, the stalled chain is likely the one
+with the slow provider, so it will also be the one contributing least to any volume-based sanity check.
+
+**Failure 2 — 100 blocks means four different durations.** At the twelve-second slot time you know
+from [epoch and finality timing](/c/epoch-and-finality-timing), 100 Ethereum blocks is around twenty
+minutes; on an L2 whose sequencer confirms in 2 to 4 seconds<Cite src="op-transaction-statuses" /> the
+same count is a few minutes. One threshold
+across four chains is simultaneously far too loose on one and far too tight on another, which is how a
+threshold ends up muted. Express the threshold in seconds and derive it from the block timestamp the
+status endpoint already reports.<Cite src="ponder-observability" />
+
+**Failure 3 — a gap behind the cursor, at any lag.** Lag measures the distance from the head to the
+cursor. It says nothing about whether the range below the cursor is complete. A reconnect that skipped
+two minutes leaves the lag at zero and a hole in the history. Only the contiguity query
+sees this<Cite src="postgres-srf" />, and it is the failure that produced the nine-day outage at the
+top of this lesson.
+
+**What to replace it with — five checks, all per chain.**
+
+1. **Contiguity, per chain, healthy result zero rows.** Sliding window frequently, full range daily.
+2. **Freshness in seconds, per chain, with a per-chain threshold** derived from a week of observed
+   distribution rather than chosen. `/status` gives the indexed block number and timestamp for each
+   chain, or `null` while the backfill is incomplete<Cite src="ponder-observability" /> — and `null`
+   must be handled as its own state, not coerced.
+3. **Finality distance, per chain:** `latest` minus
+   `finalized`.<Cite src="execution-apis-block-tags" /><Cite src="viem-get-block" /> On the L2s, know
+   that the ladder has an upper bound measured in hours, not
+   minutes.<Cite src="op-transaction-statuses" />
+4. **Reorg rate, per chain.** Ponder counts them in
+   `ponder_realtime_reorg_total`<Cite src="ponder-observability" />; a step change is worth knowing
+   about even though individual reorgs are routine, and it is chain-specific by
+   nature.<Cite src="envio-indexing-and-reorgs" />
+5. **A heartbeat from the checking job itself**, alerting on absence.
+
+**And one configuration question the alert redesign should force you to answer.** Four chains in one
+pipeline means an ordering mode is in effect, and if nobody chose it, it is `"multichain"` —
+non-deterministic across chains, with a documented requirement that your logic avoid cross-chain writes
+or be commutative.<Cite src="ponder-config-reference" /> Before tuning alerts, check whether any table
+in your schema is written from more than one chain's handler. If one is, the monitoring gap is the
+smaller of your two problems.
+
+**The rule underneath all five.** Every one of these checks is silent on a healthy pipeline and loud
+on an unhealthy one, and every one of them asserts something about data rather than about a process.
+That is the property that distinguishes a check from a dashboard.
+</Answer>
+</Check>
+
+## What this unlocks, and what the module was for
+
+The module is finished, so it is worth saying plainly what the eight lessons add up to.
+
+**A pipeline is correct by construction when four small things are true.** The natural key identifies
+an event by its position. The write is idempotent on that key. The cursor commits in the same
+transaction as the rows it describes.<Cite src="postgres-transactions" /> And every consumer declares
+which tier it reads — optimistic from the tip, or finalized from a boundary the chain
+publishes.<Cite src="execution-apis-block-tags" />
+
+Given those four, a reorg is an ordinary event. The indexer rolls back, the raw rows are corrected,
+the finalized tier never contained the wrong data in the first place, and no email went out. Without
+them, the same reorg is an incident, and the incident is always discovered by a user rather than by
+you.
+
+**What the core tracks were for.** You needed logs and bloom filters to know what an event is. You
+needed transaction structure to know why a hash is not an identity. You needed finality to know that
+the boundary exists and where. You needed the EVM's execution order to know that the key is a position.
+None of this module is new cryptography or new protocol — it is the product-engineering consequence of
+things you already knew, and that is precisely why it is where the losses are.
+
+**What to do next.** The module's two practices are the honest test: kill an ingester repeatedly during
+a backfill and diff the result against an uninterrupted run, and build the finality gate so a
+notification job provably cannot fire for an event that was later reorged out. Then run this module's
+reflection prompt against your own product, because the list of irreversible things it produces is
+usually longer than anyone expects, and every item on it is currently firing from some rung of the
+chain — chosen or not.

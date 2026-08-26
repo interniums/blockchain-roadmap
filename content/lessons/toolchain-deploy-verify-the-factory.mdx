@@ -1,0 +1,311 @@
+---
+id: toolchain-deploy-verify-the-factory
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources: [erc-7955, create2-deployer-proxy-repo, foundry-create2-guide, foundry-cast-create2, foundry-config-overview, eip-155, eip-1014, eip-7702, layerzero-uniform-address]
+stack: { foundry: "1.7.1", solidity: "0.8.36" }
+---
+
+`new Token{salt: SALT}()` compiles. It works on your local Anvil. It works on Sepolia, on Base, on
+Arbitrum, on every chain you have ever used. Then a partner asks for a deployment on their app-chain,
+and the same line produces nothing at all — or produces something at an address that does not match
+the one you published for every other chain.
+
+Nothing about your contract changed. What changed is that a specific contract, which you have never
+mentioned in your code, is not there.
+
+## The bootstrapping problem, stated plainly
+
+The previous lesson left the derivation with four inputs, one of which is the **deployer**. For an
+address to be identical across chains, that deployer must be identical across chains — the same
+address on every one of them.
+
+ERC-7955 states the resulting circularity better than a paraphrase can: getting the same address and
+code on multiple chains "is typically done by having a known CREATE2 factory contract at a specific
+address"; but then, "how do you get a CREATE2 factory contract with a specific address and
+code?"<Cite src="erc-7955" />
+
+You cannot use CREATE2 to deploy the CREATE2 factory. And you cannot use a plain CREATE from an
+account you control, because a
+[CREATE address depends on that account's nonce](/c/create-address-from-nonce), which diverges the
+moment the account does anything on one chain and not another.
+
+Every answer in production today is a way out of that circle. There are four, and each trades
+something different away.
+
+## Answer one: the address nobody controls
+
+The deterministic deployment proxy lives at
+`0x4e59b44847b379578588920cA78FbF26c0B4956C`.<Cite src="foundry-create2-guide" /><Cite src="erc-7955" />
+Foundry routes salted creation syntax through it by default, which is why `new Token{salt: SALT}()`
+has always worked for you.<Cite src="foundry-create2-guide" />
+
+Its interface is as small as an interface gets. Send it a transaction whose "data should be the 32
+byte 'salt' followed by your init code", and it deploys.<Cite src="create2-deployer-proxy-repo" />
+
+### How it got to the same address everywhere
+
+This is Nick's method, and it is worth walking through byte by byte, because the mechanism explains
+both why it works and exactly where it fails.
+
+**Subgoal 1 — construct a signature that could not have come from any key.** The deployment
+transaction ends with `r` and `s` both set to
+`0x2222222222222222222222222222222222222222222222222222222222222222`, and `v` set to
+`0x1b`.<Cite src="create2-deployer-proxy-repo" /> Nobody chose those values by signing; they were
+typed.
+
+**Subgoal 2 — let ECDSA recovery invent the sender.** A signature does not have to have been produced
+by a key for `ecrecover` to return an address from it. The recovered sender is
+`0x3fab184622dc19b6109349b94811493bf2a45362`.<Cite src="create2-deployer-proxy-repo" /> That account
+exists in the sense that anyone can send it ether; it does not exist in the sense that anyone can
+spend from it. The README's phrasing for this is "a one-time-use-account", and the consequence it
+draws is the whole trick: "no matter what chain the deployer is on, its address will always be the
+same".<Cite src="create2-deployer-proxy-repo" />
+
+**Subgoal 3 — accept that the gas parameters are now frozen.** Because there is no private key, the
+transaction can never be re-signed. Whatever gas price and gas limit were in the signed payload are
+in it forever: a gas price of 100 gwei and a gas limit of
+100,000.<Cite src="create2-deployer-proxy-repo" /> The README notes the actual gas used is 68,131 and
+that the excess was deliberate — "to avoid having to move the proxy to a different address, we opted
+to give excess gas".<Cite src="create2-deployer-proxy-repo" />
+
+**Subgoal 4 — replay it anywhere.** Fund `0x3fab1846…` with enough ether to cover 100,000 gas at 100
+gwei, submit the raw transaction, and the proxy lands. The sender is fixed and its nonce is zero, so
+the CREATE address is the same on every chain that accepts the transaction.
+
+<Figure
+  caption="Every property that makes this work, and the one that makes it fail on a new chain, comes from the same missing private key."
+  alt="Nick's method in four steps: r and s are typed as 0x2222 repeated with v of 0x1b, ECDSA recovery invents the sender 0x3fab1846 for which no key exists, the gas price of 100 gwei and gas limit of 100,000 can never be re-signed, and the proxy lands at 0x4e59b448 as a CREATE from nonce 0."
+>
+  <Flow
+    nodes={[
+      { id: 'sig', label: 'a typed signature', note: 'r = s = 0x2222…, v = 0x1b', col: 0, tone: 'accent' },
+      { id: 'rec', label: 'ecrecover invents a sender', note: '0x3fab1846…, no key exists', col: 1 },
+      { id: 'gas', label: 'gas frozen forever', note: '100 gwei, 100,000 gas', col: 2, tone: 'warn' },
+      { id: 'proxy', label: 'proxy at 0x4e59b448…', note: 'CREATE from nonce 0', col: 3 },
+    ]}
+  />
+</Figure>
+
+The README summarises the payoff exactly: between CREATE2 and the one-time-use account, "a given
+contract will exist at the *exact* same address on every chain, but without having to use the same gas
+pricing or limits every time".<Cite src="create2-deployer-proxy-repo" /> Your contract's deployment is
+flexible; only the proxy's own deployment is frozen.
+
+### Where it fails, and it is not "rarely"
+
+ERC-7955 lists the downsides of Nick's method as three bullets, and each one is a class of chain, not
+an edge case:<Cite src="erc-7955" />
+
+- **It "does not work on chains that only accept EIP-155 replay-protected transactions."** The signed
+  payload has no chain id. EIP-155 defines the replay-protected form as hashing nine RLP elements
+  including the chain id, with `v` set from the chain id; the six-element form with `v` of 27 or 28 is
+  the legacy one.<Cite src="eip-155" /> A chain that mandates the former rejects this transaction
+  outright — and rejecting unprotected transactions is a perfectly reasonable policy for a new chain
+  to adopt.
+- **It "is sensitive to changes in gas parameters on the target chain since the gas price and limit in
+  the deployment transaction is sealed, and a new one cannot be signed."**<Cite src="erc-7955" /> A
+  chain whose base fee sits above 100 gwei cannot include a 100-gwei legacy transaction at all.
+- **"Reverts, such as those caused by alternative gas schedules, make the CREATE2 factory no longer
+  deployable."**<Cite src="erc-7955" /> This is the sharpest one. The nonce is consumed by the failed
+  attempt. There is no second attempt, because there is no key to sign one with. A chain that reprices
+  an opcode such that 100,000 gas is no longer enough has permanently lost the ability to host the
+  proxy at that address.
+
+<Misconception
+  belief="The 0x4e59 factory exists on every chain."
+  reality="It cannot be deployed by Nick's method on chains that require EIP-155 replay protection or that use a different gas schedule, and a single failed attempt on such a chain makes it permanently undeployable there. Foundry's own guide says the default proxy may not be available on all chains."
+  why="It is present on every chain most developers have ever used, so its absence never comes up until a new chain does."
+  src="erc-7955"
+/>
+
+### Checking, and overriding
+
+Foundry's guide gives the one-line check, and the answer to read:<Cite src="foundry-create2-guide" />
+
+```bash
+cast code 0x4e59b44847b379578588920ca78fbf26c0b4956c --rpc-url $RPC_URL
+```
+
+`0x` means it is not there. Run this against every chain in a launch *before* you compute a single
+address, not after.
+
+When it is missing, `create2_deployer` in `foundry.toml`, or `--create2-deployer` on the command line,
+points salted creation at a different factory.<Cite src="foundry-create2-guide" /><Cite src="foundry-config-overview" />
+`cast create2` takes the same input as `--deployer`, defaulting to the 0x4e59 address when you omit
+it.<Cite src="foundry-cast-create2" />
+
+Two operational consequences follow, and both are things to write down rather than remember:
+
+**The factory is part of the address.** It is the `deployer` term in
+`keccak256(0xff ++ deployer ++ salt ++ keccak256(init_code))[12:]`.<Cite src="eip-1014" /> Change
+factories on one chain and that chain gets a different address, for the same reason a changed
+constructor argument does.
+
+**Record which factory you used, per chain.** Six months later, "why is Base different" has exactly
+one cheap answer, and it is a line in a file.
+
+## Answers two and three: a secret key, and preinstalls
+
+ERC-7955 names both alternatives and both of their prices.<Cite src="erc-7955" />
+
+**A guarded secret key.** Hold a private key, sign a deployment on each new chain at whatever nonce is
+canonical, and the factory lands at the same address everywhere. This is what the Safe Singleton
+Factory at `0x914d7Fec6aaC8cd542e72Bca78B30650d45643d7` and CreateX at
+`0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed` do.<Cite src="erc-7955" /> It fixes the gas problem
+completely — a key can sign a fresh transaction with today's parameters. It introduces a governance
+problem instead: it "is permissioned: the party that holds the secret key has the ultimate say on
+which chains will get the CREATE2 factory deployments", the key must be guarded, and "if the
+transaction at the given nonce is not a successful CREATE2 factory deployment, then it is no longer
+possible to have a CREATE2 factory at the canonical address" — by human error, for
+example.<Cite src="erc-7955" />
+
+**Preinstalls.** Chains ship the factories in their genesis state; OP Stack and ZKsync both do
+this.<Cite src="erc-7955" /> The price is that it "is not standardized nor adopted by all chains" and
+remains permissioned in a different direction, since a chain can decline. The EIP notes that attempts
+to standardise it through RIP-7740 "have not been successful".<Cite src="erc-7955" />
+
+Look at the shape of the three answers together. Nick's method removes the key and loses flexibility.
+The secret key restores flexibility and reintroduces a trusted party. Preinstalls move the decision to
+the chain operator. Each one moves the trust rather than eliminating it.
+
+## Answer four: publish the key
+
+ERC-7955's proposal is the inversion that makes the pattern click. If the problem with a secret key is
+that someone holds it, do not make the key secret.
+
+The EIP publishes it. `DEPLOYER_PRIVATE_KEY` is
+`0x942ba639ec667bdded6d727ad2e483648a34b584f916e6b826fdb7b512633731`, printed in the specification,
+deriving `DEPLOYER_ADDRESS` `0x962560A0333190D57009A0aAAB7Bfa088f58461C`.<Cite src="erc-7955" />
+
+A published key alone would be useless — anyone could sign anything from that account, and the nonce
+would be unpredictable. The mechanism that makes it work is
+[EIP-7702 delegation](/c/delegation-designator).<Cite src="eip-7702" /> The deployment process is
+three steps:<Cite src="erc-7955" />
+
+1. Deploy a **bootstrap contract** whose code performs one `CREATE2` of a fixed
+   `CREATE2_FACTORY_INIT_CODE` with a fixed `CREATE2_FACTORY_SALT` of
+   `0x000000000000000000000000000000000000000000000000000000000001bec5`.
+2. Sign an EIP-7702 authorization with the published key, delegating `DEPLOYER_ADDRESS` to that
+   bootstrap contract.
+3. Send a type `0x4` transaction carrying that authorization, calling `DEPLOYER_ADDRESS`.
+
+The result is the factory at `0xC0DEb853af168215879d284cc8B4d0A645fA9b0E` with code hash
+`0x2ad75e1e9642e6fce7d293d52fa5a8f62a79a2079abb7402256add02d6e8bc30`.<Cite src="erc-7955" />
+
+Now walk the three failures of Nick's method against this design:
+
+- **Replay protection.** A type `0x4` transaction is a modern, chain-id-carrying transaction. Any
+  chain that accepts EIP-7702 accepts it.
+- **Frozen gas.** The authorization is signed fresh, by anyone, at any time, with today's gas
+  parameters. The EIP's own summary of the benefit is that the method "is secure against 'out of gas'
+  and other errors".<Cite src="erc-7955" />
+- **Permanent failure.** Because the final step is `CREATE2`, "no transaction executed by
+  `DEPLOYER_ADDRESS` can permanently block the deployment of the CREATE2 factory contract to
+  `CREATE2_FACTORY_ADDRESS`".<Cite src="erc-7955" /> A failed attempt costs gas and nothing else.
+
+<Matrix
+  corner="Route to a factory at one address"
+  cols={['How the address is fixed', 'What it costs', 'Where it fails']}
+  rows={[
+    { label: "Nick's method — 0x4e59b448…", cells: ['a one-time-use account, recovered from a typed signature, deploying at nonce 0', 'nothing to guard, and nothing to re-sign', { v: 'chains that require EIP-155 replay protection, or price the gas schedule differently — and one failed attempt is permanent', tone: 'danger' }] },
+    { label: 'A guarded secret key — Safe Singleton, CreateX', cells: ['a held key, signing at a canonical nonce', 'permissioned: the key holder decides which chains get it', 'a transaction at that nonce that is not a successful factory deployment ends it'] },
+    { label: 'Preinstalls — OP Stack, ZKsync', cells: ['the chain ships the factory in its genesis state', 'the chain operator decides', 'not standardised and not adopted by all chains'] },
+    { label: 'ERC-7955 — 0xC0DEb853…', cells: ['a published key, delegated by EIP-7702 to a bootstrap contract that CREATE2s the factory', 'anyone can grief a pending attempt by advancing the nonce', { v: 'Draft: parameters can still change', tone: 'warn' }] },
+  ]}
+  caption="Every route moves the trust somewhere else — into a frozen transaction, a key holder, a chain operator, or whoever will pay to delay you."
+  alt="Four routes to a CREATE2 factory at a canonical address: Nick's method, a guarded secret key as used by the Safe Singleton Factory and CreateX, chain preinstalls on OP Stack and ZKsync, and the ERC-7955 published-key bootstrap, compared on how the address is fixed, what each costs, and where each fails."
+/>
+
+### The honest status, and the honest caveats
+
+**It is Draft.**<Cite src="erc-7955" /> As of August 2026 the `0x4e59` proxy is what your tooling
+actually uses and what exists on the chains you actually deploy to. Treat ERC-7955 as a precise
+description of a real problem and a credible proposed fix — not as current practice, and not as a set
+of addresses to hardcode, since draft parameters can change.
+
+The EIP is candid about two residual issues, and both are worth knowing because they are properties of
+the design rather than bugs in it:<Cite src="erc-7955" />
+
+**Anyone can grief the deployment.** Because the key is public, anyone can sign an alternative
+delegation and front-run a legitimate attempt, advancing the deployer's nonce and invalidating the
+pending authorization. The EIP argues this is bounded: the attacker "can only delay the deployment of
+the CREATE2 factory with a sustained attack at a gas cost to the attacker, but not permanently prevent
+it", and suggests private transactions or working directly with block builders as the
+circumvention.<Cite src="erc-7955" />
+
+**A future upgrade could close the door.** If some later mechanism permanently sets an account's code,
+the publicly-known key means `DEPLOYER_ADDRESS` could be set to code that does not bootstrap,
+permanently preventing future deployments.<Cite src="erc-7955" /> The EIP's answer is adoption: once
+mainnet has the factory, the key has no value there.
+
+<Aside kind="note">
+Notice what ERC-7955 tells you about the whole subject. Cross-chain address determinism is not a
+property of `CREATE2`. It is a property of *deployment infrastructure*, which is social, per-chain, and
+still being argued about in 2026. A vendor page that says "deterministic addresses on every chain"
+means "on every chain where somebody already did this work".<Cite src="layerzero-uniform-address" />
+</Aside>
+
+<Check type="explain" concept="nicks-method">
+A partner chain is launching. Their team says: "we're EIP-155-only, all transactions must carry a
+chain id — it's a security requirement." They ask what that means for your deployment, which currently
+promises one address across seven chains via the `0x4e59` factory.
+
+Explain the consequence, and lay out your options in the order you would try them.
+
+<Answer>
+**The consequence: the `0x4e59` proxy cannot be deployed there by its normal route.** Its deployment
+transaction is a legacy, pre-EIP-155 transaction with no chain id and `v` of
+`0x1b`.<Cite src="create2-deployer-proxy-repo" /><Cite src="eip-155" /> A chain that rejects
+unprotected transactions rejects it, and there is no key to re-sign it with. ERC-7955 lists this as
+the first downside of Nick's method.<Cite src="erc-7955" />
+
+Their policy is defensible, by the way. It is not a misconfiguration to argue them out of.
+
+**Option 1 — confirm the fact before designing around it.** `cast code 0x4e59… --rpc-url` against
+their endpoint. `0x` confirms it.<Cite src="foundry-create2-guide" /> They may already have
+preinstalled a factory, in which case this conversation is over — many stacks do exactly
+that.<Cite src="erc-7955" />
+
+**Option 2 — ask which factory they do have.** If they preinstalled the Safe Singleton Factory
+(`0x914d7Fec…`) or CreateX (`0xba5Ed099…`), point Foundry at it with `create2_deployer` in
+`foundry.toml` or `--create2-deployer`.<Cite src="erc-7955" /><Cite src="foundry-create2-guide" /> Be
+explicit about what this costs: the deployer is part of the address
+derivation,<Cite src="eip-1014" /> so this chain gets a different address from the other seven. That is
+a product decision, not a technical one — decide whether the uniform address or the launch date
+matters more.
+
+**Option 3 — deploy your own factory there.** Any contract that does `CREATE2` on supplied
+salt-plus-initcode works. It will be at an address unique to that chain, which again breaks
+uniformity, but it puts you in control.
+
+**Option 4 — change the derivation rather than the factory.** CREATE3 makes the final address depend
+on deployer and salt only — but the CREATE3 deployer contract still has to be at a matching address on
+every chain, so this relocates the problem rather than solving it. It helps only if you already have
+that deployer everywhere.
+
+**Option 5 — stop promising one address.** Publish a per-chain address table. This is the option
+nobody proposes in the meeting and it is frequently correct: seven chains at one address plus one
+outlier is a footnote, whereas delaying a launch to preserve a cosmetic property is a real cost.
+
+**What to write down either way.** Which factory was used on which chain, in the deployment record,
+next to the salt. The address is a function of both, and six months from now nobody will remember
+which chain was the exception.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Immediately next:** you now have an address and a story about how it got there. The final lesson
+asks the other question a user asks — what code is actually at it, on this chain, and what does a
+green "verified" badge certify about that.
+
+**In multi-chain launches:** the factory check belongs in the pre-flight list, alongside the RPC alias
+and the signer. Three lines of `cast code` before you compute anything is the cheapest step in the
+runbook.
+
+**In reading other people's deployments:** when you see a protocol at the same address on a dozen
+chains and a different one on the thirteenth, you now know the shape of the answer without asking. One
+of the four inputs moved, and the factory is the input people forget is an input.

@@ -1,0 +1,337 @@
+---
+id: fundamentals-encoding-a-call-becomes-bytes
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [solidity-abi-spec, solidity-abi-encoding-functions, nist-fips-202, fourbyte-directory, eip-165, oz-proxies-function-clashes]
+stack: { foundry: "1.7.1" }
+---
+
+A contract on chain is a blob of bytecode. It has no method table, no name lookup, no reflection. The
+only thing a caller can hand it is one flat byte string.
+
+So: how does `transfer(recipient, amount)` survive that trip? The answer is the contract ABI, and it
+is worth learning as a decoder rather than as a library call — because you will read raw calldata in
+a block explorer, in a trace, and in a signature you are being asked to approve, long before you
+write an encoder.
+
+## The shape of the byte string
+
+Calldata is four bytes of **selector** followed by the **argument block**.<Cite src="solidity-abi-spec" />
+That is the whole top-level structure. Everything else is how the argument block is laid out.
+
+Before any of the layout, note what the specification says about itself in its opening paragraph:
+the encoding **is not self-describing and requires a schema in order to
+decode**.<Cite src="solidity-abi-spec" /> Hold that sentence. Every one of the three encodings in
+this module says a version of it, and the differences between them are almost entirely differences
+in *how much* schema you have to bring.
+
+The selector is the first four bytes of the keccak-256 hash of the function's canonical
+signature.<Cite src="solidity-abi-spec" /> Canonical means: the function name, an open parenthesis,
+the parameter types separated by single commas with no spaces, a close parenthesis. No parameter
+names. No data location. No return type — Solidity's overload resolution deliberately ignores return
+types, so that call resolution stays context-independent, and two functions differing only in what
+they return are the same function as far as the wire is concerned.<Cite src="solidity-abi-spec" />
+
+"Canonical type spelling" has teeth. `uint` and `int` are synonyms in the language but not in the
+signature: `uint256` and `int256` must be used when computing the selector. `address` is used as
+itself even though it is a `uint160` everywhere else, and `bool` is used as itself even though it is
+a restricted `uint8`.<Cite src="solidity-abi-spec" /> The spelling rules are arbitrary in the way
+all conventions are, and they are load-bearing in the way all hash inputs are.
+
+These three strings are near-identical to a human and produce three unrelated digests:
+
+```text
+keccak256("transfer(address,uint256)")   a9059cbb2ab09eb219583f4a59a5d0623ade346d962bcd4e46b11da047c9049b
+keccak256("transfer(address, uint256)")  9d61d234b1c0bf86e47632c9591e43cd7ab4fcd7c71a7c5f820aa10f800c88c4
+keccak256("transfer(address,uint)")      6cb927d8770b2b9c4fe615474f966e28a580a7dd1fffeaa06990257cebfe1e7b
+```
+
+One space, and it is a different function. `uint` instead of `uint256`, and it is a different
+function. The selector everyone knows for ERC-20 transfer, `0xa9059cbb`, is the first four bytes of
+line one and only line one.
+
+<Aside kind="note">
+There is a compiler-level defence against getting that string wrong, and it is under-used.
+`abi.encodeWithSignature("transfer(address,uint)", ...)` compiles happily and produces the wrong
+selector, because the signature is just a string. `abi.encodeCall(IERC20.transfer, (to, amount))`
+takes a *function pointer* and performs a full type-check, ensuring the arguments match the
+signature; its result equals `abi.encodeWithSelector(functionPointer.selector, ...)`.<Cite src="solidity-abi-encoding-functions" />
+Same bytes, and one of the two spellings cannot be typo'd.
+</Aside>
+
+## Head and tail
+
+Inside the argument block, each argument is either **static** or **dynamic**, and the specification
+defines the split by recursion rather than by a list you memorise.<Cite src="solidity-abi-spec" />
+
+Dynamic means: `bytes`, `string`, `T[]` for any `T` — and then two rules that catch people out.
+`T[k]`, a *fixed*-length array, is dynamic if its element type `T` is dynamic. And a tuple
+`(T1,...,Tk)` is dynamic if **any** member is.<Cite src="solidity-abi-spec" /> Everything else is
+static.
+
+So `uint256[2]` is static and contributes two words to the head. `string[2]` — also a fixed-length
+array, also exactly two elements — is dynamic and contributes one offset word. A struct of three
+`uint256`s is static; add one `string` to it and the whole struct becomes dynamic and moves to the
+tail. Dynamism is contagious upward, and it changes the head size, which changes every offset in the
+call.
+
+The layout is then: every argument contributes exactly one 32-byte word to the **head**, in
+declaration order. A static argument puts its value there. A dynamic argument puts an **offset**
+there, and its real content goes into the **tail** after all the heads, as a 32-byte length followed
+by the padded data.<Cite src="solidity-abi-spec" />
+
+The property that matters: the head has a fixed size that depends only on the argument *types*. A
+decoder therefore knows where the tail begins before it has looked at a single value.
+
+<Figure
+  caption="Four bytes of payload arrive behind three full words — a pointer in the head, a length in the tail, and only then the data."
+  alt="Calldata for mint of address, uint256 and bytes: a four-byte selector, then three head words holding the address, the id, and an offset of 0x60; then the tail, a 32-byte length of four followed by the four data bytes right-padded to a full word."
+>
+  <ByteLayout
+    caption="mint(address,uint256,bytes)"
+    fields={[
+      { label: 'selector', size: 4, tone: 'accent', note: 'not a word' },
+      { label: 'to', size: 32, note: 'head: value' },
+      { label: 'id', size: 32, note: 'head: value' },
+      { label: 'offset', size: 32, tone: 'warn', note: 'head: 0x60' },
+      { label: 'length', size: 32, note: 'tail: 4' },
+      { label: 'data', size: 32, tone: 'muted', note: 'tail: padded' },
+    ]}
+  />
+</Figure>
+
+### Worked decode: three arguments, one of them dynamic
+
+Real calldata for `mint(address to, uint256 id, bytes data)` with `to = 0x…beef`, `id = 7`,
+`data = 0xdeadbeef`. Byte offsets are counted from the start of the argument block, not from the
+start of calldata.
+
+```text
+        94d008ef                                                            selector
+[  0]   000000000000000000000000000000000000000000000000000000000000beef    head: to
+[ 32]   0000000000000000000000000000000000000000000000000000000000000007    head: id
+[ 64]   0000000000000000000000000000000000000000000000000000000000000060    head: offset -> 96
+[ 96]   0000000000000000000000000000000000000000000000000000000000000004    tail: length of data
+[128]   deadbeef00000000000000000000000000000000000000000000000000000000    tail: data, right-padded
+```
+
+**Step 1 — establish where the heads end.** Three arguments, so three head words, so the head is 96
+bytes. This came from the signature alone; no value was read.
+
+**Step 2 — read the static heads in place.** Word 0 is an address: 20 significant bytes,
+right-aligned. Word 1 is the `uint256` seven.
+
+**Step 3 — follow the dynamic head as a pointer.** Word 2 holds `0x60` = 96. That is exactly where
+the heads end, which is the normal case for the first dynamic argument.
+
+**Step 4 — read the tail as length-then-data.** At byte 96, a 32-byte length of 4. The four bytes
+follow, right-padded with zeros to fill the word. Padding is not part of the value; the length word
+is what defines the boundary.<Cite src="solidity-abi-spec" />
+
+**Step 5 — check the total.** 4 selector + 96 head + 32 length + 32 padded data = 164 bytes, which
+is what the encoder emits.
+
+### Worked decode: two dynamic arguments, and the offset that is not the head size
+
+The rule "the offset equals the head size" holds for the *first* dynamic argument only. Here is the
+specification's own example, `f(uint256,uint32[],bytes10,bytes)` called with
+`(0x123, [0x456, 0x789], "1234567890", "Hello, world!")`.<Cite src="solidity-abi-spec" />
+
+```text
+        8be65246                                                            selector
+[  0]   0000000000000000000000000000000000000000000000000000000000000123    head: uint256
+[ 32]   0000000000000000000000000000000000000000000000000000000000000080    head: offset -> 128
+[ 64]   3132333435363738393000000000000000000000000000000000000000000000    head: bytes10
+[ 96]   00000000000000000000000000000000000000000000000000000000000000e0    head: offset -> 224
+[128]   0000000000000000000000000000000000000000000000000000000000000002    tail A: 2 elements
+[160]   0000000000000000000000000000000000000000000000000000000000000456    tail A: element 0
+[192]   0000000000000000000000000000000000000000000000000000000000000789    tail A: element 1
+[224]   000000000000000000000000000000000000000000000000000000000000000d    tail B: 13 bytes
+[256]   48656c6c6f2c20776f726c642100000000000000000000000000000000000000    tail B: the string
+```
+
+**Subgoal: size the head without reading anything.** Four arguments, four words, 128 bytes. Note
+that `bytes10` is *static* — a fixed-width byte type sits in the head, padded on the right, and only
+`bytes` with no number is dynamic.<Cite src="solidity-abi-spec" />
+
+**Subgoal: predict the first offset.** `0x80` = 128 = the head size, exactly as before.
+
+**Subgoal: derive the second offset instead of reading it.** It must be the head size plus the
+entire length of the first tail. The first tail is a `uint32[]` with two elements: one length word
+plus two element words, three words, 96 bytes. So `128 + 96 = 224 = 0xe0`, which is what word 3
+holds.<Cite src="solidity-abi-spec" />
+
+**Subgoal: notice which of those two predictions needed a value.** The first did not. The second
+did — you had to know the array held two elements before you could say where the second payload
+began. That is the whole practical difference between the head and the tail, and it is why a decoder
+walks offsets rather than computing them.
+
+**Subgoal: see the padding rules disagree, on purpose.** `bytes10` pads right, to 32. The `uint32`
+elements pad left, to 32 each — the array's elements are full words even though the declared element
+type is four bytes.<Cite src="solidity-abi-spec" /> Both are consequences of the previous lesson:
+data left-aligns, magnitude right-aligns, and everything is a word.
+
+### Nesting, and why the offsets are relative
+
+Take `g(uint256[][], string[])`. The first argument's tail is a length word followed by *two more
+offsets*, one per inner array — and those offsets count from the start of that argument's own
+content, not from the start of the argument block.
+
+The specification works it through: with `[[1, 2], [3]]`, the inner offsets come out as `0x40` and
+`0xa0`, which are byte 64 and byte 160 measured from the beginning of the outer array's
+data.<Cite src="solidity-abi-spec" /> Read them as absolute positions in the call and you will land
+in the middle of an unrelated payload.
+
+This is not an accident of implementation. The design criteria for the encoding say the data of a
+variable or an array element "is not interleaved with other data and it is relocatable, i.e. it only
+uses relative addresses", and that the number of reads needed to reach a value is at most the depth
+of the value in the structure.<Cite src="solidity-abi-spec" /> Relative offsets are what make one
+encoder work unchanged for a call, a return value, an event argument and a nested tuple — the same
+routine emits a fragment without knowing where the fragment will end up.
+
+<Misconception
+  belief="A dynamic argument's offset is an absolute position in calldata."
+  reality="It is relative to the start of the argument block — the byte after the selector. Inside a nested structure it is relative to the start of that structure, not to the start of the call."
+  why="At the top level the two differ by exactly four, so subtracting the selector once makes the rule look simpler than it is. The spec defines the offset as the position of the tail relative to the start of the enclosing encoding, which is what makes the same encoder work for a call, a return value, an event argument and a nested tuple without changing rules."
+  src="solidity-abi-spec"
+/>
+
+<Check type="predict" concept="abi-encoding">
+Here is the argument block for `register(address who, string name)`, with `name = "chainpath"`.
+Without decoding the last word by eye, say what value the offset word must hold and why.
+
+```text
+[  0]   00000000000000000000000000000000000000000000000000000000000000aa
+[ 32]   ????????????????????????????????????????????????????????????????
+[ 64]   0000000000000000000000000000000000000000000000000000000000000009
+[ 96]   636861696e706174680000000000000000000000000000000000000000000000
+```
+
+Then a second, harder one from the same rules: how large is the head for
+`h(uint256[2] a, string[2] b)`, and how many of its words are offsets?
+
+<Answer>
+**`0x40` — decimal 64.**
+
+Two arguments means two head words means a 64-byte head. The first dynamic argument's tail starts
+immediately after the head, so the offset is 64.<Cite src="solidity-abi-spec" />
+
+Notice you derived that from the *signature*, not from the data. The value `0x09` at byte 64 is the
+length of `"chainpath"` in bytes, and the string's UTF-8 bytes follow, right-padded to fill the
+word — a `string` is encoded exactly as `bytes` after UTF-8 encoding, and the length counts bytes,
+not characters.<Cite src="solidity-abi-spec" />
+
+**The second question: the head is 96 bytes, and exactly one of its three words is an offset.**
+
+`uint256[2]` is a fixed-length array of a static type, so it is static: it contributes both of its
+elements inline, two head words. `string[2]` is a fixed-length array too, but its element type is
+dynamic, so the array is dynamic and contributes one offset word.<Cite src="solidity-abi-spec" />
+Two arguments, three head words.
+
+That asymmetry is the trap. Both arguments are written `T[2]`; both hold exactly two elements; one
+is inline and the other is a pointer, and nothing at the call site distinguishes them. The practical
+form: if you are hand-reading calldata and an offset word does not equal the head size, you are
+either past the first dynamic argument, or you have mis-sized the head because a type you read as
+static is not.
+</Answer>
+</Check>
+
+## Four bytes is not an identifier
+
+A selector is a truncated hash: four bytes taken off the front of a 32-byte
+digest.<Cite src="solidity-abi-spec" /><Cite src="nist-fips-202" /> Four bytes is 2³² values — a
+little over four billion — for an unbounded space of function signatures, so collisions exist and are
+findable by brute force in the time it takes to enumerate candidate names.
+
+<Figure
+  caption="The bytes that would have made the name unique never leave the compiler — only the shaded eighth of the digest is ever sent."
+  alt="The 32-byte keccak digest of the string transfer of address and uint256, with its first four bytes marked as the selector that is transmitted and the remaining twenty-eight bytes marked as discarded."
+>
+  <Anatomy
+    value="a9059cbb2ab09eb219583f4a59a5d0623ade346d962bcd4e46b11da047c9049b"
+    parts={[
+      { from: 0, to: 8, label: 'selector', note: 'the 4 bytes sent', tone: 'accent' },
+      { from: 8, to: 64, label: 'discarded', note: '28 bytes of the digest', tone: 'muted' },
+    ]}
+  />
+</Figure>
+
+They are not hypothetical. Both of these pairs are real, and you can reproduce either in a second
+with `cast sig`:
+
+```text
+0x42966c68   burn(uint256)
+0x42966c68   collate_propagate_storage(bytes16)
+
+0x23b872dd   transferFrom(address,address,uint256)
+0x23b872dd   gasprice_bit_ether(int128)
+```
+
+`0x23b872dd` is the ERC-20 `transferFrom` selector that every token integration depends on. Public
+signature databases catalogue both spellings, which is how a block explorer can show you a plausible
+but wrong function name for a call.<Cite src="fourbyte-directory" />
+
+The four-byte space also gets used as a namespace in its own right, which stretches it further.
+ERC-165 defines an interface identifier as the **XOR of all the function selectors in the
+interface** — `0x01ffc9a7` for ERC-165 itself — and reserves `0xffffffff` as the identifier a
+conforming contract must always answer `false` for.<Cite src="eip-165" /> An interface is thereby
+named by four bytes derived from other four-byte values, all of them truncated digests.
+
+Where that stops being arithmetic and starts being an attack surface is the boundary between
+separately compiled contracts. The compiler tracks selector collisions within a single contract and
+refuses to compile them — but it does not track collisions *across* contracts, such as between a
+proxy and the logic contract it delegates to.<Cite src="oz-proxies-function-clashes" /> One party
+picks a function name; the other party's dispatcher decides what those four bytes mean.
+
+<Misconception
+  belief="A function selector identifies a function uniquely."
+  reality="It is a 4-byte truncation of a hash. Distinct signatures collide, collisions are cheap to search for, and nothing in the encoding disambiguates them."
+  why="Within a single contract the compiler refuses to compile two functions whose selectors collide, so you never meet one by accident. The guarantee is local to one compilation unit — a proxy dispatching between two separately compiled contracts has no such check, and an attacker choosing a function name to collide with an existing one is doing arithmetic, not cryptography."
+  src="oz-proxies-function-clashes"
+/>
+
+<Aside kind="warn">
+How a compiled contract actually *dispatches* on the selector — a linear chain of comparisons, a
+binary search over sorted selectors, or a jump table — differs between compiler pipelines, and
+widely-cited write-ups disagree with the current compiler source. Do not reason about per-function
+dispatch cost from a blog post; measure it on the bytecode you shipped.
+</Aside>
+
+## Why the encoding is safe to decode
+
+Step back and notice the property that makes all of this work. Every element in an ABI encoding is
+either fixed-width or explicitly length-prefixed. There is never a point where a decoder has to guess
+where one value ends and the next begins.<Cite src="solidity-abi-spec" />
+
+That is not a nice-to-have. It is the reason `abi.decode` can exist at all, and — as the next lesson
+shows — the reason its tightly-packed sibling is unsafe to hash. Hold onto the phrase: *an encoding
+you cannot decode is an encoding you cannot safely hash.*
+
+One caveat to bank now and collect in the last lesson of this module. "Decodable" is not the same as
+"one encoding per value". The specification defines a **strict encoding mode** in which offsets are
+as small as possible with no gaps and no overlaps, and records that the Solidity encoder always
+produces strict output while the Solidity decoder **does not enforce
+it**.<Cite src="solidity-abi-spec" /> A decoder that follows pointers wherever they point will
+accept encodings the encoder would never emit. That is survivable here and fatal elsewhere, for
+reasons the final lesson makes precise.
+
+## Where this pays off
+
+The head-and-tail layout, the relative offsets, and the static/dynamic split are the three facts you
+need to read any calldata by hand, and they are not confined to calls: return values and event
+arguments use the identical encoding, minus the four selector bytes.<Cite src="solidity-abi-spec" />
+Learn to read one and you can read a trace, a log payload, a revert blob and a multicall's nested
+arguments with the same eyes.
+
+The selector is the entry point for everything about proxies and function routing, and the
+cross-contract collision gap is the seed of a real attack surface in upgradeable
+patterns.<Cite src="oz-proxies-function-clashes" /> It also explains a mundane daily annoyance with
+a precise cause: when a wallet shows you "unknown function", it is telling you it could not reverse
+four bytes of a keccak digest.<Cite src="nist-fips-202" />
+
+And `abi.encodeCall` is the small habit this lesson should leave you with — the only one of the four
+encoding helpers whose arguments are checked against a real function signature at compile
+time.<Cite src="solidity-abi-encoding-functions" /> The next lesson is about the helper that checks
+nothing at all, and what that costs.

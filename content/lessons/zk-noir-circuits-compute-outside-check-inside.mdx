@@ -1,0 +1,420 @@
+---
+id: zk-noir-circuits-compute-outside-check-inside
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [noir-docs-unconstrained, aztec-unconstrained-blog, noir-docs-thinking-in-circuits, noir-docs-nargo-commands, noir-docs-control-flow, noir-docs-profiler, noir-docs-fields, noir-docs-assert, aztec-v5-proving-vulnerability]
+stack: {}
+---
+
+Two circuits. Read them before reading anything else.
+
+```rust
+// A
+unconstrained fn sqrt_hint(x: Field) -> Field { /* ... */ }
+
+fn main(x: pub Field) -> pub Field {
+    // Safety: 'r' is constrained below by 'assert(r * r == x)'.
+    let r = unsafe { sqrt_hint(x) };
+    assert(r * r == x);
+    r
+}
+
+// B
+unconstrained fn sqrt_hint(x: Field) -> Field { /* ... */ }
+
+fn main(x: pub Field) -> pub Field {
+    let r = unsafe { sqrt_hint(x) };
+    r
+}
+```
+
+A is one of the best optimisations available in circuit programming. B is a machine that produces
+proofs of false statements. The difference is one line, and the deleted line is not a validation — it
+is the entire content of the claim.
+
+In B, `r` is whatever the prover decided to return. Not what the function body computes: what the
+*prover* returns, because the prover runs witness generation and controls every value in it. The
+circuit's public output is `r`, and there is no constraint anywhere relating `r` to `x`. A verifier
+handed a proof from B accepts `r = 7` for `x = 2` and reports success, because the circuit never
+claimed a relationship between them.
+
+This lesson is the module's centre. The pattern in A is the main lever you have for making circuits
+cheap, and the gap between A and B is the main way circuits become unsound.
+
+## What an unconstrained function is
+
+An unconstrained function executes during witness generation and contributes no constraints. The Noir
+documentation frames it as enabling a circuit language to perform non-deterministic computation:
+unconstrained execution lets developers generate witnesses from code that does not generate any
+constraints, and being able to execute logic outside a circuit is critical both for circuit
+performance and for constructing proofs on information external to a
+circuit.<Cite src="noir-docs-unconstrained" />
+
+The compiled form has its own name in the toolchain. Constrained code becomes ACIR opcodes;
+unconstrained code becomes **Brillig** opcodes, and `nargo info` reports the two in separate
+columns.<Cite src="noir-docs-unconstrained" /> The same command's documented job is to give detailed
+information on each of a program's functions, each represented by a single
+circuit.<Cite src="noir-docs-nargo-commands" /> They are different currencies. Brillig opcodes are
+executed; ACIR opcodes are proved. Only the second kind appears in the bill.
+
+<Figure
+  caption="The hint is not the claim. The assertion is — and deleting it leaves a circuit that still compiles and still proves."
+  alt="Inputs feed an unconstrained function that runs during witness generation and lays down no constraints; the value it returns is prover-chosen until an assertion inside the circuit pins it down."
+>
+  <Flow
+    lanes={['inputs', 'outside the circuit', 'the seam', 'inside the circuit']}
+    nodes={[
+      { id: 'x', label: 'x', note: 'a public input', col: 0 },
+      { id: 'fn', label: 'unconstrained fn', note: 'runs at witness generation; lays down no constraints', col: 1, tone: 'muted' },
+      { id: 'r', label: 'the returned r', note: 'whatever the prover chose', col: 2, tone: 'danger' },
+      { id: 'chk', label: 'assert(r * r == x)', note: 'the entire content of the claim', col: 3, tone: 'accent' },
+    ]}
+    edges={[
+      { from: 'x', to: 'fn' },
+      { from: 'fn', to: 'r' },
+      { from: 'r', to: 'chk', label: 'unsafe { }' },
+      { from: 'x', to: 'chk' },
+    ]}
+  />
+</Figure>
+
+Inside unconstrained code, the restrictions from two lessons ago lift. `break` and `continue` become
+available in `for` and `loop`; the `loop` construct and `while` loops become available — all three
+allowed only there, because constrained code requires that Noir knows exactly how many iterations a
+loop may have.<Cite src="noir-docs-control-flow" /><Cite src="noir-docs-unconstrained" /> Bit shifts
+stop being expensive, because they are no longer being proved; the guidance is to translate away from
+bit shifts in constrained functions and to use them freely in unconstrained functions and
+tests.<Cite src="noir-docs-thinking-in-circuits" /> There is also a predicate, `is_unconstrained()`,
+for code that needs to behave differently depending on which side of the line it is running
+on.<Cite src="noir-docs-thinking-in-circuits" />
+
+And the documentation states the obligation in the same breath as the capability: since a ZK DSL
+proves not just computation but that some computation was handled correctly, it is **necessary** that
+when you move an operation from inside the circuit to an unconstrained environment, the appropriate
+constraints are still laid down elsewhere in the circuit.<Cite src="noir-docs-unconstrained" />
+
+## The asymmetry, and what it is worth
+
+The pattern's engine is the gap between deriving an answer and confirming one. Aztec's write-up gives
+the canonical framing: assuming division is costly to prove and multiplication is easy, do not prove
+`100 / 5 = x`; instead compute the quotient unconstrained and prove `x * 5 = 100`.<Cite src="aztec-unconstrained-blog" />
+
+The honest footnote in that same post is worth more than the example. On a division this simple, both
+versions land at approximately the same ACIR opcode count, because the optimisation is easy enough
+for the compiler to do itself — the optimised form is 2 ACIR opcodes and 7 final backend gates, the
+unoptimised 3 opcodes and 8 gates.<Cite src="aztec-unconstrained-blog" /> One gate saved. The pattern
+does not pay on toy examples, and reaching for it before measuring is how circuits acquire trust
+boundaries in exchange for nothing.
+
+Where it pays is where the derivation is genuinely hard inside a circuit. The Noir docs' worked case
+is converting a `u64` into an array of eight `u8` values. Constrained, that program is **65 ACIR
+opcodes** and 8 Brillig opcodes. Moving the conversion into an unconstrained function and asserting
+the reverse computation — multiply each byte by its place value, sum, and assert the sum equals the
+input — brings it to **33 ACIR opcodes** and 114 Brillig opcodes.<Cite src="noir-docs-unconstrained" />
+
+```rust
+fn main(num: u64) -> pub [u8; 8] {
+    // Safety: 'out' is properly constrained below in 'assert(num == reconstructed_num);'
+    let out = unsafe { u64_to_u8(num) };
+    let mut reconstructed_num = 0;
+    for i in 0..8 {
+        reconstructed_num += (out[i] as u64 << (56 - (8 * i as u64)));
+    }
+    assert(num == reconstructed_num);
+    out
+}
+
+unconstrained fn u64_to_u8(num: u64) -> [u8; 8] {
+    let mut out: [u8; 8] = [0; 8];
+    for i in 0..8 {
+        out[i] = (num >> (56 - (i as u64 * 8))) as u8;
+    }
+    out
+}
+```
+
+<Cite src="noir-docs-unconstrained" />
+
+**Subgoal: read the trade in the right units.** Brillig opcodes went from 8 to 114 — fourteen times
+more executed work — while ACIR opcodes halved. The docs put the reasoning plainly: it is often
+faster for the backend to run more unconstrained code to verify it with fewer constrained opcodes
+later.<Cite src="noir-docs-unconstrained" /> You are not making the computer do less. You are moving
+work out of the expensive column.
+
+**Subgoal: notice the direction of the check.** The circuit does not verify the conversion by
+performing it. It performs the *inverse* — reconstruction is multiplication and addition, which the
+docs describe as relatively easy operations inside a SNARK, whereas truncating a `u64` into a `u8`
+lays down four ACIR opcodes per cast that expand into multiple gates.<Cite src="noir-docs-unconstrained" />
+Finding the cheap direction is the skill.
+
+### The counter-example that teaches the metric
+
+Aztec's larger case is worth carrying because its numbers move in opposite directions. Converting
+unsigned integers to `u8` arrays, three versions:<Cite src="aztec-unconstrained-blog" />
+
+<Matrix
+  numeric
+  corner="Version"
+  cols={['ACIR opcodes', 'Backend circuit size']}
+  rows={[
+    { label: 'Original, fully constrained', cells: ['91', '3,619'] },
+    { label: 'Constrained, cast earlier to drop an XOR', cells: ['75', '3,143'] },
+    { label: 'Unconstrained hint plus reverse check', cells: [{ v: '78', tone: 'warn' }, { v: '2,902', tone: 'good' }] },
+  ]}
+  caption="Two columns, three versions, and no ordering that satisfies both."
+  alt="Three versions of a u8-array conversion: the fully constrained original at 91 ACIR opcodes and 3,619 gates, an earlier cast at 75 and 3,143, and an unconstrained hint with a reverse check at 78 and 2,902."
+/>
+
+The third version has **more** ACIR opcodes than the second and **fewer** gates. The post's own
+comment: more ACIR opcodes than before, but ones that are easier for the backend to prove, resulting
+in fewer gates overall.<Cite src="aztec-unconstrained-blog" /> If you had optimised against the first
+column, you would have reverted the change that helped. That distinction gets a full lesson next.
+
+## The pattern catalogue
+
+Once seen, the shape recurs. Each row is "derive outside, confirm inside", and the confirmation is
+always the cheap direction of an operation you already have.
+
+| Expensive to derive | Cheap to check | The constraint |
+|---|---|---|
+| Quotient `q = a / b` | Multiplication | `assert(q * b + r == a)` **and** `assert(r < b)` |
+| Inverse `i` of `x` | One multiplication | `assert(i * x == 1)` |
+| Square root `r` of `x` | One multiplication | `assert(r * r == x)` |
+| Sorted permutation of an array | Ordering plus permutation | adjacent-pair ordering, plus proof the multiset is unchanged |
+| Index of a matching element | One read, one equality | `assert(xs[idx] == target)` |
+| Decomposition into bytes or bits | Recomposition | `assert(sum of place values == input)` |
+| Membership position in a tree | Hashing up one path | `assert(computed_root == root)` |
+
+Three warnings live in that table, and each has ended a project somewhere.
+
+**The division row needs two constraints, not one.** `q * b == a` alone is false for anything that
+does not divide evenly, and if you write `q * b + r == a` while forgetting `r < b`, the prover picks
+`q = 0` and `r = a`. The remainder bound is not a tidiness detail; it is what makes the quotient
+unique.
+
+**The sorting row is two properties, not one.** Ordering alone is satisfied by an array of zeroes.
+The permutation half — that the output is a rearrangement of the input and not a different multiset —
+is the expensive part, and the part people leave out.
+
+**The search row constrains one thing and not another.** `assert(xs[idx] == target)` proves the
+element is present at the claimed index. It proves nothing about *absence*, so it cannot be used to
+show a value is missing, and it does not prove `idx` is the first match. If your logic depends on
+either, you need a different circuit.
+
+The general form of all three: **a check pins down a hint only to the extent that the check has a
+unique solution.** Every time you write one, ask what else would satisfy it.
+
+<Misconception
+  belief="Unconstrained functions are a performance feature — a way to speed the prover up."
+  reality="They are a trust boundary. Their outputs are prover-chosen, and a missing or insufficient constraint on the returned hint is a soundness hole that produces accepted proofs of false statements."
+  why="The documentation introduces them under performance because performance is the motivation for using them, and the security obligation reads as a caveat rather than as the definition."
+  src="aztec-unconstrained-blog"
+/>
+
+## `unsafe` is a signature, not a permission
+
+Calling an unconstrained function from constrained code requires wrapping the call in an
+`unsafe { ... }` block, which makes it explicit that the result is not automatically constrained and
+that the programmer takes responsibility for adding the necessary
+constraints.<Cite src="noir-docs-unconstrained" /> The compiler emits a warning unless the block
+carries a `// Safety: ...` comment explaining why the call is safe — placed either on the block or on
+the enclosing statement.<Cite src="noir-docs-unconstrained" />
+
+Read that comment requirement as what it is: a code-review artifact with compiler enforcement behind
+it. The comment is where the author states which constraint discharges the obligation. In review, the
+question is never "is there a Safety comment" but "does the constraint it names actually pin the
+value down", and the second question is one only a human answers.
+
+One clarification, because the keyword invites a wrong analogy. Noir's `unsafe` does **not** disable
+other compiler checks — it only permits calling unconstrained functions, and all other type checking,
+visibility rules and constraint generation remain in effect.<Cite src="noir-docs-unconstrained" />
+It is narrower than Rust's `unsafe`, and the obligation it marks is different in kind: Rust's is
+about memory validity that the compiler cannot see, Noir's is about a statement the *prover* gets to
+choose.
+
+<Aside kind="stop">
+**The one-sentence rule for the rest of your career in this language.** Every value crossing out of
+an `unsafe` block is attacker-controlled until a constraint says otherwise, and "a constraint" means
+one whose only solution is the value you intended. Nothing else in this module matters as much.
+</Aside>
+
+## What the compiler will catch, and what it will not
+
+Noir ships two compilation security passes, and problems they find are reported as "bugs" rather than
+errors — for example, `**bug**: Brillig function call isn't properly covered by a manual
+constraint`.<Cite src="noir-docs-unconstrained" />
+
+**Independent subgraph detection** examines the instruction flow graph for values that do not come
+from any provided input and do not reach any output, which would mean no constraints ensure the
+required continuity. It is on by default and disabled with
+`--skip-underconstrained-check`.<Cite src="noir-docs-unconstrained" />
+
+**Brillig manual constraint coverage** checks the rule you would write yourself: every value resulting
+from an unconstrained call — *including every array element of a resulting array* — has to be involved
+in a later constraint against either one of the call's arguments or a constant, where "involved"
+means a descendant value of a result is checked against a descendant value of an
+argument.<Cite src="noir-docs-unconstrained" /> It is on by default and disabled with
+`--skip-brillig-constraints-check`; a lookback option,
+`--enable-brillig-constraints-check-lookback`, exists to avoid certain false positives at the cost of
+compilation speed.<Cite src="noir-docs-unconstrained" /> Both flags carry the same documented warning:
+they can improve compilation speed but can also lead to correctness errors, and the check should
+always be run on production code.<Cite src="noir-docs-unconstrained" />
+
+This is a real and valuable safety net, and it is worth understanding precisely what it is not.
+
+The documentation's own illustration:<Cite src="noir-docs-unconstrained" />
+
+```rust
+unconstrained fn factor(v0: Field) -> [Field; 2] { /* ... */ }
+
+fn main(foo: Field) -> pub [Field; 2] {
+    // Safety: factored is constrained below by `assert(factored[0] * factored[1] == foo)`
+    let factored = unsafe { factor(foo) };
+    assert(factored[0] * factored[1] == foo);
+    factored
+}
+```
+
+The pass accepts this: `factored[0] * factored[1]` is a descendant of both results and is checked
+against the argument, so coverage is satisfied.<Cite src="noir-docs-unconstrained" />
+
+Now ask the question from the catalogue. **What else satisfies that constraint?** In a field where
+most elements are invertible, `factored[0] = 1` and `factored[1] = foo` satisfies it. So does any
+`(c, foo * c⁻¹)`. The check confirms that a constraint *relating* the results to the argument exists.
+It cannot confirm that the constraint has the solution you meant, because that is a statement about
+your intent, and your intent is not in the source.
+
+<Misconception
+  belief="The compiler has an under-constrained-values check, so if it compiles clean my hints are constrained."
+  reality="The passes verify that results are involved in some constraint against arguments or constants. They do not verify that the constraint uniquely determines the value, which is what soundness requires."
+  why="A default-on check named after the exact bug class reads as a decision procedure for that bug class, and its output is a clean build."
+  src="noir-docs-unconstrained"
+/>
+
+<Aside kind="note">
+**How common is this bug class, really?** It is widely described as the most common vulnerability
+class in Noir circuits, and this module could find **no 2026 audit-corpus statistics** supporting
+that ranking. Treat it as informed judgement from the shape of the language and the emphasis of its
+documentation, not as a measured finding — and note that the strongest available evidence is
+adjacent rather than direct: Aztec's disclosure of 7 August 2026 concerned a proving-system flaw
+allowing a proof that passes verification for a transaction the network should reject, found on
+27 July 2026 after internal and external human audits had already
+completed.<Cite src="aztec-v5-proving-vulnerability" /> Different layer, same failure mode, and the
+same reason it is hard to count: the disclosure states the affected system could not distinguish
+ordinary accepted transactions from ones accepted through the flawed
+path.<Cite src="aztec-v5-proving-vulnerability" /> Soundness failures do not leave a tally behind.
+</Aside>
+
+<Check type="spot-bug" concept="unconstrained-is-untrusted">
+A circuit proves that a private leaf belongs to a public Merkle root, using an unconstrained hint to
+avoid searching for the leaf's position. Find every place the prover has a free choice, and say what
+each buys an attacker.
+
+```rust
+unconstrained fn find_position(leaf: Field, root: Field) -> (u32, [Field; 20]) {
+    // returns the index and the sibling path, looked up off-circuit
+}
+
+fn main(leaf: Field, root: pub Field, nullifier: pub Field) {
+    // Safety: the path is checked by recomputing the root below.
+    let (index, path) = unsafe { find_position(leaf, root) };
+
+    let mut node = leaf;
+    for i in 0..20 {
+        let bit = (index >> i) & 1;
+        node = if bit == 1 { hash(path[i], node) } else { hash(node, path[i]) };
+    }
+    assert(node == root);
+
+    assert(nullifier == hash(leaf, index as Field));
+}
+```
+
+<Answer>
+**The hint itself is fine, and the recomputation is the right check.** `index` and `path` are both
+prover-chosen, and both are pinned by `assert(node == root)`: any path or index that does not hash up
+to the public root fails. This is the search row of the catalogue done correctly, and it is the reason
+the pattern exists — twenty hashes instead of a search over the tree.
+
+**Bug 1 — the root check constrains only twenty bits of `index`, and the nullifier uses all
+thirty-two.** Look at what the loop touches. It reads `(index >> i) & 1` for `i` from 0 to 19, so bits
+20 through 31 of a `u32` never enter the computation of `node` and are therefore never constrained by
+`assert(node == root)`. The last line then feeds the *whole* index into the nullifier:
+`hash(leaf, index as Field)`. A prover who sets any of those twelve free high bits produces a
+different nullifier while the root check still passes — **4,096 distinct nullifiers for one leaf**,
+which is 4,096 spends of the same note.
+
+*Fix, in order of preference:* derive the nullifier from a value with no residual freedom, such as a
+secret bound to the leaf commitment, rather than from a position; and if the index must appear,
+constrain it to its used range explicitly — a bit-size assertion is exactly the kind of range
+statement Noir wants written down rather than assumed.<Cite src="noir-docs-fields" />
+
+*The general lesson:* a check pins a hint only over the part of the hint it actually reads. A value
+that is half-constrained is not a value that is mostly safe. It is an attacker's parameter with a
+smaller keyspace.
+
+**Bug 1b, for the same reason one level up.** Even with the high bits fixed, `assert(node == root)`
+binds the *pair* `(index, path)` and nothing forbids the same leaf from occupying more than one
+position in the tree. If leaves are attacker-supplied — a commitment they chose to insert twice —
+then two legitimate positions exist, and a position-derived nullifier is two nullifiers again. Any
+nullifier scheme that takes its uniqueness from *where* a note sits inherits every ambiguity in the
+tree's contents.
+
+**Bug 2 — `root` is passed into the hint, and nothing stops it being used as an oracle.** The
+unconstrained function receives the public root and returns a path. Nothing in the circuit prevents
+`find_position` from being an adversarial implementation that, given any `leaf` and `root`, searches
+for *some* `(index, path)` hashing to that root — the prover supplies the function's behaviour, not
+just its inputs. The `assert` still catches a genuinely wrong path, so this is not by itself a break;
+it is the reminder that **the unconstrained body is not part of the statement.** Review the assert,
+never the hint.
+
+**Bug 3 — `leaf` is never bound to the caller.** As in the previous lesson: `root` and `nullifier`
+are public, but nothing ties the proof to whoever submits it. Anyone holding the proof bytes can
+present them. Not an unconstrained-hint bug, but it is in the same signature, and the two failure
+modes compose.
+
+**What passes the compiler.** All three. Coverage is satisfied — `index` and every element of `path`
+are ancestors of `node`, which is checked against the argument `root`.<Cite src="noir-docs-unconstrained" />
+A clean build is not the finding you were looking for.
+</Answer>
+</Check>
+
+## Working the pattern deliberately
+
+A procedure that turns this from an instinct into a habit, and the one to use on your own circuits.
+
+1. **Measure first.** Get a gate count on the honest, fully constrained version. Without it you have
+   no idea whether the trust boundary buys anything, and the division example says it often does
+   not.<Cite src="aztec-unconstrained-blog" />
+2. **Find the direction.** Ask which way of relating input and output is arithmetic. Multiplication,
+   addition and place-value reconstruction are cheap; decomposition, comparison, division and search
+   are not.<Cite src="noir-docs-thinking-in-circuits" />
+3. **Write the constraint before the hint.** Literally: write the `assert` first — it explicitly
+   constrains the predicate that follows it, and a false predicate at runtime means the program
+   fails to be proven<Cite src="noir-docs-assert" /> — then write the unconstrained function that
+   produces something satisfying it. The failure mode is always an absent
+   or weak check, and writing it first makes the check the design rather than the follow-up.
+4. **Ask what else satisfies it.** If a second value would pass, the hint is not pinned. Add the
+   missing bound — the remainder bound, the permutation argument, the uniqueness condition.
+5. **Measure again**, in gates, not ACIR opcodes. The profiler will show you where they went, mapping
+   backend gates back to source locations.<Cite src="noir-docs-profiler" />
+6. **Write the `// Safety:` line as a claim you would defend in review**, naming the constraint that
+   discharges the obligation.<Cite src="noir-docs-unconstrained" />
+
+## What this unlocks
+
+**Next lesson** is step 1 and step 5 done properly. You have now seen two examples where ACIR opcodes
+and backend gates moved in opposite directions — 75 opcodes at 3,143 gates against 78 opcodes at
+2,902<Cite src="aztec-unconstrained-blog" /> — and reading the wrong column reverses the conclusion.
+The lesson is short, and it is the one that makes every optimisation in this one measurable.
+
+**In the practice exercises**, you will build B from the opening on purpose: write a hint, omit the
+constraint, produce a proof of a false statement, watch a verifier accept it, then add one line and
+watch it reject. That sequence is worth more than any amount of reading, because the thing you need
+to internalise is not that the hole exists but that **nothing looks wrong while it is open.**
+
+**And in the module's reflection**, you will list every unconstrained call in your circuit, its check,
+and what a malicious prover gains without it. Any entry whose answer is "nothing" is a hint that
+should not exist — an accepted trust boundary bought for no gate savings at all.

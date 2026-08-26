@@ -1,0 +1,291 @@
+---
+id: evm-transaction-types-why-one-stuck-tx-blocks-the-rest
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    execution-specs,
+    execution-apis,
+    ethereum-org-transactions,
+    eip-1559,
+    eip-7702,
+    eip-4844,
+    geth-legacypool,
+    geth-blobpool,
+    nethermind-7702-attack-surfaces,
+  ]
+stack: {}
+---
+
+At 03:14 a settlement service signs transaction number 1,204 with a `maxFeePerGas` computed from a
+base-fee estimate that was four blocks stale. Nothing else goes wrong. No process crashes, no key is
+lost, no contract reverts.
+
+By 09:00 the service has 1,800 signed transactions outstanding and not one of them has been included —
+including the eleven it re-sent with correct fees, the seven it sent to a different RPC provider, and
+the one an engineer sent by hand from a wallet marked "cancel".
+
+Every one of those responses was aimed at the wrong object. The problem was never any of the 1,799
+transactions after 1,204. It was 1,204, and until 1,204 resolves, nothing behind it is even *eligible*.
+
+## One rule, and everything else is consequence
+
+A transaction from an account is valid only when its nonce equals that account's current nonce
+exactly. The nonce is a sequentially incrementing counter indicating the transaction number from the
+account,<Cite src="ethereum-org-transactions" /> and the protocol increments it by exactly one per
+included transaction.<Cite src="execution-specs" />
+
+There is no "greater than or equal to". There is no reordering window, no priority override, no
+skipping a slot that turned out to be a mistake. A transaction with nonce `n+1` is not a low-priority
+transaction while `n` is outstanding — it is an **invalid** transaction, and it stays invalid until
+`n` is included.
+
+That single rule is the source of every stuck-transaction incident you will ever debug, and it
+interacts badly with two things you already know from Track 01. The
+[mempool is not a queue](/c/mempool-is-not-a-queue): pending transactions are a set, re-priced and
+re-sorted every block by whoever is building. And a
+[sender's transactions are totally ordered](/c/nonce-total-ordering): within one account, they are the
+one thing in the mempool that *is* a queue. Both are true at once. Across senders there is no line;
+within a sender there is nothing but line.
+
+### Pending and queued are different sets
+
+Clients implement the rule by splitting the pool. go-ethereum's legacy pool keeps a *pending* set of
+transactions that are executable right now — nonce-contiguous from the account's current nonce — and
+holds everything behind a gap separately; its admission path literally asks whether a new transaction
+`isGapped`, and treats it as executable only if the transactions already held can fill the gap
+up to it.<Cite src="geth-legacypool" />
+
+The operational consequence is the one that makes incidents confusing: **a gapped transaction is not
+gossiped and cannot be mined, and nothing in the interface says so.** Your wallet shows "pending". The
+RPC returns an object for the hash. `eth_getTransactionReceipt` returns null, which it also does for a
+transaction that is genuinely about to land. From the outside, structurally-ineligible and merely-slow
+look identical.
+
+<Misconception
+  belief="My transaction is stuck because the network is congested."
+  reality="Far more often it is stuck because an earlier nonce from the same account has not landed, which makes it ineligible rather than unlucky. Congestion is a fee problem and re-pricing fixes it; a nonce gap is a structural problem and re-pricing the wrong transaction does nothing at all."
+  why="Both present as 'pending forever', and every wallet offers a speed-up button that only addresses the first case."
+  src="geth-legacypool"
+/>
+
+<Compare
+  axis="What you can observe"
+  columns={[
+    { title: 'Underpriced', note: 'the fee is too low', tone: 'warn' },
+    { title: 'Gapped', note: 'an earlier nonce is outstanding', tone: 'danger' },
+  ]}
+  rows={[
+    { label: 'What does eth_getTransactionReceipt return?', cells: ['null', 'null'] },
+    { label: 'What does the wallet show?', cells: ['Pending', 'Pending'] },
+    { label: 'Does a node return an object for the hash?', cells: ['Yes', 'Yes'] },
+    { label: 'Is it gossiped to other nodes?', cells: ['Yes', 'No — it is held out of the pending set'] },
+    { label: 'Could a proposer include it in the next block?', cells: ['Yes, if the fee clears', 'No, at any fee'] },
+    { label: 'Does re-pricing this transaction help?', cells: ['Yes — that is the whole fix', 'No — the fix is at a lower nonce'] },
+  ]}
+  caption="The rows a user can see are identical. The rows that decide the outcome are the ones nothing surfaces."
+  alt="An underpriced transaction and a nonce-gapped transaction compared: receipt, wallet display and hash lookup are identical for both, but only the underpriced one is gossiped, only it can be included by a proposer, and only it is fixed by re-pricing."
+/>
+
+## There is no cancel
+
+The word is not in any specification, and the operation does not exist. What wallets label "cancel" is
+a **replacement**: a different transaction signed with the *same* sender and the *same* nonce, usually
+a zero-value self-transfer, broadcast in the hope that it is the one that gets
+mined.<Cite src="ethereum-org-transactions" /> The two race. Whichever is included invalidates the
+other, and if the original wins, you have paid for a self-transfer and achieved nothing.
+
+Whether a node will even accept the replacement is **client policy, not consensus**. No EIP specifies
+a minimum fee bump. go-ethereum's legacy pool carries a `PriceBump` in its default configuration,
+documented as the minimum price bump percentage required to replace an existing nonce, currently set
+to 10; the blob pool sets the same field to 100, with a design note arguing that replacing an
+already-propagated blob transaction wastes real bandwidth and should be aggressively
+discouraged.<Cite src="geth-legacypool" /><Cite src="geth-blobpool" /> Other figures circulate in the
+ecosystem — 12.5% is commonly quoted — and other clients set their own values; the sources surveyed
+for this curriculum do not agree on a single number, and none of them is normative anyway.
+
+The engineering conclusion is not a number. It is: **the bump threshold is a property of the node you
+are talking to, it differs between clients and between pools, and a replacement that one provider
+accepts another may reject with `replacement transaction underpriced`.** Build the percentage as
+configuration, and treat rejection as an expected branch rather than an error.
+
+<Misconception
+  belief="A stuck transaction can be cancelled."
+  reality="You can only broadcast a competing transaction at the same nonce and hope it wins. There is no protocol operation that removes a signed transaction from existence, and a signature you released is public forever."
+  why="Wallet interfaces render this as a Cancel button, which hides both the race and the fact that the original remains valid and includable until the nonce moves past it."
+  src="ethereum-org-transactions"
+/>
+
+### And it may simply disappear
+
+A pool is a bounded, local cache, not a durable queue. go-ethereum's legacy pool defaults cap an
+account at 16 pending slots and 64 queued, cap the pool globally at 5,120 pending and 1,024 queued,
+and drop transactions after a `Lifetime` of three hours.<Cite src="geth-legacypool" /> Those are
+go-ethereum's current defaults, they are configurable, and every other client has its own.
+
+Which gives four ways a transaction leaves every pool without ever being mined: it is **replaced**, it
+is **evicted on slot pressure**, it is **evicted on lifetime**, or it is **invalidated** because the
+account's nonce moved past it or its balance no longer covers `gas_limit * max_fee_per_gas`, which is
+the amount the sender must be able to afford.<Cite src="eip-1559" /><Cite src="geth-legacypool" />
+None of the four produces a receipt, an error, or a notification. Any product that treats "I
+broadcast it" as "it will eventually land" is wrong on all four counts.
+
+<Figure
+  caption="Only the top exit ends in a receipt. The other four leave the sender holding a hash that will never resolve to anything."
+  alt="A broadcast transaction enters one node's bounded local pool and leaves it by one of five routes: included in a block, replaced at the same nonce, evicted under per-account slot pressure, evicted after the pool lifetime expires, or invalidated because the account nonce moved past it or its balance stopped covering the upfront debit."
+>
+  <Flow
+    lanes={['you', 'one node', 'how it ends']}
+    nodes={[
+      { id: 'b', label: 'signed and sent', note: 'a hash, and nothing else', col: 0, tone: 'accent' },
+      { id: 'pool', label: 'a pool', note: 'bounded, local, not durable', col: 1 },
+      { id: 'mined', label: 'included', note: 'the only exit with a receipt', col: 2, tone: 'good' },
+      { id: 'rep', label: 'replaced', note: 'another tx won the nonce', col: 2, tone: 'warn' },
+      { id: 'slot', label: 'evicted on slots', note: '16 pending per account', col: 2, tone: 'warn' },
+      { id: 'life', label: 'evicted on lifetime', note: '3 hours by default', col: 2, tone: 'warn' },
+      { id: 'inv', label: 'invalidated', note: 'nonce moved, or balance fell', col: 2, tone: 'danger' },
+    ]}
+    edges={[
+      { from: 'b', to: 'pool' },
+      { from: 'pool', to: 'mined', tone: 'good' },
+      { from: 'pool', to: 'rep', tone: 'warn' },
+      { from: 'pool', to: 'slot', tone: 'warn' },
+      { from: 'pool', to: 'life', tone: 'warn' },
+      { from: 'pool', to: 'inv', tone: 'danger' },
+    ]}
+  />
+</Figure>
+
+## The wrinkle that makes nonce tracking hard again
+
+Computing the next nonce used to be a solved problem: ask the node, add one for each transaction you
+have in flight. EIP-7702 broke the premise.
+
+Processing an authorization tuple **increments the authorising account's nonce by one**, and this
+happens whether or not that account sent the transaction.<Cite src="eip-7702" /> Nothing else changed
+about nonces; what changed is that "the account's nonce" is no longer the same quantity as "the number
+of transactions this account has sent". A relayer can sponsor a delegation for your user's address,
+and your user's nonce moves without your user broadcasting anything.
+
+For a wallet or a service that maintains its own nonce counter from its own send history, that is a
+silent off-by-one that manifests as a gap — and a gap, per everything above, stalls the whole account.
+
+Clients have added pool rules specifically to contain this, and they are strict enough to break
+designs that work fine on undelegated accounts. In go-ethereum:
+
+- An account that is delegated, **or merely has a pending authorization in the pool**, is limited to
+  **at most one in-flight executable transaction**.<Cite src="geth-legacypool" />
+- A gapped-nonce transaction from such an account is rejected outright, with an error named
+  `gapped-nonce tx from delegated accounts`.<Cite src="geth-legacypool" />
+- A transaction carrying an authorization signed by an address that already has in-flight transactions
+  known to the pool is rejected as `authority already reserved`.<Cite src="geth-legacypool" />
+
+Read that list as a product constraint rather than as trivia. **A batch sender that keeps five
+transactions in flight from one EOA stops working the moment that EOA is delegated**, and the failure
+appears at submission time against some providers and not others, depending on which client they run.
+
+<Aside kind="warn">
+The same asymmetry is what makes sponsored authorizations griefable. The sponsor pays intrinsic gas
+for every tuple regardless of validity,<Cite src="eip-7702" /> and the authority can invalidate a
+tuple before inclusion simply by getting any transaction of their own mined, which moves their nonce
+past the one the tuple names.<Cite src="nethermind-7702-attack-surfaces" /> A relayer that does not
+price this in is subsidising a denial-of-service.
+</Aside>
+
+Blob transactions add their own version of the constraint. go-ethereum's blob pool design holds that
+nonce-gapped blob transactions are disallowed, and that the presence of blob transactions from an
+account excludes non-blob transactions from that account in the pool — you cannot interleave an
+ordinary transaction between two blob transactions from the same sender and expect the pool to hold
+it.<Cite src="geth-blobpool" /> The current implementation keeps gapped blob transactions only in a
+short-lived reorder buffer, capped in both duration and total count, explicitly as a DoS
+guard.<Cite src="geth-blobpool" /> For an L2 batcher, that means the pool semantics you validated on
+type-2 traffic do not carry over to type-3 traffic.<Cite src="eip-4844" />
+
+## What a correct sender looks like
+
+Everything above collapses into a small number of design commitments.
+
+**One allocator per account, and it is the only thing that reads the nonce.** Concurrent workers each
+calling `eth_getTransactionCount` produce collisions, because the answer does not account for what the
+other workers are about to send. `pending` includes what the *node you asked* knows about, which is
+not the same as what you sent through a different provider.<Cite src="execution-apis" />
+
+**Retain the signed bytes and the nonce that was assigned.** A replacement requires re-signing at the
+same nonce; if you cannot reconstruct which nonce a stuck transaction holds, you cannot free the
+account.
+
+**Have a stuck path, and have it act on the oldest unconfirmed nonce.** Not the newest, not the one
+the user complained about. The blocked account has exactly one blocking transaction and it is the
+lowest outstanding nonce.
+
+**Cap in-flight depth, and cap it at one for delegated accounts.** Otherwise the pool rules above will
+do it for you, at submission time, inconsistently across providers.<Cite src="geth-legacypool" />
+
+<Check type="spot-bug" concept="nonce-ordering">
+A payout worker runs four concurrent goroutines against one hot wallet. Each one does:
+
+```text
+nonce = eth_getTransactionCount(wallet, "pending")
+sign and broadcast with that nonce
+```
+
+The wallet is an ordinary EOA. Describe the failure modes, then describe what changes if the wallet is
+later delegated with an EIP-7702 authorization.
+
+<Answer>
+**Collision, from the race.** Two goroutines that call `eth_getTransactionCount` before either has
+broadcast receive the same answer and sign two different transactions at the same nonce. They become
+accidental replacements of each other: one is included, the other is invalid forever, and the payout it
+carried never happens. The service sees a successful broadcast and no receipt.
+
+**Gaps, from partial failure.** If a broadcast fails after a nonce was consumed locally — a timeout, a
+rejected fee, a provider hiccup — the later transactions form a gap and sit ineligible, not slow.
+Nothing downstream is includable.<Cite src="geth-legacypool" />
+
+**Disagreement between providers.** `pending` is answered from the pool of the node you asked, and
+pools are node-local. Round-robin across two providers and the two of them will legitimately give
+different answers to the same question at the same instant.<Cite src="execution-apis" />
+
+**The fix** is a single in-process allocator that owns the account: it reads the chain nonce once at
+startup, hands out nonces itself, and reconciles against `latest` — never `pending` — when it needs to
+resynchronise, because `latest` reflects what the chain has actually accepted rather than what one
+node happens to be holding.
+
+**Now delegate the wallet.** Two additional things break, and they break at a different layer.
+
+First, the account's nonce can now advance without this service sending anything, because processing
+an EIP-7702 authorization increments the authority's nonce.<Cite src="eip-7702" /> A local counter
+that only counts its own sends will drift, and drift produces a gap.
+
+Second, and more abruptly: go-ethereum limits a delegated account — or one with a pending
+authorization in the pool — to a single in-flight executable transaction, and rejects gapped-nonce
+transactions from it outright.<Cite src="geth-legacypool" /> The four-goroutine design does not
+degrade here; three of the four submissions are refused. The correct shape for a delegated hot wallet
+is depth-one and strictly serial, or a different account.
+</Answer>
+</Check>
+
+## Where this pays off
+
+The nonce rule is the reason several later mechanisms exist in the shape they do.
+
+**Account abstraction and batching.** The whole appeal of getting several operations into one
+transaction is that a sequence of separate transactions from one sender is fragile in precisely the
+way this lesson describes — and the type-`0x04` envelope you met earlier is one of the answers.<Cite src="eip-7702" />
+
+**Relayers and sponsored flows.** Once the payer and the actor are different accounts, they have
+different nonce sequences, and which of the two can stall the other becomes a design question with a
+real answer.<Cite src="nethermind-7702-attack-surfaces" />
+
+**L2 batch posting.** A sequencer's inbox transactions come from one address, in order, forever. Every
+throughput property of that pipeline is bounded by this rule, and the blob pool's stricter policy
+tightens it further.<Cite src="geth-blobpool" />
+
+**And the product surface.** "Pending" is the single most overloaded word in this domain: it can mean
+executable and competing, ineligible behind a gap, or already dropped from every pool you can reach.
+The module's reflection prompt asks you to look at code you have written and decide which of the five
+envelopes it silently assumes. Ask the same question of your pending state — and of what your
+interface offers a user at ten seconds, two minutes and ten minutes, given that all three of those
+words are live possibilities.

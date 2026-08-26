@@ -1,0 +1,422 @@
+---
+id: solidity-token-standards-amount-sent-vs-arrived
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources: [eip-20, weird-erc20, uniswap-v2-router02-source, lido-tokens-integration-guide, oz-safe-erc20-source, measured-gas-constants, eip-1155]
+stack: { solidity: "0.8.36" }
+---
+
+A vault has been live for six weeks. Deposits and withdrawals both work. Then a withdrawal reverts
+for insufficient balance, and the operator checks the numbers: the contract's internal ledger says
+it owes 1,000,000 units and `balanceOf(vault)` says it holds 980,000.
+
+Nobody stole anything. There was no exploit transaction to find. The contract has been recording a
+number that was never true, once per deposit, for six weeks — and the first person to notice is the
+last person to withdraw.
+
+This lesson is about the gap between the amount a function was asked to move and the amount that
+actually arrived, and about the second, stranger gap: balances that change while nothing calls the
+token at all.
+
+## The first gap: fees on transfer
+
+Some tokens deduct on every transfer. The catalogue names STA and PAXG as tokens that take a fee,
+and — the part that matters more — names USDT and USDC as tokens that do not currently charge a fee
+*but may do so in the future*.<Cite src="weird-erc20" />
+
+Read that second clause with the previous lessons in hand. Both are upgradeable, so "does this token
+charge a fee" is not a property you can check once and cache; it is a property of whichever
+implementation is behind the proxy at the moment your transaction executes.<Cite src="weird-erc20" />
+A token that is compliant today can become fee-on-transfer by an administrative action you will not
+be told about.
+
+The catalogue also records what this has already cost: the STA transfer fee was used to drain
+several Balancer pools.<Cite src="weird-erc20" />
+
+### Worked example: how a vault becomes insolvent on purpose-built arithmetic
+
+The token takes 2% on transfer. The vault credits the requested amount.
+
+**Subgoal: establish the lie.** Alice deposits 100.
+
+```text
+  transferFrom(alice, vault, 100)   -> vault receives 98, token burns 2
+  shares[alice] = 100                  <- credited from the argument, not the outcome
+  balanceOf(vault) = 98
+```
+
+The contract's ledger and the token's ledger now disagree by 2, and nothing anywhere reports it. The
+transfer returned `true`. The event says 100 left Alice.
+
+**Subgoal: repeat until somebody notices.** Bob and Carol each deposit 100.
+
+<Matrix
+  numeric
+  corner="After"
+  cols={["Credited — from the argument", "Held — the token's ledger", 'Shortfall']}
+  rows={[
+    { label: "alice's deposit of 100", cells: ['100', '98', { v: '2', tone: 'warn' }] },
+    { label: 'three deposits of 100', cells: ['300', '294', { v: '6', tone: 'danger' }] },
+  ]}
+  caption="One ledger is written from the argument and the other from the outcome, so the gap grows once per deposit and never corrects itself."
+  alt="After Alice's deposit of 100 the contract has credited 100 while the token holds 98, a shortfall of 2. After three such deposits the figures are 300 credited, 294 held, a shortfall of 6."
+/>
+
+**Subgoal: pay the early users with the late users' money.** Alice withdraws 100 and gets it —
+there are 294 units sitting there. Bob withdraws 100 and gets it; 94 remain. Carol asks for 100 and
+the transfer reverts.
+
+Name the shape precisely, because it is the general form and not a fee-on-transfer curiosity: **the
+accounting error is a subsidy from the last withdrawer to every earlier one.** It is invisible while
+deposits outpace withdrawals, and it surfaces as a single failing transaction belonging to somebody
+who did nothing wrong. That is also why it is hard to detect in testing — a test that deposits and
+withdraws in the same order, with the same user, never touches the failing path.
+
+<Misconception
+  belief="If transferFrom(user, address(this), amount) returns true, the contract received amount."
+  reality="The boolean says the transfer happened. It says nothing about how much moved. Fees, burns, rounding and max-value special cases all deliver less than the argument."
+  why="Every ordinary payments API returns the amount as part of the result. ERC-20's transfer returns a bool and nothing else, so the only information about quantity is the argument you supplied — which is a request, not a receipt."
+  src="weird-erc20"
+/>
+
+## The general fix: credit what arrived
+
+Stop trusting the argument. Measure.
+
+```solidity
+uint256 before = token.balanceOf(address(this));
+token.safeTransferFrom(msg.sender, address(this), amount);
+uint256 received = token.balanceOf(address(this)) - before;
+shares[msg.sender] += received;
+```
+
+This is not a workaround invented for this lesson. Uniswap V2's router carries a whole family of
+`SupportingFeeOnTransferTokens` functions built on exactly this shape:<Cite src="uniswap-v2-router02-source" />
+
+```solidity
+uint balanceBefore = IERC20(path[path.length - 1]).balanceOf(to);
+_swapSupportingFeeOnTransferTokens(path, to);
+require(
+    IERC20(path[path.length - 1]).balanceOf(to).sub(balanceBefore) >= amountOutMin,
+    'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT'
+);
+```
+
+There is a design detail in that family worth more than the code. The ordinary
+`swapExactTokensForTokens` returns `uint[] memory amounts` — the computed path amounts. The
+fee-supporting variant returns **nothing**.<Cite src="uniswap-v2-router02-source" /> You cannot quote
+what you cannot predict, so the router stops pretending to and gives you a floor check instead. When
+you are designing an interface around uncertain amounts, that is the honest move: replace the
+promised figure with a bound the caller supplies.
+
+### What the delta pattern costs, and where it breaks
+
+It is not free and it is not universal. Four caveats, in the order they bite.
+
+**It costs two extra external calls.** Each `balanceOf` is an account access to the token plus a
+storage read inside it. On the first touch that is 2,600 plus 2,100 gas; on the second, with both
+warm, 100 plus 100 — measured on forge 1.7.1 with solc 0.8.36.<Cite src="measured-gas-constants" />
+The cold reads are usually paid anyway because the transfer itself touches the same slots, so the
+marginal cost of measuring is small. Small, not zero.
+
+**It assumes `balanceOf` is honest and stable across the call.** If the token's balance can change
+for a reason other than your transfer while your transfer is executing — a rebase, a hook that moves
+additional value, a reentrant deposit from another user — the delta attributes that change to your
+depositor.
+
+**It breaks when one contract holds a shared balance.** Two accounting systems in the same contract,
+or one contract holding both user deposits and protocol fees, measure a delta that includes anything
+else that arrived in the same call. The delta answers "how much did this contract's balance change",
+which is only the same as "how much did this user deposit" when nothing else can move.
+
+**It is incompatible with reentrancy through the token.** If the transfer can call out — the next
+three lessons' subject — an attacker can deposit inside your deposit, and the two deltas interleave.
+Measure, and also guard.
+
+## The second gap: balances that move on their own
+
+A fee reduces what arrives. A rebase changes what you already have.
+
+stETH is the token to reason about because its documentation is unusually direct. Balances are
+recalculated when the Lido oracle reports the consensus-layer balance update — normally daily — and
+the update lands on every address holding the token at that moment.<Cite src="lido-tokens-integration-guide" />
+The rebase can in principle be negative, if validators are penalised or slashed, though the
+documentation records that daily rebases have not been negative to
+date.<Cite src="lido-tokens-integration-guide" />
+
+The mechanism underneath is shares. A share is a unit of claim on the total ether the protocol
+controls; the token's balance function converts shares to a balance using the current rate, and the
+contract stores the sum of all shares to do it.<Cite src="lido-tokens-integration-guide" /> If that
+sounds like the vault accounting from lessons nine through eleven, it is — the same construction,
+arrived at for the same reason.
+
+Now the consequence, which the documentation states as guidance: **when integrating stETH, store and
+operate on shares rather than on public balances, because balances change on transfers, mints, burns
+*and* rebases, while share balances change only on transfers, mints and
+burns.**<Cite src="lido-tokens-integration-guide" />
+
+That sentence is the whole integration rule, and it also tells you what breaks if you ignore it:
+
+- **A stored amount goes stale.** "User deposited 100" is wrong tomorrow, in a direction that
+  depends on validator performance.
+- **An event-derived index drifts.** ERC-20 requires a `Transfer` event when tokens are transferred;
+  a rebase is not a transfer, so an indexer reconstructing balances from `Transfer` logs diverges a
+  little more every day.<Cite src="eip-20" /><Cite src="lido-tokens-integration-guide" /> Compare
+  ERC-1155, which explicitly requires the queried balance and the event-derived balance to be
+  identical — a guarantee ERC-20 never made.<Cite src="eip-1155" />
+- **A cached balance is a bug with a clock.** The catalogue notes that systems caching token
+  balances, Balancer and Uniswap v2 among them, operate on outdated information when balances move
+  outside transfers, and that some pools had to be special-cased into the rebase procedure
+  itself.<Cite src="weird-erc20" />
+
+The two available fixes are the same two the rest of this module keeps producing: hold shares
+(`transferShares` rather than `transfer`), or integrate the wrapped, non-rebasing version — wstETH,
+whose balance does not move and whose value against stETH does
+instead.<Cite src="lido-tokens-integration-guide" />
+
+### Rounding is a third source of the same gap
+
+There is a smaller effect in the same token that catches people who have already handled the big
+one. Because a balance is computed from shares by integer division, transferring a *whole* balance
+frequently leaves 1 to 2 wei behind on the sender, and the documentation warns that the error can
+grow as the share rate grows.<Cite src="lido-tokens-integration-guide" />
+
+So a function that reads `balanceOf(user)` and then transfers exactly that amount can fail its own
+"balance is now zero" assertion. The recommended path is `transferShares`, which moves the unit the
+accounting is actually kept in.<Cite src="lido-tokens-integration-guide" />
+
+Note what this is: the amount sent is not the amount that arrived, produced by rounding rather than
+by policy. Same failure, different cause, same fix — measure, or work in the unit that does not
+round.
+
+<Misconception
+  belief="A holder's balance only changes when a transfer happens."
+  reality="Rebasing tokens recalculate every holder's balance on a schedule, with no per-holder transfer and no per-holder Transfer event. Stored amounts and log-derived indexes both drift."
+  why="Every other token teaches that a balance change implies an event, and ERC-20 never promised the converse. ERC-1155 later did; ERC-20 did not."
+  src="lido-tokens-integration-guide"
+/>
+
+## The special case that is neither a fee nor a rebase
+
+One more, because it defeats a naive delta check in a way that is worth seeing.
+
+Compound's cUSDCv3 has a special case for `amount == type(uint256).max` in its transfer functions:
+it transfers the user's whole balance rather than the enormous number you
+passed.<Cite src="weird-erc20" /> The catalogue is explicit about the systems this breaks — vault
+types that transfer a user-supplied amount and then credit the user with the same value in storage,
+without checking what actually moved.<Cite src="weird-erc20" />
+
+Think about which direction that goes. Fee-on-transfer delivers *less* than requested, which makes
+the vault insolvent. This delivers less than the literal argument too — but the argument was
+`type(uint256).max`, so a contract that credits the argument credits a user with the maximum
+`uint256` on a deposit of whatever they happened to hold. That is not a rounding error; that is
+minting the protocol's entire share supply to one address.
+
+Same rule, and now for a second reason: credit the delta, never the argument.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'Fee on transfer', note: 'STA, PAXG' },
+    { title: 'Rebase', note: 'stETH', tone: 'warn' },
+    { title: 'max means everything', note: 'cUSDCv3' },
+  ]}
+  rows={[
+    {
+      label: 'What is the gap?',
+      cells: [
+        'Less arrives than the argument asked for.',
+        'What the holder already has is recalculated.',
+        'Far less arrives than the literal argument.',
+      ],
+    },
+    {
+      label: 'When does it happen?',
+      cells: [
+        'On every transfer.',
+        'When the Lido oracle reports — normally daily.',
+        'Only when the argument is type(uint256).max.',
+      ],
+    },
+    {
+      label: 'What does crediting the argument do?',
+      cells: [
+        'Overstates the deposit a little, once per deposit.',
+        'Freezes a number the token will redefine tomorrow.',
+        "Credits the maximum uint256 — the protocol's whole share supply, to one address.",
+      ],
+    },
+    {
+      label: 'What fixes it?',
+      cells: [
+        'Credit the measured delta.',
+        'Store shares, or list the wrapped non-rebasing token.',
+        'Credit the measured delta.',
+      ],
+    },
+  ]}
+  caption="Measuring the delta fixes the outer two columns and does nothing for the middle one, because nothing about a rebase happens during your call."
+  alt="Fee-on-transfer, rebasing and the cUSDCv3 max-value special case compared on what the gap is, when it happens, what crediting the argument does, and what fixes it."
+/>
+
+## The gap you create yourself: decimals
+
+The three gaps above are the token's doing. This one is yours, and it belongs here because it
+produces the same symptom — a number in your storage that does not mean what the code assumes.
+
+`decimals` is display metadata. It is OPTIONAL in the standard, other contracts MUST NOT expect it
+to be present, and it does not appear in any arithmetic the token performs.<Cite src="eip-20" />
+Balances are integers. A token with 6 decimals stores `1000000` for one unit and a token with 18
+stores `1000000000000000000`, and the token itself never divides by anything.
+
+The catalogue records the range you have to survive: USDC has 6, Gemini USD has 2, YAM-V2 has 24,
+and it names the two distinct consequences — larger-than-expected precision loss at the low end, and
+unexpected reverts from overflow at the high end.<Cite src="weird-erc20" />
+
+**Subgoal: see where the factor has to live.** Suppose a vault takes USDC (6) and prices it against
+an 18-decimal accounting unit at $1.00.
+
+```text
+  user deposits            1000000        1 USDC, in USDC's units
+  internal unit            10**18         "one dollar" in the vault's units
+  correct scale factor     10**12
+```
+
+**Subgoal: get it wrong in the cheap direction.** Omit the factor and one USDC is credited as
+`0.000000000001` internal units. Harmless-looking, catastrophic in a market: the position rounds to
+nothing and the user has deposited into a black hole.
+
+**Subgoal: get it wrong in the expensive direction.** Apply the factor twice, or hard-code 18 for a
+token that has 6, and one USDC is credited as a million dollars. That is the direction that becomes
+an exploit rather than a support ticket, and it is the direction a test written by the same person
+who wrote the bug does not catch, because both use the same constant.
+
+The defensive shape is to read `decimals()` at integration time rather than hard-coding it — through
+something like `SafeERC20.tryGetDecimals`, which treats a missing or implausible answer as failure
+rather than as 18.<Cite src="oz-safe-erc20-source" /> And to hold one rule: **a raw balance is
+meaningless without the address it came from.** Any function signature that takes an amount without
+a token is a place where two scales can meet.
+
+## The taxonomy, as an integration checklist
+
+"ERC-20 compliant" is a spectrum, and the catalogue is the map. Each row below is a deviation with a
+named example and the assumption it breaks — every entry drawn from the same
+source.<Cite src="weird-erc20" />
+
+| Deviation | Named examples | What it breaks |
+|---|---|---|
+| Returns no `bool` | USDT, BNB, OMG | The ABI decode in your caller |
+| Returns `false` on success | Tether Gold | Any return-value discipline at all |
+| Returns `false` instead of reverting | ZRX, EURS | Unchecked calls proceed on a failed transfer |
+| Fee on transfer | STA, PAXG (and a future switch on USDT, USDC) | Credited amount ≠ received amount |
+| Balance changes outside transfers | rebasing and airdropping designs | Stored amounts, cached balances, log-derived indexes |
+| Upgradeable | USDC, USDT | Every behaviour you verified once |
+| Blocklists | USDC, USDT | Liveness — funds can be frozen in your contract |
+| Pausable | BNB, ZIL | Liveness, at the token owner's discretion |
+| Non-18 decimals | USDC (6), Gemini USD (2), YAM-V2 (24) | Precision loss; overflow on the high side |
+| Revert on zero-value transfer | LEND | Payout loops with a possibly-empty leg |
+| Revert on zero-value approval | BNB | Approve-to-zero-then-set |
+| Revert on approval to the zero address | OpenZeppelin-derived tokens | Burn-style and cleanup paths |
+| Revert on transfer to the zero address | OpenZeppelin-derived tokens | Burning by transferring to `0x0` |
+| Values capped below `uint96` | UNI, COMP | Unlimited approvals; large transfers |
+| Multiple addresses for one balance | proxied tokens | Any per-address bookkeeping or allowlist |
+| Flash-mintable | DAI | Total supply is not a bound during a transaction |
+| Reentrant transfer | ERC-777 tokens | Checks-Effects-Interactions in your code |
+| `type(uint256).max` means "everything" | cUSDCv3 | Crediting the argument |
+| Malicious code in `name` | observed in the wild | Front ends that render metadata unescaped |
+
+Two things to take from the table rather than from any single row.
+
+**The deviations are independent.** A token can be upgradeable *and* blocklisting *and* six-decimal
+*and* return no boolean, and USDT is three of those four. There is no "compliant / non-compliant"
+bit to check.
+
+**Most of the rows are liveness, not theft.** Blocklists, pausing and zero-value reverts do not let
+anyone take your users' money; they let somebody else decide when your users can move it. That is a
+different conversation with a product owner than "we might get hacked", and it is the one most teams
+never have.
+
+The rule that follows is unglamorous and is the actual deliverable of this lesson: **integration
+safety is a per-token question, answered by reading the deployed source at the address you will
+actually call.** Not the project's documentation, not the interface file, not a blog post listing
+"the weird ones". The catalogue is a starting set of cases to test against, not an inventory of the
+tokens that have them.<Cite src="weird-erc20" />
+
+### How to actually answer it
+
+The checks that fit in an afternoon, in the order that eliminates the most risk per minute:
+
+**Fetch the deployed source at the address, not the project's repository.** If the address is a
+proxy, follow it to the implementation and note that the answer has an expiry date, because whoever
+holds the upgrade key can change it.<Cite src="weird-erc20" />
+
+**Read three functions and nothing else at first**: `transfer`, `transferFrom`, `approve`. Their
+return statements answer the previous lesson. Any arithmetic between the debit and the credit
+answers this one. Any external call inside them answers the next three.
+
+**Send one unit on a fork and diff the balances.** A single test that transfers 1 unit between two
+addresses and asserts `receivedDelta == sentDelta` settles fee-on-transfer empirically, in less time
+than reading about it takes.
+
+**Grep the implementation for an admin surface**: pause, blocklist, freeze, upgrade, and any
+`onlyOwner` path that touches balances. Those are the liveness rows of the table, and they are a
+disclosure obligation to your users rather than a bug to fix.
+
+**Write down the answer next to the address in your config.** The next person to add a token will
+copy whatever pattern they find there.
+
+<Check type="predict" concept="balance-delta-pattern">
+A lending market credits collateral using the measured-delta pattern:
+
+```solidity
+uint256 before = token.balanceOf(address(this));
+token.safeTransferFrom(msg.sender, address(this), amount);
+collateral[msg.sender] += token.balanceOf(address(this)) - before;
+```
+
+The team is confident this handles fee-on-transfer tokens, and it does. They now want to list stETH.
+Predict what goes wrong, and say whether the delta pattern is the thing that fails.
+
+<Answer>
+**The deposit itself is fine.** The delta is measured across the transfer, so whatever arrives —
+including the 1-to-2-wei rounding shortfall that stETH's integer division
+produces — is what gets credited.<Cite src="lido-tokens-integration-guide" /> The delta pattern does
+its job.
+
+**The stored number then stops being true, and nothing re-measures it.** `collateral[user]` is an
+amount, frozen at deposit time. The next daily oracle report changes what a stETH balance means, for
+every holder, with no transfer and no per-holder
+event.<Cite src="lido-tokens-integration-guide" /> The market's records and the token's records
+diverge from that moment and keep diverging.
+
+**Both directions are bad.** If rebases are positive, the market holds more stETH than it has
+credited — the surplus is unattributed, and whoever finds a path to claim it takes yield that
+belonged to depositors. If a rebase is ever negative, the market has credited more than it holds and
+is undercollateralised across every stETH position at once, without any position having moved.
+
+**So the delta pattern is not what fails.** It answers "how much arrived", which is a
+transfer-time question. The failure is that collateral is a *standing* quantity and the token
+redefines standing quantities on a schedule. The two fixes are the ones Lido documents: store shares
+and convert at read time, or list wstETH, whose balance does not
+move.<Cite src="lido-tokens-integration-guide" />
+
+The transferable lesson is that "measure the delta" and "store the right unit" are answers to
+different questions, and a token can require both.
+</Answer>
+</Check>
+
+## Where this pays off
+
+**The next three lessons** add the missing hazard: transfers that hand execution to somebody else
+mid-flight. Everything here assumed the token did its work and returned. ERC-721, ERC-1155 and
+ERC-777 do not.
+
+**Lessons nine through eleven** take the share accounting that Lido's documentation describes and
+make it the whole subject — ERC-4626 is that construction, standardised, with an arithmetic failure
+at the bottom of it.
+
+**The DeFi track** meets every row of the table again as a live integration decision: which assets a
+market lists is a risk question, and most of the risk is in the rows about liveness rather than the
+rows about theft.

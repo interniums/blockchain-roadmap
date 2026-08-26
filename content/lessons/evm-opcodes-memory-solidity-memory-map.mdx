@@ -1,0 +1,306 @@
+---
+id: evm-opcodes-memory-solidity-memory-map
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    solidity-layout-memory,
+    solidity-inline-assembly,
+    ottersec-memory-safety,
+    solidity-forum-memory-safe,
+    yellow-paper,
+    eip-5656,
+    solady,
+  ]
+stack:
+  solc: "0.8.36"
+---
+
+An assembly block needs somewhere to stash a 32-byte value for two statements. The author picks
+offset `0x40`, because it is early, it is obviously not in use by any array they declared, and
+writing there is one instruction.
+
+The tests pass. Three months later someone adds a line to an unrelated function in the same contract
+and a `bytes memory` return value comes back full of garbage. The bisect points at the new line. The
+new line is correct.
+
+Offset `0x40` is not free space. It holds the free-memory pointer, and overwriting it told every
+subsequent allocation in that call to start somewhere the author picked by accident.
+
+The previous lessons described memory as the machine sees it: an untyped byte array with no
+allocator. This lesson is about the allocator that Solidity builds on top of it — a convention that
+occupies exactly four words, that the compiler's own generated code depends on, and that inline
+assembly can break in four distinct ways.
+
+## Four reserved words, and what each is for
+
+Solidity reserves the first four 32-byte slots of memory. The documentation states the ranges
+inclusively:<Cite src="solidity-layout-memory" />
+
+<Figure
+  caption="Three of the four reserved words are data and one of them is the allocator, which is why a stray write at 0x40 damages allocations made by code you never touched."
+  alt="Solidity's memory map at the start of a call. Bytes 0 to 63 are scratch space for hashing methods. Bytes 64 to 95 hold the free-memory pointer. Bytes 96 to 127 are the zero slot, the initial value of every empty dynamic memory array. Allocation runs upward from byte 128, hexadecimal 0x80."
+>
+  <ByteLayout
+    offsets
+    caption="memory at the start of a call"
+    fields={[
+      { label: 'scratch', size: 64, tone: 'muted', note: '0x00–0x3f, hashing' },
+      { label: 'free-memory pointer', size: 32, tone: 'accent', note: '0x40, holds 0x80' },
+      { label: 'zero slot', size: 32, tone: 'danger', note: '0x60, never write' },
+      { label: 'allocations', variable: true, note: 'from 0x80, forward only' },
+    ]}
+  />
+</Figure>
+
+Allocation begins at `0x80`, which is where the free-memory pointer points when execution
+starts.<Cite src="solidity-layout-memory" />
+
+Each of those three regions behaves differently, and the differences are what make assembly around
+them either routine or catastrophic.
+
+**Scratch space is genuinely yours, between statements.** The documentation says so directly: it can
+be used within inline assembly.<Cite src="solidity-layout-memory" /> Sixty-four bytes is exactly two
+words, which is exactly what `keccak256(abi.encode(a, b))` needs, which is why every hand-written
+mapping-slot derivation you have read writes to `0x00` and `0x20` and then hashes 64 bytes from
+`0x00`. It is a documented, sanctioned use. The words *between statements* are the limit: nothing may
+survive there across a statement boundary, because the compiler is free to clobber it.
+
+**The free-memory pointer is the allocator.** It is not a hint, a cache, or a debugging aid. It is
+the single piece of state that says where the next object goes.
+
+**The zero slot must never be written.** It is the initial value for dynamic memory arrays and should
+never be written to.<Cite src="solidity-layout-memory" /> Every empty `uint[] memory` in the contract
+points at `0x60` and reads its length from there. Write a non-zero value into that slot and every
+empty dynamic array in the rest of the call claims to have that many elements.
+
+<Aside kind="warn">
+The failure mode of writing to `0x60` is worth picturing, because it does not look like memory
+corruption. It looks like an empty array having 8,364,164 elements, and then a loop over that array
+running until it runs out of gas. The distance between cause and symptom is the whole problem.
+</Aside>
+
+## What allocating actually is
+
+There is no `malloc`. Allocation is three instructions and a convention:
+
+```solidity
+assembly ("memory-safe") {
+    let ptr := mload(0x40)     // 1. read where free memory starts
+    mstore(ptr, 0x2a)          // 2. use the bytes it names
+    mstore(0x40, add(ptr, 0x20)) // 3. write the advanced pointer back
+}
+```
+
+Step three is the one that gets skipped, and skipping it is not a leak — it is the opposite. Your
+bytes stay where they are, the pointer still names them as free, and the *next* allocation is handed
+the same address. Two live objects then occupy one region and each sees the other's writes.
+
+<Figure
+  caption="The third instruction is the whole allocator; omit it and the next caller is handed an address that is already occupied."
+  alt="Allocating in Solidity is three steps: read the free-memory pointer at 0x40, write into the bytes it names, then store the advanced pointer back so the next allocation gets fresh bytes. If the third step is omitted the pointer is unchanged and the next allocation is handed the same address."
+>
+  <Flow
+    nodes={[
+      { id: 'r', label: 'mload(0x40)', note: 'the free pointer', col: 0 },
+      { id: 'u', label: 'use the bytes', note: 'your object', col: 1, tone: 'accent' },
+      { id: 'w', label: 'mstore(0x40, …)', note: 'pointer advances', col: 2, tone: 'good' },
+      { id: 'x', label: 'skip it', note: 'pointer stays', col: 2, tone: 'danger', dashed: true },
+      { id: 'ok', label: 'next allocation', note: 'fresh bytes', col: 3, tone: 'good' },
+      { id: 'bad', label: 'next allocation', note: 'your bytes', col: 3, tone: 'danger', dashed: true },
+    ]}
+    edges={[
+      { from: 'r', to: 'u' },
+      { from: 'u', to: 'w' },
+      { from: 'u', to: 'x', tone: 'danger', dashed: true },
+      { from: 'w', to: 'ok', tone: 'good' },
+      { from: 'x', to: 'bad', tone: 'danger', dashed: true },
+    ]}
+  />
+</Figure>
+
+The pointer only ever moves forward. Solidity always places new objects at the free-memory pointer,
+and memory is never freed.<Cite src="solidity-layout-memory" /> That is the allocator, in its
+entirety: a monotonically increasing integer at a fixed address.
+
+### What the objects look like
+
+Enough of the layout to read a memory dump:
+
+- A dynamic array stores its length in the first word, followed by the elements.<Cite src="solidity-layout-memory" />
+- Elements of memory arrays always occupy multiples of 32 bytes — the documentation notes this holds
+  even for `bytes1[]`.<Cite src="solidity-layout-memory" /> `bytes` and `string` are the exception:
+  those are packed.
+- A multi-dimensional memory array is an array of *pointers* to arrays, not a flat block.<Cite src="solidity-layout-memory" />
+
+The first two points are why [packing does nothing in memory](/c/packing-helps-storage-only): a
+`uint8[100] memory` occupies 3,200 bytes, exactly as a `uint256[100] memory` does. The third is why
+copying a nested memory array is not one `MCOPY` and why passing one between functions is cheaper
+than it looks — you are moving a pointer.<Cite src="eip-5656" />
+
+## Four ways to break the convention
+
+Each of these is a real bug pattern, and each has a distinct signature.
+
+**One: write below `0x80` for storage rather than scratch.** Anything you leave in scratch space
+across a statement boundary can be overwritten by compiler-generated code that also uses it. The
+symptom is a value that is correct in a small test and wrong once the surrounding function grows.
+
+**Two: overwrite the free-memory pointer at `0x40`.** Every subsequent allocation in the call goes to
+wherever you pointed it — possibly on top of live data, possibly below `0x80`, possibly into the
+reserved region itself. The symptom is corruption in code you never touched, and it appears or
+disappears depending on how much allocation happens afterwards.
+
+**Three: write to the zero slot at `0x60`.** Every empty dynamic array in the call now has a
+non-zero length.
+
+**Four: use memory without advancing the pointer.** The next allocation aliases yours. This is the
+most common of the four, because it is the one you get by *omission* rather than by doing something
+that looks wrong.
+
+The unifying point is the one the concept turns on: **the compiler's own generated code relies on
+this convention.** Breaking it does not corrupt only your data. It corrupts data belonging to code
+you did not write, in functions you did not modify, at a distance that makes the bisect useless.
+
+<Misconception
+  belief="The reserved region is a convention, so I can ignore it inside my own assembly as long as I am careful with my own data."
+  reality="The compiler's generated code reads the free-memory pointer, uses the scratch space, and relies on the zero slot. Ignoring the convention corrupts unrelated allocations, not just yours."
+  why="The word convention sounds like a style rule — a naming scheme, an indentation preference — rather than a contract with a party that is not in the room. The other party here is the code generator, and it never announces its use of these addresses in the source you are reading."
+  src="solidity-layout-memory"
+/>
+
+## Free memory is not zeroed memory
+
+This one catches careful people, because it contradicts something true.
+
+The machine zero-initialises memory: any byte never written reads as zero.<Cite src="yellow-paper" />
+It is therefore tempting to conclude that the region above the free-memory pointer is a supply of
+zeroed scratch.
+
+It is not, and the documentation is explicit. Some operations need a temporary area larger than the
+64 bytes of scratch space. They are placed where the free-memory pointer points, and because their
+lifetime is short, the pointer is *not* updated. The memory may or may not be zeroed out afterwards,
+and you should not expect free memory to point at zeroed memory.<Cite src="solidity-layout-memory" />
+
+The same passage warns off the obvious workaround: reaching for `MSIZE` to find a definitely-zeroed
+region and then using that pointer non-temporarily, without updating the free-memory pointer, can
+have unexpected results.<Cite src="solidity-layout-memory" />
+
+<Misconception
+  belief="Memory above the free-memory pointer is zeroed, because the EVM zero-initialises memory."
+  reality="The machine's guarantee is about memory never written. The compiler writes above the pointer for short-lived temporaries without advancing it, so that region may hold arbitrary leftovers."
+  why="Both halves of the confusion are true statements about different subjects. The machine does zero-initialise. The compiler does write above the pointer. Nothing in the source shows the second happening, so the first is the only fact in view."
+  src="solidity-layout-memory"
+/>
+
+## The annotation is a promise, not a check
+
+You will have noticed `("memory-safe")` on the assembly block above. It deserves one paragraph here
+and a full treatment in the Yul module.
+
+The annotation asserts that your block only touches memory it is allowed to touch — your own
+allocations, Solidity allocations you legitimately reference, the scratch space, and temporary space
+beyond the free-memory pointer that you do not leave anything depending
+on.<Cite src="solidity-inline-assembly" /> The compiler does not verify the claim. It *acts* on it,
+by allowing optimisations such as moving stack values into memory that would be unsound if the claim
+were false.<Cite src="solidity-forum-memory-safe" />
+
+Two consequences follow, in opposite directions.
+
+Annotating falsely produces undefined behaviour that typically does not show up in tests, because
+whether the optimiser exercises the unsound path depends on unrelated code — an audit firm's
+walkthrough of exactly this failure is worth reading before you write the annotation for the first
+time.<Cite src="ottersec-memory-safety" />
+
+Omitting it is safe for correctness but has a cost you did not choose: an assembly block that touches
+memory or assigns to a memory variable and is not annotated disables stack-to-memory movement and
+other memory optimisations for the whole compilation unit.<Cite src="solidity-inline-assembly" /> One
+lazy block taxes every function in the file.
+
+There is a third case people miss: a block that neither touches memory nor assigns to a memory
+variable is automatically memory-safe and needs no annotation at
+all.<Cite src="solidity-inline-assembly" />
+
+<Check type="spot-bug" concept="solidity-free-memory-pointer">
+A library function concatenates two `bytes memory` values. The author wrote it in assembly for speed:
+
+```solidity
+function concat(bytes memory a, bytes memory b)
+    internal pure returns (bytes memory out)
+{
+    assembly ("memory-safe") {
+        out := mload(0x40)
+        let lenA := mload(a)
+        let lenB := mload(b)
+        mstore(out, add(lenA, lenB))
+        mcopy(add(out, 0x20), add(a, 0x20), lenA)
+        mcopy(add(add(out, 0x20), lenA), add(b, 0x20), lenB)
+    }
+}
+```
+
+It returns the right bytes in every test. Name every defect you can find, and say which of them the
+tests were never going to catch.
+
+<Answer>
+**Defect one — the free-memory pointer is never advanced.** `out` is set to `mload(0x40)` and the
+region is written, but `0x40` is never updated.<Cite src="solidity-layout-memory" /> The next
+allocation in the caller receives the same address and writes over the concatenated result. The tests
+pass because a test that calls `concat` and immediately compares the result usually allocates nothing
+in between; add one statement that does, and the result changes underneath you. This is the failure
+mode that appears during an unrelated refactor.
+
+The fix is one instruction, and note that it must round up to a word boundary, because everything
+after this allocation expects to start word-aligned:
+
+```solidity
+mstore(0x40, add(out, and(add(add(0x20, add(lenA, lenB)), 0x1f), not(0x1f))))
+```
+
+**Defect two — the annotation is now false.** `("memory-safe")` promises the block only touches
+memory it is entitled to.<Cite src="solidity-inline-assembly" /> A block that writes above the
+free-memory pointer and leaves data there for the caller to depend on has left something
+depended-upon in temporary space, which is exactly what the permitted-regions rule
+excludes.<Cite src="solidity-inline-assembly" /> Because the annotation is unverified, the compiler
+believes it and may make optimisation decisions that are unsound — and whether it does depends on
+unrelated code, which is why this class of bug survives test suites.<Cite src="ottersec-memory-safety" />
+Fixing defect one also makes the annotation true.
+
+**Defect three — the trailing bytes of the last word are not cleared.** The length word says
+`lenA + lenB`, but the allocation rounds up to a word boundary and the bytes past the logical end are
+whatever was there before. Free memory is not reliably zeroed.<Cite src="solidity-layout-memory" />
+Anything that reads the buffer by length is fine; anything that hashes the padded region, ABI-encodes
+it, or compares it word-wise is not, and a test that only checks the decoded value will not see it.
+
+**What the tests were never going to catch:** defects one and three, because both depend on what
+happens *after* the function returns, and defect two, because it depends on optimiser decisions that
+change with unrelated edits. Only a test that allocates between the call and the comparison would
+catch the first. This is the general shape of memory-convention bugs: the code that observes the
+damage is not the code that caused it.
+
+**A fourth thing worth saying, though it is not a defect:** `mcopy` here requires a Cancun-or-later
+target.<Cite src="eip-5656" /> Compiling this for an older EVM version, or deploying to a chain that
+lacks the opcode, produces bytecode that does not run. Production assembly libraries handle this
+explicitly rather than assuming.<Cite src="solady" />
+</Answer>
+</Check>
+
+## Where this pays off
+
+**Calldata versus memory**, next lesson, is the decision that determines how much of this allocator
+you use at all. A `calldata` parameter never touches the free-memory pointer.
+
+**Inline assembly and Yul** take the memory-safe dialect apart properly: the exact wording of the
+four permitted regions, what the optimiser does with the promise, and how a false annotation
+miscompiles.<Cite src="solidity-inline-assembly" />
+
+**Proxies** are the most common legitimate reason to write assembly against this map. A fallback that
+forwards arbitrary calldata and returns arbitrary return data has to work in raw offsets, and it is
+one of the few places where the trade is clearly worth it.
+
+**Reading production libraries** becomes possible. Solady and comparable codebases are dense with
+assembly that manipulates the free-memory pointer deliberately, and the difference between reading
+that as magic and reading it as ordinary allocator discipline is exactly this
+lesson.<Cite src="solady" />

@@ -1,0 +1,474 @@
+---
+id: evm-execution-four-calls-three-contexts
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: stable
+changeKind: clarifying
+sources:
+  [
+    execution-specs-osaka-system,
+    execution-specs-osaka-storage,
+    execution-specs-osaka-gas,
+    eip-214,
+    eip-1153,
+    erc-1967,
+    erc-7201,
+    eip-1167,
+    eip-7702,
+    eip-2929,
+    solidity-layout-storage,
+  ]
+stack: {}
+---
+
+A team ships an upgradeable contract. The proxy keeps a pointer to its implementation in the first
+storage slot it declared. The implementation, written by a different person in a different week,
+declares `uint256 public totalSupply` as *its* first state variable.
+
+The first mint goes through. `totalSupply` becomes 1,000,000. Nothing reverts.
+
+The next call to the proxy loads its implementation pointer, finds the number one million where an
+address used to be, treats the low twenty bytes of it as an address, and calls into it. That address
+holds no code. A call to an address with no code succeeds and returns nothing. So every function on
+the proxy now returns successfully, does nothing, and reports no error — including the upgrade
+function that would have fixed it.
+
+Nobody wrote a bug. Two contracts disagreed about what slot 0 means, and one opcode made that
+disagreement matter.
+
+That opcode is `DELEGATECALL`, and this lesson is about the family it belongs to. There are four
+call instructions. They differ in exactly three things — whose code runs, whose storage it runs
+against, and what identity it runs under — and every proxy, every library pattern and every
+account-delegation scheme is a particular answer to those three questions.
+
+## The four, side by side
+
+Everything in this table is read directly out of the arguments each opcode passes to the shared
+call implementation in the executable specification.<Cite src="execution-specs-osaka-system" />
+"Caller" below means the contract executing the call instruction.
+
+| | `CALL` | `CALLCODE` | `DELEGATECALL` | `STATICCALL` |
+|---|---|---|---|---|
+| code executed | callee's | callee's | callee's | callee's |
+| storage written | callee's | **caller's** | **caller's** | callee's (writes banned) |
+| `address(this)` inside | callee | **caller** | **caller** | callee |
+| `msg.sender` inside | caller | caller | **caller's own caller** | caller |
+| `msg.value` inside | the value argument | the value argument | **caller's `msg.value`** | 0 |
+| ether actually moves | yes | to itself | **no** | no |
+| takes a value argument | yes | yes | no | no |
+| state mutation | allowed | allowed | allowed | **banned, whole subtree** |
+
+Three of the four rows that matter are marked in bold on `DELEGATECALL`, and that is the shape of the
+lesson: `DELEGATECALL` is the one that lies about where it is.
+
+### `CALL` — the ordinary one
+
+`CALL` is what you get from `token.transfer(...)`, from `addr.call{value: v}("")`, from any external
+function invocation that is not something more exotic. The specification builds the child message with
+`caller` set to the current contract and `to` set to the callee, `should_transfer_value=True`, and the
+value taken from the stack.<Cite src="execution-specs-osaka-system" />
+
+Two details are easy to miss.
+
+**A `CALL` with insufficient balance does not revert.** If the calling contract's balance is less than
+the value requested, the specification pushes 0, clears the return-data buffer, refunds the gas that
+would have been forwarded, and continues.<Cite src="execution-specs-osaka-system" /> Another failure
+that is not an exception.
+
+**A `CALL` inside a static context with non-zero value is an exceptional halt**, before the callee is
+consulted at all.<Cite src="execution-specs-osaka-system" />
+
+### `DELEGATECALL` — borrowed code, your storage, your identity
+
+`DELEGATECALL` takes no value argument, and its message is constructed like this:
+
+```python
+GenericCall(
+    value=evm.message.value,          # inherited, not supplied
+    caller=evm.message.caller,        # inherited, not this contract
+    to=evm.message.current_target,    # yourself
+    code_address=code_address,        # someone else's code
+    should_transfer_value=False,      # no ether moves
+    ...
+)
+```
+
+<Cite src="execution-specs-osaka-system" />
+
+Read the four assignments as four separate promises. The code comes from somewhere else. The storage,
+balance and address are yours, because `to` is yourself. `msg.sender` is whoever called *you*, so an
+`onlyOwner` check inside the borrowed code sees the original user. And `msg.value` reports the value
+your frame received, but `should_transfer_value=False` means no ether moves as part of this
+instruction, because there is nowhere for it to move to.
+
+That last pair is a genuine trap. `msg.value` is a *reported number* here, not a transfer. A contract
+that loops over a batch of operations with `delegatecall`, where each borrowed function credits the
+caller `msg.value`, will credit the same ether once per iteration. The machine is behaving exactly as
+specified; the code is reading a per-frame report as if it were a per-operation receipt.
+
+<Misconception
+  belief="A proxy forwards the call to the implementation."
+  reality="It does not forward anything. It loads the implementation's code and executes it inside itself. The account whose storage changes, whose balance is spent and whose address appears in every log is the proxy."
+  why="'Forwarding' is what proxies do in every other context — HTTP proxies, RPC proxies, reverse proxies all pass a request onward to a different server that does the work. Here the analogy inverts: the request never leaves, the code arrives."
+  src="erc-1967"
+/>
+
+### `STATICCALL` — a flag, not an annotation
+
+`STATICCALL` looks like `CALL` with no value argument, and the important part is one line in the
+shared implementation:
+
+```python
+is_static = params.is_staticcall or evm.message.is_static
+```
+
+<Cite src="execution-specs-osaka-system" />
+
+The flag is inherited by every frame beneath. Once you are inside a static context, everything you
+call, and everything it calls, is also static, to arbitrary depth. There is no opcode to clear it.
+
+What the flag forbids is an explicit list, and each one raises `WriteInStaticContext` in its own
+implementation rather than being filtered centrally: `SSTORE`, `TSTORE`, every `LOG` variant,
+`CREATE` and `CREATE2`, `SELFDESTRUCT`, and a `CALL` carrying non-zero
+value.<Cite src="execution-specs-osaka-storage" /><Cite src="execution-specs-osaka-system" />
+
+The `TSTORE` entry is worth flagging explicitly, because it is a question this corpus previously could
+not settle: EIP-214's enumerated opcode list predates EIP-1153, so the EIP text does not mention
+transient storage.<Cite src="eip-214" /><Cite src="eip-1153" /> The executable specification does
+settle it — `tstore` raises `WriteInStaticContext` on exactly the same line shape as
+`sstore`.<Cite src="execution-specs-osaka-storage" /> Transient storage is not an escape hatch from a
+static context.
+
+<Misconception
+  belief="STATICCALL is how the compiler implements `view`, so it means the same thing."
+  reality="`view` is a compile-time promise about one function's own body. STATICCALL is a runtime flag that makes any mutating opcode fail anywhere in the entire call subtree, including inside contracts the callee calls, which the compiler has never seen."
+  why="The two usually coincide, because Solidity emits STATICCALL when the target is declared view. The divergence appears when the callee's code is not what its interface claimed, or when a view function reaches a contract that tries to write — at which point a compile-time annotation would have been silent and the runtime flag is not."
+  src="eip-214"
+/>
+
+This is what makes `STATICCALL` genuinely useful rather than decorative: it lets you invoke code you
+do not trust and know, mechanically, that it cannot have changed anything. Price oracles, callback
+sniffing and interface probing all rest on that guarantee.
+
+### `CALLCODE` — the ancestor, and why it was replaced
+
+`CALLCODE` sets `to = evm.message.current_target`, so like `DELEGATECALL` it runs borrowed code
+against your own storage. What it does *not* do is preserve identity: `caller` is set to the current
+contract, and the value argument comes off the stack rather than being inherited, with
+`should_transfer_value=True` moving that value from the contract to
+itself.<Cite src="execution-specs-osaka-system" />
+
+The consequence is that borrowed code running under `CALLCODE` sees `msg.sender` as the proxy rather
+than the user, which breaks every access-control check written the obvious way. `DELEGATECALL` exists
+because that was the wrong default. Treat `CALLCODE` as a historical artefact you may meet in old
+bytecode and never as a design option.
+
+<Compare
+  axis="Question the new frame answers"
+  columns={[
+    { title: 'Call someone else', note: 'CALL, STATICCALL' },
+    { title: 'Be someone else', note: 'CALLCODE', tone: 'muted' },
+    { title: 'Stay yourself', note: 'DELEGATECALL', tone: 'accent' },
+  ]}
+  rows={[
+    {
+      label: 'Whose code executes?',
+      cells: ["The callee's", "The callee's", "The callee's"],
+    },
+    {
+      label: 'Whose storage does an SSTORE land in?',
+      cells: ["The callee's", 'Yours', 'Yours'],
+    },
+    {
+      label: 'What does address(this) report?',
+      cells: ['The callee', 'You', 'You'],
+    },
+    {
+      label: 'What does msg.sender report?',
+      cells: ['You', 'You', 'Whoever called you'],
+    },
+    {
+      label: 'What does msg.value report?',
+      cells: ['The value argument', 'The value argument', 'What your own frame received'],
+    },
+    {
+      label: 'Does ether actually move?',
+      cells: ['Yes, to the callee', 'From you to yourself', 'No — nothing is transferred'],
+    },
+    {
+      label: 'Whose balance can the borrowed code spend?',
+      cells: ["The callee's", 'Yours', 'Yours'],
+    },
+    {
+      label: 'What is the column for?',
+      cells: ['Calling another contract', 'Nothing — a historical artefact', 'Proxies, libraries, EIP-7702'],
+    },
+  ]}
+  caption="Four instructions collapse into three contexts, and the split that matters is not CALL against DELEGATECALL — it is calling someone else against running someone else's code as yourself."
+  alt="The four EVM call instructions grouped into three execution contexts. CALL and STATICCALL run the callee's code against the callee's storage, balance and address. CALLCODE runs borrowed code against your storage and balance but resets msg.sender to you and takes a value argument. DELEGATECALL runs borrowed code against your storage and balance while inheriting msg.sender and msg.value from your own frame and transferring no ether."
+/>
+
+### Tracing one call through both frames
+
+Tables are easy to nod at. Run a real one.
+
+A user at `0xUSER` calls `withdraw(100)` on a proxy at `0xPROXY`, whose implementation is at
+`0xIMPL`. The implementation's `withdraw` reduces `balances[msg.sender]`, then sends ether with
+`msg.sender.call{value: amount}("")`.
+
+**Subgoal — establish the outer frame's context.** The transaction's top-level frame has
+`address(this) == 0xPROXY`, `msg.sender == 0xUSER`, `msg.value == 0`, and it is executing the proxy's
+own runtime code: a handful of instructions that load the implementation pointer and delegatecall.
+
+**Subgoal — open the delegatecall frame and name what changed.** A new frame opens with a fresh stack,
+zeroed memory and its own gas budget. Its `code` is `0xIMPL`'s. Its `address(this)` is still
+`0xPROXY`, because `to = evm.message.current_target`. Its `msg.sender` is still `0xUSER`, because
+`caller = evm.message.caller`.<Cite src="execution-specs-osaka-system" /> Precisely one thing about
+the context changed: the bytes being executed.
+
+**Subgoal — decide which account's storage the write lands in.** `balances[msg.sender] -= 100`
+compiles to an `SSTORE` at a slot derived from the implementation's declaration order. The `SSTORE`
+executes in a frame whose account is `0xPROXY`. The write lands in the proxy's storage trie. The
+implementation's own storage — it has an account, and that account has a storage root — is untouched
+and always will be.
+
+**Subgoal — follow the inner `CALL` and watch the identity flip.** `msg.sender.call{value: ...}` is a
+plain `CALL` from the current frame. Its `caller` is `evm.message.current_target`, which is
+`0xPROXY`. So the user's receiving contract sees `msg.sender == 0xPROXY`, not `0xIMPL` and not
+`0xUSER`. The ether comes out of the proxy's balance, because that is the account the frame is acting
+as.
+
+**Subgoal — notice what a log would say.** Any `LOG` emitted anywhere in this trace is recorded
+against `0xPROXY`. Indexers, subgraphs and block explorers see one address emitting events, which is
+the property that makes upgradeability usable at all — and the property that makes "which version of
+the code emitted this" a question the chain does not answer.
+
+<Figure
+  caption="One thing changed at the delegatecall and everything changed again one instruction later, at an ordinary CALL made from inside the borrowed code."
+  alt="A user's transaction reaches the proxy, whose frame has address(this) equal to the proxy and msg.sender equal to the user. A DELEGATECALL into the implementation opens a frame that keeps both of those values and changes only the code being executed. A plain CALL from inside that frame opens a third frame in which msg.sender is the proxy and the ether comes from the proxy's balance."
+>
+  <Flow
+    lanes={['the user', 'proxy code', 'implementation code', 'the recipient']}
+    nodes={[
+      { id: 'u', label: '0xUSER', note: 'signs the transaction', col: 0 },
+      { id: 'p', label: '0xPROXY', note: 'this = PROXY, sender = USER', col: 1 },
+      { id: 'd', label: "0xIMPL's bytes", note: 'this = PROXY, sender = USER', col: 2, tone: 'accent' },
+      { id: 'r', label: 'recipient', note: 'sender = PROXY, ether from PROXY', col: 3, tone: 'warn' },
+    ]}
+    edges={[
+      { from: 'u', to: 'p', label: 'tx' },
+      { from: 'p', to: 'd', label: 'DELEGATECALL', tone: 'accent' },
+      { from: 'd', to: 'r', label: 'CALL', tone: 'warn' },
+    ]}
+  />
+</Figure>
+
+## Slot numbers are assigned by the borrowed code
+
+Now the storage collision from the opening, stated as a mechanism rather than an anecdote.
+
+Storage in the EVM is a map from 256-bit key to 256-bit value, per account. Solidity assigns those
+keys by declaration order: the first state variable that needs a full slot gets slot 0, the next gets
+slot 1, and so on, with mappings and dynamic arrays hashing their own contents into derived
+slots.<Cite src="solidity-layout-storage" />
+
+Under `DELEGATECALL`, the code doing the assigning and the account holding the storage are two
+different contracts written at two different times. The implementation's compiler assigned slot 0 to
+whatever the implementation declared first. It has never seen the proxy's declarations, and the proxy
+has never seen its. Nothing checks, because there is nothing at the machine level that could check —
+by the time `SSTORE` executes, a slot number is a 256-bit integer with no provenance.
+
+So the two contracts must agree by convention, and there are exactly two conventions in use.
+
+**Fixed hashed slots.** ERC-1967 defines constants for proxy-specific state, chosen so that no
+ordinary layout will ever assign them. The implementation pointer lives at
+`0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc`, defined as
+`bytes32(uint256(keccak256('eip1967.proxy.implementation')) - 1)`, and the admin pointer at
+`0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103`.<Cite src="erc-1967" /> You can
+recompute both in one line — `cast keccak "eip1967.proxy.implementation"` and subtract one — and
+doing so once is worth more than reading the constant a dozen times.
+
+**Namespaced layouts.** ERC-7201 generalises the idea. A namespace identified by a string is rooted at
+`keccak256(keccak256(id) - 1) & ~0xff`, expressed in Solidity as
+`keccak256(abi.encode(uint256(keccak256(bytes(id))) - 1)) & ~bytes32(uint256(0xff))`, and a whole
+struct of related state is laid out from that root.<Cite src="erc-7201" /> The final mask clearing the
+low byte is deliberate: it leaves 256 consecutive slots below each root free, which is what makes a
+struct of several fields safe to place there.
+
+<Aside kind="warn">
+Both conventions work by putting proxy state where a compiler will never point. Neither prevents two
+*implementations* from colliding with each other across an upgrade — if version two reorders or
+removes a state variable that version one already wrote, the storage is still there and now means
+something different. The layout is a property of the account, not of the code, and it outlives every
+deployment.
+</Aside>
+
+Notice why the subtraction of one appears in both formulas. A slot equal to `keccak256(something)`
+exactly is a slot a compiler could plausibly produce, since mappings and dynamic arrays derive their
+slots by hashing. Subtracting one lands on a value with no known preimage under the standard
+derivations, which is the same "make the collision uncomputable rather than merely unlikely" argument
+you met with [second preimages in Merkle trees](/c/merkle-second-preimage) in Track 01.
+
+<Matrix
+  corner="Slot"
+  cols={['What the proxy put there', 'What the implementation put there', 'What the account holds']}
+  rows={[
+    {
+      label: '0',
+      cells: [
+        { v: 'implementation address', tone: 'danger' },
+        { v: 'uint256 totalSupply', tone: 'danger' },
+        { v: 'whichever wrote last', tone: 'danger' },
+      ],
+    },
+    {
+      label: '1',
+      cells: [{ v: 'admin address', tone: 'warn' }, { v: 'mapping balances', tone: 'warn' }, { v: 'whichever wrote last', tone: 'warn' }],
+    },
+    {
+      label: 'keccak(…) − 1',
+      cells: [
+        { v: 'implementation address', tone: 'good' },
+        { v: 'nothing — no declaration order reaches it', tone: 'muted' },
+        { v: 'the pointer, alone', tone: 'good' },
+      ],
+    },
+  ]}
+  caption="Slot 0 is the one slot both compilers assign with confidence, which is exactly why no proxy may keep anything there."
+  alt="A proxy and its implementation both assign their first state variables to slots 0 and 1, so each account slot holds whichever contract wrote to it last. A slot derived as keccak of a string minus one is reachable by neither compiler's declaration order, so the implementation pointer stored there cannot be overwritten by ordinary state."
+/>
+
+## The delegatecall that cannot fail
+
+Return to the opening scene and finish it, because the mechanism that turned a bad slot into a silent
+brick is worth its own paragraph.
+
+None of the four call instructions checks that the target has code. A call to an account with an empty
+code field runs an empty program, which halts immediately with success and no output. The instruction
+pushes 1. Nothing is wrong from the machine's point of view — an empty program ran to completion.
+
+For `CALL` this is [the missing existence check](/c/raw-call-no-existence-check) that Track 03's
+accounts module already introduced. For `DELEGATECALL` inside a proxy it is worse, because the proxy's
+fallback typically returns whatever the delegatecall returned, and what it returned is nothing. Every
+function on the proxy now "succeeds" and returns empty bytes, which a decoder will read as zero, an
+empty array or a false — depending on what the caller expected.
+
+This is exactly why production proxy implementations check the implementation address has code before
+delegating, and why an uninitialised proxy — one whose implementation slot is still zero — is a
+recognised footgun rather than an exotic edge case. It is also why the correct response to "the call
+succeeded" is never "so the thing happened", a theme the next two lessons take apart properly.
+
+## One primitive, four products
+
+The reason this instruction gets a lesson rather than a paragraph is that it is the same mechanism
+underneath four things that look unrelated.
+
+**Upgradeable proxies.** The account is permanent, the code is a pointer. Users interact with one
+address forever while the logic behind it changes.<Cite src="erc-1967" />
+
+**Minimal proxies.** ERC-1167 specifies a 45-byte runtime contract whose entire body is: copy the
+calldata, `DELEGATECALL` a hard-coded implementation, return whatever comes back.<Cite src="eip-1167" />
+Thousands of these can be deployed cheaply, each with its own storage and identity, all sharing one
+copy of the logic. Not upgradeable — the implementation address is baked into the bytes — which is
+the point.
+
+**Libraries.** A Solidity `library` with non-internal functions is deployed once and reached by
+`DELEGATECALL`, so its code operates on the calling contract's storage. That is why library functions
+can take `storage` references at all.
+
+**Account delegation.** EIP-7702 writes a 23-byte
+[delegation designator](/c/delegation-designator) into an EOA's code field, and thereafter a call to
+that account executes the designated contract's code with the EOA as the storage and identity
+context.<Cite src="eip-7702" /> Structurally identical to a proxy: borrowed code, your storage, your
+identity. Which is why the delegation lesson in the accounts module says a delegate is closer to
+handing over your key than to granting an allowance, and why *migrating between delegates* raises
+exactly the storage-collision problem this lesson is about.<Cite src="eip-7702" />
+
+The specification even makes the connection mechanical: `DELEGATECALL`'s implementation calls
+`access_delegation` on the target address before deciding what code to run, so a delegatecall into a
+delegated EOA resolves one hop and stops — chains are not followed.<Cite src="execution-specs-osaka-system" /><Cite src="eip-7702" />
+
+<Aside kind="note">
+Every one of the four call variants charges the cold-or-warm account access price for its target
+before computing what gas it can forward: 2,600 the first time an address is touched in a transaction,
+100 afterwards.<Cite src="execution-specs-osaka-gas" /><Cite src="eip-2929" /> With EIP-7702 in play a
+delegated target costs an additional access charge to resolve the designator, because two accounts are
+being loaded rather than one.<Cite src="eip-7702" />
+</Aside>
+
+<Check type="spot-bug" concept="delegatecall-is-the-proxy-primitive">
+A protocol adds a batching helper so users can perform several actions in one transaction:
+
+```solidity
+contract Batcher {
+    function batch(bytes[] calldata calls) external payable {
+        for (uint256 i = 0; i < calls.length; i++) {
+            (bool ok, ) = address(this).delegatecall(calls[i]);
+            require(ok, "sub-call failed");
+        }
+    }
+
+    function deposit() external payable {
+        credits[msg.sender] += msg.value;
+    }
+}
+```
+
+The team's reasoning: `delegatecall` to `address(this)` keeps everything in this contract's storage
+and preserves the original `msg.sender`, so each queued action behaves exactly as if the user had
+sent it directly.
+
+Both halves of that reasoning are correct. Name the bug anyway, and say what the attacker sends.
+
+<Answer>
+**`msg.value` is inherited by every delegatecall frame, and no ether moves.**
+
+`DELEGATECALL` constructs its child message with `value=evm.message.value` and
+`should_transfer_value=False`.<Cite src="execution-specs-osaka-system" /> So each iteration of the
+loop opens a frame that reports the *same* `msg.value` the outer `batch` call received, and none of
+them transfers anything, because there is nowhere to transfer to — the storage and balance are
+already this contract's.
+
+**The attack.** Send one ether, with `calls` containing ten copies of the encoded `deposit()`
+selector. Each iteration runs `deposit()` in a frame reporting `msg.value == 1 ether`, so
+`credits[attacker]` increases by ten ether against one ether actually paid. Withdraw ten.
+
+**Why the team's reasoning did not catch it.** Both stated premises are true. Storage is this
+contract's; `msg.sender` is genuinely the original user. The premise nobody stated is the one that
+fails: "each frame's `msg.value` describes what that frame received". In a delegatecall it describes
+what the *outer* frame received, and it says so once per iteration.
+
+**The fix is not a reentrancy guard.** Nothing re-enters. Either make the batch entry point
+non-payable and require callers to fund separately, or track the remaining unspent value in a local
+and pass it explicitly to each sub-call, so the accounting lives somewhere the machine is not
+re-reporting. Several audited implementations of payable multicall carry a comment to exactly this
+effect, and the bug has been found in production more than once.
+
+**The general form.** Under `DELEGATECALL`, `address(this)`, `msg.sender` and `msg.value` are all
+inherited. Two of those inheritances are the reason you reached for the instruction. The third one
+arrives whether you wanted it or not.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**Forwarded gas is a ceiling**, next, adds the one remaining dimension to the table above: how much of
+your gas the new frame gets, who decides, and why the caller always survives.
+
+**Deployment is a two-stage rocket** explains where the implementation contract in every pattern above
+comes from, and why a minimal proxy's address depends on the implementation address baked into its
+initcode.
+
+**Proxy patterns** in the Solidity track — transparent, UUPS, beacon, diamond — are four different
+answers to "where does the implementation pointer live and who may change it". Every one of them is
+this instruction plus a storage convention, and knowing that is most of what separates reading those
+patterns from memorising them.
+
+**Storage collisions** and [delegatecall as a risk surface](/c/delegatecall-storage-is-the-risk) get
+their full treatment in the security track, where the failure modes are catalogued rather than
+demonstrated once.
+
+And in the accounts module, [EIP-7702 delegation](/c/delegation-designator) stops being a new feature
+to learn and becomes an instance of a mechanism you already understand — with one difference worth
+holding onto: a proxy's implementation pointer is chosen by whoever controls the proxy, and an EOA's
+delegate is chosen by a signature from the account itself.<Cite src="eip-7702" />

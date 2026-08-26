@@ -1,0 +1,341 @@
+---
+id: app-transaction-ux-one-intent
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: hot
+changeKind: clarifying
+sources:
+  [
+    eip-5792,
+    viem-send-calls,
+    viem-get-calls-status,
+    viem-wait-for-calls-status,
+    wagmi-use-send-calls,
+    wagmi-use-wait-for-calls-status,
+    viem-wait-for-transaction-receipt,
+    envio-reorgs,
+  ]
+stack: { viem: "2.x", wagmi: "3.x" }
+---
+
+The funnel chart said the deposit flow converted at 61%. Thirty-nine percent of users who pressed
+**Deposit** never deposited, and the growth team had a quarter of work planned around that number.
+
+The instrumentation was fine. The definition was wrong. `deposit_started` fired when the user pressed
+the button; `deposit_completed` fired on the receipt for the vault call. Between them sat an approval
+transaction that the analytics did not model at all, and most of the missing 39% had signed it,
+watched a second wallet prompt appear for something they thought they had already done, and closed the
+tab.
+
+The chart was measuring the chain's decomposition of the action. The user had performed one action.
+
+That gap is this lesson. Not the mechanics of batching — you have those — but the modelling
+consequence: **the unit your interface, your database and your metrics track has to be the thing the
+user asked for, and on a chain that is almost never one transaction.**
+
+## The mapping is one-to-many, and it is structural
+
+The examples are not exotic. They are most of what applications do.
+
+- **Approve then swap, or approve then deposit.** Two transactions because the allowance model puts the
+  authorisation in a different contract from the action.
+- **Permit then deposit.** One signature and one transaction — better, and still two prompts with two
+  failure modes, one of which produces no on-chain trace at all when the user declines.
+- **Bridge then act.** Two transactions on two chains, with an indeterminate wait between them that
+  belongs to a third party, and a second half your user may not be present for.
+- **Deploy then configure.** A factory call and an initialisation call, where being interrupted between
+  them leaves a live contract in a state you never intended to ship.
+
+In each case the user has one sentence for what they are doing. Your system has two or three rows, two
+or three hashes, two or three ways to fail, and — if you built it the way the funnel above was built —
+no object that represents the sentence.
+
+<Aside kind="note">
+The failure is worse than cosmetic in the approve case, because the intermediate state persists. A
+user who approves and abandons has left a standing allowance to a contract they never used. That is a
+real security posture change, made by someone who believes they cancelled. An intent model is what lets
+you notice you are in that state and say something about it, rather than rendering a fresh
+"Approve → Deposit" flow that starts the same two prompts again.
+</Aside>
+
+## Model the intent, not the transactions
+
+The fix is a record whose identity is the user's action. Everything the chain produces hangs off it as
+an attribute.
+
+**Subgoal: name the intent in the user's words, because that name is what the interface will render and
+what support will search for.** "Deposit 500 USDC into the yield vault" — not "approve", not "call
+`deposit(uint256)`".
+
+**Subgoal: give the intent an id you generate, before anything is signed.** This is the point at which
+most designs go wrong by waiting for the chain to hand them an identifier. You already know from
+[lesson four](/c/tx-replacement-changes-the-hash) that the transaction hash is not a stable
+identifier for a user's action. At the intent level it is not even a candidate — there are several
+hashes, and which ones exist depends on how the wallet decided to execute.
+
+**Subgoal: represent each step with the identifier appropriate to how that step was sent**, because
+that varies by wallet and by chain and you do not get to normalise it away.
+
+```ts
+type StepRef =
+  | { via: 'transaction'; chainId: number; address: `0x${string}`; nonce: number }
+  | { via: 'calls'; chainId: number; id: string }
+
+type Intent = {
+  id: string                    // ours, generated client-side, before any prompt
+  label: string                 // "Deposit 500 USDC into the yield vault"
+  actor: `0x${string}`
+  steps: { name: string; ref?: StepRef; state: StepState }[]
+  policy: Tier                  // from the confirmation-policy lesson
+}
+```
+
+The two shapes of `StepRef` are the two worlds this module has covered. A step sent as an ordinary
+transaction is keyed on `(address, chainId, nonce)` — the durable key, immune to replacement. A step
+sent as a batch is keyed on the identifier the wallet call returns.
+
+**Subgoal: project the steps onto exactly one status the user can act on**, because a progress list
+with three independent spinners is a status report, not an interface. The projection needs a rule for
+each combination, and writing that rule is where you discover which combinations you had never
+considered — the most valuable of which is "step one succeeded and step two was declined", the state
+that produced the standing allowance above.
+
+<Figure
+  caption="Every box but the leftmost is something the chain produced. Only the leftmost is what the user asked for."
+  alt="One intent, named in the user's words and carrying an id generated before any prompt, expands into an approve step and then a deposit step. Signing both projects to a single status the user reads; stopping after the approval leaves a standing allowance, which is a state rather than an absence."
+>
+  <Flow
+    lanes={['the intent', 'step one', 'step two', 'what the user reads']}
+    nodes={[
+      { id: 'i', label: 'Deposit 500 USDC', note: 'one id, generated first', col: 0, tone: 'accent' },
+      { id: 's1', label: 'approve', note: 'prompt one', col: 1 },
+      { id: 's2', label: 'deposit', note: 'prompt two', col: 2 },
+      { id: 'stuck', label: 'standing allowance', note: 'no screen names this', col: 2, tone: 'danger' },
+      { id: 'ok', label: 'one status', note: "in the user's words", col: 3, tone: 'good' },
+    ]}
+    edges={[
+      { from: 'i', to: 's1' },
+      { from: 's1', to: 's2', label: 'signs' },
+      { from: 's1', to: 'stuck', label: 'stops', tone: 'danger' },
+      { from: 's2', to: 'ok', tone: 'good' },
+    ]}
+  />
+</Figure>
+
+## What EIP-5792 gives you, and exactly where it stops
+
+For steps on a single chain, the wallet can carry the grouping for you. You already know the request
+side: `wallet_sendCalls` submits [several calls as one user-visible action](/c/erc-5792-sendcalls), and
+you know from [batching is not atomicity](/c/batching-is-not-atomicity) that whether the group is
+all-or-nothing is negotiated rather than implied. What matters here is the *status* side, because it is
+a lifecycle and it is not the lifecycle you have been modelling all module.
+
+`wallet_getCallsStatus` returns a numeric `status` field summarising the batch, in documented
+categories: 1xx pending, 2xx confirmed, 4xx off-chain failures, 5xx chain rules
+failures.<Cite src="eip-5792" /> The defined codes are these.<Cite src="eip-5792" />
+
+<Matrix
+  caption="A one-bit receipt status cannot encode this column: 500 and 600 are both failures, and only one of them means nothing happened."
+  alt="The five defined wallet_getCallsStatus codes: 100 pending, 200 confirmed with receipts covering all calls, 400 not included and the wallet will not retry, 500 reverted completely with only gas-related changes possibly landed, and 600 reverted partially with some batch-related changes possibly landed."
+  corner="Code"
+  cols={['Meaning']}
+  rows={[
+    { label: '100', cells: ['Received by the wallet, execution on chain not complete — pending'] },
+    { label: '200', cells: [{ v: 'Included on chain without reverts; receipts covers all calls — confirmed', tone: 'good' }] },
+    { label: '400', cells: [{ v: 'Not included on chain, and the wallet will not retry — off-chain failure', tone: 'warn' }] },
+    { label: '500', cells: [{ v: 'Reverted completely; only gas-related changes may have landed', tone: 'warn' }] },
+    {
+      label: '600',
+      cells: [
+        { v: <>Reverted partially; some changes related to the batch calls may have landed<Cite src="eip-5792" /></>, tone: 'danger' },
+      ],
+    },
+  ]}
+/>
+
+Look at 400 and 600, because neither has an analogue in the single-transaction world you have been
+working in.
+
+**400 is the state lesson two had to infer.** For a lone transaction, "it will never land" is something
+you deduce by comparing the account's nonce against the transaction's, because nothing announces a
+drop. Here the wallet tells you, in a status code, that it is done trying. That is a real improvement
+and it is worth the plumbing.
+
+**600 has no analogue at all.** `receipt.status` is one bit — this transaction succeeded or it did not.
+A partially reverted batch is a state where some of the user's intent happened. The single-transaction
+mental model cannot express it, and an interface that renders 5xx and 6xx the same way will tell a user
+that nothing happened when in fact half of it did. In the approve-then-deposit case, half is precisely
+the dangerous half.
+
+viem surfaces the same information with both a code and a word: `getCallsStatus` returns `statusCode`
+alongside `status`, plus `atomic`, `chainId`, `id` and `receipts`.<Cite src="viem-get-calls-status" />
+Branch on the code. The word is a summary of the code and there are more codes than words.
+
+### The id can be yours, which solves the correlation problem by construction
+
+This part is under-taught and it is the single most useful operational detail in the specification.
+
+`wallet_sendCalls` accepts an optional `id` in its parameters, and if one is provided the wallet MUST
+respect it and return it in the response. Identifiers — whether app-provided or wallet-generated — must
+be unique strings of up to 4096 bytes, app-provided ids must be unique per sender per app (with each
+app identified by its domain), and wallets MUST reject requests with duplicate
+ids.<Cite src="eip-5792" />
+
+So your `Intent.id` and the wallet's batch id can be the same string. No correlation table, no race
+between "we created a record" and "the wallet gave us an identifier", and a retry that reuses the id is
+rejected by the wallet rather than silently executed twice — idempotency at the boundary, of the same
+kind [idempotency via upsert](/c/idempotency-via-upsert) gave you inside your database.
+
+The specification also bounds how long the wallet is a usable source of truth: within 24 hours of the
+corresponding `wallet_sendCalls`, wallets SHOULD return a call-batch status when `wallet_getCallsStatus`
+is called with the same id.<Cite src="eip-5792" /> After that, you are back to receipts and block
+numbers — which is fine, because the `receipts` in the status response carry `transactionHash`,
+`blockNumber` and `blockHash`,<Cite src="eip-5792" /> and storing those when they first arrive is what
+makes your record independent of the wallet still remembering.
+
+<Aside kind="warn">
+Not every wallet supports any of this, which is why an intent model needs both `StepRef` shapes rather
+than being rewritten around batches. When the wallet lacks EIP-5792, viem's
+[sequential fallback](/c/sendcalls-fallback) executes the calls one at a time over
+`eth_sendTransaction` — same button, different number of prompts, and a group that is definitively not
+atomic. Your projection rule has to produce a sensible single status in both worlds, which it will if
+it was written over `steps` rather than over a batch response.
+</Aside>
+
+## The waiting helper has the same lie in it as the first lesson
+
+Module symmetry worth noticing. viem's `waitForCallsStatus` waits for a batch and returns the status
+and receipts. Its default `status` predicate is `(parameters) => parameters.statusCode >= 200`,
+documented as waiting for non-pending status codes, and `throwOnFailure` defaults to
+`false`.<Cite src="viem-wait-for-calls-status" />
+
+Read those two together. The default resolves on 400, on 500 and on 600, and does not throw. It is the
+batch-level version of the bug that opened this module: **the promise resolving means the waiting is
+over, not that the thing succeeded.** The library is being consistent and correct — "stop polling" and
+"it worked" are different questions and the default answers the first — but code written on the
+`await`-means-success reflex will report a completely reverted batch as a completed deposit.
+
+If you want the stricter behaviour, ask for it: the `status` parameter takes a predicate, and the
+documentation's own example is `({ status }) => status === 'success'`.<Cite src="viem-wait-for-calls-status" />
+The other defaults are worth knowing when you set a policy: `timeout` defaults to 60 000 milliseconds
+and `retryCount` to 4.<Cite src="viem-wait-for-calls-status" />
+
+In React the same shape is available as hooks: `useSendCalls` requests that the wallet sign and
+broadcast a batch, with `useSendCallsSync` for waiting until inclusion,<Cite src="wagmi-use-send-calls" />
+and `useWaitForCallsStatus` takes the batch `id` and waits for confirmation, with `pollingInterval` and
+`timeout` options.<Cite src="wagmi-use-wait-for-calls-status" /> These are wagmi 3 names; v2-era
+material will not match.
+
+## Where optimistic UI stops
+
+One question is left, and the whole module has been assembling the answer.
+
+Optimistic rendering — showing the expected outcome before it is confirmed — is good interface design.
+It is what makes an application feel like software rather than a form submission. The question is never
+whether to do it. It is where it stops.
+
+**The boundary is not a confidence level.** It is tempting to write "we render optimistically until one
+confirmation, then we act", as though optimism were a phase that ends when certainty arrives. It is
+not, because certainty is a gradient and consequences are binary. The boundary is this:
+
+> Optimistic state is safe exactly as long as it is a projection of data you own. It stops being safe
+> the moment it is an **input** to something outside your database.
+
+A balance that re-renders, a list that re-sorts, a badge that disappears, a row that says "pending" —
+all reversible, all yours, all fine to show before confirmation. Dispatching an order, sending a payout,
+emailing a receipt, calling a partner's API, minting a coupon code — none of them yours, none of them
+retractable, all of them unsafe at any confidence below the policy you wrote in
+[the confirmation-policy lesson](/c/tx-confirmation-policy-is-a-product-decision).
+
+You have a vendor's version of this rule from the last lesson, and it is worth restating in its
+original form because it is not a slogan, it is a limitation of every framework that offers to handle
+this for you. When Envio rolls back on a reorg, the rollback covers the entities in your schema and the
+data your handlers read and write; it explicitly does **not** cover side effects in your handler code —
+API calls, external services, custom caches, files written by your handlers.<Cite src="envio-reorgs" />
+Everything inside the database is un-appendable. Everything outside it is not. That is the same line,
+drawn by someone shipping a product against it.
+
+<Misconception
+  belief="Optimistic UI is safe once you wait for a confirmation — the risk is about how long you wait."
+  reality="The risk is about what the optimistic state causes. Waiting longer reduces the probability of being wrong and does nothing to the cost, and it is the cost that decides whether optimism is appropriate."
+  why="Confidence is the dimension the chain gives you numbers for, so it is the dimension the argument gravitates to. Reversibility is a property of your own system, which means nobody publishes a figure for it and you have to write it down yourself."
+  src="envio-reorgs"
+/>
+
+<Misconception
+  belief="Batching the calls with EIP-5792 removes the partial-failure problem, so an intent can be modelled as one thing again."
+  reality="Atomicity is negotiated per wallet and per chain rather than implied by batching, and the status codes include 600 — reverted partially, with some batch-related changes possibly on chain."
+  why="'Batch' reads as 'transaction' in the database sense. The specification deliberately did not promise that, and the existence of a distinct partial-revert code is the clearest evidence of it."
+  src="eip-5792"
+/>
+
+The practical test, when you are unsure about a particular render: **write the compensating action.** If
+undoing this means a database update, you are optimistic. If it means an apology email, a refund
+workflow or a phone call, you were not being optimistic — you were being wrong at a rate you had not
+measured. That test also tells you where the intent model earns its keep: compensation is defined per
+intent, in the user's language, not per transaction.
+
+<Check type="explain" concept="tx-optimistic-ui-boundary">
+A checkout flow does four things when the user presses **Pay**: renders the cart as paid, decrements
+the displayed stock count, posts a job to the fulfilment queue, and sends a confirmation email. The
+payment is an approve-then-charge pair, and roughly half your users are on wallets supporting
+EIP-5792 while the rest are not.
+
+Say which of the four may be optimistic and why. Then say what your intent record must contain for the
+two wallet populations to produce the same interface, and name the batch status code that would make
+your handling of "half of it happened" visible.
+
+<Answer>
+**Render cart as paid, and decrement displayed stock — optimistic.** Both are projections of state you
+own. The compensating action for each is a re-render, which is the test passing. Decrementing the
+*displayed* count is fine; decrementing the authoritative inventory that other users' checkouts read is
+not the same thing, and if the same number serves both purposes you have an outside-the-database effect
+wearing a UI label.
+
+**Fulfilment job — not optimistic.** The queue is outside your database and the consumer picks physical
+items. The compensating action is a cancellation that races a picker, which is the test failing. This
+one waits for the tier your policy assigns, which for an irreversible physical action is `finalized`.
+
+**Confirmation email — not optimistic.** The compensating action is a second email retracting the
+first, which is exactly the apology-email case. This is the row teams most often get wrong, because an
+email feels lightweight next to a shipment; the relevant property is not weight, it is that you cannot
+un-send it.
+
+**What the intent record must contain.** One id you generated before any prompt, a `label` in the
+user's words, a `steps` array where each step carries either `(address, chainId, nonce)` for a plain
+transaction or the batch `id` for a 5792 group, and a projection rule that turns any combination of
+step states into one status. The two populations then differ only in how many `StepRef`s of each shape
+exist — and the number of wallet prompts, which is the thing the batch was for. If you supply your own
+id on `wallet_sendCalls`, the wallet must respect it and return it, and duplicate ids must be
+rejected,<Cite src="eip-5792" /> so the batch id and the intent id can be one string and the two
+populations share a primary key.
+
+**The code that makes "half of it happened" visible is 600** — reverted partially, meaning some changes
+related to the batch calls may have been included on chain.<Cite src="eip-5792" /> Handling it
+separately from 500 is what lets you say "your approval went through but the charge did not" instead of
+"payment failed", and in this flow that difference determines whether the user's next action is a retry
+or a revocation. Note also that the default wait resolves on any status code at or above 200 and does
+not throw by default,<Cite src="viem-wait-for-calls-status" /> so 500 and 600 arrive down the success
+path unless you branch on the code.
+</Answer>
+</Check>
+
+## What this unlocks
+
+**This is the end of the module, so here is what you now hold.** A transaction state machine with the
+three off-happy-path edges drawn as prominently as the success edge. A durable key that survives
+replacement. A simulation step that deletes most of the error states before they are created. A
+confirmation policy derived per action from what it costs to be wrong. The ability to un-append when the
+chain changes its mind. And an intent record that makes all of the above addressable by the thing the
+user actually asked for.
+
+**Where it goes next is off-chain.** Every irreversible consequence you identified needs somewhere to
+live that is not a browser tab — a queue, a worker, a reconciliation job that can rebuild its view from
+the chain rather than from its own memory of events. The other modules in this track give you the
+pieces: wallet capabilities for what the client can be asked to do, and account abstraction for changing
+who signs and who pays in the first place.
+
+**And the reflection prompt is the real exercise.** Name the most irreversible thing your product does
+off-chain in response to a transaction, then write its policy as "we act after X because the worst case
+if we are wrong is Y". The funnel chart that opened this lesson was a measurement problem. That sentence
+is the design problem underneath it, and it is the one nobody will write for you.

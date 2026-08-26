@@ -1,0 +1,414 @@
+---
+id: app-error-surfaces-triage
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [measured-revert-surfaces-1-7-1, viem-src-node-errors, viem-src-rpc-errors, viem-src-contract-errors, viem-src-base-error, viem-errors-glossary, eip-1193, geth-gasestimator-source, solidity-docs-src-control-structures, eip-7825]
+stack: { viem: "2.x", foundry: "1.7.1" }
+---
+
+The best-engineered client library in this ecosystem classifies node errors with a regular
+expression, and one of them reads:
+
+```ts
+export class ExecutionRevertedError extends BaseError {
+  static code = 3
+  static nodeMessage = /execution reverted|gas required exceeds allowance/
+}
+```
+
+That is viem's own source.<Cite src="viem-src-node-errors" /> The alternation is the point: the
+message a node emits when a *contract reverted* and the message it emits when the *sender cannot
+afford the gas* both map to the same class. You spent the last lesson learning that those are two
+unrelated causes, one decided by contract logic and one decided by arithmetic on a balance before
+any code runs.<Cite src="geth-gasestimator-source" /> A client that branches on
+`err instanceof ExecutionRevertedError` has inherited that collapse.
+
+This is not a criticism of viem. It is the best available behaviour given what a node hands over:
+the node did not distinguish them either, and a regex over a message string is the only signal
+present. It is a demonstration that **no library can classify for you**, because the distinctions
+your interface needs are not distinctions the wire carries. That is the work of this lesson.
+
+## Four buckets, because there are four shapes of response
+
+Sort by what the person in front of the screen should do next, not by what went wrong technically.
+Four buckets exhaust it, and each one implies a completely different piece of interface.
+
+**Bucket one — the user can fix it.** Insufficient balance for value or gas. A missing or
+insufficient token approval. Connected to the wrong chain. Slippage exceeded because the price
+moved. An amount above a per-transaction limit. A deadline that expired while the form sat open.
+
+*Interface:* name the specific thing, the specific number, and the single next action. Ideally
+render the action as a button — switch chain, approve, set max — because a message that describes
+an action the interface could have performed is a message that should have been a button.
+
+*Alert:* none. This is not a defect, it is the system working. Count it, do not page anyone.
+
+**Bucket two — your application is broken.** A `Panic` of any code. A revert data payload whose
+selector is not in your union ABI. A decode that throws. Arguments the contract rejects as
+malformed. An estimate above the per-transaction cap of 16,777,216 for a call your interface
+offered as a single click.<Cite src="eip-7825" />
+
+*Interface:* a generic apology, an explicit statement about money — nothing was signed, or the
+transaction was sent and reverted — and no technical content. Never the panic code, never the
+selector, never the hex.
+
+*Alert:* everything. Panic code in hex and decimal, the undecodable selector, contract address,
+function, arguments, chain id, block number, provider, and the raw JSON-RPC envelope. This is the
+bucket where your logging is the product.
+
+**Bucket three — transient chain or wallet state.** Nonce too low or a nonce gap. Replacement
+transaction underpriced. Fee cap below base fee. RPC timeout or rate limit. A provider disconnect.
+State moved between simulation and send.
+
+*Interface:* say it is temporary, say what the system is doing about it, and offer a retry. Do not
+say "failed" — for most of this bucket nothing has failed yet, and a user who reads "failed" and
+resubmits is how you get two transactions where they wanted one.
+
+*Alert:* aggregate, not per-event. One nonce race is noise; a rate of nonce races is a bug in your
+nonce handling. One RPC timeout is weather; a rate of them is a provider problem you should be
+failing over from.
+
+**Bucket four — the user declined.** They saw the wallet prompt and said no. EIP-1193 assigns this
+code 4001, "User Rejected Request", and viem surfaces it as
+`UserRejectedRequestError`.<Cite src="eip-1193" /><Cite src="viem-src-rpc-errors" />
+
+*Interface:* return the flow to where it was, silently or with the mildest possible acknowledgement.
+No red. No warning icon. No "transaction failed". Nothing failed — a person considered a proposal
+and declined it, which is the security model working exactly as designed.
+
+*Alert:* none, and do not log it as an error either. A rejection rate that spikes is a *product*
+signal — your prompt is asking for something users are not willing to grant — and it belongs in
+product analytics, not in the error stream where it drowns bucket two.
+
+<Matrix
+  corner="Bucket"
+  cols={['What the interface does', 'What reaches you']}
+  rows={[
+    {
+      label: 'the user can fix it',
+      cells: ['Names the thing, the number, and one action — ideally a button', { v: 'a count, and nobody is paged', tone: 'muted' }],
+    },
+    {
+      label: 'your application is broken',
+      cells: ['A generic apology and an explicit statement about money', { v: 'everything, down to the raw JSON-RPC envelope', tone: 'danger' }],
+    },
+    {
+      label: 'transient chain or wallet state',
+      cells: ['Says it is temporary and offers a retry — never "failed"', { v: 'the rate, not the event', tone: 'warn' }],
+    },
+    {
+      label: 'the user declined',
+      cells: ['Returns the flow to where it was. No red, no icon', { v: 'nothing — this is product analytics', tone: 'good' }],
+    },
+  ]}
+  caption="Two of the four must never page anyone, and one of them is not a failure at all."
+  alt="The four triage buckets against what the interface renders and what reaches the team: a specific action and a bare count; a generic apology and a full envelope; a retry affordance and an aggregated rate; and a silent return with nothing logged as an error."
+/>
+
+<Misconception
+  belief="A user rejecting a signature is an error the interface should report."
+  reality="It is the only outcome on this list where the system behaved perfectly. EIP-1193 gives it its own code, 4001, precisely so clients can treat it as a decision rather than a fault."
+  why="It arrives through the same throw as every real failure, so the default handler catches it and renders it in red alongside genuine breakage."
+  src="eip-1193"
+/>
+
+## Classify from structure, then arithmetic, then decode — never from strings
+
+The order matters, because each stage is more reliable than the one after it and cheaper to get
+right.
+
+<Figure
+  caption="Every leaf here is reached without reading a single message string."
+  alt="A four-stage classification tree: specified provider codes yield declined (4001) and wrong chain (4902); your own funding arithmetic yields cannot pay gas; the decoded revert yields Panic, an unknown selector and a named custom error; and whatever is left falls through to unclassified. Panic, unknown selector and unclassified all route to the app-bug bucket."
+>
+  <Tree root={{ label: 'a failure reached your catch', tone: 'accent', children: [
+    { label: '1. codes', note: 'EIP-1193, numeric', children: [
+      { label: 'declined', note: '4001', tone: 'good' },
+      { label: 'wrong chain', note: '4902' },
+    ] },
+    { label: '2. arithmetic', note: 'balance vs fee cap', children: [
+      { label: 'cannot pay gas', note: 'user can fix' },
+    ] },
+    { label: '3. decode', note: 'against the union ABI', children: [
+      { label: 'Panic', note: 'app bug', tone: 'danger' },
+      { label: 'unknown selector', note: 'app bug', tone: 'danger' },
+      { label: 'named error', note: 'by meaning' },
+    ] },
+    { label: '4. fallback', note: 'default', children: [
+      { label: 'unclassified', note: 'app bug', tone: 'danger' },
+    ] },
+  ] }} />
+</Figure>
+
+**Stage one: provider and transport codes.** Numeric, specified, and stable across
+implementations in the range that EIP-1193 covers. `4001` is a rejection. `4902` is an unknown
+chain in the wallet. `4901` is a chain disconnect. viem exposes each as a class with a `static code`
+you can compare against, which is better than reading the number
+yourself.<Cite src="viem-src-rpc-errors" /><Cite src="eip-1193" /> The errors glossary is the
+enumerated list of what is available to match
+against.<Cite src="viem-errors-glossary" /> This stage catches bucket four and most of bucket three
+with no ambiguity at all.
+
+**Stage two: your own arithmetic.** Before you accept anything a node said about funding, compute
+it. You have the balance, the value, and the fee cap; the estimator's own rule is
+`allowance = (balance - value) / feeCap`.<Cite src="geth-gasestimator-source" /> Reproducing that
+locally settles bucket one's most common member without depending on any message text — and it is
+the only way to separate "cannot afford gas" from "the contract reverted", because the wire and
+the library both collapse them.<Cite src="viem-src-node-errors" />
+
+**Stage three: the decoded revert.** Walk the cause chain to
+`ContractFunctionRevertedError`, take `raw`, and run the four-way branch against your union
+ABI.<Cite src="viem-src-base-error" /><Cite src="viem-src-contract-errors" /> `Panic` goes to
+bucket two, unconditionally.<Cite src="solidity-docs-src-control-structures" /> A named custom
+error you recognise goes wherever its meaning puts it — `InsufficientBalance` is bucket one,
+`Paused` is bucket one or three depending on your product, `ReentrancyGuardReentrantCall` is bucket
+two. An `unknown-selector` result is bucket two: your build is missing an ABI.
+
+**Stage four: whatever is left.** Empty revert data with no context verdict, an unrecognised
+transport failure, a shape you have never seen. Bucket two, with the raw envelope attached, because
+an unclassified failure is by definition a gap in your model.
+
+Notice what is not on this list. At no point do you match a substring against `error.message`. The
+message is formatting code — geth appends a reason only when `abi.UnpackRevert` succeeds, anvil
+inlines raw argument bytes into the string, and both are free to change in a patch
+release.<Cite src="measured-revert-surfaces-1-7-1" />
+
+<Aside kind="note">
+viem's node-error classes are still useful — just as *inputs* rather than as the classification.
+`NonceTooLowError` matching `/nonce too low|transaction already imported|already known/` is three
+providers' phrasings for one condition, collected by people who have seen more providers than you
+have.<Cite src="viem-src-node-errors" /> Take that work; do not take
+`ExecutionRevertedError` as a statement about contracts, because it is not one.
+</Aside>
+
+## A message that names the next action
+
+A bucket is not yet a message. The test for a message is three questions, and every one of them
+has to be answerable by the person reading it.
+
+**What failed?** In their vocabulary. "The swap", "the approval", "sending 50 USDC" — not
+`writeContract`, not `0xcf479181`, not "the transaction".
+
+**Why?** The specific reason, with the specific numbers you decoded. Not a category.
+
+**What should I do now?** Exactly one thing, phrased as an action they can take. If there is no
+such thing, say that honestly rather than inventing one.
+
+Score the strings this module started with:
+
+```text
+"execution reverted"                        no / no / no
+"0xcf479181000000…0064"                     no / no / no
+"Error: user rejected transaction"          no / no / no — and nothing failed
+"Transaction failed: arithmetic underflow"  no / leaks a bug / advice that works by accident
+"Not enough balance. Add funds."            partially / guesses / wrong for 5 of 6 empty reverts
+```
+
+Now the same failures, classified:
+
+```text
+"You have 5 USDC. This swap needs 100 USDC.
+ Add 95 USDC to continue."                            what / why / do — bucket one
+
+"Approve USDC for this pool first."     [Approve]     what / why / do — bucket one, as a button
+
+"You're connected to Base. This pool is on
+ Arbitrum."                             [Switch]      what / why / do — bucket one
+
+"Something went wrong on our side. Nothing was
+ signed and no funds moved. We've been notified."     what / honest / nothing to do — bucket two
+
+"The network is busy. We'll retry automatically —
+ you don't need to do anything."        [Retry now]   what / why / do — bucket three
+
+(nothing; the form returns to its previous state)     bucket four
+```
+
+The first message is the one the whole module was for. It exists only because a custom error
+carried two typed numbers, because your union ABI contained the definition, and because the
+classifier put it in bucket one instead of a toast. Remove any of those three and you are back to
+"execution reverted".
+
+<Misconception
+  belief="Showing the technical detail is more honest than a generic message."
+  reality="For bucket two it is less honest. 'Arithmetic overflow' presents a defect in your contract as information the user can act on, which is false, and it suppresses the alert that would have got it fixed. Honesty is saying that something is broken on your side and that you know."
+  why="Engineers read a panic code as informative because to them it is; the message is written for someone who cannot act on it."
+  src="solidity-docs-src-control-structures"
+/>
+
+## Worked example: a triage function and the table that proves it
+
+**Subgoal 1 — make the classifier return a bucket and a payload, never a string.** Copy is a
+separate artifact with separate reviewers, separate translations, and a separate release cadence. A
+function that returns English is a function you cannot localise, test, or change without touching
+error logic.
+
+```ts
+type Triage =
+  | { bucket: 'user-can-fix'; kind: string; data?: Record<string, unknown> }
+  | { bucket: 'app-bug'; kind: string; report: Record<string, unknown> }
+  | { bucket: 'transient'; kind: string; retryAfterMs?: number }
+  | { bucket: 'declined' }
+```
+
+**Subgoal 2 — order the branches so the reliable signals win.** Provider codes first, because they
+are specified. Then your own funding arithmetic, because it does not depend on anyone's phrasing.
+Then the decoded revert. Then the fallback.
+
+```ts
+export function triage(err: unknown, ctx: Ctx): Triage {
+  const base = err instanceof BaseError ? err : null
+
+  // 1. specified provider codes
+  if (base?.walk((e) => e instanceof UserRejectedRequestError)) return { bucket: 'declined' }
+  if (base?.walk((e) => e instanceof SwitchChainError))
+    return { bucket: 'user-can-fix', kind: 'wrong-chain', data: { want: ctx.chainId } }
+
+  // 2. arithmetic you own — settles funding without reading any message
+  if (ctx.balance - ctx.value < ctx.gasEstimate * ctx.maxFeePerGas)
+    return { bucket: 'user-can-fix', kind: 'insufficient-gas-funds', data: { …ctx } }
+
+  // 3. the decoded revert
+  const shape = decodeRevert(err, ctx.errorAbi)
+  if (shape.kind === 'panic') return { bucket: 'app-bug', kind: 'panic', report: { …shape, …ctx } }
+  if (shape.kind === 'unknown-selector')
+    return { bucket: 'app-bug', kind: 'missing-abi', report: { …shape, …ctx } }
+  if (shape.kind === 'custom') return mapCustomError(shape, ctx)
+
+  // 4. transport and node conditions, using viem's classes as inputs
+  if (base?.walk((e) => e instanceof NonceTooLowError))
+    return { bucket: 'transient', kind: 'nonce-race' }
+
+  return { bucket: 'app-bug', kind: 'unclassified', report: { raw: err, …ctx } }
+}
+```
+
+**Subgoal 3 — write the test table before the implementation, from failures you can actually
+produce.** Every row in this table is something the module measured or derived, and every one is
+reproducible against anvil:
+
+```text
+input                                       expected bucket   expected kind
+custom error InsufficientBalance(5,100)     user-can-fix      insufficient-balance
+custom error LockedUntil(1790000000)        user-can-fix      time-locked
+Error(string) "amount too small"            user-can-fix      contract-message
+Panic(0x11)                                 app-bug           panic
+Panic(0x32)                                 app-bug           panic
+selector 0xc00eb440, not in the union ABI   app-bug           missing-abi
+0x with target code size 0                  app-bug           wrong-address
+0x with gasUsed == gasLimit                 transient         out-of-gas
+zero balance, non-zero fee cap              user-can-fix      insufficient-gas-funds
+provider code 4001                          declined          —
+node message "nonce too low"                transient         nonce-race
+```
+
+**Subgoal 4 — force the two failures that look identical to land in different rows.** The last
+lesson's pair is the test that matters most: a real revert and a broke sender both arrive as
+`ExecutionRevertedError`.<Cite src="viem-src-node-errors" /> If your table has them landing in the
+same bucket, stage two of the pipeline is not doing its job. Rows eight and nine above are the same
+test for the empty-revert case, separated purely by context.
+
+**Subgoal 5 — assert that every bucket-one kind has copy naming a next action.** A unit test over
+your copy table: for each `kind`, the string must be non-empty and must be different from the
+generic fallback. It is a trivial test and it catches the commonest regression in this whole area,
+which is a new error kind shipping with the fallback string attached because nobody wrote the copy.
+
+**Subgoal 6 — decide what happens when the classifier is wrong, because it will be.** Default to
+bucket two. An unclassified failure routed to "app bug" produces a slightly over-apologetic message
+and an alert that tells you exactly what you did not model. An unclassified failure routed to
+"user can fix" produces a user taking an action that cannot help. The asymmetry is large and it
+should be built into the default.
+
+<Check type="explain" concept="error-message-must-name-the-next-action">
+A team implements the four buckets and ships. Six weeks later, error volume by bucket looks like
+this:
+
+```text
+user-can-fix   62%
+transient      21%
+declined       11%
+app-bug         6%   — of which 71% is kind "unclassified"
+```
+
+Their conclusion, in the retro: the taxonomy works, coverage is good, and the 6% app-bug rate is
+acceptable for a young product.
+
+Say what is actually wrong here, what the 71% figure means, and what you would change. Then say
+what an ideal version of this table looks like six weeks after fixing it — including which number
+you would expect to *rise*.
+
+<Answer>
+**The 71% is the whole story and they read past it.** Bucket two's default is `unclassified` — the
+fallback for a failure the pipeline did not recognise. Seventy-one percent of it means that for
+roughly four out of every hundred failures, their classifier learned nothing. Those users saw a
+generic apology for a failure that may well have been a missing approval, a wrong chain, or an
+expired deadline: bucket-one problems rendered as bucket-two copy, which tells a person who could
+have fixed it in one click that the product is broken and there is nothing they can do.
+
+**Why the headline rate looks fine.** They read 6% as "our defect rate", which would be reasonable
+if bucket two meant defects. It does not — it is also the catch-all. A catch-all is not a small
+number of defects, it is an unknown number of unmodelled cases wearing a defect's clothing. The
+correct reading of this table is: 4.3% of all failures are unclassified, and they have no idea what
+those are.
+
+**What the other numbers cannot tell them, either.** `user-can-fix` at 62% is only good news if
+each of those failures got a *specific* message. A bucket-one classification that falls through to
+a generic "check your inputs" string fails the three-question test just as completely as a hex
+dump. The bucket count is not the metric; the metric is what fraction of bucket-one events rendered
+copy naming a concrete next action, and this table does not measure it.
+
+**What to change.**
+
+*Break the fallback out.* `unclassified` must be its own top-level line, reported next to the other
+four rather than inside one of them. Its rate is the health metric for the classifier.
+
+*Attach the raw envelope and the decode result to every unclassified event.* Code, message, data,
+provider, chain id, target address, block, and the output of the four-way shape branch. That
+converts the 4.3% into a ranked list of specific unhandled failures — almost certainly a short list
+with a long tail, since a handful of causes will dominate.
+
+*Instrument bucket one for specificity.* Count events per `kind`, and count how many rendered the
+generic string. A `kind` with high volume and generic copy is the highest-leverage fix on the board.
+
+*Check whether `declined` is polluting anything.* At 11% it is large enough that if any of it is
+being logged as an error or shown in red, it is both misreporting the product and burying bucket
+two.
+
+**What the table should look like after six weeks of that work.** `unclassified` down to a low
+single-digit share of failures and still falling — it never reaches zero, because new contracts and
+new providers keep producing new shapes. `app-bug` excluding the fallback should be *small and
+roughly flat*, since real defects get fixed.
+
+And the number that should **rise** is `user-can-fix`. Every unclassified failure they diagnose is
+overwhelmingly likely to turn out to be a user-fixable condition they had not modelled — a
+specific token's revert, a specific chain's quirk, a deadline case. A rising `user-can-fix` share
+against a falling `unclassified` share is the signature of a classifier that is learning. If
+`user-can-fix` stayed flat while `unclassified` fell, they moved events into bucket two instead of
+diagnosing them, which is the failure mode this exercise is designed to catch.
+</Answer>
+</Check>
+
+## What this unlocks
+
+The module started at the bottom of the stack — a `REVERT` opcode handing back a byte string the
+EVM never looks at — and ends at a sentence on a screen. Between them: four shapes on the wire, a
+union ABI assembled from the call graph, a gas estimator that searches rather than measures, four
+estimation failures the wire refuses to distinguish, and four buckets that turn all of it into a
+decision about what a person should do next.
+
+Two things are worth carrying into the rest of the app track. The first is that **classification is
+your job, not your library's** — demonstrated by a regular expression in viem's source that folds
+two of your four estimation causes into one class, because the node gave it nothing better to work
+with.<Cite src="viem-src-node-errors" /> The second is the test that keeps the whole apparatus
+honest: if you cannot write a sentence that names what failed, why, and the one thing to do next,
+you have not classified the failure — you have only labelled it.
+
+Everything downstream inherits this. A [transaction's lifecycle](/c/tx-lifecycle-states) has three
+off-happy-path edges, each of which produces failures that need exactly this treatment. A
+[batched call through a wallet](/c/wallet-capabilities) can fail per-call, and the buckets are how
+you decide which call's failure the user hears about. Account abstraction adds validation failures
+that never reach the EVM at all, on a channel with its own error conventions — and the reason those
+will make sense when you meet them is that you now know the difference between a failure and its
+encoding.

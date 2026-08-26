@@ -1,0 +1,367 @@
+---
+id: evm-transaction-types-the-one-that-pays-elsewhere
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources:
+  [
+    eip-4844,
+    eip-1559,
+    eip-7918,
+    eip-7594,
+    eip-7840,
+    eip-7892,
+    eip-2718,
+    geth-blobpool,
+    ethereum-org-peerdas,
+  ]
+stack: {}
+---
+
+An L2 team is watching a mint. The execution base fee has gone up by a factor of ten in nine minutes,
+their alerting is lit, and someone asks the obvious question: should we pause the batcher until this
+passes?
+
+The answer is no, and the reason is not "it will be over soon". The reason is that the batcher's cost
+is denominated in a resource whose price the mint does not touch. Blob gas and execution gas are
+priced by two separate mechanisms reading two separate header fields, and neither one is an input to
+the other.<Cite src="eip-4844" /><Cite src="eip-1559" />
+
+That is the headline of this lesson, and it is the correct instinct to build. It also has exactly one
+deliberate exception, added later and now Final, which sets a floor under blob prices as a function of
+the execution base fee.<Cite src="eip-7918" /> Getting the exception right is the difference between
+knowing the design and repeating a slogan.
+
+## The envelope, and the thing it does not contain
+
+Type `0x03` is the 1559 field set plus two:
+
+`rlp([chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas, gas_limit, to, value, data, access_list, max_fee_per_blob_gas, blob_versioned_hashes, y_parity, r, s])`<Cite src="eip-4844" />
+
+Three constraints on that list are not visible in it:
+
+- **`to` MUST NOT be nil.** Every other field follows 1559 semantics, but this one deviates: a blob
+  transaction must always name a 20-byte address, which means **a blob transaction can never be a
+  contract creation**.<Cite src="eip-4844" />
+- **`blob_versioned_hashes` must be non-empty,** and every entry must begin with
+  `VERSIONED_HASH_VERSION_KZG`, the byte `0x01`.<Cite src="eip-4844" />
+- **The blobs are not in the payload.** `blob_versioned_hashes` is a list of hashes. The blob bytes
+  themselves are somewhere else entirely.
+
+A versioned hash is `VERSIONED_HASH_VERSION_KZG || sha256(commitment)[1:]` — the version byte followed
+by all but the first byte of the SHA-256 hash of the blob's KZG
+commitment.<Cite src="eip-4844" /> The EVM's access to a blob is exactly this and nothing more: the
+`BLOBHASH` opcode, byte `0x49`, costs 3 gas, takes an index from the stack, and returns
+`tx.blob_versioned_hashes[index]` — or a zeroed 32 bytes if the index is out of
+range.<Cite src="eip-4844" />
+
+<Figure
+  caption="A blob reaches the EVM as a 32-byte name, and one of those bytes is spent saying which scheme did the naming."
+  alt="A versioned hash is 32 bytes: a one-byte VERSIONED_HASH_VERSION_KZG tag of 0x01, followed by the last 31 bytes of the SHA-256 hash of the blob's KZG commitment."
+>
+  <ByteLayout
+    offsets
+    caption="one entry of blob_versioned_hashes"
+    fields={[
+      { label: '0x01', size: 1, tone: 'accent', note: 'VERSIONED_HASH_VERSION_KZG' },
+      { label: 'sha256(commitment)', size: 31, note: 'first byte dropped' },
+    ]}
+  />
+</Figure>
+
+<Misconception
+  belief="A blob transaction is how you put cheap data where a contract can read it."
+  reality="The EVM cannot read blob contents at all. A contract can obtain a 32-byte versioned hash and nothing else. Blobs are a data-availability mechanism — a public commitment that some bytes were published — not storage."
+  why="'Cheap data on Ethereum' is heard as 'cheap storage', and the transaction does visibly carry the data across the network. It carries it past the EVM, not into it."
+  src="eip-4844"
+/>
+
+That misconception has a corollary worth stating separately: **blobs are not retained forever.**
+EIP-4844 sets `MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS` to 4096 epochs, a little over eighteen days, as
+the window during which nodes are required to serve them.<Cite src="eip-4844" /> What you are buying
+is a guarantee that the data *was* available long enough for anyone who cared to fetch it — long
+enough to run a fraud proof or reconstruct a state — not a guarantee that it will still be there next
+year.
+
+## Two network representations, and why your library broke
+
+This is the part that surprises people who have only read the payload definition.
+
+A blob transaction has two forms on the wire. In `BlockBodies` responses — the canonical, consensus
+form — it is the plain [EIP-2718](/c/eip-2718-envelope) payload above.<Cite src="eip-2718" /> In
+`PooledTransactions` responses, during transaction gossip, it is *wrapped* to carry the blobs
+alongside.<Cite src="eip-4844" /> Under EIP-4844 that
+wrapper was `rlp([tx_payload_body, blobs, commitments, proofs])`, with one KZG proof per
+blob.<Cite src="eip-4844" />
+
+PeerDAS changed it. The current wrapper is
+`rlp([tx_payload_body, wrapper_version, blobs, commitments, cell_proofs])`, where `wrapper_version` is
+a single byte currently set to 1, and `cell_proofs` holds `CELLS_PER_EXT_BLOB` proofs **per blob**
+rather than one.<Cite src="eip-7594" /> The reason is a straight cost transfer: computing cell proofs
+is expensive and verifying them is cheap, so rather than have every block producer recompute them for
+every blob, the specification requires the **sender** to compute them and ship them in the
+wrapper.<Cite src="eip-7594" />
+
+If you have ever seen a blob-submission library fail after a network upgrade with an error about proof
+counts, this is why. Any tooling written against the EIP-4844-era one-proof-per-blob shape produces a
+wrapper that current nodes reject.
+
+<Figure
+  caption="The consensus form has not moved; the gossip form has, and a library that hard-codes one list has hard-coded the one that changes."
+  alt="Three encodings of a type-3 transaction: the canonical BlockBodies form is the plain EIP-2718 payload; the EIP-4844 pooled wrapper appended blobs, commitments and one proof per blob; the PeerDAS wrapper inserts a wrapper_version byte and replaces the proofs with CELLS_PER_EXT_BLOB cell proofs per blob."
+>
+  <ByteLayout
+    caption="BlockBodies — the consensus form"
+    fields={[
+      { label: 'type', size: 1, tone: 'accent', note: '0x03' },
+      { label: 'tx_payload_body', note: 'the 14 fields above' },
+    ]}
+  />
+  <ByteLayout
+    caption="PooledTransactions — as EIP-4844 shipped it"
+    fields={[
+      { label: 'type', size: 1, tone: 'accent', note: '0x03' },
+      { label: 'tx_payload_body' },
+      { label: 'blobs', tone: 'muted' },
+      { label: 'commitments', tone: 'muted' },
+      { label: 'proofs', tone: 'warn', note: 'one per blob' },
+    ]}
+  />
+  <ByteLayout
+    caption="PooledTransactions — after PeerDAS"
+    fields={[
+      { label: 'type', size: 1, tone: 'accent', note: '0x03' },
+      { label: 'tx_payload_body' },
+      { label: 'wrapper_version', size: 1, tone: 'accent', note: 'currently 1' },
+      { label: 'blobs', tone: 'muted' },
+      { label: 'commitments', tone: 'muted' },
+      { label: 'cell_proofs', tone: 'warn', note: 'CELLS_PER_EXT_BLOB per blob' },
+    ]}
+  />
+</Figure>
+
+One more networking rule, easy to miss and operationally significant: **nodes must not automatically
+broadcast blob transactions to their peers.** They are announced by hash via
+`NewPooledTransactionHashes` and must then be explicitly requested with
+`GetPooledTransactions`.<Cite src="eip-4844" /> A blob transaction does not flood outward the way an
+ordinary one does; it advertises and waits to be pulled.
+
+## The second market
+
+Now the fee mechanics, which are a deliberate near-copy of EIP-1559 operating on a different resource.
+
+Each blob consumes `GAS_PER_BLOB` blob gas, defined as `2**17` — 131,072 — so a transaction's blob
+gas is `GAS_PER_BLOB * len(tx.blob_versioned_hashes)`.<Cite src="eip-4844" /> The price per unit comes
+from a header field: `excess_blob_gas` is a running total of blob gas consumed in excess of the target,
+increased by above-target blocks and decreased by below-target ones, floored at
+zero.<Cite src="eip-4844" /> The base fee per blob gas is then an exponential in that running total,
+approximating
+
+```text
+base_fee_per_blob_gas = MIN_BASE_FEE_PER_BLOB_GAS
+                      * e ** (excess_blob_gas / BLOB_BASE_FEE_UPDATE_FRACTION)
+```
+
+with `MIN_BASE_FEE_PER_BLOB_GAS` of 1 wei and a `BLOB_BASE_FEE_UPDATE_FRACTION` that EIP-4844 set at
+3,338,477 — chosen so the maximum per-block rate of change at target is about
+1.125.<Cite src="eip-4844" /> Treat that constant the way you treat the target and the maximum: it is
+now a per-fork entry in the `blobSchedule` alongside them, not a fixed number.<Cite src="eip-7840" />
+
+Three differences from the execution market matter more than the similarities.
+
+**There is no blob tip.** The envelope carries `max_fee_per_blob_gas` and no priority counterpart.
+The blob fee is deducted from the sender's balance before execution and **burned in full**, and it is
+**not refunded if the transaction fails**.<Cite src="eip-4844" /> A proposer earns nothing from your
+blob gas, which means you cannot bid your way past a competitor on the blob side. You compete on the
+execution tip, or you wait.
+
+**Your `max_fee_per_blob_gas` is a hard inclusion gate.** A block is invalid if it contains a blob
+transaction whose ceiling is below that block's blob base fee.<Cite src="eip-4844" /> This is the same
+shape as the 1559 ceiling, applied to a second resource, and it fails the same way: below the base
+fee, the transaction is not slow, it is ineligible.
+
+**The capacity numbers are not constants any more.** EIP-4844 shipped with a target of 3 blobs and a
+maximum of 6 per block, described in the EIP itself as small initial limits expected to be increased
+as the network demonstrated reliability.<Cite src="eip-4844" /> They have been. Target and maximum now
+live in a per-fork `blobSchedule` in client configuration rather than being hard-coded
+constants,<Cite src="eip-7840" /> and are stepped by *blob-parameter-only* forks — lightweight
+upgrades that change nothing but these parameters.<Cite src="eip-7892" /> **This lesson deliberately
+does not tell you the current target and maximum.** Sources retrieved for this curriculum disagree
+about which BPO forks have activated as of August 2026, and no primary source was found that settles
+it; the honest answer is to read the pair from your client's configured schedule for the current fork
+rather than from any document, including this one.
+
+<Aside kind="note">
+Note what the split into two exponential mechanisms buys structurally. Execution gas and blob gas
+measure different scarce things — one is CPU and state access on every executing node, the other is
+bandwidth and temporary storage across the peer set. Pricing them with a single number would force
+those two costs to be traded off at a fixed exchange rate that nobody chose. Two mechanisms let each
+resource discover its own price, and let each be scaled on its own schedule, which is precisely what
+the BPO forks have been doing to blob capacity without touching the execution gas limit.<Cite src="eip-7892" />
+</Aside>
+
+## The independence, stated precisely
+
+Here is the claim in the form that survives contact with the specification.
+
+**Demand-side independence holds, and it is the point.** The execution base fee is updated from the
+parent block's execution gas used.<Cite src="eip-1559" /> The blob base fee is updated from
+`excess_blob_gas`, which accumulates from blob gas used.<Cite src="eip-4844" /> A block full of
+NFT mints raises the first and leaves the second alone; a block full of rollup batches does the
+reverse. Rollups buy data capacity without bidding against ordinary users for execution capacity, and
+a spike in one market is not evidence about the other.
+
+<Misconception
+  belief="Blob transactions compete with ordinary transactions and make them more expensive."
+  reality="They are metered and priced separately, in different units, from different header fields. Blob demand does not enter the execution base-fee update at all."
+  why="Both are called 'gas', both appear in the same block, and block explorers show them in the same fee column. The naming collision does most of the damage."
+  src="eip-4844"
+/>
+
+**And there is one coupling, in one direction, at the floor.** EIP-7918 — Final — observed that when
+the blob base fee bottoms out near its 1-wei minimum, the mechanism stops functioning as a market: a
+10% change in the blob base fee can shift a blob consumer's total cost by a negligible fraction,
+so the price carries almost no signal and demand becomes inelastic.<Cite src="eip-7918" /> Its fix is
+a reserve price. An `if`-clause is added to `calc_excess_blob_gas`: when
+`BLOB_BASE_COST * base_fee_per_gas` exceeds `GAS_PER_BLOB * base_fee_per_blob_gas`, the update no
+longer subtracts the target, so `excess_blob_gas` climbs rather than
+decaying.<Cite src="eip-7918" /> With `BLOB_BASE_COST` set to `2**13`, the ratio between the reserve
+blob base fee and the execution base fee is fixed at `BLOB_BASE_COST / GAS_PER_BLOB`, or
+one-sixteenth.<Cite src="eip-7918" />
+
+The second stated purpose is worth carrying because it explains why the coupling points this way and
+not the other: verifying KZG proofs is genuinely expensive compute that nodes perform on behalf of
+blob consumers, and the execution base fee is the network's own live measure of how in-demand that
+compute is.<Cite src="eip-7918" />
+
+So the accurate sentence is: **the two markets do not compete for the same capacity and blob demand
+never moves the execution price, but the execution base fee places a floor under the blob base fee.**
+The exception runs execution → blob, at the bottom of the range only, at a fixed ratio. If your
+blob costs are already meaningfully above 1 wei per blob gas, the floor is not binding and full
+independence is what you observe.
+
+## A different pool, with different rules
+
+Because blob transactions are large and the pool is not consensus, clients treat them separately.
+go-ethereum keeps them in a dedicated blob pool with its own configuration, and its design notes give
+the reasoning: replacements are expensive because propagating a replacement blob transaction wastes
+real bandwidth, so replacement should be aggressively discouraged; evicting an already-propagated blob
+transaction is a denial-of-service vector; and the presence of blob transactions from an account
+excludes non-blob transactions from that same account in the pool.<Cite src="geth-blobpool" />
+
+The consequence for an L2 batcher is that the pool behaviours you learned on ordinary transactions do
+not transfer. The next lesson takes that apart properly, because all of it is downstream of one rule
+about nonces.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: '0x02', note: '1559' },
+    { title: '0x03', note: 'blob', tone: 'accent' },
+    { title: '0x04', note: 'delegation', tone: 'muted' },
+  ]}
+  rows={[
+    {
+      label: 'What does the envelope add to the 1559 field set?',
+      cells: [
+        'Nothing beyond it — this is the field set',
+        'max_fee_per_blob_gas and blob_versioned_hashes',
+        'authorization_list, which may not be empty',
+      ],
+    },
+    {
+      label: 'Which meter prices the addition?',
+      cells: [
+        'Execution gas',
+        'Blob gas, from a separate header field',
+        'Execution gas, as intrinsic cost',
+      ],
+    },
+    {
+      label: 'Can a proposer be outbid on the addition?',
+      cells: [
+        'Yes — the priority fee is the bid',
+        'No — there is no blob tip; the fee is burned',
+        'Yes — the priority fee is the bid',
+      ],
+    },
+    {
+      label: 'May the transaction create a contract?',
+      cells: [
+        'Yes — destination may be nil',
+        'No — to must not be nil',
+        'No — creation is excluded by the EIP',
+      ],
+    },
+    {
+      label: 'Is the addition charged when execution fails?',
+      cells: [
+        'Unused execution gas is returned',
+        'Yes — the blob fee is not refunded',
+        'Yes — every tuple is billed, valid or not',
+      ],
+    },
+    {
+      label: 'What can the EVM read of the addition?',
+      cells: [
+        'Nothing — it only warms state',
+        'One 32-byte versioned hash per index, via BLOBHASH',
+        'The delegated code, running at the authority',
+      ],
+    },
+  ]}
+  caption="Type 0x03 is the only envelope whose extra charge buys no tip, comes back on nothing, and is metered by a header field the execution market never reads."
+  alt="Types 0x02, 0x03 and 0x04 compared on what each adds to the 1559 field set, which meter prices it, whether a proposer can be outbid on it, whether contract creation is allowed, whether the charge survives failure, and what the EVM can read of it."
+/>
+
+<Check type="explain" concept="separate-fee-markets">
+Your rollup's batcher posts blobs continuously. Over one hour the execution base fee rises by a factor
+of ten because of an unrelated mint, while blob demand is unchanged.
+
+Work out what happens to (a) the blob gas your batcher consumes, (b) the blob base fee it pays, and
+(c) the total cost of a batch. Say under what condition your answer to (b) changes.
+
+<Answer>
+**(a) Blob gas consumed does not change at all.** It is `GAS_PER_BLOB * len(blob_versioned_hashes)`,
+a pure function of how many blobs you attach — `2**17` per blob.<Cite src="eip-4844" /> Nothing about
+execution demand enters it.
+
+**(b) The blob base fee is unaffected — in the ordinary case.** It is derived from `excess_blob_gas`,
+which accumulates only from blob gas used relative to the target, and blob demand is stated as
+unchanged.<Cite src="eip-4844" />
+
+**(c) The total cost still rises, and this is the part people get wrong in the other direction.** A
+blob transaction pays *both* markets. Its calldata, its call into the inbox contract and its 21000
+intrinsic cost are all ordinary execution gas, charged at the execution base fee plus tip — so that
+component multiplies by roughly ten along with everyone else's.<Cite src="eip-1559" /> "The markets
+are independent" means the blob component is unaffected, not that the transaction is.
+
+**The condition that changes (b): the EIP-7918 reserve price.** If the blob base fee is low enough
+that `BLOB_BASE_COST * base_fee_per_gas` exceeds `GAS_PER_BLOB * base_fee_per_blob_gas` — that is, if
+the blob base fee sits below one-sixteenth of the execution base fee — then `calc_excess_blob_gas`
+stops subtracting the target, and `excess_blob_gas` rises even though blob demand did
+not.<Cite src="eip-7918" /> A tenfold jump in the execution base fee raises that floor tenfold, so a
+batcher that had been enjoying near-minimum blob prices will see them pulled up. A batcher already
+paying well above the floor sees nothing.
+
+**The rule to carry into an incident:** ask which of your costs is denominated in which resource
+before you conclude that a price spike is yours.
+</Answer>
+</Check>
+
+## Where this pays off
+
+The blobs module goes underneath this envelope: what a blob actually is as 4,096 field elements, what
+a KZG commitment compresses, and how PeerDAS distributes the data so that no node has to hold all of
+it.<Cite src="ethereum-org-peerdas" /> Everything there explains *why* the transaction carries a hash
+rather than the data.
+
+On the scaling track, the two-market structure is the economic foundation of the rollup cost model,
+and the EIP-7918 floor is the reason a rollup's data cost is not independent of L1 congestion at the
+bottom of the range — a subtlety that matters exactly when you are trying to explain why your unit
+economics moved.<Cite src="eip-7918" />
+
+And in the very next lesson, the blob pool's separate rules turn out to be one instance of the general
+problem: a sender's transactions form a strict sequence, and every pool policy in existence is a
+consequence of that.

@@ -1,0 +1,359 @@
+---
+id: protocol-client-architecture-the-one-wire-between-them
+authorship: authored
+verifiedAt: "2026-08-26"
+volatility: evolving
+changeKind: clarifying
+sources: [engine-api-spec, engine-api-common, engine-api-authentication, engine-api-paris, engine-api-cancun, engine-api-prague, engine-api-osaka, engine-api-amsterdam, besu-engine-api, engine-api-visual-guide, ethereum-org-nodes-clients]
+stack: {}
+---
+
+Here is the log line that ends most first nodes, and it looks like nothing:
+
+```text
+WARN  Beacon client online, but no consensus updates received. Please ensure your beacon client is
+      operational to follow the chain!
+```
+
+The execution client prints it every thirty seconds or so. Both processes are running. Neither has
+crashed. Disk is filling, CPU is busy, peers are connected on both sides. And the node will sit like that
+for as long as you leave it, doing real work that accomplishes nothing, because the two halves cannot
+authenticate to each other.
+
+The previous lesson established that a node is two processes and that exactly one channel joins them.
+This lesson is that channel: what it is, why it is deliberately not the API you already know, and why the
+most common first-time node failure produces no crash, no error status, and no obvious symptom.
+
+## The `engine` namespace
+
+The channel is a JSON-RPC namespace. Its methods are named `engine_*`, they are served by the execution
+client, and they are called by the consensus client.<Cite src="engine-api-spec" />
+
+Three requirements from the specification's common definitions shape everything about how it is deployed.
+
+**It is served on its own port.** Client software **MUST** expose the Engine API at a port independent
+from the JSON-RPC API, and the specification names 8551 as the default.<Cite src="engine-api-common" />
+Read the modal verbs carefully, because this is a place where folklore and specification differ in a way
+worth being precise about: the *separation* is a MUST, while 8551 is stated as the default rather than
+required. Every client happens to agree on it, which is why it reads like a mandate.
+
+**It is not only `engine_*`.** To let the consensus client read execution state and logs over the same
+connection — deposits, for instance — the specification requires the execution client to also expose a
+specific subset of `eth` methods on that port: `eth_blockNumber`, `eth_call`, `eth_chainId`,
+`eth_getCode`, `eth_getBlockByHash`, `eth_getBlockByNumber`, `eth_getLogs`, `eth_sendRawTransaction` and
+`eth_syncing`.<Cite src="engine-api-common" /> Nine methods, no more. A port that answers
+`eth_getBalance` is your public API, not your Engine API.
+
+**Ordering is normative.** The consensus client **MUST** respect the order of fork-choice update events
+when calling `engine_forkchoiceUpdated`, and the execution client **MUST** process those calls in the
+order received.<Cite src="engine-api-common" /> This is not a performance note. Reordering these calls
+means telling the execution client that the head is X and then that it is an earlier Y, which is a
+different chain.
+
+<Compare
+  axis="Question"
+  columns={[
+    { title: 'The Engine API port', note: 'spec names 8551 as the default', tone: 'accent' },
+    { title: 'The public JSON-RPC port', note: 'what your application talks to' },
+  ]}
+  rows={[
+    {
+      label: 'Who is it for?',
+      cells: ['Exactly one peer — the paired consensus client.', 'Anyone you choose to expose it to.'],
+    },
+    {
+      label: 'Which methods answer on it?',
+      cells: [
+        { v: 'engine_*, plus nine named eth_ methods. No more.', tone: 'accent' },
+        'The whole eth_, debug_ and trace_ surface.',
+      ],
+    },
+    {
+      label: 'How is a caller authenticated?',
+      cells: [
+        { v: 'JWT HS256 over a shared 256-bit secret; alg none is rejected.', tone: 'accent' },
+        'However you configure it. Nothing in this specification applies.',
+      ],
+    },
+    {
+      label: 'What can a caller make the node do?',
+      cells: [
+        { v: 'Set the head, set the finalised hash, start building a block.', tone: 'danger' },
+        'Read the chain and submit transactions.',
+      ],
+    },
+    {
+      label: 'What does compromise of it cost you?',
+      cells: [
+        { v: 'Authority over the process — treat it as node compromise.', tone: 'danger' },
+        { v: 'Read access, plus whatever your rate limits allow.', tone: 'warn' },
+      ],
+    },
+  ]}
+  caption="Nine eth_ methods is the whole overlap: a port that answers eth_getBalance is your public API, not your Engine API."
+  alt="The Engine API port and the public JSON-RPC port compared across intended caller, available methods, authentication, the authority a caller gains, and the cost of compromise."
+/>
+
+<Misconception
+  belief="The Engine API is just another JSON-RPC endpoint. If I can reach it, I can call it."
+  reality="It is authenticated with a local shared secret and is meant to be reachable only by the paired consensus client. It speaks the same wire protocol as the public API and is a completely different trust boundary."
+  why="It looks like eth_* RPC, uses the same encoding rules, and the two ports differ only by a number."
+  src="engine-api-common"
+/>
+
+## Why it is a separate surface
+
+The public API is a read interface for anyone. The Engine API is a control interface for exactly one
+peer. Anything with Engine API access can tell your execution client what the canonical head is, what to
+treat as finalised, and what block to start building. That is not a subset of "read the chain"; it is
+authority over the process.
+
+Two more differences follow from that.
+
+**Versioning is per method, not per API.** The specification is explicit: the version of each method and
+structure is independent of every other, the `VN` suffix is part of the name, and the number **MUST**
+increment when the parameter set, the response value, the behaviour, or a structure's fields
+change.<Cite src="engine-api-common" /> Concretely: the Prague fork file defines `engine_newPayloadV4` and
+`engine_getPayloadV4` and no new `forkchoiceUpdated` at all<Cite src="engine-api-prague" />, so the
+current forkchoice method there is still the `V3` introduced in Cancun.<Cite src="engine-api-cancun" />
+Methods drift apart on purpose.
+
+**Errors have their own numbers.** Beyond the standard JSON-RPC codes, the Engine API defines
+`-38001 Unknown payload`, `-38002 Invalid forkchoice state`, `-38003 Invalid payload attributes`,
+`-38004 Too large request`, `-38005 Unsupported fork` and `-38006 Too deep
+reorg`.<Cite src="engine-api-common" /> Each of those describes a state that only exists because one
+process is driving another. `-38005` in particular is how a fork boundary is enforced across the wire:
+after Osaka activates, `engine_getBlobsV1` **MUST** return unsupported-fork, and `engine_getPayloadV4`
+**MUST** do the same for any payload whose timestamp is at or after
+activation.<Cite src="engine-api-osaka" />
+
+**And the two sides negotiate what they support.** `engine_exchangeCapabilities` lets each client send
+the other the list of Engine API method names it currently supports, version suffixes included. Execution
+clients **MUST** implement it; consensus clients may call it or not, and the execution client **MUST NOT**
+log errors if it is never called.<Cite src="engine-api-common" /> It is how a client pair discovers,
+before a fork, whether its counterpart has shipped the new method versions yet.
+
+<Matrix
+  corner="What"
+  cols={['Which process holds it', 'Does it cross this wire?']}
+  rows={[
+    {
+      label: 'An execution payload',
+      cells: [
+        'Arrives at the consensus client inside a beacon block',
+        { v: 'Yes — as an argument to engine_newPayload', tone: 'accent' },
+      ],
+    },
+    {
+      label: 'The head, safe and finalised hashes',
+      cells: [
+        'Computed by consensus-side fork choice',
+        { v: 'Yes — as an argument to engine_forkchoiceUpdated', tone: 'accent' },
+      ],
+    },
+    {
+      label: 'Attestations, and their aggregation',
+      cells: [
+        'Consensus client only',
+        { v: 'No. The evidence behind a head change never enters the execution process.', tone: 'muted' },
+      ],
+    },
+    {
+      label: 'Beacon blocks, signatures, the validator registry',
+      cells: [
+        'Consensus client only',
+        { v: 'No. The execution client has no notion of a beacon block.', tone: 'muted' },
+      ],
+    },
+    {
+      label: 'Account state, receipts, logs',
+      cells: [
+        'Execution client only',
+        'Only through the nine eth_ methods the specification requires on this port',
+      ],
+    },
+    {
+      label: 'eth_getBalance',
+      cells: [
+        'Execution client only',
+        { v: 'No — and a port that answers it is the wrong port', tone: 'warn' },
+      ],
+    },
+  ]}
+  caption="Everything that decides which chain the node is on crosses in one direction; the evidence behind that decision never crosses at all."
+  alt="A table of what does and does not travel over the Engine API: execution payloads and fork-choice hashes do, attestations and beacon blocks do not, and execution state is reachable only through nine permitted eth methods."
+/>
+
+<Aside kind="note">
+The per-fork files are the fastest way to see what changed: Paris, Shanghai, Cancun, Prague, Osaka and
+Amsterdam each have their own document under `src/engine`.<Cite src="engine-api-spec" /> Amsterdam's is
+written and reviewable — it defines `engine_newPayloadV5`, which requires a `blockAccessList` field and
+whose timeout is 6s rather than 8s.<Cite src="engine-api-amsterdam" /> That the file exists says nothing
+about when or whether it activates. Reading an unshipped fork's spec is a research activity, not a
+deployment plan.
+</Aside>
+
+## The secret both processes read
+
+Authentication is JWT, and the specification for it is short enough that it is worth knowing nearly all
+of it.
+
+**The algorithm.** The execution client **MUST** support `HMAC + SHA256` (`HS256`), and **MUST** reject
+`alg: none`.<Cite src="engine-api-authentication" />
+
+**The key.** Both clients **SHOULD** accept a `jwt-secret` configuration parameter naming a file that
+contains a hex-encoded 256-bit secret. If no such parameter is given, a client **SHOULD** generate one
+valid for the lifetime of the run and **SHOULD** write it as a `jwt.hex` file, so that the counterpart
+can be provisioned from it.<Cite src="engine-api-authentication" />
+
+**The claims.** The `iat` — issued-at — claim is required, and the execution client **SHOULD** only accept
+timestamps within ±60 seconds of the current time.<Cite src="engine-api-authentication" /> Two optional
+claims exist: `id` for a consensus client instance identifier and `clv` for its type and version. Any
+other claims the execution client does not recognise **MUST** be ignored.<Cite src="engine-api-authentication" />
+
+**Where the token rides.** Over HTTP, every individual JSON-RPC request is authenticated by a token in the
+HTTP header. Over WebSocket, only the initial handshake is authenticated — the upgrade request carries
+the header, and the message dialogue afterwards does not. Over local IPC there is no authentication at
+all, on the reasoning that a process able to open the socket is already sufficiently
+permissioned.<Cite src="engine-api-authentication" />
+
+That `iat` rule is the one that surprises people. The token is minted fresh, so **clock skew between the
+two processes breaks authentication exactly as a wrong secret does.** A machine whose NTP has drifted
+more than a minute produces a node that has the right secret in the right file and still cannot pair.
+Check the clock before you regenerate the key.
+
+### What the scheme is not for
+
+The authentication document names its own threat model, and being explicit about it is the useful part.
+
+It defends against two things: an RPC port exposed to the internet, letting attackers exchange messages
+with the Engine API, and an RPC port reachable from a browser, letting a malicious web page submit
+messages to it.<Cite src="engine-api-authentication" />
+
+It is explicitly **not** designed to prevent an attacker who can sniff network traffic from reading that
+traffic, nor from replaying earlier messages.<Cite src="engine-api-authentication" /> Confidentiality is
+not offered. Replay protection is not offered. The scheme assumes the wire is a loopback interface, and
+everything it promises is conditional on that assumption holding.
+
+There is one more property that follows from HMAC being symmetric, and the document states it as a design
+consequence rather than a flaw: because the key is shared, several consensus clients can use the same key
+and, from an authentication standpoint, impersonate each other. The upside is that an execution client
+does not need to be provisioned with a separate key per consensus
+client.<Cite src="engine-api-authentication" /> The downside is that "which consensus client sent this"
+is not a question the authentication layer can answer. That is precisely why the optional `id` and `clv`
+claims exist — as labels for operators, not as identity.
+
+<Misconception
+  belief="Both clients are running and neither has crashed, so the pairing is working."
+  reality="A mismatched secret leaves both processes alive and busy while no payload is ever validated and no head is ever adopted. Nothing crashes, so liveness checks pass and the node never follows the chain."
+  why="Every usual health signal — process up, port open, peers connected, logs scrolling — is a signal about one process in isolation, and each process is genuinely fine in isolation."
+  src="engine-api-authentication"
+/>
+
+### The branch that turns a config error into a silent one
+
+The failure mode has a specific cause, spelled out in the specification. If the `jwt-secret` parameter is
+given but the file cannot be read, or does not contain a hex-encoded 256-bit key, the client **SHOULD**
+treat it as an error — and the specification offers two acceptable responses: abort the startup, **or**
+show an error and continue without exposing the authenticated
+port.<Cite src="engine-api-authentication" />
+
+Both branches are conformant. The second one is why this failure is quiet. An execution client that took
+it is a process that started successfully, prints one message you may have scrolled past, serves your
+public API perfectly, and has no Engine API listening at all. Every health check you have passes.
+
+So the diagnosis is a two-sided read, and it takes seconds once you know the shape:
+
+**Subgoal 1 — ask the execution client whether the authenticated port is even up.** If it took the
+continue-without-exposing branch, no amount of consensus-client debugging will help. This is a startup
+message, not a steady-state one, so read from the beginning of the log rather than the tail.
+
+**Subgoal 2 — ask the consensus client what it gets when it calls.** An HTTP 401 against the Engine port
+is an authentication failure: wrong secret, or skewed clock. A connection refused is a port or process
+problem. A timeout is a network or resource problem. Three different fixes.
+
+**Subgoal 3 — separate "wrong secret" from "wrong clock".** Compare the two processes' system time before
+regenerating anything. The ±60 second `iat` window is the whole
+mechanism.<Cite src="engine-api-authentication" />
+
+**Subgoal 4 — check you are provisioning the same file, not the same contents.** Container mounts,
+different users, a secret regenerated on restart by one side and not the other — the file's *path* is
+what each process was configured with, and two paths holding two different auto-generated keys is the
+common shape of this.
+
+<Check type="spot-bug" concept="engine-api-jwt">
+A colleague is hardening your staking setup. They propose: "The beacon node runs on a different machine
+from the execution client, so let's expose the Engine API port to the private network and point the
+beacon node at it. It is JWT-authenticated, so it is safe over the wire, and we will use the same
+`jwt.hex` we already have."
+
+Name what is wrong with the security reasoning, and say what you would do instead.
+
+<Answer>
+**The plan may be operationally fine. The security *reasoning* is wrong, in a way that matters if anyone
+later relies on it.**
+
+**The specific error.** "It is JWT-authenticated, so it is safe over the wire" attributes a property the
+scheme explicitly disclaims. The authentication document states it is not designed to prevent an attacker
+who can read network traffic from reading that traffic, nor from replaying earlier
+messages.<Cite src="engine-api-authentication" /> JWT here answers "may this caller issue commands",
+against an attacker who cannot see the link. It offers no confidentiality and no replay protection. Over
+a real network segment, both of those are now assumptions about the segment rather than guarantees from
+the protocol.
+
+**What the threat model actually covers.** The two attacks named are an RPC port exposed to the internet
+and an RPC port reachable from a browser.<Cite src="engine-api-authentication" /> Both are attacks by
+someone who can *send* to the port but not *watch* it. Moving the channel onto a shared network
+introduces the second kind of adversary, which is outside what the scheme was built for.
+
+**What is at stake if it fails.** Engine API access is not read access. It is the authority to set the
+head, set the finalised hash, and start block building on a chosen parent.<Cite src="engine-api-common" />
+Treat compromise of this channel as compromise of the node, not as an information leak.
+
+**The shared-key point, which is easy to miss.** HMAC is symmetric, so every holder of that `jwt.hex` can
+impersonate every other holder.<Cite src="engine-api-authentication" /> Reusing one secret across a fleet
+means one leaked file is authority over every execution client in it. The `id` and `clv` claims are
+labels, not identity — they will not tell you which host misbehaved.<Cite src="engine-api-authentication" />
+
+**What to do instead.**
+
+*Prefer no network at all.* If the two processes can share a host, run them there and use the loopback
+interface, which is the deployment the threat model assumes. Where the clients support it, local IPC
+removes the authentication question entirely, by design.<Cite src="engine-api-authentication" />
+
+*If they must be split, carry the confidentiality yourself.* An authenticated, encrypted tunnel between
+the two hosts restores the property JWT does not provide. The JWT stays — it is still the access control
+— but it stops being the only thing between an eavesdropper and the control channel.
+
+*Give each pair its own secret.* One key per execution client, generated per host, never checked into
+configuration management as a shared value.
+
+*Bind the listener.* The Engine port should be bound to the interface it is actually reached on and
+nothing wider. The spec requires it to be a separate port from the public API precisely so that this
+decision can be made independently.<Cite src="engine-api-common" />
+
+**The framing to leave your colleague with.** JWT on the Engine API is a lock on a door inside your
+house. It is not a lock rated for a door onto the street, and the specification says so about itself.
+</Answer>
+</Check>
+
+## What this unlocks
+
+- **The next lesson** is what actually travels over this wire: three calls, in an order, on a
+  twelve-second clock — one that asks "is this block good", one that says "this is the chain, and maybe
+  start building", and one that collects the result.<Cite src="engine-api-paris" />
+- **Every future fork** you read about will arrive here as a version bump. Diffing two fork files under
+  `src/engine` is the fastest way to see what a network upgrade demands of node
+  operators.<Cite src="engine-api-spec" />
+- **The module's practice** has you generate a secret, pair two clients, then corrupt the secret and read
+  what each side says. Doing it once converts the silent failure into a recognisable one.
+- **Two supplementary reads are worth the time.** A client's own Engine API reference shows the same
+  methods from the implementer's side, which is a useful contrast with the
+  specification<Cite src="besu-engine-api" />, and a widely circulated visual guide draws the call
+  sequence as a diagram if that is how you prefer to hold it.<Cite src="engine-api-visual-guide" /> Both
+  are secondary to the spec files, and neither is where you check a version
+  number.<Cite src="ethereum-org-nodes-clients" />
+
+The habit worth forming: whenever a component authenticates to another, find the document's own statement
+of what the scheme does *not* protect against. The Engine API's is one paragraph long, and it is the
+paragraph that tells you where you may and may not put the wire.
