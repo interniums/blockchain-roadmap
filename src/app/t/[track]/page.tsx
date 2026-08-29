@@ -5,11 +5,8 @@ import { allTracks, crumbsFor, getModulesOf, getTrack } from '@/lib/content/load
 import { Breadcrumb } from '@/components/nav/Breadcrumb';
 import { Keyboard } from '@/components/nav/Keyboard';
 import { TrackRail } from '@/components/nav/TrackRail';
-import { Capabilities } from './_track/Capabilities';
 import { ContextRail } from './_track/ContextRail';
 import { ModuleList } from './_track/ModuleList';
-import { ModuleSpine } from './_track/ModuleSpine';
-import { hoursMinutes, trackFigures } from './_track/figures';
 
 type Params = { track: string };
 
@@ -37,7 +34,6 @@ export default async function TrackPage({ params }: { params: Promise<Params> })
   if (!track) notFound();
 
   const modules = getModulesOf(track.id);
-  const figures = trackFigures(track.id);
 
   // First lesson in reading order within this track — the one honest "start here" link.
   const firstModule = modules.find((m) => (m.lessons?.length ?? 0) > 0);
@@ -84,33 +80,7 @@ export default async function TrackPage({ params }: { params: Promise<Params> })
                 {track.tagline}
               </p>
             )}
-            <p className="mt-3 text-[13px] text-[var(--color-ink-3)]">
-              {figures.modules} modules · {figures.lessons} lessons ·{' '}
-              {hoursMinutes(figures.readingMin)} of reading · {figures.practices} practices
-            </p>
           </header>
-
-          <p className="mt-4 rounded border border-[var(--color-rule)] bg-[var(--color-warn-soft)] px-3 py-2 text-[13px] leading-relaxed text-[var(--color-warn)]">
-            {figures.written === 0 ? (
-              <>
-                Outline stage. All {figures.lessons} lessons in this track have titles, concepts,
-                prerequisites and reading estimates — none of the lesson prose is written yet. The
-                structure below is real; the pages it leads to are not finished.
-              </>
-            ) : (
-              <>
-                {figures.written} of {figures.lessons} lessons in this track are written. The rest
-                are outlined only — titles and concepts exist, the prose does not.
-              </>
-            )}
-            {figures.stubModules > 0 && (
-              <>
-                {' '}
-                {figures.stubModules} module{figures.stubModules === 1 ? ' is' : 's are'} marked a
-                stub: deliberately shallow, enough to orient you and no more.
-              </>
-            )}
-          </p>
 
           {firstModule && firstLesson && (
             <p className="mt-4">
@@ -126,28 +96,7 @@ export default async function TrackPage({ params }: { params: Promise<Params> })
             </p>
           )}
 
-          <div className="mt-8">
-            <Capabilities track={track} />
-          </div>
-
-          <section aria-labelledby="spine-heading" className="mt-10">
-            <h2
-              id="spine-heading"
-              className="text-[11px] uppercase tracking-wider text-[var(--color-ink-3)]"
-            >
-              Module spine
-            </h2>
-            <p className="mt-1 max-w-[62ch] text-[13px] leading-relaxed text-[var(--color-ink-3)]">
-              Same diagram as the roadmap, one level down. Positions are authored, not computed,
-              so this shape does not move when the content grows. Every node is a link into the
-              module.
-            </p>
-            <div className="mt-3">
-              <ModuleSpine trackId={track.id} modules={modules} />
-            </div>
-          </section>
-
-          <section aria-labelledby="modules-heading" className="mt-10">
+          <section aria-labelledby="modules-heading" className="mt-8">
             <h2
               id="modules-heading"
               className="text-[11px] uppercase tracking-wider text-[var(--color-ink-3)]"

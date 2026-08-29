@@ -6,22 +6,13 @@ import { Breadcrumb } from '@/components/nav/Breadcrumb';
 import { Keyboard } from '@/components/nav/Keyboard';
 import { TrackRail } from '@/components/nav/TrackRail';
 import { crumbsFor, getConcept, getModule } from '@/lib/content/load';
-import type { Volatility } from '@/lib/content/types';
 
 import { Appearances } from './_concept/Appearances';
-import { ConceptList } from './_concept/ConceptList';
-import { MasteryScope } from './_concept/MasteryScope';
 import { Misconceptions } from './_concept/Misconceptions';
 import { Neighbourhood } from './_concept/Neighbourhood';
 import { SourcesRail } from './_concept/SourcesRail';
-import { YourRecord } from './_concept/YourRecord';
-import { creditAncestors, scopeIdsFor, titlesFor } from './_concept/ancestors';
 import { conceptSiblings, derived, trackTitle } from './_concept/derive';
-import { Badge, Empty, Notice, RailBlock, Section } from './_concept/ui';
-import { HOT_WARNING, VOLATILITY_LABEL, VOLATILITY_MEANS, WINDOW_DAYS } from './_concept/volatility';
-
-/** One timestamp per build, so freshness cannot drift between sections of the same page. */
-const BUILT_AT = new Date();
+import { Badge, Empty, RailBlock, Section } from './_concept/ui';
 
 export function generateStaticParams() {
   return derived().conceptIds.map((concept) => ({ concept }));
@@ -36,6 +27,11 @@ export async function generateMetadata({
   return { title: `${c.title} · Chainpath`, description: c.oneLine };
 }
 
+/**
+ * A concept page is the exact statement plus its neighbourhood. It carries no record of you and
+ * no clock: what it knows about the world does not change because you visited, and the source
+ * dates behind it are the author's maintenance problem, not the reader's.
+ */
 export default async function ConceptPage({
   params,
 }: { params: Promise<{ concept: string }> }) {
@@ -43,25 +39,10 @@ export default async function ConceptPage({
   const c = getConcept(id);
   if (!c) notFound();
 
-  const volatility: Volatility = c.volatility ?? 'evolving';
   const mod = getModule(c.moduleId);
   const index = derived();
-  const assumedBy = index.assumedBy.get(c.id) ?? [];
   const practices = index.practices.get(c.id) ?? [];
   const { prev, next } = conceptSiblings(c.id, c.moduleId);
-
-  // How far this concept reaches. The whole argument for a flat /c/ route in one number.
-  const named = [...c.requires, ...c.requiredBy, ...c.related.map((e) => e.to), ...(c.paysOffIn ?? [])];
-  const neighbourTracks = new Set<string>([c.trackId]);
-  for (const nid of named) {
-    const n = getConcept(nid);
-    if (n) neighbourTracks.add(n.trackId);
-  }
-
-  // One batched read of your record covers every concept this page names, plus the ancestors
-  // a review here could credit — so the credited list can print titles, not ids.
-  const scopeIds = scopeIdsFor(c.id, named);
-  const scopeTitles = titlesFor(scopeIds);
 
   const crumbs = [
     ...crumbsFor({ trackId: c.trackId, moduleId: c.moduleId }),
@@ -85,9 +66,7 @@ export default async function ConceptPage({
         <Breadcrumb crumbs={crumbs} />
 
         <header className="mt-5">
-          <p className="text-[11px] uppercase tracking-wider text-[var(--color-ink-3)]">
-            Concept · L5 · the unit of mastery
-          </p>
+          <p className="text-[11px] uppercase tracking-wider text-[var(--color-ink-3)]">Concept</p>
           <h1 className="mt-1.5 text-[30px] leading-tight font-semibold text-[var(--color-ink)]">
             {c.title}
           </h1>
@@ -95,13 +74,6 @@ export default async function ConceptPage({
             {c.oneLine}
           </p>
           <div className="mt-3 flex flex-wrap items-center gap-1.5">
-            <Badge
-              tone={volatility === 'hot' ? 'warn' : volatility === 'evolving' ? 'neutral' : 'good'}
-              title={`Re-verify window: ${WINDOW_DAYS[volatility]} days`}
-            >
-              {VOLATILITY_LABEL[volatility]} · {WINDOW_DAYS[volatility]}d window
-            </Badge>
-            {!c.volatility && <Badge tone="danger">volatility unset — assuming evolving</Badge>}
             {c.needsSource && <Badge tone="warn">needs a carrying source</Badge>}
             {c.claimKind && <Badge tone="neutral">{c.claimKind} claim</Badge>}
             <span className="text-[12px] text-[var(--color-ink-3)]">
@@ -139,18 +111,6 @@ export default async function ConceptPage({
               </Empty>
             </div>
           )}
-
-          <div className="mt-3 max-w-[68ch]">
-            {volatility === 'hot' ? (
-              <Notice tone="warn" title="Hot — how much to trust this page">
-                {VOLATILITY_MEANS.hot} {HOT_WARNING}
-              </Notice>
-            ) : (
-              <p className="text-[12.5px] leading-relaxed text-[var(--color-ink-3)]">
-                {VOLATILITY_MEANS[volatility]}
-              </p>
-            )}
-          </div>
         </section>
 
         <Section
@@ -162,53 +122,17 @@ export default async function ConceptPage({
           <Misconceptions items={c.misconceptions ?? []} />
         </Section>
 
-        {/* One scope, one read: every concept named below carries your standing on it. */}
-        <MasteryScope ids={scopeIds} titles={scopeTitles}>
-          <Section
-            id="neighbourhood"
-            title="Neighbourhood"
-            caption="Grouped lists, deliberately not a mini-graph. At 1,490 concepts a list is faster to read, keyboard-reachable, and impossible to get lost in. Every entry names the track it lives in, and how well it is holding for you."
-          >
-            <Neighbourhood concept={c} />
-          </Section>
+        <Section
+          id="neighbourhood"
+          title="Neighbourhood"
+          caption="Grouped lists, deliberately not a mini-graph. At 1,490 concepts a list is faster to read, keyboard-reachable, and impossible to get lost in."
+        >
+          <Neighbourhood concept={c} />
+        </Section>
 
-          <Section
-            id="appearances"
-            title="Where this appears"
-            caption="A concept is not owned by one lesson — that is why this page sits at /c/ and not under a module."
-          >
-            <Appearances
-              taughtIn={c.lessons}
-              assumedBy={assumedBy}
-              practices={practices}
-              fromTrackId={c.trackId}
-            />
-          </Section>
-
-          {(c.paysOffIn?.length ?? 0) > 0 && (
-            <Section
-              id="unlocks"
-              title="This unlocks"
-              count={c.paysOffIn?.length ?? 0}
-              caption="Authored as paysOffIn: the concrete places this pays for itself later. Foundations without a named payoff are the ones people abandon."
-            >
-              <ConceptList ids={c.paysOffIn ?? []} fromTrackId={c.trackId} empty="" />
-            </Section>
-          )}
-
-          <Section
-            id="record"
-            title="Your record"
-            caption="What the app knows about you and this concept, and how much of it you actually earned by retrieval."
-          >
-            <YourRecord
-              conceptId={c.id}
-              conceptTitle={c.title}
-              prereqIds={c.requires}
-              creditAncestorCount={creditAncestors(c.id).length}
-            />
-          </Section>
-        </MasteryScope>
+        <Section id="appearances" title="Where this appears">
+          <Appearances taughtIn={c.lessons} practices={practices} fromTrackId={c.trackId} />
+        </Section>
 
         <nav
           aria-label="Sibling concepts"
@@ -216,7 +140,7 @@ export default async function ConceptPage({
         >
           <SiblingLink id={prev} direction="prev" />
           <Link href={moduleHref} className="text-[var(--color-ink-3)] hover:text-[var(--color-accent)]">
-            Up to {mod?.title ?? 'module'} <span className="text-[11px]">(Esc)</span>
+            Up to {mod?.title ?? 'module'}
           </Link>
           <SiblingLink id={next} direction="next" />
         </nav>
@@ -229,10 +153,8 @@ export default async function ConceptPage({
         <RailBlock title={`Sources (${c.sources?.length ?? 0})`}>
           <SourcesRail
             sourceIds={c.sources ?? []}
-            volatility={volatility}
             needsSource={c.needsSource}
             claimKind={c.claimKind}
-            builtAt={BUILT_AT}
           />
         </RailBlock>
 
@@ -251,24 +173,6 @@ export default async function ConceptPage({
               <span className="ml-1.5 text-[11px] text-[var(--color-ink-3)]">module</span>
             </li>
           </ul>
-          <p className="mt-2.5 text-[12px] leading-snug text-[var(--color-ink-3)]">
-            Home is where this concept is introduced, not where it belongs. Its neighbourhood reaches{' '}
-            {neighbourTracks.size} of 13 tracks — which is why the route is <span className="font-mono">/c/</span>{' '}
-            and not nested under one module.
-          </p>
-        </RailBlock>
-
-        <RailBlock title="Keyboard">
-          <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 text-[12.5px] text-[var(--color-ink-3)]">
-            <dt className="font-mono text-[var(--color-ink-2)]">Esc</dt>
-            <dd>Up to the home module</dd>
-            <dt className="font-mono text-[var(--color-ink-2)]">J / K</dt>
-            <dd>Next / previous concept in this module</dd>
-            <dt className="font-mono text-[var(--color-ink-2)]">M</dt>
-            <dd>Roadmap</dd>
-            <dt className="font-mono text-[var(--color-ink-2)]">⌘K</dt>
-            <dd>Search everything</dd>
-          </dl>
         </RailBlock>
       </aside>
     </div>
@@ -288,7 +192,7 @@ function SiblingLink({ id, direction }: { id: string | null; direction: 'prev' |
   return (
     <Link href={`/c/${id}`} className="max-w-[38%] text-[var(--color-ink-2)] hover:text-[var(--color-accent)]">
       <span className="block text-[11px] uppercase tracking-wider text-[var(--color-ink-3)]">
-        {label} · {direction === 'prev' ? 'K' : 'J'}
+        {label}
       </span>
       {direction === 'prev' && <span aria-hidden="true">← </span>}
       {c?.title ?? id}

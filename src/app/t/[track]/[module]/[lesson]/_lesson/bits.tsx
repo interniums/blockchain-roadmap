@@ -1,4 +1,4 @@
-import type { LessonStatus, Tier, Volatility } from '@/lib/content/types';
+import type { Tier } from '@/lib/content/types';
 
 /** Small shared primitives for the lesson screen. Structure only — no visual identity. */
 
@@ -25,18 +25,6 @@ export function Chip({
   );
 }
 
-const STATUS_LABEL: Record<LessonStatus, { label: string; tone: Tone; title: string }> = {
-  outlined: { label: 'Outlined', tone: 'warn', title: 'Concepts and structure are decided; the prose is not written.' },
-  drafted: { label: 'Drafted', tone: 'warn', title: 'A first pass exists and has not been reviewed.' },
-  reviewed: { label: 'Reviewed', tone: 'good', title: 'Written and checked against its sources.' },
-  published: { label: 'Published', tone: 'good', title: 'Finished.' },
-};
-
-export function StatusBadge({ status }: { status: LessonStatus }) {
-  const s = STATUS_LABEL[status] ?? { label: status, tone: 'neutral' as Tone, title: '' };
-  return <Chip tone={s.tone} title={s.title}>{s.label}</Chip>;
-}
-
 const TIER_LABEL: Record<Tier, string> = {
   spec: 'Spec',
   'canonical-docs': 'Canonical docs',
@@ -46,21 +34,6 @@ const TIER_LABEL: Record<Tier, string> = {
 
 export function TierBadge({ tier }: { tier: Tier }) {
   return <Chip tone={tier === 'spec' || tier === 'canonical-docs' ? 'accent' : 'neutral'}>{TIER_LABEL[tier] ?? tier}</Chip>;
-}
-
-const VOLATILITY_TITLE: Record<Volatility, string> = {
-  stable: 'Unlikely to change.',
-  evolving: 'Changes at the pace of the ecosystem — re-verify periodically.',
-  hot: 'Changing now. Treat the date on every source as load-bearing.',
-};
-
-export function VolatilityChip({ volatility }: { volatility?: Volatility }) {
-  if (!volatility) return null;
-  return (
-    <Chip tone={volatility === 'hot' ? 'warn' : 'neutral'} title={VOLATILITY_TITLE[volatility]}>
-      {volatility}
-    </Chip>
-  );
 }
 
 /** A framed section. Used for the rail panels and the top/bottom strips. */

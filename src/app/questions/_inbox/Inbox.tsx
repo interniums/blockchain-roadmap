@@ -3,13 +3,12 @@
 import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AskQuestion } from '@/components/question';
-import { ageWords, daysBetween, formatStamp } from '@/components/question/age';
 import { store } from '@/lib/state/client';
 import { lookupLabels } from '../labels';
 import type { ConceptLabel, OriginLabel } from '../model';
 import { QuestionCard } from './QuestionCard';
 import { readParked, writeParked } from './park';
-import { counts, groupRows, matches, type Filter, type Row, type Sort } from './rows';
+import { counts, groupRows, matches, type Filter, type Row } from './rows';
 
 type Phase = 'loading' | 'ready' | 'error';
 
@@ -18,7 +17,6 @@ interface Snapshot {
   concepts: Map<string, ConceptLabel>;
   origins: Map<string, OriginLabel>;
   /** One clock for the whole render, so every age on screen is measured from the same instant. */
-  at: number;
 }
 
 /**
@@ -39,7 +37,6 @@ async function snapshot(): Promise<Snapshot> {
     rows: withPark,
     concepts: new Map(bundle.concepts.map((c) => [c.id, c])),
     origins: new Map(bundle.origins.map((o) => [o.key, o])),
-    at: Date.now(),
   };
 }
 
@@ -60,16 +57,13 @@ export function Inbox() {
   const [items, setItems] = useState<Row[]>([]);
   const [concepts, setConcepts] = useState<Map<string, ConceptLabel>>(new Map());
   const [origins, setOrigins] = useState<Map<string, OriginLabel>>(new Map());
-  const [now, setNow] = useState(0);
   const [filter, setFilter] = useState<Filter>('open');
-  const [sort, setSort] = useState<Sort>('newest');
   const [status, setStatus] = useState('');
 
   const apply = useCallback((snap: Snapshot, announce?: string) => {
     setConcepts(snap.concepts);
     setOrigins(snap.origins);
     setItems(snap.rows);
-    setNow(snap.at);
     setPhase('ready');
     if (announce) setStatus(announce);
   }, []);
@@ -116,7 +110,7 @@ export function Inbox() {
 
   const tally = useMemo(() => counts(items), [items]);
   const visible = useMemo(() => items.filter((r) => matches(r, filter)), [items, filter]);
-  const groups = useMemo(() => groupRows(visible, sort), [visible, sort]);
+  const groups = useMemo(() => groupRows(visible), [visible]);
 
   if (phase === 'loading') {
     return (
@@ -142,8 +136,6 @@ export function Inbox() {
     );
   }
 
-  const oldestDays = tally.oldestOpen === null ? null : daysBetween(tally.oldestOpen, now);
-
   return (
     <div>
       <p aria-live="polite" className="sr-only">
@@ -161,16 +153,11 @@ export function Inbox() {
             <Tally value={tally.open} label="open" />
             <Tally value={tally.parked} label="parked" />
             <Tally value={tally.answered} label="answered" />
-            <p className="text-[12.5px] text-[var(--color-ink-3)]">
-              {oldestDays === null ? (
-                <>No open loop right now — every question you asked has an answer or a park.</>
-              ) : (
-                <>
-                  Oldest open loop: <span className="text-[var(--color-ink-2)]">{ageWords(oldestDays)}</span>{' '}
-                  ({formatStamp(tally.oldestOpen)})
-                </>
-              )}
-            </p>
+            {tally.open === 0 && (
+              <p className="text-[12.5px] text-[var(--color-ink-3)]">
+                No open loop right now — every question you asked has an answer or a park.
+              </p>
+            )}
           </section>
 
           <div className="mt-3 flex flex-wrap items-end gap-x-5 gap-y-3 rounded border border-[var(--color-rule)] bg-[var(--color-surface)] p-3">
@@ -189,20 +176,6 @@ export function Inbox() {
                     {f.label}
                   </option>
                 ))}
-              </select>
-            </div>
-            <div>
-              <label htmlFor="q-sort" className="mb-1 block text-[11px] uppercase tracking-wider text-[var(--color-ink-3)]">
-                Order
-              </label>
-              <select
-                id="q-sort"
-                value={sort}
-                onChange={(e) => setSort(e.target.value as Sort)}
-                className="rounded border border-[var(--color-rule)] bg-[var(--color-surface)] px-2 py-1 text-[13px] text-[var(--color-ink)]"
-              >
-                <option value="newest">Newest first</option>
-                <option value="oldest">Oldest first</option>
               </select>
             </div>
             <div className="ml-auto">
@@ -267,7 +240,6 @@ export function Inbox() {
                           concept={label}
                           extras={r.conceptIds.slice(1).map((id) => concepts.get(id)).filter((c): c is ConceptLabel => !!c)}
                           origin={r.raisedFrom ? origins.get(r.raisedFrom) ?? null : null}
-                          now={now}
                           onAnswer={handleAnswer}
                           onPark={handlePark}
                         />

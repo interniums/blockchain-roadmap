@@ -5,9 +5,8 @@
  * Screens never branch on mode; they read `can` from capabilities and call this.
  */
 
-export interface DueConcept { conceptId: string; due: number; stability: number; reps: number }
-export interface Mastery { conceptId: string; mastery: number; reps: number; due: number | null; creditedShare: number }
-export interface LessonState { lessonId: string; status: 'unread' | 'reading' | 'read'; scrollPct: number; lastOpenedAt: number | null }
+export interface QueuedConcept { conceptId: string; retrievability: number; stability: number; reps: number }
+export interface Mastery { conceptId: string; mastery: number; reps: number; creditedShare: number }
 export interface QuestionRow { id: number; text: string; conceptIds: string[]; raisedFrom: string | null; status: 'open' | 'answered' | 'parked'; answer: string | null; raisedAt: number; resolvedAt: number | null }
 export interface NoteRow { id: number; scope: string; targetId: string; body: string; createdAt: number }
 export interface ReflectionRow { id: number; moduleId: string; prompt: string; body: string; writtenAt: number }
@@ -15,23 +14,21 @@ export interface AttemptRow { id: number; practiceId: string; attemptedAt: numbe
 
 export interface ReviewOutcome {
   conceptId: string;
-  nextDue: number;
   credited: { conceptId: string; depth: number }[];
 }
 
 export interface StateStore {
   readonly durable: boolean;
 
-  dueConcepts(now: number, limit: number): Promise<DueConcept[]>;
+  /**
+   * The queue, softest memory first. No date filter and no cutoff: there is no such thing as
+   * an overdue concept here, only one you are more or less likely to have lost. Sorting happens
+   * in JS because retrievability is not expressible in SQL.
+   */
+  nextByRetrievability(limit: number): Promise<QueuedConcept[]>;
   masteryFor(conceptIds: string[]): Promise<Mastery[]>;
   /** rating: 1 Again · 2 Hard · 3 Good · 4 Easy. confidence 1-3. */
   recordReview(conceptId: string, rating: 1 | 2 | 3 | 4, confidence?: 1 | 2 | 3): Promise<ReviewOutcome>;
-
-  lessonState(lessonIds: string[]): Promise<LessonState[]>;
-  markLessonOpened(lessonId: string): Promise<void>;
-  markLessonRead(lessonId: string, conceptIds: string[]): Promise<void>;
-  setScroll(lessonId: string, pct: number): Promise<void>;
-  recentTrail(limit: number): Promise<LessonState[]>;
 
   askQuestion(text: string, conceptIds: string[], raisedFrom?: string): Promise<QuestionRow>;
   questions(status?: 'open' | 'answered' | 'parked'): Promise<QuestionRow[]>;
@@ -46,18 +43,8 @@ export interface StateStore {
   recordAttempt(practiceId: string, passed: boolean, hintsUsed: number, output?: string): Promise<void>;
   attemptsFor(practiceId: string): Promise<AttemptRow[]>;
 
-  summary(): Promise<{ dueCount: number; lessonsRead: number; openQuestions: number; conceptsStudied: number }>;
+  summary(): Promise<{ openQuestions: number; conceptsStudied: number }>;
 
-  /**
-   * Plan §17. Called when a lesson is opened. If its content changed since the learner last saw it
-   * AND the edit was marked `corrective`, the lesson's concepts reset to unproven and re-enter the
-   * queue — with a reason the learner can read. Nothing ever changes state without saying why.
-   */
-  reconcileContent(
-    lessonId: string, contentHash: string,
-    changeKind: 'cosmetic' | 'clarifying' | 'corrective' | undefined,
-    conceptIds: string[],
-  ): Promise<{ changed: boolean; reset: string[] }>;
 }
 
 /** 0-1. Retrievability-ish: reps and stability both matter, and a never-reviewed concept is 0. */

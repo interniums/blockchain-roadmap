@@ -7,7 +7,6 @@ export interface Row extends QuestionRow {
 
 export type QuestionState = 'open' | 'parked' | 'answered';
 export type Filter = 'open' | 'parked' | 'answered' | 'all';
-export type Sort = 'newest' | 'oldest';
 
 export function stateOf(r: Row): QuestionState {
   if (r.status === 'answered') return 'answered';
@@ -29,12 +28,14 @@ export interface Group {
 }
 
 /**
- * Grouped by the concept the question was captured against, newest question first by default.
- * A question naming several concepts appears once, under the first; the rest ride along as
- * context on the card, because a question in two places is a question you answer twice.
+ * Grouped by the concept the question was captured against, and ordered by that concept — not by
+ * when anything was asked. A question naming several concepts appears once, under the first; the
+ * rest ride along as context on the card, because a question in two places is answered twice.
+ *
+ * The row order inside a group is stable insertion order, which happens to be newest-first from
+ * the store. That is an implementation detail and is never labelled as a date.
  */
-export function groupRows(rows: Row[], sort: Sort): Group[] {
-  const dir = sort === 'newest' ? -1 : 1;
+export function groupRows(rows: Row[]): Group[] {
   const byKey = new Map<string, Row[]>();
   for (const r of rows) {
     const k = primaryConcept(r);
@@ -42,12 +43,8 @@ export function groupRows(rows: Row[], sort: Sort): Group[] {
     list.push(r);
     byKey.set(k, list);
   }
-  const groups: Group[] = [...byKey].map(([key, list]) => ({
-    key,
-    rows: [...list].sort((a, b) => (a.raisedAt - b.raisedAt) * dir),
-  }));
-  // Groups follow the same clock as the questions inside them.
-  groups.sort((a, b) => (a.rows[0].raisedAt - b.rows[0].raisedAt) * dir);
+  const groups: Group[] = [...byKey].map(([key, list]) => ({ key, rows: list }));
+  groups.sort((a, b) => a.key.localeCompare(b.key));
   return groups;
 }
 
@@ -55,14 +52,11 @@ export function counts(rows: Row[]) {
   let open = 0;
   let parked = 0;
   let answered = 0;
-  let oldestOpen: number | null = null;
   for (const r of rows) {
     const s = stateOf(r);
-    if (s === 'open') {
-      open += 1;
-      if (oldestOpen === null || r.raisedAt < oldestOpen) oldestOpen = r.raisedAt;
-    } else if (s === 'parked') parked += 1;
+    if (s === 'open') open += 1;
+    else if (s === 'parked') parked += 1;
     else answered += 1;
   }
-  return { open, parked, answered, oldestOpen, total: rows.length };
+  return { open, parked, answered, total: rows.length };
 }

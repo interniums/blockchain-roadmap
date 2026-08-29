@@ -16,11 +16,10 @@ export interface ReviewItem {
   conceptHref: string;
   misconception: { belief: string; reality: string } | null;
   /** Where a full re-read would happen, when one is warranted. */
-  reread: { href: string; label: string; outlineOnly: boolean } | null;
+  reread: { href: string; label: string } | null;
   /** requires + deepens, depth 1. Used to explain honestly why credit was or was not possible. */
   prereqCount: number;
   reps: number;
-  dueAt: number;
 }
 
 export interface ConceptLabel {

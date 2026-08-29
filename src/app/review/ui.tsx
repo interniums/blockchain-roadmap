@@ -105,18 +105,4 @@ export function QuietLink({ href, children }: { href: string; children: ReactNod
   );
 }
 
-/** Plain-English due date. Never a countdown, never a streak. */
-export function whenLabel(ts: number, now = Date.now()): string {
-  const ms = ts - now;
-  const date = new Date(ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
-  if (ms <= 0) return `now (${date})`;
-  if (ms < 60 * 60 * 1000) return 'within the hour';
-  const days = Math.round(ms / 86_400_000);
-  if (days < 1) return `later today (${date})`;
-  if (days === 1) return `tomorrow (${date})`;
-  if (days < 60) return `in ${days} days (${date})`;
-  const months = Math.round(days / 30);
-  return `in about ${months} months (${date})`;
-}
-
 export const pct = (n: number) => `${Math.round(n * 100)}%`;

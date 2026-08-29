@@ -13,7 +13,6 @@ export const can = {
   writeProgress: true,               // local: SQLite. web: localStorage, not synced.
   persistProgress: MODE === 'local', // web progress is device-only
   composeNotes: MODE === 'local',
-  reverifySources: MODE === 'local',
 } as const;
 
 export const WEB_NOTICE =

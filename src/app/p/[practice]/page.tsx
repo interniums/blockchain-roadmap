@@ -16,6 +16,7 @@ import { RunCheck } from './_components/RunCheck';
 import { ManualCheck } from './_components/ManualCheck';
 import { AttemptLog } from './_components/AttemptLog';
 import { whyManual } from './_components/explain';
+import { inventory } from '@/app/setup/inventory';
 
 /** All 236 practices are prerendered; anything else falls through to notFound(). */
 export function generateStaticParams() {
@@ -89,10 +90,12 @@ export default async function PracticePage({ params }: { params: Promise<{ pract
   /**
    * The tier is a property of the authored command, decided here on the server by the same parser
    * the runner uses. Runnable: the app executes it and grades the JUnit. Manual: it needs a shell,
-   * so it is handed to you instead. 101 of 236 are runnable — the split is a design decision, not
-   * a shortfall.
+   * so it is handed to you instead. The split is a design decision, not a shortfall — and it is
+   * counted from the content by `inventory()`, never asserted, because a hand-written figure here
+   * was already wrong in both directions.
    */
   const tier = classifyAcceptance(command ?? undefined);
+  const inv = inventory();
   const runnable = tier.tier === 'runnable' && Boolean(command);
   /** computed either way so the manual copy is always available; ignored on the runnable branch */
   const why = whyManual(tier.reason, command);
@@ -117,7 +120,7 @@ export default async function PracticePage({ params }: { params: Promise<{ pract
       <aside className="hidden w-[210px] shrink-0 lg:block">
         <div className="sticky top-6">
           {mod ? <TrackRail trackId={mod.trackId} activeModuleId={mod.id} /> : (
-            <Link href="/m" className="text-[13px] text-[var(--color-accent)]">← Roadmap</Link>
+            <Link href="/" className="text-[13px] text-[var(--color-accent)]">← Curriculum</Link>
           )}
         </div>
       </aside>
@@ -351,26 +354,14 @@ export default async function PracticePage({ params }: { params: Promise<{ pract
               Why two tiers
             </h2>
             <p className="mt-2 text-[var(--color-ink-2)]">
-              101 of the 236 acceptance commands reduce to a plain argument list; the app runs those and reads the
-              results test by test. The other 135 need a shell — pipes, <code className="font-mono">&amp;&amp;</code>{' '}
-              chains, globs, placeholders — and a page in a browser does not get a shell. Those are handed to your
-              terminal, which is strictly more capable than the runner.
+              {inv.runnable} of the {inv.total} acceptance commands reduce to a plain argument list; the app runs
+              those and reads the results test by test. The other {inv.manual} need a shell — pipes,{' '}
+              <code className="font-mono">&amp;&amp;</code> chains, globs, placeholders — and a page in a browser
+              does not get a shell. Those are handed to your terminal, which is strictly more capable than the
+              runner.
             </p>
           </section>
 
-          <section aria-labelledby="keys-p">
-            <h2 id="keys-p" className="text-[11px] uppercase tracking-wider text-[var(--color-ink-3)]">Keys</h2>
-            <dl className="mt-2 flex flex-col gap-1">
-              <div className="flex gap-2">
-                <dt><kbd className="rounded border border-[var(--color-rule)] bg-[var(--color-surface-2)] px-1 font-mono text-[12px]">Esc</kbd></dt>
-                <dd className="text-[var(--color-ink-2)]">Up to the module</dd>
-              </div>
-              <div className="flex gap-2">
-                <dt><kbd className="rounded border border-[var(--color-rule)] bg-[var(--color-surface-2)] px-1 font-mono text-[12px]">J</kbd> / <kbd className="rounded border border-[var(--color-rule)] bg-[var(--color-surface-2)] px-1 font-mono text-[12px]">K</kbd></dt>
-                <dd className="text-[var(--color-ink-2)]">Next / previous practice here</dd>
-              </div>
-            </dl>
-          </section>
         </div>
       </aside>
     </div>

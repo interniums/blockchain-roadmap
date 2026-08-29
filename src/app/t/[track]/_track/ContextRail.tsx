@@ -1,8 +1,6 @@
 import Link from 'next/link';
 import { getTrack } from '@/lib/content/load';
-import { can, WEB_NOTICE } from '@/lib/capabilities';
 import type { Track } from '@/lib/content/types';
-import { hoursMinutes, trackFigures } from './figures';
 
 function RailHeading({ id, children }: { id: string; children: React.ReactNode }) {
   return (
@@ -36,40 +34,14 @@ function TrackLinks({ ids, empty }: { ids: string[]; empty: string }) {
   );
 }
 
-function Figure({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex items-baseline justify-between gap-3 border-b border-[var(--color-rule)] py-1.5 last:border-b-0">
-      <dt className="text-[13px] text-[var(--color-ink-2)]">{label}</dt>
-      <dd className="tabular-nums text-[13.5px] text-[var(--color-ink)]">{value}</dd>
-    </div>
-  );
-}
-
 /**
- * Where this track sits in the graph, and how big it is.
- * Cross-track links are the point: a track is not a silo, it borrows and it feeds.
+ * Where this track sits in the graph. Cross-track links are the point: a track is not a silo,
+ * it borrows and it feeds. Deliberately carries no size figures and no clock — the track is a
+ * place in the subject, not a workload.
  */
 export function ContextRail({ track }: { track: Track }) {
-  const f = trackFigures(track.id);
-
   return (
     <div className="flex flex-col gap-6">
-      <section aria-labelledby="rail-size">
-        <RailHeading id="rail-size">Size of this track</RailHeading>
-        <dl className="mt-1.5">
-          <Figure label="Modules" value={String(f.modules)} />
-          <Figure label="Lessons" value={String(f.lessons)} />
-          <Figure label="Reading time" value={hoursMinutes(f.readingMin)} />
-          <Figure label="Practices" value={String(f.practices)} />
-          <Figure label="Concepts taught" value={String(f.concepts)} />
-        </dl>
-        {f.practices > 0 && !can.runPractice && (
-          <p className="mt-2 text-[12.5px] leading-relaxed text-[var(--color-warn)]">
-            Practice checks are read-only here. {WEB_NOTICE}
-          </p>
-        )}
-      </section>
-
       <section aria-labelledby="rail-borrows">
         <RailHeading id="rail-borrows">Borrows from</RailHeading>
         <TrackLinks
@@ -84,14 +56,6 @@ export function ContextRail({ track }: { track: Track }) {
           ids={track.feedsInto ?? []}
           empty="Nothing yet. Nothing downstream declares a dependency on this track."
         />
-      </section>
-
-      <section aria-labelledby="rail-exit">
-        <RailHeading id="rail-exit">Exit project</RailHeading>
-        <p className="mt-1.5 text-[13px] leading-relaxed text-[var(--color-ink-3)]">
-          Not authored. No track in the curriculum carries an exit project yet — the
-          per-module practices are the only build work currently specified.
-        </p>
       </section>
     </div>
   );

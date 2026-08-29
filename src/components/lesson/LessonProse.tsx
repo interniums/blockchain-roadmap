@@ -35,8 +35,6 @@ export function ProvenanceStrip({ body }: { body: LessonBody }) {
   return (
     <p className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11.5px] text-[var(--color-ink-3)]">
       <span style={{ color: badge.c }}>{badge.t}</span>
-      {body.verifiedAt && <span>Verified {body.verifiedAt}</span>}
-      {body.volatility && <span>{body.volatility}</span>}
       {body.stack && Object.keys(body.stack).length > 0 && (
         <span className="font-mono">{Object.entries(body.stack).map(([k, v]) => `${k} ${v}`).join(' · ')}</span>
       )}

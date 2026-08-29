@@ -26,7 +26,7 @@ export function searchIndex(): SearchItem[] {
     out.push({ id, label: p.title, sub: `${p.kind} · practice`, href: `/p/${id}`, kind: 'Practice' });
   }
   for (const [id, s] of g.sourceById) {
-    out.push({ id, label: s.title, sub: s.tier, href: `/sources#${id}`, kind: 'Source' });
+    out.push({ id, label: s.title, sub: s.tier, href: s.url, kind: 'Source' });
   }
   idx = out;
   return out;

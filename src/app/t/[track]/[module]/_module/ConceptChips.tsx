@@ -5,35 +5,29 @@ import Link from 'next/link';
 import { store } from '@/lib/state/client';
 import type { Mastery } from '@/lib/state/store';
 import type { ConceptRef } from './derive';
-import { dueLabel, masteryPct } from './fmt';
+import { masteryPct } from './fmt';
 
 /**
  * Concepts introduced here, each carrying your mastery of it. Four distinct states, and the
  * difference between the middle two is the whole point:
  *
- *   no record      — the scheduler has never heard of it. Not a zero score; no score.
- *   unproven       — reading put it in the queue, but you have never been asked for it.
+ *   no record      — you have never answered anything about it. Not a zero score; no score.
  *   credited       — its stability came mostly from reviewing things built on top of it,
  *                    not from being retrieved. Shown, because it is the one number that
  *                    flatters you if you hide it.
  *   reviewed       — a percentage that means something.
  */
 function MasteryMark({ m }: { m: Mastery | undefined }) {
-  if (!m || m.due === null) {
+  // Nothing enters the schedule except by being answered, so there is no "in the queue but never
+  // retrieved" state to render — a concept either has a record or it does not.
+  if (!m || m.reps === 0) {
     return <span className="text-[11px] text-[var(--color-ink-3)]">no record</span>;
-  }
-  if (m.reps === 0) {
-    return (
-      <span className="text-[11px] text-[var(--color-warn)]" title="In the review queue, never retrieved.">
-        unproven
-      </span>
-    );
   }
   const mostlyCredited = m.creditedShare >= 0.5;
   return (
     <span
       className={`text-[11px] tabular-nums ${mostlyCredited ? 'text-[var(--color-warn)]' : 'text-[var(--color-ink-2)]'}`}
-      title={`${m.reps} review${m.reps === 1 ? '' : 's'} · ${dueLabel(m.due)} · ${Math.round(m.creditedShare * 100)}% of its strength came from prerequisite credit rather than from being asked`}
+      title={`${m.reps} review${m.reps === 1 ? '' : 's'} · ${Math.round(m.creditedShare * 100)}% of its strength came from prerequisite credit rather than from being asked`}
     >
       {masteryPct(m.mastery)}%{mostlyCredited ? ' · mostly credited' : ''}
     </span>
@@ -67,7 +61,6 @@ export function ConceptChips({
   const orphan = new Set(unplaced);
   const known = byId ? [...byId.values()] : [];
   const reviewed = known.filter((m) => m.reps > 0);
-  const queued = known.filter((m) => m.due !== null && m.reps === 0);
   const credited = reviewed.filter((m) => m.creditedShare >= 0.5);
 
   return (
@@ -117,11 +110,9 @@ export function ConceptChips({
           ? 'Mastery could not be read from the store, so no chip above claims one.'
           : !byId
             ? 'Reading your mastery of these concepts…'
-            : reviewed.length === 0 && queued.length === 0
-              ? 'Nothing recorded yet — none of these concepts has entered your review queue. That is what an untouched module looks like, not a score of zero.'
-              : `${reviewed.length} of ${concepts.length} reviewed at least once${
-                queued.length > 0 ? ` · ${queued.length} in the queue but never retrieved` : ''
-              }${
+            : reviewed.length === 0
+              ? 'Nothing recorded yet — you have not answered anything about these concepts. That is what an untouched module looks like, not a score of zero.'
+              : `${reviewed.length} of ${concepts.length} answered at least once${
                 credited.length > 0
                   ? ` · ${credited.length} held up mostly by prerequisite credit rather than by being asked`
                   : ''

@@ -1,6 +1,6 @@
 'use client';
 
-import { RECORD_IS_DURABLE, usePracticeRecord, whenLong } from './record';
+import { RECORD_IS_DURABLE, usePracticeRecord } from './record';
 
 /**
  * The attempt history: when, outcome, hints used. Read-only — writing an attempt belongs next to
@@ -69,7 +69,6 @@ export function AttemptLog({ practiceId, rungs }: { practiceId: string; rungs: n
                   >
                     {a.passed ? 'Passed' : 'Did not pass'}
                   </span>
-                  <span className="tabular-nums text-[var(--color-ink-2)]">{whenLong(a.attemptedAt)}</span>
                   <span className="text-[var(--color-ink-3)]">
                     {a.hintsUsed === 0
                       ? 'no hints taken'

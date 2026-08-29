@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { can } from '@/lib/capabilities';
 import { store, stateIsDurable } from '@/lib/state/client';
@@ -9,33 +9,37 @@ import { ItemView, type ItemStage } from './ItemView';
 import { OutcomeView, type CreditedView, type Outcome } from './OutcomeView';
 import { loadConceptLabels, loadReviewItems } from './queue';
 import type { Confidence, Rating, ReviewItem } from './types';
-import { Kbd, Label, Panel, PrimaryButton, QuietLink, whenLabel } from './ui';
+import { Kbd, Label, Panel, PrimaryButton, QuietLink } from './ui';
 
 type Phase = 'loading' | 'error' | 'empty' | 'start' | 'item' | 'outcome' | 'done';
-type EndReason = 'time' | 'queue' | 'stopped';
 
-/** Bounded on purpose: a long absence must not be able to dump a backlog on the screen. */
-const MAX_ITEMS = 150;
-const YEAR_MS = 365 * 24 * 60 * 60 * 1000;
-const CAPS = [5, 10, 20];
-const DEFAULT_CAP = 10;
+/**
+ * How much of the queue is pulled into one session. Not a target and never shown: it exists so a
+ * long absence cannot load fifteen hundred rows into a browser tab.
+ */
+const PULL = 60;
 
 interface Done {
   item: ReviewItem;
-  rating: Rating;
-  confidence: Confidence;
   confidentlyWrong: boolean;
 }
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 function reReadNote(item: ReviewItem): string {
-  const on = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
   const where = item.reread ? `Re-read: ${item.reread.label}.` : 'No lesson teaches it yet — start from the sources.';
-  return `Confidently wrong in review on ${on}. Graded Again while certain, so this needs a full re-read rather than a shorter interval. ${where}`;
+  return `Confidently wrong in review. Graded Again while certain, so this needs a full re-read rather than another attempt. ${where}`;
 }
 
-export function ReviewSession({ poolSize }: { poolSize: number }) {
+/**
+ * The drill. One concept at a time, softest memory first, for as long as you feel like it.
+ *
+ * There is no session length, no cap, no clock, no count of what is waiting, and no date on
+ * anything. You pull items until you stop, and stopping is one click that never asks twice. The
+ * scheduler still does its full FSRS work underneath — it just never reports a deadline, because a
+ * deadline is the one thing that turns a memory into a debt.
+ */
+export function ReviewSession() {
   const [phase, setPhase] = useState<Phase>('loading');
   const [itemStage, setItemStage] = useState<ItemStage>('prompt');
   const [fatal, setFatal] = useState<string | null>(null);
@@ -43,21 +47,12 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
 
   const [queue, setQueue] = useState<ReviewItem[]>([]);
   const [index, setIndex] = useState(0);
-  const [dueCount, setDueCount] = useState(0);
   const [studied, setStudied] = useState(0);
   const [dropped, setDropped] = useState<string[]>([]);
-  const [nextDueAt, setNextDueAt] = useState<number | null>(null);
-
-  const [capMin, setCapMin] = useState(DEFAULT_CAP);
-  const [startedAt, setStartedAt] = useState<number | null>(null);
-  /** Sampled clock. Render never calls Date.now() itself — that would be impure and could tear. */
-  const [nowTs, setNowTs] = useState(0);
 
   const [pendingRating, setPendingRating] = useState<Rating | null>(null);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [reviewed, setReviewed] = useState<Done[]>([]);
-  const [endReason, setEndReason] = useState<EndReason>('queue');
-  const [remainingDue, setRemainingDue] = useState<number | null>(null);
 
   const [announcement, setAnnouncement] = useState('');
   const startRef = useRef<HTMLButtonElement>(null);
@@ -67,22 +62,21 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
   const load = useCallback(async () => {
     try {
       const summary = await store.summary();
-      const due = await store.dueConcepts(Date.now(), MAX_ITEMS);
+      const next = await store.nextByRetrievability(PULL);
       const { items, dropped: gone } = await loadReviewItems(
-        due.map((d) => ({ conceptId: d.conceptId, due: d.due, reps: d.reps })),
+        next.map((d) => ({ conceptId: d.conceptId, reps: d.reps })),
       );
       setStudied(summary.conceptsStudied);
-      setDueCount(summary.dueCount);
       setDropped(gone);
       if (!items.length) {
-        const upcoming = await store.dueConcepts(Date.now() + YEAR_MS, 1);
-        setNextDueAt(upcoming[0]?.due ?? null);
-        setAnnouncement('Nothing is due.');
+        setAnnouncement('Nothing has entered the queue yet.');
         setPhase('empty');
         return;
       }
+      // Order is retrievability-ascending from the store; interleave then spreads it across
+      // tracks without reordering by strength — the softest things stay near the front.
       setQueue(interleave(items));
-      setAnnouncement(`${summary.dueCount} due. Choose how long you have, then start.`);
+      setAnnouncement('Ready.');
       setPhase('start');
     } catch (e) {
       setFatal(errText(e));
@@ -90,7 +84,6 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
     }
   }, []);
 
-  /** Re-fetch the queue: the loading state first, then the read. Safe to call from an event. */
   const boot = useCallback(() => {
     setPhase('loading');
     setFatal(null);
@@ -105,41 +98,13 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
     void load();
   }, [load]);
 
-  // ---- the clock --------------------------------------------------------------------------
-  // Sampled every 20s rather than every second: the cap is a boundary, not a countdown to watch.
-  useEffect(() => {
-    if (phase !== 'item' && phase !== 'outcome') return;
-    const id = window.setInterval(() => setNowTs(Date.now()), 20_000);
-    return () => window.clearInterval(id);
-  }, [phase]);
-
-  const capMs = capMin * 60_000;
-  const minutesLeft = useMemo(
-    () => (startedAt === null ? null : Math.max(0, Math.ceil((capMs - (nowTs - startedAt)) / 60_000))),
-    [nowTs, startedAt, capMs],
-  );
-  /** What the last clock sample says — used in render. */
-  const pastCap = startedAt !== null && nowTs - startedAt >= capMs;
-  /** The real check, only ever called from an event handler. */
-  const timeUp = () => startedAt !== null && Date.now() - startedAt >= capMs;
-
   // ---- transitions ------------------------------------------------------------------------
-  const finish = useCallback(async (reason: EndReason) => {
-    setEndReason(reason);
+  const finish = useCallback(() => {
     setPhase('done');
-    setAnnouncement('Session finished.');
-    try {
-      const summary = await store.summary();
-      setRemainingDue(summary.dueCount);
-    } catch {
-      setRemainingDue(null);
-    }
+    setAnnouncement('Stopped.');
   }, []);
 
   const startSession = () => {
-    const t = Date.now();
-    setStartedAt(t);
-    setNowTs(t);
     setIndex(0);
     setReviewed([]);
     setOutcome(null);
@@ -147,7 +112,7 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
     setSaveError(null);
     setItemStage('prompt');
     setPhase('item');
-    setAnnouncement('Session started. First concept.');
+    setAnnouncement('First concept.');
   };
 
   const reveal = () => {
@@ -176,24 +141,14 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
         const rawCredited = rating === 1 ? [] : result.credited;
         const creditedIds = rawCredited.map((c) => c.conceptId);
         const labels = creditedIds.length ? await loadConceptLabels(creditedIds) : [];
-        const mastery = await store.masteryFor([item.conceptId, ...creditedIds]);
 
-        const byId = new Map(mastery.map((m) => [m.conceptId, m]));
         const labelById = new Map(labels.map((l) => [l.conceptId, l]));
         const credited: CreditedView[] = [];
         for (const c of rawCredited) {
           const label = labelById.get(c.conceptId);
-          if (!label) continue;
-          const m = byId.get(c.conceptId);
-          credited.push({
-            label,
-            depth: c.depth,
-            creditedShare: m?.creditedShare ?? 0,
-            mastery: m?.mastery ?? 0,
-          });
+          if (label) credited.push({ label, depth: c.depth });
         }
 
-        const self = byId.get(item.conceptId);
         const confidentlyWrong = rating === 1 && confidence === 3;
         let noteSaved: boolean | null = null;
         let noteError: string | null = null;
@@ -211,23 +166,15 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
           item,
           rating,
           confidence,
-          nextDue: result.nextDue,
           credited,
-          mastery: self?.mastery ?? 0,
-          creditedShare: self?.creditedShare ?? 0,
           confidentlyWrong,
           noteSaved,
           noteError,
           creditComputed: stateIsDurable,
         });
-        setReviewed((prev) => [...prev, { item, rating, confidence, confidentlyWrong }]);
-        setNowTs(Date.now());
+        setReviewed((prev) => [...prev, { item, confidentlyWrong }]);
         setPhase('outcome');
-        setAnnouncement(
-          credited.length
-            ? `Recorded. It also refreshed ${credited.length} ${credited.length === 1 ? 'prerequisite' : 'prerequisites'}.`
-            : 'Recorded. Nothing was credited underneath it.',
-        );
+        setAnnouncement('Recorded.');
       } catch (e) {
         setSaveError(errText(e));
         setItemStage('confidence');
@@ -236,26 +183,20 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
     [queue, index, pendingRating],
   );
 
-  const advance = useCallback(async () => {
+  const advance = useCallback(() => {
     setOutcome(null);
     setPendingRating(null);
     setSaveError(null);
     const next = index + 1;
     if (next >= queue.length) {
-      await finish('queue');
-      return;
-    }
-    if (timeUp()) {
-      await finish('time');
+      finish();
       return;
     }
     setIndex(next);
-    setNowTs(Date.now());
     setItemStage('prompt');
     setPhase('item');
     setAnnouncement('Next concept.');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [index, queue.length, finish, startedAt, capMs]);
+  }, [index, queue.length, finish]);
 
   // ---- keyboard ---------------------------------------------------------------------------
   useEffect(() => {
@@ -284,7 +225,7 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
       }
       if (phase === 'outcome' && (e.key === 'n' || e.key === 'N')) {
         e.preventDefault();
-        void advance();
+        advance();
       }
     }
     window.addEventListener('keydown', onKey);
@@ -319,8 +260,7 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
     <p className="mt-3 text-[12.5px] leading-relaxed text-[var(--color-ink-3)]">
       {dropped.length} scheduled {dropped.length === 1 ? 'concept is' : 'concepts are'} no longer in the
       curriculum ({dropped.slice(0, 3).join(', ')}
-      {dropped.length > 3 ? ', …' : ''}) and cannot be shown. They stay in your history; they are not
-      counted in the queue below.
+      {dropped.length > 3 ? ', …' : ''}) and cannot be shown. They stay in your history.
     </p>
   );
 
@@ -357,48 +297,23 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
     return (
       <div className="mt-10">
         {live}
-        {studied === 0 ? (
-          <>
-            <h2 className="text-[20px] font-semibold tracking-tight">Nothing is scheduled yet.</h2>
-            <p className="mt-3 max-w-[68ch] text-[14px] leading-relaxed text-[var(--color-ink-2)]">
-              None of the {poolSize.toLocaleString('en-GB')} concepts in the curriculum have entered the
-              review schedule. A concept enters it when you finish a lesson that teaches it — reading is what
-              puts something into the queue, and it enters unproven, due immediately.
-            </p>
-            <p className="mt-3 max-w-[68ch] text-[14px] leading-relaxed text-[var(--color-ink-2)]">
-              This is an empty queue, not a missed one. There is nothing here to catch up on.
-            </p>
-          </>
-        ) : (
-          <>
-            <h2 className="text-[20px] font-semibold tracking-tight">Nothing is due right now.</h2>
-            <p className="mt-3 max-w-[68ch] text-[14px] leading-relaxed text-[var(--color-ink-2)]">
-              {studied.toLocaleString('en-GB')} of {poolSize.toLocaleString('en-GB')} concepts are in your
-              schedule and all of them are still holding.{' '}
-              {nextDueAt !== null
-                ? `The next one comes back ${whenLabel(nextDueAt)}.`
-                : 'None of them has a future date recorded yet.'}
-            </p>
-            <p className="mt-3 max-w-[68ch] text-[14px] leading-relaxed text-[var(--color-ink-2)]">
-              Coming back sooner would not help: reviewing something you still know is the least useful thing
-              you can do with the time. Read something new instead.
-            </p>
-          </>
-        )}
+        <h2 className="text-[20px] font-semibold tracking-tight">Nothing to drill yet.</h2>
+        <p className="mt-3 max-w-[68ch] text-[14px] leading-relaxed text-[var(--color-ink-2)]">
+          {studied === 0
+            ? 'A concept enters this queue when you answer something about it — an inline check inside a lesson, or a practice you pass. Nothing enters it by being read, so there is nothing here you have neglected.'
+            : 'Everything you have answered so far is still holding well enough that asking again would not teach you anything. Read something new instead.'}
+        </p>
         {droppedNotice}
         <div className="mt-5 flex flex-wrap gap-4 text-[13.5px]">
-          <Link href="/m" className="text-[var(--color-accent)] hover:underline">
-            Roadmap
-          </Link>
           <Link href="/" className="text-[var(--color-accent)] hover:underline">
-            Today
+            The curriculum
           </Link>
           <button
             type="button"
             onClick={() => boot()}
             className="text-[var(--color-ink-2)] underline hover:text-[var(--color-accent)]"
           >
-            Check again
+            Look again
           </button>
         </div>
         {deviceNotice}
@@ -411,13 +326,11 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
     return (
       <div className="mt-8">
         {live}
-        <h2 className="text-[20px] font-semibold tracking-tight">
-          {dueCount.toLocaleString('en-GB')} {dueCount === 1 ? 'concept is' : 'concepts are'} due.
-        </h2>
+        <h2 className="text-[20px] font-semibold tracking-tight">Softest first.</h2>
         <p className="mt-3 max-w-[68ch] text-[14px] leading-relaxed text-[var(--color-ink-2)]">
-          {dueCount > 1 && 'You will not necessarily be shown all of them. '}
-          The session ends on the clock, not on an empty queue — whatever is left is still there
-          afterwards, unpunished and undecayed.
+          One concept at a time, starting with whatever you are least likely to still have. Stop
+          whenever you want — there is no length to this and nothing is waiting on the other side of
+          it.
         </p>
 
         <Panel tone="quiet" className="mt-5">
@@ -433,7 +346,7 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
               </>
             ) : (
               <>
-                The queue is interleaved across tracks by design, but everything due right now comes from a
+                The queue is interleaved across tracks by design, but everything in it right now comes from a
                 single track, so there is nothing to mix. That changes as soon as you are studying in more
                 than one place.
               </>
@@ -441,33 +354,9 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
           </p>
         </Panel>
 
-        <fieldset className="mt-6 min-w-0 border-0 p-0">
-          <legend className="text-[14px] font-medium text-[var(--color-ink)]">
-            How long do you have?
-          </legend>
-          <p className="mt-1 max-w-[68ch] text-[12.5px] text-[var(--color-ink-2)]">
-            The cap is time, never a count. You will always finish the concept you are on.
-          </p>
-          <div className="mt-3 flex flex-wrap gap-4">
-            {CAPS.map((m) => (
-              <label key={m} className="flex items-center gap-2 text-[14px] text-[var(--color-ink)]">
-                <input
-                  type="radio"
-                  name="cap"
-                  value={m}
-                  checked={capMin === m}
-                  onChange={() => setCapMin(m)}
-                  className="accent-[var(--color-accent)]"
-                />
-                {m} minutes
-              </label>
-            ))}
-          </div>
-        </fieldset>
-
         <div className="mt-6 flex flex-wrap items-center gap-4">
           <PrimaryButton onClick={startSession} buttonRef={startRef}>
-            Start reviewing
+            Start
           </PrimaryButton>
           <span className="text-[12.5px] text-[var(--color-ink-3)]">
             <Kbd>space</Kbd> reveal · <Kbd>1</Kbd>–<Kbd>4</Kbd> grade · <Kbd>n</Kbd> next
@@ -481,42 +370,18 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
   }
 
   if (phase === 'done') {
-    const heads: Record<EndReason, string> = {
-      time: `Time is up — that was your ${capMin} minutes.`,
-      queue: 'That is everything this session had queued.',
-      stopped: 'Session ended.',
-    };
     const flagged = reviewed.filter((r) => r.confidentlyWrong);
-    const tracksSeen = new Set(reviewed.map((r) => r.item.trackTitle));
     return (
       <div className="mt-8">
         {live}
         <h2 ref={doneRef} tabIndex={-1} className="text-[20px] font-semibold tracking-tight">
-          {heads[endReason]}
+          Stopped.
         </h2>
         <p className="mt-3 max-w-[68ch] text-[14px] leading-relaxed text-[var(--color-ink-2)]">
-          {reviewed.length === 0 ? (
-            'Nothing was recorded — you ended before grading anything. That is a complete and unremarkable outcome.'
-          ) : (
-            <>
-              {reviewed.length} {reviewed.length === 1 ? 'concept' : 'concepts'} reviewed
-              {tracksSeen.size > 1 ? ` across ${tracksSeen.size} tracks` : ''}.
-              {endReason === 'time' && ' The item you were on was finished first; nothing was cut off mid-recall.'}
-            </>
-          )}
+          {reviewed.length === 0
+            ? 'Nothing was recorded — you stopped before grading anything. That is a complete and unremarkable outcome.'
+            : 'Everything you graded went back into the schedule. What you did not reach is exactly where it was.'}
         </p>
-
-        {remainingDue !== null && remainingDue > 0 && (
-          <p className="mt-3 max-w-[68ch] text-[14px] leading-relaxed text-[var(--color-ink-2)]">
-            {remainingDue.toLocaleString('en-GB')} still due. They keep. Nothing about them gets worse
-            because you stopped, and none of it has to happen today.
-          </p>
-        )}
-        {remainingDue === 0 && (
-          <p className="mt-3 max-w-[68ch] text-[14px] leading-relaxed text-[var(--color-ink-2)]">
-            Nothing else is due. The rest of the schedule is out in front of you, not behind.
-          </p>
-        )}
 
         {flagged.length > 0 && (
           <Panel tone="warn" className="mt-5">
@@ -525,8 +390,8 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
               wrong.
             </p>
             <p className="mt-2 max-w-[68ch] text-[13px] leading-relaxed text-[var(--color-ink-2)]">
-              Each of these is queued for a full re-read rather than just a shorter interval, and is flagged
-              as a note on the concept so it is still there when you come back.
+              That pairing is the one worth acting on: a wrong model held confidently does not get fixed by
+              being asked again. Each is flagged as a note on the concept, so it is still there later.
             </p>
             <ul className="mt-3 flex flex-col gap-1.5 text-[13.5px]">
               {flagged.map((f) => (
@@ -542,12 +407,9 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
         )}
 
         <div className="mt-6 flex flex-wrap items-center gap-4">
-          <PrimaryButton onClick={() => boot()}>Another session</PrimaryButton>
+          <PrimaryButton onClick={() => boot()}>Go again</PrimaryButton>
           <Link href="/" className="text-[13.5px] text-[var(--color-accent)] hover:underline">
-            Back to Today
-          </Link>
-          <Link href="/m" className="text-[13.5px] text-[var(--color-accent)] hover:underline">
-            Roadmap
+            The curriculum
           </Link>
         </div>
         {deviceNotice}
@@ -562,7 +424,8 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
       <div className="mt-10">
         {live}
         <p role="status" className="text-[14px] text-[var(--color-ink-2)]">
-          The queue ran out. <button type="button" className="underline" onClick={() => void finish('queue')}>Close the session</button>.
+          The queue ran out.{' '}
+          <button type="button" className="underline" onClick={finish}>Stop here</button>.
         </p>
       </div>
     );
@@ -585,7 +448,6 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
         <ItemView
           item={item}
           stage={itemStage}
-          position={`item ${index + 1} of ${queue.length} queued`}
           onReveal={reveal}
           onGrade={grade}
           onConfidence={(c) => void chooseConfidence(c)}
@@ -593,40 +455,26 @@ export function ReviewSession({ poolSize }: { poolSize: number }) {
       ) : (
         outcome && (
           <>
-            <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-              <Label>
-                {outcome.item.trackTitle} · {outcome.item.moduleTitle}
-              </Label>
-              <p className="text-[11px] text-[var(--color-ink-3)]">
-                item {index + 1} of {queue.length} queued
-              </p>
-            </div>
+            <Label>
+              {outcome.item.trackTitle} · {outcome.item.moduleTitle}
+            </Label>
             <h2 className="mt-2 text-[22px] font-semibold tracking-tight">{outcome.item.title}</h2>
             <OutcomeView
               outcome={outcome}
-              nextLabel={
-                index + 1 >= queue.length ? 'Finish' : pastCap ? 'Finish — time is up' : 'Next concept'
-              }
-              onNext={() => void advance()}
+              nextLabel={index + 1 >= queue.length ? 'That is the queue' : 'Next concept'}
+              onNext={advance}
             />
           </>
         )
       )}
 
-      <div className="mt-8 flex flex-wrap items-center justify-between gap-x-6 gap-y-2 border-t border-[var(--color-rule)] pt-3">
-        <p aria-hidden="true" className="text-[12px] text-[var(--color-ink-3)]">
-          {minutesLeft === null
-            ? null
-            : minutesLeft > 0
-              ? `about ${minutesLeft} min left of ${capMin}`
-              : `past the ${capMin} min cap — this is the last one`}
-        </p>
+      <div className="mt-8 flex justify-end border-t border-[var(--color-rule)] pt-3">
         <button
           type="button"
-          onClick={() => void finish('stopped')}
+          onClick={finish}
           className="text-[12.5px] text-[var(--color-ink-2)] underline hover:text-[var(--color-accent)]"
         >
-          End the session here
+          Stop
         </button>
       </div>
     </div>

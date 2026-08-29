@@ -179,7 +179,7 @@ export function siblings(lessonId: string) {
 
 export function crumbsFor(opts: { trackId?: string; moduleId?: string; lessonId?: string }): Crumb[] {
   const g = graph();
-  const out: Crumb[] = [{ href: '/m', label: 'Roadmap' }];
+  const out: Crumb[] = [{ href: '/', label: 'Curriculum' }];
   const t = opts.trackId ? g.trackById.get(opts.trackId) : undefined;
   if (t) out.push({ href: `/t/${t.id}`, label: t.title });
   const m = opts.moduleId ? g.moduleById.get(opts.moduleId) : undefined;

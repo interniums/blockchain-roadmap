@@ -38,7 +38,7 @@ export default async function SetupPage() {
 
   return (
     <div className="mx-auto w-full max-w-[980px] px-6 py-6">
-      <Breadcrumb crumbs={[{ href: '/m', label: 'Roadmap' }, { href: '/setup', label: 'Setup' }]} />
+      <Breadcrumb crumbs={[{ href: '/', label: 'Curriculum' }, { href: '/setup', label: 'Setup' }]} />
 
       <p className="mt-4 text-[11px] uppercase tracking-wider text-[var(--color-ink-3)]">
         {local ? 'This machine' : 'Read-only copy'}
@@ -392,7 +392,7 @@ export default async function SetupPage() {
         </dl>
 
         <nav aria-label="Setup navigation" className="mt-8 flex flex-wrap items-center gap-4 border-t border-[var(--color-rule)] pt-4 text-[13px]">
-          <Link href="/m" className="text-[var(--color-accent)] hover:underline">← Roadmap</Link>
+          <Link href="/" className="text-[var(--color-accent)] hover:underline">← Curriculum</Link>
           <Link href="/" className="text-[var(--color-ink-2)] hover:text-[var(--color-accent)]">Today</Link>
         </nav>
       </Section>

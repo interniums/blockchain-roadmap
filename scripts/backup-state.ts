@@ -10,7 +10,7 @@ import Database from 'better-sqlite3';
 const DB = path.join(process.cwd(), '.chainpath', 'state.db');
 const OUT = path.join(process.cwd(), 'content', 'state-backup');
 
-const TABLES = ['review_state', 'review_log', 'lesson_progress', 'practice_attempt', 'note', 'question', 'reflection', 'content_version'];
+const TABLES = ['review_state', 'review_log', 'practice_attempt', 'note', 'question', 'reflection'];
 
 if (!fs.existsSync(DB)) {
   console.log('no state.db yet — nothing to back up');

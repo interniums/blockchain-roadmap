@@ -209,6 +209,77 @@ for mid, m in modules.items():
             if c not in concepts: err('BROKEN-LESSON-TEACHES', f'{lid}: {c!r}')
         for c in (L.get('assumes') or []):
             if c not in concepts: err('BROKEN-LESSON-ASSUMES', f'{lid}: {c!r}')
+# --- gating integrity ---------------------------------------------------------------------------
+# Content is gated on `assumes`: a lesson opens once the lesson teaching each assumed concept is
+# complete. Three properties have to hold or the gate locks the learner out of real content, and
+# none of them was enforced before — the zk track shipped a mutual pair that made 12 lessons
+# permanently unreachable at any amount of work.
+#
+#   R9  every concept is taught by exactly one lesson  (a concept with two homes has no
+#       canonical parent, so it cannot be addressed in one tree either)
+#   R10 no `assumes` edge points forward in reading order
+#   R11 no cycle in the module projection of `assumes`
+
+_teachers = {}
+for mid, m in modules.items():
+    for L in (m.get('lessons') or []):
+        for c in (L.get('teaches') or []):
+            _teachers.setdefault(c, []).append(L.get('id'))
+
+for c, ls in _teachers.items():
+    if len(ls) > 1:
+        err('R9-CONCEPT-TWO-HOMES', f'{c}: taught by {len(ls)} lessons ({", ".join(ls)})')
+for c in concepts:
+    if c not in _teachers:
+        warn('R9-CONCEPT-UNTAUGHT', f'{c}: no lesson teaches it')
+
+# reading order = track number, module order, lesson order
+_pos = {}
+_lesson_module = {}
+_i = 0
+for t in sorted(tracks.values(), key=lambda x: x.get('number', 0)):
+    _mods = [m for m in modules.values() if m.get('trackId') == t.get('id')]
+    for m in sorted(_mods, key=lambda x: x.get('order', 0)):
+        for L in sorted(m.get('lessons') or [], key=lambda x: x.get('order', 0)):
+            _pos[L.get('id')] = _i
+            _lesson_module[L.get('id')] = m.get('id')
+            _i += 1
+
+_module_edges = collections.defaultdict(set)
+for mid, m in modules.items():
+    for L in (m.get('lessons') or []):
+        lid = L.get('id')
+        if lid not in _pos: continue
+        for c in (L.get('assumes') or []):
+            src = _teachers.get(c)
+            if not src: continue
+            src_lid = src[0]
+            if src_lid not in _pos: continue
+            if _pos[src_lid] > _pos[lid]:
+                # WARN, not ERR, until the gate ships: these 4 are a pre-existing content
+                # condition, not a regression, and each needs an authoring decision (drop the
+                # edge, or move the lesson) rather than a mechanical fix. Promote to err() in the
+                # same commit as gating, or the gate will lock these 4 lessons behind content
+                # up to 154 lessons downstream of them.
+                warn('R10-ASSUMES-POINTS-FORWARD',
+                     f'{lid} assumes {c!r}, taught {_pos[src_lid] - _pos[lid]} lessons later in {src_lid}')
+            src_mid = _lesson_module[src_lid]
+            if src_mid != mid: _module_edges[mid].add(src_mid)
+
+# Tarjan-free cycle check: a module reachable from itself through `assumes` is a deadlock.
+_state = {}
+def _walk(node, stack):
+    if _state.get(node) == 'done': return
+    if _state.get(node) == 'open':
+        cut = stack[stack.index(node):]
+        err('R11-ASSUMES-CYCLE', ' -> '.join(cut + [node]))
+        return
+    _state[node] = 'open'
+    for nxt in sorted(_module_edges.get(node, ())):
+        _walk(nxt, stack + [node])
+    _state[node] = 'done'
+for mid in sorted(modules): _walk(mid, [])
+
 for tid, t in tracks.items():
     for mid in (t.get('modules') or []):
         if mid not in modules: err('BROKEN-MODULE-REF', f'{tid}: {mid!r}')

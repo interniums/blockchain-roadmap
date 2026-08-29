@@ -28,14 +28,12 @@ export const CONFIDENCES: { level: Confidence; title: string; body: string }[] =
 export function ItemView({
   item,
   stage,
-  position,
   onReveal,
   onGrade,
   onConfidence,
 }: {
   item: ReviewItem;
   stage: ItemStage;
-  position: string;
   onReveal: () => void;
   onGrade: (rating: Rating) => void;
   onConfidence: (level: Confidence) => void;
@@ -49,27 +47,28 @@ export function ItemView({
 
   return (
     <article aria-labelledby="review-item-title">
-      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-        <Label>
-          {item.trackTitle} · {item.moduleTitle}
-        </Label>
-        <p className="text-[11px] text-[var(--color-ink-3)]">{position}</p>
-      </div>
+      <Label>
+        {item.trackTitle} · {item.moduleTitle}
+      </Label>
 
       <h2 id="review-item-title" className="mt-2 text-[22px] font-semibold tracking-tight">
         {item.title}
       </h2>
 
-      <p className="mt-3 max-w-[68ch] text-[16px] leading-relaxed text-[var(--color-ink)]">
-        {item.oneLine}
-      </p>
+      {/* The one-liner is a compression of the answer, so it stays behind the reveal with it.
+          Printing it above the button turns retrieval into recognition and feeds the scheduler
+          a grade for the wrong task. */}
+      {stage !== 'prompt' && (
+        <p className="mt-3 max-w-[68ch] text-[16px] leading-relaxed text-[var(--color-ink)]">
+          {item.oneLine}
+        </p>
+      )}
 
       {stage === 'prompt' && (
         <div className="mt-5">
           <p className="max-w-[68ch] text-[13px] leading-relaxed text-[var(--color-ink-2)]">
             Say the full explanation out loud, or write it, before you reveal anything. The retrieval is
             the part that works; reading the answer is not.
-            {item.reps === 0 && ' You have not been tested on this one before.'}
           </p>
           <div className="mt-3">
             <PrimaryButton onClick={onReveal} buttonRef={firstAction} hint={<Kbd>space</Kbd>}>

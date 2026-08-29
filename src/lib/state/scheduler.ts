@@ -33,6 +33,16 @@ function toCard(s: ConceptState): Card {
   } as Card;
 }
 
+/**
+ * Probability you would retrieve this right now, 0-1. This is what orders the queue: the softest
+ * memory comes first. It replaces a `due <= now` cutoff, which manufactured both a backlog and a
+ * forward appointment — neither of which this product is willing to show you.
+ */
+export function retrievability(s: ConceptState, now: Date): number {
+  if (s.reps === 0) return 0;
+  return f.get_retrievability(toCard(s), now, false);
+}
+
 /** A direct review: full FSRS update. */
 export function review(s: ConceptState, rating: Grade, now: Date): ConceptState {
   const next = f.next(toCard(s), now, rating);
@@ -52,24 +62,6 @@ export function review(s: ConceptState, rating: Grade, now: Date): ConceptState 
  *  - only a passing grade credits. Failing an advanced concept says nothing good about its prereqs.
  *  - credit decays with graph distance, and never exceeds a full review's effect.
  */
-/**
- * Plan §17: new concepts are rate-limited into the schedule, regardless of how much you read.
- * Without this a long reading session dumps dozens of due items the next morning, which is exactly
- * the backlog the design promises never to produce.
- */
-export const NEW_PER_DAY = 20;
-
-/** Stagger anything past the daily ceiling onto later days instead of making it due now. */
-export function introductionDue(alreadyIntroducedToday: number, index: number, now: Date): Date {
-  const slot = alreadyIntroducedToday + index;
-  const daysOut = Math.floor(slot / NEW_PER_DAY);
-  if (daysOut === 0) return now;
-  const d = new Date(now);
-  d.setDate(d.getDate() + daysOut);
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
-
 export const CREDIT_DECAY = 0.5;
 export const MAX_CREDIT_DEPTH = 2;
 

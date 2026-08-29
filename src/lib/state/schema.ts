@@ -1,8 +1,12 @@
-import { sqliteTable, text, integer, real, primaryKey } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, text, integer, real } from 'drizzle-orm/sqlite-core';
 
 /**
- * All learner state. Never committed to git — see plan §17, backed up as JSON on every content build.
+ * All learner state. Never committed to git — backed up as JSON by `npm run backup`.
  * Keyed by content ids, which are immutable by contract (renames are formerIds, never edits).
+ *
+ * There is deliberately no record of what you have opened, scrolled or read. The only thing this
+ * app tracks is what you have attempted: a graded retrieval, or a practice run. Reading leaves
+ * no trace, so it can never become a debt.
  */
 
 export const reviewState = sqliteTable('review_state', {
@@ -31,15 +35,6 @@ export const reviewLog = sqliteTable('review_log', {
   reviewedAt: integer('reviewed_at', { mode: 'timestamp_ms' }).notNull(),
   /** null for a direct review; the descendant concept id when this was prerequisite credit */
   creditedFrom: text('credited_from'),
-});
-
-export const lessonProgress = sqliteTable('lesson_progress', {
-  lessonId: text('lesson_id').primaryKey(),
-  status: text('status').notNull().default('unread'), // unread | reading | read
-  scrollPct: real('scroll_pct').notNull().default(0),
-  lastOpenedAt: integer('last_opened_at', { mode: 'timestamp_ms' }),
-  completedAt: integer('completed_at', { mode: 'timestamp_ms' }),
-  checksSkipped: integer('checks_skipped').notNull().default(0),
 });
 
 export const practiceAttempt = sqliteTable('practice_attempt', {
@@ -77,9 +72,3 @@ export const reflection = sqliteTable('reflection', {
   body: text('body').notNull(),
   writtenAt: integer('written_at', { mode: 'timestamp_ms' }).notNull(),
 });
-
-export const contentVersion = sqliteTable('content_version', {
-  lessonId: text('lesson_id').notNull(),
-  contentHash: text('content_hash').notNull(),
-  seenAt: integer('seen_at', { mode: 'timestamp_ms' }).notNull(),
-}, (t) => [primaryKey({ columns: [t.lessonId, t.contentHash] })]);

@@ -77,7 +77,6 @@ export interface LessonRow {
   id: string;
   title: string;
   status: LessonStatus;
-  readingMin?: number;
   teaches: ConceptRef[];
 }
 
@@ -86,7 +85,6 @@ export function lessonRows(m: Module): LessonRow[] {
     id: l.id,
     title: l.title,
     status: l.status,
-    readingMin: l.readingMin,
     teaches: conceptRefs(l.teaches ?? []),
   }));
 }
@@ -94,7 +92,6 @@ export function lessonRows(m: Module): LessonRow[] {
 export interface ModuleTotals {
   lessons: number;
   written: number;
-  readingMin: number;
   concepts: number;
   /** module.teaches entries no lesson in this module actually teaches */
   unplacedConcepts: string[];
@@ -107,7 +104,6 @@ export function totals(m: Module): ModuleTotals {
   return {
     lessons: lessons.length,
     written: lessons.filter((l) => l.status !== 'outlined').length,
-    readingMin: lessons.reduce((n, l) => n + (l.readingMin ?? 0), 0),
     concepts: (m.teaches ?? []).length,
     unplacedConcepts: (m.teaches ?? []).filter((c) => !byLesson.has(c)),
   };

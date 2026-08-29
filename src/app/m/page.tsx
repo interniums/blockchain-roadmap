@@ -1,7 +1,7 @@
 import type { Metadata } from 'next';
 import { Breadcrumb } from '@/components/nav/Breadcrumb';
 import { Keyboard } from '@/components/nav/Keyboard';
-import { allTracks, crumbsFor, getModulesOf, stats } from '@/lib/content/load';
+import { allTracks, crumbsFor, getModulesOf } from '@/lib/content/load';
 import type { Track } from '@/lib/content/types';
 import { WEB_NOTICE, can } from '@/lib/capabilities';
 import { BOARD_W, boardHeight, buildEdges, domOrder } from './geometry';
@@ -17,35 +17,23 @@ export const metadata: Metadata = {
 
 interface Sizes {
   perTrack: Map<string, { modules: number; lessons: number }>;
-  outlined: number;
-  written: number;
 }
 
-/** Module and lesson counts per track, plus how much of the curriculum is still outline-only. */
+/** Module and lesson counts per track. Shape, not workload. */
 function measure(tracks: Track[]): Sizes {
   const perTrack = new Map<string, { modules: number; lessons: number }>();
-  let outlined = 0;
-  let written = 0;
   for (const t of tracks) {
     const modules = getModulesOf(t.id);
     let lessons = 0;
-    for (const m of modules) {
-      for (const l of m.lessons ?? []) {
-        lessons += 1;
-        if (l.status === 'outlined') outlined += 1;
-        else written += 1;
-      }
-    }
+    for (const m of modules) lessons += (m.lessons ?? []).length;
     perTrack.set(t.id, { modules: modules.length, lessons });
   }
-  return { perTrack, outlined, written };
+  return { perTrack };
 }
 
 function toNodes(tracks: Track[], sizes: Sizes): TrackNodeData[] {
   const byId = new Map(tracks.map((t) => [t.id, t]));
   const title = (id: string) => byId.get(id)?.title ?? id;
-  // A spine track earns a checkpoint if there is another spine track below it.
-  const spineRows = new Set(tracks.filter((t) => t.layout.lane === 'spine').map((t) => t.layout.row));
 
   return domOrder(tracks).map((t) => {
     const size = sizes.perTrack.get(t.id) ?? { modules: 0, lessons: 0 };
@@ -59,27 +47,20 @@ function toNodes(tracks: Track[], sizes: Sizes): TrackNodeData[] {
       row: t.layout.row,
       moduleCount: size.modules,
       lessonCount: size.lessons,
-      lessonsRead: 0,
       needs: (t.entersFrom ?? []).map((id) => title(id)),
       opens: (t.feedsInto ?? []).map((id) => title(id)),
-      checkpoint:
-        t.layout.lane === 'spine' && spineRows.has(t.layout.row + 1)
-          ? t.capabilities?.[0]
-          : undefined,
     };
   });
 }
 
 export default function RoadmapPage() {
   const tracks = allTracks();
-  const totals = stats();
 
   const maxRow = tracks.reduce((n, t) => Math.max(n, t.layout.row), 1);
   const height = boardHeight(maxRow);
   const edges = buildEdges(tracks);
 
   const sizes = measure(tracks);
-  const { outlined, written } = sizes;
   const nodes = toNodes(tracks, sizes);
   const chips: ChipTrack[] = nodes.map((n) => ({ id: n.id, number: n.number, title: n.title }));
 
@@ -90,7 +71,7 @@ export default function RoadmapPage() {
 
       <div className="mx-auto max-w-[1360px] px-6 pb-24">
         <header className="pt-8 pb-6">
-          <Breadcrumb crumbs={[{ href: '/', label: 'Today' }, ...crumbsFor({})]} />
+          <Breadcrumb crumbs={crumbsFor({})} />
 
           <h1 className="mt-3 text-[34px] leading-[1.1] font-semibold tracking-tight">Roadmap</h1>
 
@@ -101,12 +82,6 @@ export default function RoadmapPage() {
             open any track at any time.
           </p>
 
-          <p className="mt-3 max-w-[64ch] text-[13.5px] leading-relaxed text-[var(--color-warn)]">
-            {outlined} of {outlined + written} lessons are <strong>outlined only</strong> — titles,
-            concepts, prerequisites and reading times are authored, but the lesson prose is not
-            written yet. Counts below are of planned material, not finished material.
-          </p>
-
           {!can.persistProgress && (
             <p className="mt-2 max-w-[64ch] text-[13.5px] leading-relaxed text-[var(--color-warn)]">
               Hosted copy: progress is kept on this device only and is never synced, and practice
@@ -115,15 +90,7 @@ export default function RoadmapPage() {
           )}
         </header>
 
-        <RoadmapChrome
-          tracks={chips}
-          totals={{
-            modules: totals.modules,
-            lessons: totals.lessons,
-            concepts: totals.concepts,
-            practices: totals.practices,
-          }}
-        >
+        <RoadmapChrome tracks={chips}>
           <p className="mt-4 flex flex-wrap items-center gap-x-5 gap-y-1 font-mono text-[10.5px] uppercase tracking-[0.08em] text-[var(--color-ink-3)]">
             <span className="flex items-center gap-1.5">
               <span className="inline-block h-0 w-6 border-t-2 border-[var(--color-ink-3)]" aria-hidden="true" />

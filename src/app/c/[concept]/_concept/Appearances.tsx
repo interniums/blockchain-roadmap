@@ -25,13 +25,8 @@ function LessonRow({ id, fromTrackId }: { id: string; fromTrackId: string }) {
         href={`/t/${trackId}/${moduleId}/${lesson.id}`}
         className="group block rounded px-2 py-1.5 hover:bg-[var(--color-surface-2)]"
       >
-        <span className="flex items-baseline justify-between gap-3">
-          <span className="text-[14px] text-[var(--color-ink)] group-hover:text-[var(--color-accent)]">
-            {lesson.title}
-          </span>
-          <span className="shrink-0 text-[11px] text-[var(--color-ink-3)]">
-            {lesson.readingMin ? `${lesson.readingMin} min` : '—'}
-          </span>
+        <span className="block text-[14px] text-[var(--color-ink)] group-hover:text-[var(--color-accent)]">
+          {lesson.title}
         </span>
         <span className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[12px] text-[var(--color-ink-3)]">
           <span className={crossTrack ? 'text-[var(--color-accent)]' : undefined}>
@@ -40,7 +35,6 @@ function LessonRow({ id, fromTrackId }: { id: string; fromTrackId: string }) {
           </span>
           <span aria-hidden="true">›</span>
           <span>{mod?.title ?? moduleId}</span>
-          {lesson.status !== 'published' && <Badge tone="warn">{lesson.status} — no prose yet</Badge>}
         </span>
       </Link>
     </li>
@@ -61,13 +55,8 @@ function PracticeRow({ id }: { id: string }) {
   return (
     <li>
       <Link href={`/p/${p.id}`} className="group block rounded px-2 py-1.5 hover:bg-[var(--color-surface-2)]">
-        <span className="flex items-baseline justify-between gap-3">
-          <span className="text-[14px] text-[var(--color-ink)] group-hover:text-[var(--color-accent)]">
-            {p.title}
-          </span>
-          <span className="shrink-0 text-[11px] text-[var(--color-ink-3)]">
-            {p.difficulty ? `difficulty ${p.difficulty}/5` : ''}
-          </span>
+        <span className="block text-[14px] text-[var(--color-ink)] group-hover:text-[var(--color-accent)]">
+          {p.title}
         </span>
         <span className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[12px] text-[var(--color-ink-3)]">
           <Badge>{p.kind}</Badge>
@@ -100,12 +89,11 @@ function Group({
 }
 
 /**
- * Every place in the curriculum this concept shows up: taught, assumed, exercised.
- * A concept belongs to many lessons — this list is the reason the route is flat.
+ * Where this concept is taught, and where it is put under load.
  */
 export function Appearances({
-  taughtIn, assumedBy, practices, fromTrackId,
-}: { taughtIn: string[]; assumedBy: string[]; practices: string[]; fromTrackId: string }) {
+  taughtIn, practices, fromTrackId,
+}: { taughtIn: string[]; practices: string[]; fromTrackId: string }) {
   return (
     <div className="flex flex-col gap-7">
       <Group
@@ -121,22 +109,6 @@ export function Appearances({
         ) : (
           <List>
             {taughtIn.map((id) => (
-              <LessonRow key={id} id={id} fromTrackId={fromTrackId} />
-            ))}
-          </List>
-        )}
-      </Group>
-
-      <Group
-        heading="Assumed by"
-        gloss="Lessons that expect you to already hold this. If it is shaky, these are where it shows."
-        count={assumedBy.length}
-      >
-        {assumedBy.length === 0 ? (
-          <Empty>No lesson declares this concept as a prerequisite in its assumes list.</Empty>
-        ) : (
-          <List>
-            {assumedBy.map((id) => (
               <LessonRow key={id} id={id} fromTrackId={fromTrackId} />
             ))}
           </List>

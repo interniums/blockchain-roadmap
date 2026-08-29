@@ -3,9 +3,8 @@ import type { Module } from '@/lib/content/types';
 import { moduleFigures, plural } from './figures';
 
 /**
- * The same modules as the spine, in the same order, as a readable list.
- * Title, summary, and the two counts that tell you what a module asks of you:
- * how much reading, and how much building.
+ * The modules of a track, in order, as a readable list. Title, summary, and how much
+ * building it asks of you. No reading estimate and no clock — you read it when you read it.
  */
 export function ModuleList({ trackId, modules }: { trackId: string; modules: Module[] }) {
   if (modules.length === 0) {
@@ -46,8 +45,7 @@ export function ModuleList({ trackId, modules }: { trackId: string; modules: Mod
                   </span>
                 )}
                 <span className="mt-2 block text-[12.5px] text-[var(--color-ink-3)]">
-                  {plural(f.lessons, 'lesson')} · {plural(f.practices, 'practice', 'practices')} ·{' '}
-                  {plural(f.concepts, 'concept')} · {f.readingMin} min reading
+                  {plural(f.lessons, 'lesson')} · {plural(f.practices, 'practice', 'practices')}
                 </span>
               </span>
             </Link>

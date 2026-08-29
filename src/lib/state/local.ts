@@ -1,13 +1,13 @@
 import 'server-only';
-import { eq, lte, gte, inArray, desc, and } from 'drizzle-orm';
+import { eq, inArray, desc, and } from 'drizzle-orm';
 import { db } from './db';
 import * as t from './schema';
-import { graph, resolveConceptId } from '../content/load';
+import { graph } from '../content/load';
 import {
-  emptyState, review, applyCredit, ancestorsWithDepth, introductionDue, type ConceptState,
+  emptyState, review, applyCredit, ancestorsWithDepth, retrievability, type ConceptState,
 } from './scheduler';
 import type {
-  StateStore, DueConcept, Mastery, LessonState, QuestionRow, NoteRow, ReflectionRow, AttemptRow, ReviewOutcome,
+  StateStore, QuestionRow, NoteRow, ReflectionRow, ReviewOutcome,
 } from './store';
 import { masteryOf } from './store';
 
@@ -33,10 +33,21 @@ function upsert(s: ConceptState) {
 export const localStore: StateStore = {
   durable: true,
 
-  async dueConcepts(now, limit) {
-    const rows = db().select().from(t.reviewState)
-      .where(lte(t.reviewState.due, new Date(now))).orderBy(t.reviewState.due).limit(limit).all();
-    return rows.map((r) => ({ conceptId: r.conceptId, due: r.due.getTime(), stability: r.stability, reps: r.reps }));
+  async nextByRetrievability(limit) {
+    // No WHERE clause on purpose. Every row is a concept you have personally retrieved at least
+    // once (recordReview is the only writer), so the table is bounded by the corpus, and the
+    // sort must happen here: R(t) has no SQL expression. Slice AFTER sorting, never before.
+    const now = new Date();
+    const rows = db().select().from(t.reviewState).all();
+    return rows
+      .map((r) => ({
+        conceptId: r.conceptId,
+        retrievability: retrievability(toCS(r), now),
+        stability: r.stability,
+        reps: r.reps,
+      }))
+      .sort((a, b) => a.retrievability - b.retrievability)
+      .slice(0, limit);
   },
 
   async masteryFor(ids) {
@@ -45,10 +56,9 @@ export const localStore: StateStore = {
     const byId = new Map(rows.map((r) => [r.conceptId, r]));
     return ids.map((id) => {
       const r = byId.get(id);
-      if (!r) return { conceptId: id, mastery: 0, reps: 0, due: null, creditedShare: 0 };
+      if (!r) return { conceptId: id, mastery: 0, reps: 0, creditedShare: 0 };
       return {
         conceptId: id, mastery: masteryOf(r.reps, r.stability), reps: r.reps,
-        due: r.due.getTime(),
         creditedShare: r.stability > 0 ? r.creditedStability / r.stability : 0,
       };
     });
@@ -83,64 +93,7 @@ export const localStore: StateStore = {
       }).run();
       credited.push({ conceptId: ancestorId, depth });
     }
-    return { conceptId, nextDue: after.due.getTime(), credited };
-  },
-
-  async lessonState(ids) {
-    if (!ids.length) return [];
-    const rows = db().select().from(t.lessonProgress).where(inArray(t.lessonProgress.lessonId, ids)).all();
-    const byId = new Map(rows.map((r) => [r.lessonId, r]));
-    return ids.map((id) => {
-      const r = byId.get(id);
-      return {
-        lessonId: id,
-        status: (r?.status ?? 'unread') as LessonState['status'],
-        scrollPct: r?.scrollPct ?? 0,
-        lastOpenedAt: r?.lastOpenedAt?.getTime() ?? null,
-      };
-    });
-  },
-
-  async markLessonOpened(lessonId) {
-    const now = new Date();
-    db().insert(t.lessonProgress).values({ lessonId, status: 'reading', lastOpenedAt: now })
-      .onConflictDoUpdate({ target: t.lessonProgress.lessonId, set: { lastOpenedAt: now } }).run();
-  },
-
-  async markLessonRead(lessonId, conceptIds) {
-    const now = new Date();
-    db().insert(t.lessonProgress).values({ lessonId, status: 'read', lastOpenedAt: now, completedAt: now })
-      .onConflictDoUpdate({ target: t.lessonProgress.lessonId, set: { status: 'read', completedAt: now } }).run();
-    // Reading introduces concepts into the review system, unproven — but rate-limited (§17), so a
-    // long session cannot dump a backlog on tomorrow.
-    const dayStart = new Date(now); dayStart.setHours(0, 0, 0, 0);
-    const introducedToday = db().select().from(t.reviewState)
-      .where(and(eq(t.reviewState.reps, 0), gte(t.reviewState.due, dayStart)))
-      .all()
-      .filter((r) => r.due.getTime() < dayStart.getTime() + 86400000).length;
-
-    let i = 0;
-    for (const raw of conceptIds) {
-      const id = resolveConceptId(raw) ?? raw;
-      const existing = db().select().from(t.reviewState).where(eq(t.reviewState.conceptId, id)).get();
-      if (existing) continue;
-      upsert({ ...emptyState(id, now), due: introductionDue(introducedToday, i, now) });
-      i++;
-    }
-  },
-
-  async setScroll(lessonId, pct) {
-    db().insert(t.lessonProgress).values({ lessonId, scrollPct: pct, lastOpenedAt: new Date() })
-      .onConflictDoUpdate({ target: t.lessonProgress.lessonId, set: { scrollPct: pct } }).run();
-  },
-
-  async recentTrail(limit) {
-    const rows = db().select().from(t.lessonProgress)
-      .orderBy(desc(t.lessonProgress.lastOpenedAt)).limit(limit).all();
-    return rows.map((r) => ({
-      lessonId: r.lessonId, status: r.status as LessonState['status'],
-      scrollPct: r.scrollPct, lastOpenedAt: r.lastOpenedAt?.getTime() ?? null,
-    }));
+    return { conceptId, credited };
   },
 
   async askQuestion(text, conceptIds, raisedFrom) {
@@ -197,56 +150,20 @@ export const localStore: StateStore = {
   },
 
   async attemptsFor(practiceId) {
+    // id is the tiebreak, not decoration: two attempts inside the same millisecond tie on
+    // attemptedAt, and "which one was last" is exactly what this list is for.
     const rows = db().select().from(t.practiceAttempt)
-      .where(eq(t.practiceAttempt.practiceId, practiceId)).orderBy(desc(t.practiceAttempt.attemptedAt)).all();
+      .where(eq(t.practiceAttempt.practiceId, practiceId))
+      .orderBy(desc(t.practiceAttempt.attemptedAt), desc(t.practiceAttempt.id)).all();
     return rows.map((r) => ({
       id: r.id, practiceId: r.practiceId, attemptedAt: r.attemptedAt.getTime(),
       passed: r.passed, hintsUsed: r.hintsUsed,
     }));
   },
 
-  async reconcileContent(lessonId, contentHash, changeKind, conceptIds) {
-    const now = new Date();
-    const seen = db().select().from(t.contentVersion)
-      .where(eq(t.contentVersion.lessonId, lessonId)).all();
-    const known = seen.some((r) => r.contentHash === contentHash);
-    if (!known) {
-      db().insert(t.contentVersion).values({ lessonId, contentHash, seenAt: now })
-        .onConflictDoNothing().run();
-    }
-    // First sighting of a lesson is not a "change" — there is nothing to reconcile against.
-    if (known || seen.length === 0) return { changed: false, reset: [] };
-    if (changeKind !== 'corrective') return { changed: true, reset: [] };
-
-    const reset: string[] = [];
-    for (const raw of conceptIds) {
-      const id = resolveConceptId(raw) ?? raw;
-      const row = db().select().from(t.reviewState).where(eq(t.reviewState.conceptId, id)).get();
-      if (!row || row.reps === 0) continue;          // nothing proven, nothing to invalidate
-      upsert({ ...emptyState(id, now), creditedStability: 0 });
-      db().insert(t.reviewLog).values({
-        conceptId: id, rating: 1, confidence: null, confidentlyWrong: false,
-        reviewedAt: now, creditedFrom: `corrective:${lessonId}`,
-      }).run();
-      reset.push(id);
-    }
-    if (reset.length) {
-      db().insert(t.note).values({
-        scope: 'lesson', targetId: lessonId, createdAt: now,
-        body: `This lesson was corrected — a claim in it was wrong. ${reset.length} concept(s) were reset to unproven and re-queued so you re-learn the corrected version rather than keeping a wrong one.`,
-      }).run();
-    }
-    return { changed: true, reset };
-  },
-
   async summary() {
-    const due = db().select().from(t.reviewState).where(lte(t.reviewState.due, new Date())).all();
-    const read = db().select().from(t.lessonProgress).where(eq(t.lessonProgress.status, 'read')).all();
     const open = db().select().from(t.question).where(eq(t.question.status, 'open')).all();
     const studied = db().select().from(t.reviewState).all();
-    return {
-      dueCount: due.length, lessonsRead: read.length,
-      openQuestions: open.length, conceptsStudied: studied.length,
-    };
+    return { openQuestions: open.length, conceptsStudied: studied.length };
   },
 };

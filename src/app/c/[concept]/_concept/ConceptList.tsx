@@ -1,6 +1,5 @@
 import Link from 'next/link';
 import { getConcept } from '@/lib/content/load';
-import { MasteryTag } from './MasteryTag';
 import { trackTitle } from './derive';
 import { Badge, Empty } from './ui';
 
@@ -34,8 +33,6 @@ function ConceptRow({ id, fromTrackId }: { id: string; fromTrackId: string }) {
             {c.title}
           </span>
           <span className="flex shrink-0 items-center gap-2.5">
-            {/* Your standing on this neighbour, so a weak prerequisite is visible without opening it. */}
-            <MasteryTag id={c.id} />
             <span
               className={`text-[11px] ${crossTrack ? 'text-[var(--color-accent)]' : 'text-[var(--color-ink-3)]'}`}
               title={crossTrack ? 'In a different track' : 'In this track'}

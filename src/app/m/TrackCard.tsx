@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { CARD_DEPS_H, CARD_H, CARD_W, CHECKPOINT_BLEED, CHECKPOINT_TOP, cardBox } from './geometry';
+import { CARD_DEPS_H, CARD_H, CARD_W, cardBox } from './geometry';
 import type { Lane, TrackKind } from '@/lib/content/types';
 
 export interface TrackNodeData {
@@ -12,27 +12,14 @@ export interface TrackNodeData {
   row: number;
   moduleCount: number;
   lessonCount: number;
-  /** Lessons read. Zero everywhere until progress is wired — stated, not implied. */
-  lessonsRead: number;
   needs: string[];
   opens: string[];
-  /** Plain-English capability earned by finishing this track, shown below it on the spine. */
-  checkpoint?: string;
-}
-
-function stateLabel(read: number, total: number): string {
-  if (total === 0) return 'no lessons yet';
-  if (read === 0) return 'untouched';
-  if (read >= total) return 'complete';
-  return 'in progress';
 }
 
 const nn = (n: number) => String(n).padStart(2, '0');
 
 export function TrackCard({ t }: { t: TrackNodeData }) {
   const box = cardBox(t.lane, t.row);
-  const pct = t.lessonCount === 0 ? 0 : Math.round((t.lessonsRead / t.lessonCount) * 100);
-  const state = stateLabel(t.lessonsRead, t.lessonCount);
   const depsId = `t-${t.id}-deps`;
 
   return (
@@ -73,20 +60,6 @@ export function TrackCard({ t }: { t: TrackNodeData }) {
           {t.moduleCount} modules · {t.lessonCount} lessons
         </p>
 
-        <span
-          className="mt-2 block h-1.5 rounded-full bg-[var(--color-surface-2)]"
-          aria-hidden="true"
-        >
-          <span
-            className="block h-full rounded-full bg-[var(--color-accent)]"
-            style={{ width: `${pct}%` }}
-          />
-        </span>
-
-        {/* State in words, not only in the bar's colour. */}
-        <p className="mt-1 font-mono text-[11px] text-[var(--color-ink-3)]">
-          {t.lessonsRead} of {t.lessonCount} read · {state}
-        </p>
       </Link>
 
       {/*
@@ -109,23 +82,6 @@ export function TrackCard({ t }: { t: TrackNodeData }) {
         </p>
       </div>
 
-      {t.checkpoint && (
-        <div
-          className="absolute rounded-sm border border-[var(--color-rule)] bg-[var(--color-ground)] px-3 py-1.5 text-center"
-          style={{
-            top: CHECKPOINT_TOP,
-            left: -CHECKPOINT_BLEED,
-            right: -CHECKPOINT_BLEED,
-          }}
-        >
-          <p className="font-mono text-[10px] uppercase tracking-[0.1em] text-[var(--color-accent)]">
-            Checkpoint — you can now
-          </p>
-          <p className="mt-0.5 line-clamp-2 text-[11px] leading-[1.4] text-[var(--color-ink-2)]">
-            {t.checkpoint}
-          </p>
-        </div>
-      )}
     </li>
   );
 }

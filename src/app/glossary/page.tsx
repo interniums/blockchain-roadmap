@@ -11,7 +11,6 @@ export const metadata: Metadata = {
 const LETTERS = ['#', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('')];
 
 const LIBRARY = [
-  { href: '/sources', label: 'Sources' },
   { href: '/glossary', label: 'Glossary' },
   { href: '/questions', label: 'Questions' },
 ];
@@ -68,8 +67,8 @@ export default function GlossaryPage() {
     <div className="mx-auto flex w-full max-w-[1400px] gap-8 px-6 py-6">
       <aside className="hidden w-[190px] shrink-0 lg:block">
         <nav aria-label="Library" className="sticky top-6 text-[13px]">
-          <Link href="/m" className="block text-[11px] uppercase tracking-wider text-[var(--color-ink-3)] hover:text-[var(--color-accent)]">
-            ← Roadmap
+          <Link href="/" className="block text-[11px] uppercase tracking-wider text-[var(--color-ink-3)] hover:text-[var(--color-accent)]">
+            ← Curriculum
           </Link>
           <p className="mt-2 text-[11px] uppercase tracking-wider text-[var(--color-ink-3)]">Library</p>
           <ul className="mt-1 flex flex-col gap-0.5">

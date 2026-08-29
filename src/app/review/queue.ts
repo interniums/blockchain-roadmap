@@ -9,15 +9,18 @@ import type { ConceptLabel, ReviewItem } from './types';
  *
  * A concept id can survive in the schedule after the curriculum drops or renames it. Those are
  * reported back as `dropped` rather than silently filtered — a queue that quietly shrinks is a lie.
+ *
+ * Nothing here carries a date. The order arrives from the store already sorted by how likely the
+ * memory is to have gone, and that ordering is the only thing the screen is allowed to know.
  */
 
 export async function loadReviewItems(
-  due: { conceptId: string; due: number; reps: number }[],
+  queued: { conceptId: string; reps: number }[],
 ): Promise<{ items: ReviewItem[]; dropped: string[] }> {
   const items: ReviewItem[] = [];
   const dropped: string[] = [];
 
-  for (const row of due) {
+  for (const row of queued) {
     const c = getConcept(row.conceptId);
     if (!c) {
       dropped.push(row.conceptId);
@@ -29,11 +32,7 @@ export async function loadReviewItems(
     const lessonId = c.lessons[0];
     const entry = lessonId ? getLesson(lessonId) : undefined;
     const reread = entry
-      ? {
-          href: `/t/${entry.trackId}/${entry.moduleId}/${entry.lesson.id}`,
-          label: entry.lesson.title,
-          outlineOnly: entry.lesson.status === 'outlined',
-        }
+      ? { href: `/t/${entry.trackId}/${entry.moduleId}/${entry.lesson.id}`, label: entry.lesson.title }
       : null;
 
     const m = c.misconceptions?.[0];
@@ -53,7 +52,6 @@ export async function loadReviewItems(
       reread,
       prereqCount: c.requires.length + deepens,
       reps: row.reps,
-      dueAt: row.due,
     });
   }
 

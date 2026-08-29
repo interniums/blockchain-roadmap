@@ -3,7 +3,6 @@
 import { useEffect, useId, useState } from 'react';
 import { store } from '@/lib/state/client';
 import type { ReflectionRow } from '@/lib/state/store';
-import { whenLong } from './fmt';
 
 /**
  * The reflection is the one place you write instead of read, so it is append-only:
@@ -116,7 +115,6 @@ export function ReflectionComposer({
           <ol className="mt-2 flex flex-col gap-2">
             {rows.map((r) => (
               <li key={r.id} className="rounded border border-[var(--color-rule)] bg-[var(--color-surface)] px-3 py-2">
-                <p className="text-[11px] tabular-nums text-[var(--color-ink-3)]">{whenLong(r.writtenAt)}</p>
                 {r.prompt !== prompt && (
                   <p className="mt-1 max-w-[68ch] text-[11.5px] italic text-[var(--color-warn)]">
                     Answered a different wording of this prompt: &ldquo;{r.prompt}&rdquo;

@@ -9,7 +9,7 @@ import { Breadcrumb } from '@/components/nav/Breadcrumb';
 import { TrackRail } from '@/components/nav/TrackRail';
 import { Keyboard } from '@/components/nav/Keyboard';
 import { can, WEB_NOTICE } from '@/lib/capabilities';
-import { LESSON_STATUS, Note, Section, minutes } from './_module/Chrome';
+import { Note, Section } from './_module/Chrome';
 import { conceptRefs, lessonRows, prereqRefs, totals } from './_module/derive';
 import { PrereqStrip } from './_module/PrereqStrip';
 import { LessonList } from './_module/LessonList';
@@ -75,14 +75,6 @@ export default async function ModulePage({ params }: { params: Promise<Params> }
   const firstLesson = lessons[0];
   const borrowsFrom = [...new Set(prereqs.map((p) => p.trackId).filter((id) => id && id !== track.id))];
 
-  const statusNote =
-    t.lessons === 0 ? null
-      : t.written === 0
-        ? `None of these ${t.lessons} lessons is written yet. What follows is the authored outline — order, reading estimates, and the concepts each lesson will teach. Opening one shows that outline, not a reading.`
-        : t.written < t.lessons
-          ? `${t.written} of ${t.lessons} lessons are written. The rest are outlines: title, order and concepts only.`
-          : null;
-
   return (
     <>
       <Keyboard
@@ -130,18 +122,8 @@ export default async function ModulePage({ params }: { params: Promise<Params> }
           <Section
             id="lessons"
             title="Lessons"
-            meta={
-              <>
-                {t.lessons} in order · {minutes(t.readingMin)} of reading ·{' '}
-                {t.written} of {t.lessons} written
-              </>
-            }
+            meta={<>{t.lessons} in order</>}
           >
-            {statusNote && (
-              <div className="mb-3">
-                <Note tone={t.written === 0 ? 'warn' : 'neutral'}>{statusNote}</Note>
-              </div>
-            )}
             <LessonList lessons={lessons} trackId={track.id} moduleId={mod.id} />
           </Section>
 
@@ -214,7 +196,7 @@ export default async function ModulePage({ params }: { params: Promise<Params> }
                 className="flex-1 rounded border border-[var(--color-accent)] bg-[var(--color-accent-soft)] px-3 py-2 text-[13px] text-[var(--color-accent)] hover:border-[var(--color-ink)]"
               >
                 <span className="block text-[11px] uppercase tracking-wider opacity-80">
-                  {LESSON_STATUS[firstLesson.status].written ? 'Start reading' : 'Open the first outline'}
+                  Start reading
                 </span>
                 <span className="block">{firstLesson.title}</span>
               </Link>
@@ -263,8 +245,6 @@ export default async function ModulePage({ params }: { params: Promise<Params> }
               <dl className="mt-2 flex flex-col gap-1">
                 {([
                   ['Lessons', `${t.lessons}`],
-                  ['Written', `${t.written} of ${t.lessons}`],
-                  ['Reading', minutes(t.readingMin)],
                   ['Practices', `${practices.length}`],
                   ['Concepts', `${t.concepts}`],
                   ['Assumed first', `${prereqs.length}`],
@@ -298,22 +278,6 @@ export default async function ModulePage({ params }: { params: Promise<Params> }
               </section>
             )}
 
-            <section aria-labelledby="keys-heading">
-              <h2 id="keys-heading" className="text-[11px] font-semibold uppercase tracking-wider text-[var(--color-ink-3)]">
-                Keys
-              </h2>
-              <dl className="mt-2 flex flex-col gap-1 text-[var(--color-ink-3)]">
-                <div className="flex justify-between gap-3">
-                  <dt><kbd>Esc</kbd></dt><dd>Up to {track.title}</dd>
-                </div>
-                <div className="flex justify-between gap-3">
-                  <dt><kbd>J</kbd> / <kbd>K</kbd></dt><dd>Next / previous module</dd>
-                </div>
-                <div className="flex justify-between gap-3">
-                  <dt><kbd>M</kbd></dt><dd>Roadmap</dd>
-                </div>
-              </dl>
-            </section>
           </div>
         </aside>
       </div>

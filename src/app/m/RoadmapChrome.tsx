@@ -17,11 +17,9 @@ export interface ChipTrack {
  */
 export function RoadmapChrome({
   tracks,
-  totals,
   children,
 }: {
   tracks: ChipTrack[];
-  totals: { modules: number; lessons: number; concepts: number; practices: number };
   children: React.ReactNode;
 }) {
   const [strong, setStrong] = useState(false);
@@ -73,23 +71,11 @@ export function RoadmapChrome({
     <div data-lines={strong ? 'strong' : 'muted'}>
       <div className="sticky top-0 z-30 -mx-6 border-y border-[var(--color-rule)] bg-[var(--color-ground)] px-6">
         <div className="flex flex-wrap items-center gap-x-6 gap-y-1.5 pt-2.5 pb-1.5">
-          <p className="font-mono text-[11px] text-[var(--color-ink-3)]">
-            {tracks.length} tracks · {totals.modules} modules · {totals.lessons} lessons ·{' '}
-            {totals.concepts} concepts · {totals.practices} practices
-          </p>
-
-          <p className="flex items-center gap-2 font-mono text-[11px] text-[var(--color-ink-3)]">
-            <span className="inline-block h-1.5 w-40 rounded-full bg-[var(--color-surface-2)]" aria-hidden="true">
-              <span className="block h-full w-0 rounded-full bg-[var(--color-accent)]" />
-            </span>
-            0 of {totals.lessons} lessons read
-          </p>
-
           <button
             type="button"
             aria-pressed={strong}
             onClick={() => setStrong((v) => !v)}
-            className="ml-auto rounded-sm border border-[var(--color-rule)] bg-[var(--color-surface)] px-2.5 py-1 text-[11px] text-[var(--color-ink-2)] hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]"
+            className="rounded-sm border border-[var(--color-rule)] bg-[var(--color-surface)] px-2.5 py-1 text-[11px] text-[var(--color-ink-2)] hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]"
           >
             Cross-track lines: {strong ? 'strong' : 'muted'}
             <span className="ml-1.5 font-mono text-[10px] text-[var(--color-ink-3)]">.</span>

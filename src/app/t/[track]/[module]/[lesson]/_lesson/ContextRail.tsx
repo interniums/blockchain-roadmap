@@ -47,14 +47,6 @@ function SourcesPanel({ entries, unresolved }: { entries: SourceEntry[]; unresol
                 <span className="text-[11px] text-[var(--color-ink-3)]">{host}</span>
               </span>
               <span className="mt-0.5 block text-[11px] text-[var(--color-ink-3)]">
-                {source.verifiedAt
-                  ? `Verified ${source.verifiedAt}`
-                  : source.retrievedAt
-                    ? `Retrieved ${source.retrievedAt} · never re-verified`
-                    : 'No verification date — treat with suspicion'}
-                {source.publishedAt ? ` · published ${source.publishedAt}` : ''}
-              </span>
-              <span className="mt-0.5 block text-[11px] text-[var(--color-ink-3)]">
                 Cited by: {cited.join(', ')}
               </span>
             </li>
@@ -69,21 +61,6 @@ function SourcesPanel({ entries, unresolved }: { entries: SourceEntry[]; unresol
         </Notice>
       )}
 
-      <div className="mt-3 border-t border-[var(--color-rule)] pt-2">
-        <button type="button" className={BTN} disabled={!can.reverifySources} aria-describedby="reverify-note">
-          Re-verify these sources
-        </button>
-        <Notice id="reverify-note" tone={can.reverifySources ? 'neutral' : 'warn'}>
-          {can.reverifySources
-            ? 'Fetches each URL and records today as the verification date. Arrives with the freshness board.'
-            : WEB_NOTICE}
-        </Notice>
-        <p className="mt-1">
-          <Link href="/sources" className="text-[12px] text-[var(--color-ink-3)] hover:text-[var(--color-accent)]">
-            All sources, by tier and freshness →
-          </Link>
-        </p>
-      </div>
     </Panel>
   );
 }

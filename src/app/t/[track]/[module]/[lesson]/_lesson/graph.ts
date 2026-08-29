@@ -7,8 +7,6 @@ import type { ConceptView, Source } from '@/lib/content/types';
  * content bug and hiding it is how content bugs survive.
  */
 
-export type Via = 'requires' | 'pays-off';
-
 export interface ConceptRef {
   id: string;
   title: string;
@@ -19,15 +17,14 @@ export interface ConceptRef {
   moduleId: string;
   moduleTitle: string;
   missing: boolean;
-  via?: Via;
 }
 
-export function conceptRef(id: string, via?: Via): ConceptRef {
+export function conceptRef(id: string): ConceptRef {
   const c = getConcept(id);
   if (!c) {
     return {
       id, title: id, trackId: '', trackTitle: '', trackNumber: 0,
-      moduleId: '', moduleTitle: '', missing: true, via,
+      moduleId: '', moduleTitle: '', missing: true,
     };
   }
   const track = getTrack(c.trackId);
@@ -42,54 +39,7 @@ export function conceptRef(id: string, via?: Via): ConceptRef {
     moduleId: c.moduleId,
     moduleTitle: mod?.title ?? c.moduleId,
     missing: false,
-    via,
   };
-}
-
-export interface TrackGroup {
-  trackId: string;
-  trackTitle: string;
-  trackNumber: number;
-  crossTrack: boolean;
-  refs: ConceptRef[];
-}
-
-/** Same track first (that is the reader's thread), then the rest by track number. */
-export function groupByTrack(refs: ConceptRef[], currentTrackId: string): TrackGroup[] {
-  const byTrack = new Map<string, TrackGroup>();
-  for (const r of refs) {
-    const key = r.trackId || '—';
-    const g = byTrack.get(key) ?? {
-      trackId: r.trackId,
-      trackTitle: r.trackTitle || 'Unresolved',
-      trackNumber: r.trackNumber,
-      crossTrack: r.trackId !== currentTrackId,
-      refs: [],
-    };
-    g.refs.push(r);
-    byTrack.set(key, g);
-  }
-  const groups = [...byTrack.values()];
-  for (const g of groups) g.refs.sort((a, b) => a.title.localeCompare(b.title));
-  return groups.sort((a, b) => {
-    if (a.crossTrack !== b.crossTrack) return a.crossTrack ? 1 : -1;
-    return a.trackNumber - b.trackNumber;
-  });
-}
-
-/**
- * Everything downstream of what this lesson teaches: concepts that `requires` one of them,
- * plus the authored `paysOffIn` hints. Concepts this lesson itself teaches are excluded —
- * a lesson does not lead to itself.
- */
-export function usedLater(taught: ConceptView[]): ConceptRef[] {
-  const taughtIds = new Set(taught.map((c) => c.id));
-  const seen = new Map<string, Via>();
-  for (const c of taught) {
-    for (const id of c.requiredBy) if (!taughtIds.has(id)) seen.set(id, 'requires');
-    for (const id of c.paysOffIn ?? []) if (!taughtIds.has(id) && !seen.has(id)) seen.set(id, 'pays-off');
-  }
-  return [...seen].map(([id, via]) => conceptRef(id, via));
 }
 
 const TIER_ORDER = ['spec', 'canonical-docs', 'primary-analysis', 'secondary'];

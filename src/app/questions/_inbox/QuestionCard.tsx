@@ -3,32 +3,29 @@
 import Link from 'next/link';
 import { useEffect, useId, useRef, useState } from 'react';
 import { QuestionBody } from '@/components/question/QuestionBody';
-import { askedWords, bucketFor, daysBetween, formatStamp, wordCount } from '@/components/question/age';
+import { wordCount } from '@/components/question/age';
 import type { ConceptLabel, OriginLabel } from '../model';
 import { stateOf, type Row } from './rows';
 
 const STATE_LABEL: Record<string, string> = { open: 'Open', parked: 'Parked', answered: 'Answered' };
 
 /**
- * One open loop. Age is always on the card, in plain words, next to the date — a three-month-old
- * question is a signal and hiding it would throw the signal away. Nothing here nags: there is no
- * overdue colour, no counter, no "you have been ignoring this".
+ * One open loop: the question, where it was raised, what it touches, and your answer if you have
+ * written one. No age, no date, no "still open after N weeks" — an unanswered question is not a
+ * missed appointment, and the only honest thing to say about it is that it is unanswered.
  */
 export function QuestionCard({
-  row, concept, extras, origin, now, onAnswer, onPark,
+  row, concept, extras, origin, onAnswer, onPark,
 }: {
   row: Row;
   concept: ConceptLabel | null;
   extras: ConceptLabel[];
   origin: OriginLabel | null;
-  now: number;
   onAnswer: (id: number, answer: string) => Promise<void>;
   onPark: (id: number, parked: boolean) => Promise<void>;
 }) {
   const uid = useId();
   const state = stateOf(row);
-  const days = daysBetween(row.raisedAt, now);
-  const bucket = bucketFor(days);
   const fieldRef = useRef<HTMLTextAreaElement>(null);
 
   const [writing, setWriting] = useState(false);
@@ -67,8 +64,6 @@ export function QuestionCard({
     }
   }
 
-  const openFor = row.resolvedAt ? daysBetween(row.raisedAt, row.resolvedAt) : null;
-
   return (
     <article className="rounded border border-[var(--color-rule)] bg-[var(--color-surface)] p-4">
       <div className="flex items-start justify-between gap-4">
@@ -79,22 +74,19 @@ export function QuestionCard({
       </div>
 
       <p className="mt-3 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-[12.5px] text-[var(--color-ink-3)]">
-        <span className="text-[var(--color-ink-2)]">{askedWords(days)}</span>
-        <span>· {formatStamp(row.raisedAt)}</span>
-        <span>· {bucket.label}</span>
         {origin ? (
           origin.href ? (
             <span>
-              ·{' '}
+              Raised at{' '}
               <Link href={origin.href} className="text-[var(--color-accent)] hover:underline">
                 {origin.label}
               </Link>
             </span>
           ) : (
-            <span>· raised at {origin.label} (not in the curriculum now)</span>
+            <span>Raised at {origin.label} (not in the curriculum now)</span>
           )
         ) : (
-          <span>· origin not recorded</span>
+          <span>Origin not recorded</span>
         )}
       </p>
 
@@ -126,8 +118,7 @@ export function QuestionCard({
           </h4>
           <p className="mt-1.5 whitespace-pre-wrap text-[13.5px] leading-6 text-[var(--color-ink)]">{row.answer}</p>
           <p className="mt-2 text-[12px] text-[var(--color-ink-3)]">
-            Written {formatStamp(row.resolvedAt)} · {wordCount(row.answer)} words
-            {openFor !== null && <> · the question stayed open {openFor === 0 ? 'less than a day' : askedWords(openFor).replace('asked ', '')}</>}
+            {wordCount(row.answer)} words
           </p>
         </section>
       )}

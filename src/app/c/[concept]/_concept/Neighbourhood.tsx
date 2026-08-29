@@ -44,18 +44,10 @@ export function Neighbourhood({ concept }: { concept: ConceptView }) {
     <div className="flex flex-col gap-7">
       <ConceptGroup
         heading="Requires"
-        gloss="You need these to be right before this one can be. These are the only edges that gate readiness."
+        gloss="You need these before this one. These are the only edges that gate access."
         ids={concept.requires}
         fromTrackId={concept.trackId}
         empty="Nothing. This is an entry point — it stands on no other concept in the graph."
-      />
-
-      <ConceptGroup
-        heading="Required by"
-        gloss="These depend on this concept. Getting this wrong quietly breaks all of them."
-        ids={concept.requiredBy}
-        fromTrackId={concept.trackId}
-        empty="Nothing yet. No concept in the graph names this one as a hard prerequisite."
       />
 
       {relatedGroups.length === 0 ? (

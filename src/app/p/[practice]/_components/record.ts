@@ -108,9 +108,3 @@ export function usePracticeRecord(practiceId: string) {
 
 /** Durability is a property of the store, not of the screen. Read once, worded per surface. */
 export const RECORD_IS_DURABLE = store.durable;
-
-export function whenLong(ts: number): string {
-  return new Date(ts).toLocaleString(undefined, {
-    day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
-  });
-}

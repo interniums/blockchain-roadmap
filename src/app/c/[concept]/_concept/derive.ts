@@ -1,19 +1,15 @@
 /**
  * Indexes the concept page needs that the shared content API does not expose:
- * the full concept id list, "assumed by" lessons, practices per concept, and
- * the authored sibling order inside a home module.
+ * the full concept id list, practices per concept, and the authored sibling order
+ * inside a home module.
  *
  * Built once per process from the public loader, memoised, server-only.
  */
-import {
-  allTracks, getConcept, getLesson, getModulesOf, getPracticesOf, getTrack, readingOrder,
-} from '@/lib/content/load';
+import { allTracks, getConcept, getModulesOf, getPracticesOf, getTrack } from '@/lib/content/load';
 
 export interface Derived {
   /** Every concept id in the corpus, in track > module > authored order. */
   conceptIds: string[];
-  /** conceptId -> lesson ids that declare it in `assumes`. */
-  assumedBy: Map<string, string[]>;
   /** conceptId -> practice ids that exercise it. */
   practices: Map<string, string[]>;
   /** moduleId -> concept ids homed there, in authored order. */
@@ -51,18 +47,7 @@ export function derived(): Derived {
     }
   }
 
-  const assumedBy = new Map<string, string[]>();
-  for (const { lessonId } of readingOrder()) {
-    const found = getLesson(lessonId);
-    if (!found) continue;
-    for (const id of found.lesson.assumes ?? []) {
-      const list = assumedBy.get(id) ?? [];
-      list.push(lessonId);
-      assumedBy.set(id, list);
-    }
-  }
-
-  cache = { conceptIds, assumedBy, practices, homeOrder };
+  cache = { conceptIds, practices, homeOrder };
   return cache;
 }
 

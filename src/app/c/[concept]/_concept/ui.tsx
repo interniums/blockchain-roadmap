@@ -73,25 +73,3 @@ export function Notice({
     </div>
   );
 }
-
-/**
- * A control that exists but cannot act here. Rendered as a real disabled button
- * with the reason in words — never hidden, never a silent no-op.
- */
-export function BlockedAction({ label, reason }: { label: string; reason: string }) {
-  return (
-    <div>
-      <button
-        type="button"
-        disabled
-        aria-describedby={`why-${label.replace(/\W+/g, '-')}`}
-        className="w-full cursor-not-allowed rounded border border-[var(--color-rule)] px-3 py-1.5 text-[13px] text-[var(--color-ink-3)]"
-      >
-        {label}
-      </button>
-      <p id={`why-${label.replace(/\W+/g, '-')}`} className="mt-1.5 text-[12px] leading-snug text-[var(--color-ink-3)]">
-        {reason}
-      </p>
-    </div>
-  );
-}

@@ -33,10 +33,6 @@ export function db() {
       id INTEGER PRIMARY KEY AUTOINCREMENT, concept_id TEXT NOT NULL, rating INTEGER NOT NULL,
       confidence INTEGER, confidently_wrong INTEGER NOT NULL DEFAULT 0,
       reviewed_at INTEGER NOT NULL, credited_from TEXT);
-    CREATE TABLE IF NOT EXISTS lesson_progress (
-      lesson_id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'unread',
-      scroll_pct REAL NOT NULL DEFAULT 0, last_opened_at INTEGER, completed_at INTEGER,
-      checks_skipped INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS practice_attempt (
       id INTEGER PRIMARY KEY AUTOINCREMENT, practice_id TEXT NOT NULL, attempted_at INTEGER NOT NULL,
       passed INTEGER NOT NULL, hints_used INTEGER NOT NULL DEFAULT 0, output TEXT);
@@ -50,11 +46,10 @@ export function db() {
     CREATE TABLE IF NOT EXISTS reflection (
       id INTEGER PRIMARY KEY AUTOINCREMENT, module_id TEXT NOT NULL, prompt TEXT NOT NULL,
       body TEXT NOT NULL, written_at INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS content_version (
-      lesson_id TEXT NOT NULL, content_hash TEXT NOT NULL, seen_at INTEGER NOT NULL,
-      PRIMARY KEY (lesson_id, content_hash));
     CREATE INDEX IF NOT EXISTS idx_due ON review_state(due);
-    CREATE INDEX IF NOT EXISTS idx_lesson_opened ON lesson_progress(last_opened_at);
+    CREATE INDEX IF NOT EXISTS idx_attempt_practice ON practice_attempt(practice_id);
+    DROP TABLE IF EXISTS lesson_progress;
+    DROP TABLE IF EXISTS content_version;
   `);
   _db = drizzle(sqlite, { schema });
   return _db;
