@@ -14,10 +14,12 @@ is missing.
 ```sh
 curl -L https://foundry.paradigm.xyz | bash && foundryup   # if you do not have forge
 cd practice-repo
-forge install foundry-rs/forge-std                          # only if lib/ is absent
 forge build                                                 # must succeed
 forge test                                                  # must fail - that is the starting state
 ```
+
+`forge-std` is vendored under `lib/`, so there is no install step — a fresh clone builds as it
+stands. Everything else the exercises need is in the standard library or already here.
 
 `foundry.toml` is deliberately plain: solc 0.8.36, optimizer off, one remapping. The exercises are
 about semantics, and a build profile that does anything clever would only add a variable.
