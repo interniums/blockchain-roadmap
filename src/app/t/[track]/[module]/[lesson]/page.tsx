@@ -1,21 +1,18 @@
 import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
-import Link from 'next/link';
 import { Breadcrumb } from '@/components/nav/Breadcrumb';
 import { Keyboard } from '@/components/nav/Keyboard';
-import { TrackRail } from '@/components/nav/TrackRail';
 import {
-  crumbsFor, getLesson, getModule, getPracticesOf, getSource, getTrack, readingOrder, siblings,
+  crumbsFor, getLesson, getModule, getPracticesOf, getTrack, readingOrder, siblings,
 } from '@/lib/content/load';
-import { ContextRail } from './_lesson/ContextRail';
-import { EndOfLesson } from './_lesson/EndOfLesson';
 import { getLessonBody } from '@/lib/content/body';
 import { gateFor } from '@/lib/content/gate';
-import { LessonProse, ProvenanceStrip } from '@/components/lesson/LessonProse';
-import { PrevNext, type Neighbour } from './_lesson/PrevNext';
-import { PrereqStrip } from './_lesson/Strips';
+import { LessonProse } from '@/components/lesson/LessonProse';
 import { Gate } from './_lesson/Gate';
-import { conceptRef, sourcesFor } from './_lesson/graph';
+import { SectionRail } from './_lesson/SectionRail';
+import { Margin } from './_lesson/Margin';
+import { conceptRef, type Neighbour } from './_lesson/graph';
+import { EndOfLesson } from './_lesson/EndOfLesson';
 
 type Params = { track: string; module: string; lesson: string };
 
@@ -44,10 +41,7 @@ export async function generateMetadata({ params }: { params: Promise<Params> }):
   const found = getLesson(lessonId);
   if (!found) return { title: 'Lesson not found · Chainpath' };
   const mod = getModule(found.moduleId);
-  return {
-    title: `${found.lesson.title} · Chainpath`,
-    description: mod?.title,
-  };
+  return { title: `${found.lesson.title} · Chainpath`, description: mod?.title };
 }
 
 function neighbour(
@@ -67,6 +61,18 @@ function neighbour(
   };
 }
 
+/**
+ * The reading surface. Most of the time spent in this app is here, so it gets the width and almost
+ * none of the chrome.
+ *
+ * Two layers of structure, down from seven: a section rail that says where you are inside this
+ * lesson, and a content area that is a prose column plus a margin gutter. Citations, captions and
+ * provenance live in the gutter; there is no second rail competing with the paragraph.
+ *
+ * What the top deliberately does not say: an authoring-status badge (all 635 lessons rendered an
+ * amber DRAFTED chip), a reading estimate, "Lesson 3 of 9", "#201 of 635 in reading order", how
+ * many concepts it teaches, or anything about whether you have been here before.
+ */
 export default async function LessonPage({ params }: { params: Promise<Params> }) {
   const { track: trackParam, module: moduleParam, lesson: lessonParam } = await params;
 
@@ -85,72 +91,60 @@ export default async function LessonPage({ params }: { params: Promise<Params> }
   const body = getLessonBody(lesson.id);
   if (!body) notFound();
 
-  const prereqs = (lesson.assumes ?? []).map((id) => conceptRef(id));
   const gate = gateFor(lesson.id);
-  const { entries: sourceEntries, unresolved: unresolvedSources } =
-    sourcesFor(body.sources ?? [], getSource);
+  const assumes = (lesson.assumes ?? []).map((id) => conceptRef(id));
   const practices = getPracticesOf(moduleId);
 
   const { prev, next } = siblings(lesson.id);
   const prevN = neighbour(prev, moduleId, trackId);
   const nextN = neighbour(next, moduleId, trackId);
 
+  // Two crumbs, not four. The leaf duplicated the h1 twenty pixels below it, and the root is the
+  // rail's job. Trimmed at the call site: `crumbsFor` is shared with the concept and practice
+  // screens, which need more segments rather than fewer.
+  const crumbs = crumbsFor({ trackId, moduleId, lessonId: lesson.id }).slice(1, -1);
+
   return (
     // Keyed by lesson: moving to the next lesson must not carry this one's revealed checks into it.
-    <div
-      key={lesson.id}
-      className="mx-auto grid max-w-[1680px] grid-cols-1 gap-x-8 gap-y-6 px-6 py-6 lg:grid-cols-[15rem_minmax(0,1fr)] xl:grid-cols-[15rem_minmax(0,1fr)_21rem]"
-    >
+    <div key={lesson.id} className="reading mx-auto w-full max-w-[1440px] px-8 py-8">
       <Keyboard up={moduleHref} prev={prevN?.href} next={nextN?.href} />
 
-      <aside className="order-2 lg:order-1" aria-label="Track contents">
-        <div className="lg:sticky lg:top-6 lg:max-h-[calc(100vh-3rem)] lg:overflow-y-auto lg:pr-2">
-        <TrackRail trackId={trackId} activeModuleId={moduleId} activeLessonId={lesson.id} />
-        </div>
+      <aside className="reading-rail" aria-label="Lesson contents">
+        <SectionRail sections={body.sections} moduleTitle={mod.title} moduleHref={moduleHref} />
       </aside>
 
-      <main className="order-1 min-w-0 lg:order-2">
-        <header className="border-b border-[var(--color-rule)] pb-4">
-        <Breadcrumb crumbs={crumbsFor({ trackId, moduleId, lessonId: lesson.id })} />
-        <h1 className="mt-2 max-w-[38ch] text-[26px] leading-tight font-semibold">{lesson.title}</h1>
-        <p className="mt-2 text-[12.5px] text-[var(--color-ink-3)]">
-          <Link href={moduleHref} className="hover:text-[var(--color-accent)]">
-          {mod.title}
-          </Link>
-        </p>
+      <main className="min-w-0">
+        <header className="max-w-[var(--measure)]">
+          <Breadcrumb crumbs={crumbs} />
+          <h1 className="mt-1.5 text-[30px] font-semibold leading-[1.12] tracking-tight text-balance">
+            {lesson.title}
+          </h1>
+          {body.authorship === 'generated' && (
+            <p className="mt-2 text-[var(--text-marginal)] uppercase tracking-wider text-[var(--color-warn)]">
+              Generated, not yet reviewed
+            </p>
+          )}
         </header>
 
-        <div className="mt-5 max-w-[76ch]">
-        <PrereqStrip refs={prereqs} currentTrackId={trackId} />
+        {/* `reading-body` is the element the measure is set on, so every float inside it — the
+            margin block and each first-citation note — has the same edge to push out from.
 
-        {/* The gate stands in place of the prose, not above it — and it takes the closing block
-            with it, because there is nothing to prove until the lesson has been read. */}
-        <div className="mt-6">
+            The gate stands in place of the prose, not above it, and it takes the closing control
+            with it: there is nothing to move on to until the lesson has been read. */}
+        <div className="reading-body mt-7">
           <Gate watch={gate.watch} blockers={gate.blockers}>
-            <ProvenanceStrip body={body} />
+            <Margin assumes={assumes} body={body} />
             <LessonProse body={body} />
 
             <EndOfLesson
               practices={practices}
               moduleTitle={mod.title}
               moduleHref={moduleHref}
+              next={nextN}
             />
           </Gate>
         </div>
-
-        <PrevNext prev={prevN} next={nextN} />
-        </div>
       </main>
-
-      <aside className="order-3 min-w-0" aria-label="Lesson context">
-        <div className="xl:sticky xl:top-6 xl:max-h-[calc(100vh-3rem)] xl:overflow-y-auto xl:pl-1">
-        <ContextRail
-          entries={sourceEntries}
-          unresolved={unresolvedSources}
-          lessonTitle={lesson.title}
-        />
-        </div>
-      </aside>
     </div>
   );
 }

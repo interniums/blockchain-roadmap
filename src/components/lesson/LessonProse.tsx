@@ -6,14 +6,9 @@ import type { LessonBody } from '@/lib/content/body';
 
 /** Compiles a lesson's MDX at build time with the Chainpath component set. */
 export async function LessonProse({ body }: { body: LessonBody }) {
-  // Citation numbers come from the frontmatter `sources:` order, which content-lint already
-  // enforces as a superset of what the body cites. Same order as the rail, so ¹ is the first
-  // entry there — the number is only useful if the two agree.
-  const numberOf = new Map((body.sources ?? []).map((id, i) => [id, i + 1]));
-
   const { content } = await compileMDX({
     source: body.content,
-    components: { ...mdxComponents, Answer, ...lessonScopedComponents(numberOf) },
+    components: { ...mdxComponents, Answer, ...lessonScopedComponents() },
     options: {
       parseFrontmatter: false,
       // next-mdx-remote defaults to blockJS, which strips EVERY expression-valued JSX attribute.
@@ -30,19 +25,4 @@ export async function LessonProse({ body }: { body: LessonBody }) {
     },
   });
   return <div className="lesson-prose">{content}</div>;
-}
-
-export function ProvenanceStrip({ body }: { body: LessonBody }) {
-  const badge =
-    body.authorship === 'generated' ? { t: 'Generated', c: 'var(--color-warn)' }
-    : body.authorship === 'adapted' ? { t: 'Adapted', c: 'var(--color-ink-3)' }
-    : { t: 'Authored', c: 'var(--color-good)' };
-  return (
-    <p className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11.5px] text-[var(--color-ink-3)]">
-      <span style={{ color: badge.c }}>{badge.t}</span>
-      {body.stack && Object.keys(body.stack).length > 0 && (
-        <span className="font-mono">{Object.entries(body.stack).map(([k, v]) => `${k} ${v}`).join(' · ')}</span>
-      )}
-    </p>
-  );
 }

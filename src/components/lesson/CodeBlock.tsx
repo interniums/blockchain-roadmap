@@ -55,8 +55,9 @@ function textOf(node: ReactNode): string {
   return out;
 }
 
-const SHELL =
-  'my-5 overflow-x-auto rounded-md border border-[var(--color-rule)] p-4 text-[12.5px] leading-[1.6]';
+/** No border: a raised surface does the separating, and with 1,514 fences a rectangle on each one
+ *  puts a box on nearly every screen of the corpus. */
+const SHELL = 'my-5 overflow-x-auto rounded p-4 text-[13px] leading-[1.6]';
 
 export async function CodeBlock(props: React.ComponentProps<'pre'>) {
   // A markdown fence compiles to <pre><code className="language-x">. Anything else — a hand-written
@@ -69,7 +70,7 @@ export async function CodeBlock(props: React.ComponentProps<'pre'>) {
 
   if (!code || PLAIN.has(tag) || !(LANGS as readonly string[]).includes(lang)) {
     return (
-      <pre className={`${SHELL} bg-[var(--color-surface)] text-[var(--color-ink-2)]`}>
+      <pre className={`${SHELL} bg-[var(--color-surface-2)] text-[var(--color-ink-2)]`}>
         <code>{code || props.children}</code>
       </pre>
     );
@@ -86,7 +87,7 @@ export async function CodeBlock(props: React.ComponentProps<'pre'>) {
 
   return (
     <pre
-      className={`${SHELL} bg-[var(--color-surface)] shiki-block`}
+      className={`${SHELL} shiki-block`}
       dangerouslySetInnerHTML={{ __html: `<code>${html}</code>` }}
     />
   );

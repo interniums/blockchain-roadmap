@@ -1,11 +1,22 @@
 import { getConcept, getModule, getTrack } from '@/lib/content/load';
-import type { Source } from '@/lib/content/types';
 
 /**
  * Turning ids into things a reader can act on. Server-only: the loaders read the filesystem.
  * A ref that cannot be resolved is reported as missing rather than dropped — a dangling id is a
  * content bug and hiding it is how content bugs survive.
  */
+
+/**
+ * An adjacent lesson in reading order. `boundary` says whether stepping there leaves the module or
+ * the track, which is what decides whether the end of a lesson offers "Continue" or "Build it".
+ */
+export interface Neighbour {
+  href: string;
+  title: string;
+  moduleTitle: string;
+  trackTitle: string;
+  boundary: 'module' | 'track' | null;
+}
 
 export interface ConceptRef {
   id: string;
@@ -40,44 +51,4 @@ export function conceptRef(id: string): ConceptRef {
     moduleTitle: mod?.title ?? c.moduleId,
     missing: false,
   };
-}
-
-export interface SourceEntry {
-  source: Source;
-  /** the citation numeral the prose prints for it — the rail and the marks must agree */
-  n: number;
-  host: string;
-}
-
-/**
- * The lesson's own sources, in the order its frontmatter declares them.
- *
- * This used to be built from the concepts the lesson TEACHES, via their `sources` — which is a
- * different set. Measured across the corpus: frontmatter median 10, concept-derived median 3, and
- * a median of 7 cited sources absent from the rail entirely, affecting 632 of 635 lessons. So most
- * inline citations pointed at a rail that did not list them.
- *
- * Frontmatter order is deliberately preserved rather than sorted by tier: the numerals in the
- * prose are indices into this list, and re-sorting here would make ¹ point at the wrong row.
- */
-export function sourcesFor(
-  ids: string[],
-  resolve: (id: string) => Source | undefined,
-): { entries: SourceEntry[]; unresolved: string[] } {
-  const entries: SourceEntry[] = [];
-  const unresolved: string[] = [];
-  let n = 0;
-  for (const id of ids) {
-    n += 1;
-    const s = resolve(id);
-    if (!s) { unresolved.push(id); continue; }
-    let host = '';
-    try {
-      host = new URL(s.url).hostname.replace(/^www\./, '');
-    } catch {
-      host = s.url;
-    }
-    entries.push({ source: s, n, host });
-  }
-  return { entries, unresolved };
 }

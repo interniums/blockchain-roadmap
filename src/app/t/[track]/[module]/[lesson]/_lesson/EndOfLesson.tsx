@@ -1,61 +1,86 @@
 import Link from 'next/link';
-import { hrefForPractice } from '@/lib/content/load';
 import { can, WEB_NOTICE } from '@/lib/capabilities';
+import { hrefForPractice } from '@/lib/content/load';
 import type { Practice } from '@/lib/content/types';
-import { Chip, Notice } from './bits';
+import type { Neighbour } from './graph';
 
 /**
- * The end of a lesson is one decision, not four cards. The lesson's own closing section is the
- * ending; this is only the pointer at the thing that proves it — the practice. Nothing here
- * restates a concept the reader has just read, because reading the answer next to the prompt
- * turns retrieval into recognition.
+ * The end of a lesson is one decision.
  *
- * Until the practice ladder is grained per lesson, this points at the module's build work.
+ * The lesson's own closing section — `## Where this pays off`, present in all 635 — is the ending.
+ * This is only the control after it, and it is one control, chosen by whether the module's build
+ * work is the next thing or the next reading is.
+ *
+ * Deleted from here over this pass: an "Explain why" card that reprinted the concept one-liners the
+ * reader had already seen twice on the page (putting the answer beside the prompt turns retrieval
+ * into recognition), an "Entering review" card explaining the scheduler to itself, and a list of
+ * every practice in the module fanned onto every lesson in it — up to 23 of them.
  */
 export function EndOfLesson({
-  practices, moduleTitle, moduleHref,
+  practices, moduleTitle, moduleHref, next,
 }: {
   practices: Practice[];
   moduleTitle: string;
   moduleHref: string;
+  next?: Neighbour | null;
 }) {
+  // Building is the primary move at the end of a module; mid-module, continuing is. Until practices
+  // are grained per lesson, "last lesson in the module" is the best available proxy for "you have
+  // now read enough to build the thing".
+  const atModuleEnd = !next || next.boundary !== null;
+  const primary = atModuleEnd && practices.length > 0 ? practices[0] : null;
+  const primaryHref = primary ? hrefForPractice(primary.id) : null;
+
   return (
-    <section aria-labelledby="end-of-lesson" className="mt-8 border-t border-[var(--color-rule)] pt-5">
-      <h2 id="end-of-lesson" className="text-[11px] uppercase tracking-wider text-[var(--color-ink-3)]">
-        Prove it
-      </h2>
+    <section
+      aria-labelledby="end-of-lesson"
+      className="mt-10 max-w-[var(--measure)] border-t border-[var(--color-rule)] pt-5"
+    >
+      <h2 id="end-of-lesson" className="sr-only">What comes next</h2>
 
-      {practices.length === 0 ? (
-        <Notice tone="warn">
-          {moduleTitle} carries no practice. Every module is meant to carry at least one — reading
-          without building is how understanding goes unproven.
-        </Notice>
+      {primary && primaryHref ? (
+        <>
+          <Link
+            href={primaryHref}
+            className="inline-flex flex-col gap-0.5 rounded border border-[var(--color-accent)] bg-[var(--color-accent-soft)] px-4 py-2.5 no-underline"
+          >
+            <span className="text-[var(--text-marginal)] uppercase tracking-wider text-[var(--color-accent)] opacity-80">
+              Build it · {primary.kind}
+            </span>
+            <span className="text-[15px] text-[var(--color-ink)]">{primary.title}</span>
+          </Link>
+          {!can.runPractice && (
+            <p className="mt-2 text-[var(--text-small)] text-[var(--color-warn)]">
+              You can read the spec and its acceptance criteria. Running the check needs the local
+              install — {WEB_NOTICE}
+            </p>
+          )}
+        </>
+      ) : next ? (
+        <Link
+          href={next.href}
+          className="inline-flex flex-col gap-0.5 rounded border border-[var(--color-accent)] bg-[var(--color-accent-soft)] px-4 py-2.5 no-underline"
+        >
+          <span className="text-[var(--text-marginal)] uppercase tracking-wider text-[var(--color-accent)] opacity-80">
+            Continue
+          </span>
+          <span className="text-[15px] text-[var(--color-ink)]">{next.title}</span>
+        </Link>
       ) : (
-        <ul className="mt-2 flex flex-col gap-1.5">
-          {practices.map((p) => (
-            <li key={p.id}>
-              <Link
-                href={hrefForPractice(p.id) ?? moduleHref}
-                className="flex flex-wrap items-baseline gap-2 text-[14px] text-[var(--color-ink)] hover:text-[var(--color-accent)]"
-              >
-                <Chip>{p.kind}</Chip>
-                <span>{p.title}</span>
-              </Link>
-            </li>
-          ))}
-        </ul>
+        <p className="text-[15px] text-[var(--color-ink-2)]">
+          That is the end of the curriculum in reading order.
+        </p>
       )}
 
-      {practices.length > 0 && !can.runPractice && (
-        <Notice tone="warn">
-          You can read the spec and the acceptance criteria here. Running the check needs the local
-          install — {WEB_NOTICE}
-        </Notice>
-      )}
-
-      <p className="mt-3 flex flex-wrap gap-x-4 text-[12.5px] text-[var(--color-ink-3)]">
+      <p className="mt-4 flex flex-wrap gap-x-5 gap-y-1 text-[var(--text-small)] text-[var(--color-ink-3)]">
         <Link href={moduleHref} className="hover:text-[var(--color-accent)]">↑ {moduleTitle}</Link>
         <Link href="/review" className="hover:text-[var(--color-accent)]">Drill</Link>
+        <Link href="/questions" className="hover:text-[var(--color-accent)]">Questions</Link>
+        {primary && practices.length > 1 && (
+          <Link href={moduleHref} className="hover:text-[var(--color-accent)]">
+            {practices.length - 1} more {practices.length === 2 ? 'exercise' : 'exercises'} here
+          </Link>
+        )}
       </p>
     </section>
   );

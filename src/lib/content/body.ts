@@ -33,6 +33,50 @@ export interface LessonBody {
    * 621 lessons with one and 14 with two, none with zero, and every one carries a `concept=`.
    */
   checkConcepts: string[];
+  /** the lesson's own `##` sections, in order — what the reading rail shows */
+  sections: LessonSection[];
+}
+
+/**
+ * The id a section heading gets, and the id the rail links to. One function so the two cannot
+ * drift: a rail entry pointing at a heading that anchors somewhere else is worse than no rail.
+ *
+ * Headings contain inline code and backticks (`## \`ecrecover\`, precisely`), so punctuation is
+ * stripped rather than encoded.
+ */
+export function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/`/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+}
+
+export interface LessonSection { id: string; title: string }
+
+/**
+ * The lesson's own `##` sections, in order.
+ *
+ * This is what the left rail shows while a lesson is open. Sibling lessons used to sit there, but a
+ * lesson runs 6 to 13 screens and the question you actually have mid-read is "where am I in this",
+ * not "what else is in the module" — which the module page answers, with lock state, one click up.
+ * Measured: median 6 sections per lesson, min 3, max 10, and none with zero.
+ *
+ * `#` is not scanned: a lesson body has no h1, the page supplies it from the title.
+ */
+export function sectionsIn(content: string): LessonSection[] {
+  const out: LessonSection[] = [];
+  const seen = new Map<string, number>();
+  for (const m of content.matchAll(/^##[ \t]+(.+?)[ \t]*$/gm)) {
+    const title = m[1].replace(/`/g, '');
+    const base = slugify(m[1]) || `section-${out.length + 1}`;
+    // Two sections with the same title would otherwise anchor to the same place.
+    const n = (seen.get(base) ?? 0) + 1;
+    seen.set(base, n);
+    out.push({ id: n === 1 ? base : `${base}-${n}`, title });
+  }
+  return out;
 }
 
 /**
@@ -56,8 +100,9 @@ export function getLessonBody(id: string): LessonBody | undefined {
   const contentHash = crypto.createHash('sha256').update(content).digest('hex').slice(0, 16);
   return {
     id, content, contentHash,
-    ...(data as Omit<LessonBody, 'id' | 'content' | 'contentHash' | 'checkConcepts'>),
+    ...(data as Omit<LessonBody, 'id' | 'content' | 'contentHash' | 'checkConcepts' | 'sections'>),
     checkConcepts: checkConceptsIn(content),
+    sections: sectionsIn(content),
   };
 }
 
