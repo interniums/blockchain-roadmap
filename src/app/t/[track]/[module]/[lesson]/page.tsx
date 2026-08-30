@@ -5,10 +5,8 @@ import { Breadcrumb } from '@/components/nav/Breadcrumb';
 import { Keyboard } from '@/components/nav/Keyboard';
 import { TrackRail } from '@/components/nav/TrackRail';
 import {
-  crumbsFor, getConcept, getLesson, getModule, getPracticesOf, getSource, getTrack,
-  readingOrder, siblings,
+  crumbsFor, getLesson, getModule, getPracticesOf, getSource, getTrack, readingOrder, siblings,
 } from '@/lib/content/load';
-import type { ConceptView } from '@/lib/content/types';
 import { ContextRail } from './_lesson/ContextRail';
 import { EndOfLesson } from './_lesson/EndOfLesson';
 import { getLessonBody } from '@/lib/content/body';
@@ -87,16 +85,10 @@ export default async function LessonPage({ params }: { params: Promise<Params> }
   const body = getLessonBody(lesson.id);
   if (!body) notFound();
 
-  // Concepts this lesson teaches. Unresolved ids are dropped here and caught by content:lint.
-  const taught: ConceptView[] = [];
-  for (const id of lesson.teaches ?? []) {
-    const c = getConcept(id);
-    if (c) taught.push(c);
-  }
-
   const prereqs = (lesson.assumes ?? []).map((id) => conceptRef(id));
   const gate = gateFor(lesson.id);
-  const { entries: sourceEntries, unresolved: unresolvedSources } = sourcesFor(taught, getSource);
+  const { entries: sourceEntries, unresolved: unresolvedSources } =
+    sourcesFor(body.sources ?? [], getSource);
   const practices = getPracticesOf(moduleId);
 
   const { prev, next } = siblings(lesson.id);

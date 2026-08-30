@@ -442,10 +442,17 @@ for path in sorted(glob.glob(os.path.join(ROOT, 'content/lessons/*.mdx'))):
             declared = set((yaml.safe_load(fm.group(1)) or {}).get('sources') or [])
         except Exception:
             declared = set()
-        cited = set(re.findall(r'<Cite\s+src="([^"]+)"', prose))
+        # `<Misconception src=...>` renders a citation too, and the old pattern only matched
+        # `<Cite src=`. Every mark has to be declared: the inline number is an index into the
+        # frontmatter order, so an undeclared source has no number and no rail row to point at.
+        cited = set(re.findall(r'<Cite\b[^>]*?\bsrc="([^"]+)"', prose))
+        cited |= set(re.findall(r'<Misconception\b[^>]*?\bsrc="([^"]+)"', prose, re.S))
         undeclared = sorted(cited - declared)
         if undeclared:
             err('CITE-NOT-IN-FRONTMATTER', f'{rel}: cites {undeclared[:3]} but frontmatter does not list it')
+        unknown_src = sorted(c for c in cited if c not in sources)
+        if unknown_src:
+            err('CITE-UNKNOWN-SOURCE', f'{rel}: cites {unknown_src[:3]}, not in the source library')
 
     if re.search(r'<svg\b', prose, re.I):
         err('RAW-SVG', f'{rel}: hand-written <svg> — use a diagram primitive')

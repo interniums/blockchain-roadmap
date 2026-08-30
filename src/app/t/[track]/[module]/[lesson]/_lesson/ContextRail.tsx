@@ -22,32 +22,36 @@ function SourcesPanel({ entries, unresolved }: { entries: SourceEntry[]; unresol
     >
       {entries.length === 0 ? (
         <Notice tone="danger">
-          No source is attached to any concept in this lesson. The sources rail is never allowed to be
-          empty — this is a content bug the linter should fail on, not a gap you should read past.
+          This lesson declares no sources in its frontmatter, so nothing here can be checked against
+          anything. That is a content bug the linter should fail on, not a gap you should read past.
         </Notice>
       ) : (
         <ul className="flex flex-col gap-2.5">
-          {entries.map(({ source, cited, host }) => (
-            <li key={source.id}>
-              <a
-                href={source.url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="block text-[12.5px] leading-snug text-[var(--color-ink)] hover:text-[var(--color-accent)]"
-              >
-                {source.title} <span aria-hidden="true">↗</span>
-              </a>
-              <span className="mt-1 flex flex-wrap items-center gap-1.5">
-                <TierBadge tier={source.tier} />
-                {source.vendor && (
-                  <span className="text-[11px] text-[var(--color-warn)]" title="Published by a party with an interest in the claim.">
-                    vendor
-                  </span>
-                )}
-                <span className="text-[11px] text-[var(--color-ink-3)]">{host}</span>
+          {entries.map(({ source, n, host }) => (
+            /* The id is the target every inline citation links to. Without it all 20,501 <Cite>
+               marks in the corpus were dead anchors. */
+            <li key={source.id} id={`src-${source.id}`} className="flex gap-2 scroll-mt-6">
+              <span className="w-4 shrink-0 pt-px text-right text-[10px] tabular-nums text-[var(--color-accent)]">
+                {n}
               </span>
-              <span className="mt-0.5 block text-[11px] text-[var(--color-ink-3)]">
-                Cited by: {cited.join(', ')}
+              <span className="min-w-0">
+                <a
+                  href={source.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="block text-[12.5px] leading-snug text-[var(--color-ink)] hover:text-[var(--color-accent)]"
+                >
+                  {source.title} <span aria-hidden="true">↗</span>
+                </a>
+                <span className="mt-1 flex flex-wrap items-center gap-1.5">
+                  <TierBadge tier={source.tier} />
+                  {source.vendor && (
+                    <span className="text-[11px] text-[var(--color-warn)]" title="Published by a party with an interest in the claim.">
+                      vendor
+                    </span>
+                  )}
+                  <span className="text-[11px] text-[var(--color-ink-3)]">{host}</span>
+                </span>
               </span>
             </li>
           ))}
@@ -56,8 +60,8 @@ function SourcesPanel({ entries, unresolved }: { entries: SourceEntry[]; unresol
 
       {unresolved.length > 0 && (
         <Notice tone="danger">
-          Unresolved source ids: {unresolved.join(', ')}. A concept cites a source that is not in the
-          library.
+          Unresolved source ids: {unresolved.join(', ')}. This lesson cites a source that is not in
+          the library.
         </Notice>
       )}
 

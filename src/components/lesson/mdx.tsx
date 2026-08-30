@@ -1,32 +1,68 @@
 import Link from 'next/link';
 import { getSource } from '@/lib/content/load';
 import { Check } from './Check';
+import { CodeBlock } from './CodeBlock';
 import { Anatomy, Bars, ByteLayout, Compare, Flow, Matrix, StackTrace, Timeline, Tree } from './diagrams';
 
-/** Inline citation. Renders a numbered link to the source rail entry. */
-export function Cite({ src }: { src: string }) {
-  const s = getSource(src);
-  if (!s) return <sup className="text-[var(--color-danger)]" title={`unknown source: ${src}`}>[?]</sup>;
-  return (
-    <sup>
-      <a href={`#src-${src}`} title={s.title}
-         className="ml-0.5 rounded px-1 text-[10px] text-[var(--color-accent)] no-underline hover:bg-[var(--color-accent-soft)]">
-        {s.tier === 'spec' ? 'spec' : s.tier === 'canonical-docs' ? 'docs' : 'src'}
-      </a>
-    </sup>
-  );
+/**
+ * Inline citation.
+ *
+ * It used to render the words `spec` / `docs` / `src`, which is the problem: a word reads as
+ * content and breaks the line, and there are a mean of 32 of them per lesson drawn from a median
+ * of 10 unique sources. A numeral reads as apparatus, and deduping per lesson turns ~32 marks into
+ * ~10 numbers.
+ *
+ * `numberOf` is supplied per lesson by `LessonProse` from the frontmatter `sources:` order. Without
+ * it — a `<Cite>` rendered outside a lesson — it falls back to the tier word rather than inventing
+ * a number that points at no rail entry.
+ */
+export function makeCite(numberOf?: Map<string, number>) {
+  return function Cite({ src }: { src: string }) {
+    const s = getSource(src);
+    if (!s) return <sup className="text-[var(--color-danger)]" title={`unknown source: ${src}`}>[?]</sup>;
+    const n = numberOf?.get(src);
+    return (
+      <sup>
+        <a
+          href={`#src-${src}`}
+          title={s.title}
+          className="ml-0.5 rounded px-[3px] text-[10px] tabular-nums text-[var(--color-accent)] no-underline hover:bg-[var(--color-accent-soft)]"
+        >
+          {n ?? (s.tier === 'spec' ? 'spec' : s.tier === 'canonical-docs' ? 'docs' : 'src')}
+        </a>
+      </sup>
+    );
+  };
 }
 
-export function Misconception({ belief, reality, why, src }: { belief: string; reality: string; why?: string; src?: string }) {
-  return (
-    <aside className="my-6 rounded-md border border-[var(--color-rule)] bg-[var(--color-surface)] p-4">
-      <p className="m-0 text-[11px] uppercase tracking-wider text-[var(--color-warn)]">Common belief</p>
-      <p className="mb-3 mt-1 text-[15px] text-[var(--color-ink-2)] italic">“{belief}”</p>
-      <p className="m-0 text-[11px] uppercase tracking-wider text-[var(--color-good)]">Actually</p>
-      <p className="mb-0 mt-1 text-[15px]">{reality}</p>
-      {why && <p className="mb-0 mt-2 text-[13.5px] text-[var(--color-ink-2)]">{why}{src && <Cite src={src} />}</p>}
-    </aside>
-  );
+export const Cite = makeCite();
+
+export function makeMisconception(Cite: (p: { src: string }) => React.ReactNode) {
+  return function Misconception(
+    { belief, reality, why, src }: { belief: string; reality: string; why?: string; src?: string },
+  ) {
+    return (
+      <aside className="my-6 rounded-md border border-[var(--color-rule)] bg-[var(--color-surface)] p-4">
+        <p className="m-0 text-[11px] uppercase tracking-wider text-[var(--color-warn)]">Common belief</p>
+        <p className="mb-3 mt-1 text-[15px] text-[var(--color-ink-2)] italic">“{belief}”</p>
+        <p className="m-0 text-[11px] uppercase tracking-wider text-[var(--color-good)]">Actually</p>
+        <p className="mb-0 mt-1 text-[15px]">{reality}</p>
+        {why && <p className="mb-0 mt-2 text-[13.5px] text-[var(--color-ink-2)]">{why}{src && <Cite src={src} />}</p>}
+      </aside>
+    );
+  };
+}
+
+export const Misconception = makeMisconception(makeCite());
+
+/**
+ * The components whose output depends on which lesson they are in. Everything else is static, so
+ * only these are rebuilt per lesson — and they are rebuilt together, because a numbered citation
+ * inside a misconception card must carry the same number as one in the prose beside it.
+ */
+export function lessonScopedComponents(numberOf: Map<string, number>) {
+  const Cite = makeCite(numberOf);
+  return { Cite, Misconception: makeMisconception(Cite) };
 }
 
 export function Aside({ kind = 'note', children }: { kind?: 'note' | 'warn' | 'stop'; children: React.ReactNode }) {
@@ -65,7 +101,7 @@ export const mdxComponents = {
   ol: (p: React.ComponentProps<'ol'>) => <ol {...p} className="my-3.5 list-decimal pl-5 text-[15.5px] leading-[1.7]" />,
   li: (p: React.ComponentProps<'li'>) => <li {...p} className="my-1.5" />,
   code: (p: React.ComponentProps<'code'>) => <code {...p} className="rounded border border-[var(--color-rule)] bg-[var(--color-surface-2)] px-1 py-0.5 text-[0.87em]" />,
-  pre: (p: React.ComponentProps<'pre'>) => <pre {...p} className="my-5 overflow-x-auto rounded-md border border-[var(--color-rule)] bg-[var(--color-surface)] p-4 text-[12.5px] leading-[1.6]" />,
+  pre: CodeBlock,
   blockquote: (p: React.ComponentProps<'blockquote'>) => <blockquote {...p} className="my-5 border-l-2 border-[var(--color-rule)] pl-4 text-[var(--color-ink-2)] italic" />,
   strong: (p: React.ComponentProps<'strong'>) => <strong {...p} className="font-semibold text-[var(--color-ink)]" />,
   // GFM tables. Styled to match <Matrix> so a markdown table and a figure table do not read as two

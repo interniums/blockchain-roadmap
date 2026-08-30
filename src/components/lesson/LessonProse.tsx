@@ -1,14 +1,19 @@
 import { compileMDX } from 'next-mdx-remote/rsc';
 import remarkGfm from 'remark-gfm';
-import { mdxComponents } from './mdx';
+import { lessonScopedComponents, mdxComponents } from './mdx';
 import { Answer } from './Check';
 import type { LessonBody } from '@/lib/content/body';
 
 /** Compiles a lesson's MDX at build time with the Chainpath component set. */
 export async function LessonProse({ body }: { body: LessonBody }) {
+  // Citation numbers come from the frontmatter `sources:` order, which content-lint already
+  // enforces as a superset of what the body cites. Same order as the rail, so ¹ is the first
+  // entry there — the number is only useful if the two agree.
+  const numberOf = new Map((body.sources ?? []).map((id, i) => [id, i + 1]));
+
   const { content } = await compileMDX({
     source: body.content,
-    components: { ...mdxComponents, Answer },
+    components: { ...mdxComponents, Answer, ...lessonScopedComponents(numberOf) },
     options: {
       parseFrontmatter: false,
       // next-mdx-remote defaults to blockJS, which strips EVERY expression-valued JSX attribute.
