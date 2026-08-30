@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { getTrack } from '@/lib/content/load';
+import { exitProjectOf, getTrack, hrefForPractice } from '@/lib/content/load';
 import type { Track } from '@/lib/content/types';
 
 function RailHeading({ id, children }: { id: string; children: React.ReactNode }) {
@@ -57,6 +57,41 @@ export function ContextRail({ track }: { track: Track }) {
           empty="Nothing yet. Nothing downstream declares a dependency on this track."
         />
       </section>
+
+      <ExitProject track={track} />
     </div>
+  );
+}
+
+/**
+ * The exit project, for the six core tracks that have one. Rendered only when one resolves: an
+ * elective is entered for a single capability and its module capstones deliver it, so there is
+ * nothing here to say rather than an absence to apologise for.
+ */
+function ExitProject({ track }: { track: Track }) {
+  const p = exitProjectOf(track.id);
+  if (!p) return null;
+  const href = hrefForPractice(p.id);
+  const criteria = p.acceptance?.criteria?.length ?? 0;
+
+  return (
+    <section aria-labelledby="rail-exit">
+      <RailHeading id="rail-exit">Exit project</RailHeading>
+      {href ? (
+        <Link
+          href={href}
+          className="mt-1.5 block text-[13.5px] leading-snug text-[var(--color-ink)] hover:text-[var(--color-accent)]"
+        >
+          {p.title}
+        </Link>
+      ) : (
+        <p className="mt-1.5 text-[13.5px] text-[var(--color-ink-2)]">{p.title}</p>
+      )}
+      <p className="mt-1 text-[12px] leading-snug text-[var(--color-ink-3)]">
+        One build for the whole track, graded against the{' '}
+        {(track.capabilities ?? []).length} things it says you will be able to do —{' '}
+        {criteria} criteria, all of which have to hold.
+      </p>
+    </section>
   );
 }

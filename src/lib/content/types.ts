@@ -56,11 +56,39 @@ export interface Source {
   publishedAt?: string; retrievedAt?: string; verifiedAt?: string; vendor?: boolean;
 }
 
+/**
+ * How much of the curriculum a practice answers for. Called `grain` and not `tier` because
+ * `Source.tier` already means something else, and not `level` because `difficulty` already does.
+ *
+ *   check   — an inline retrieval inside one lesson. Authored in the prose as `<Check>`, not as a
+ *             practice file; listed here because it is the bottom of the same ladder.
+ *   block   — a repo exercise over the 2-3 lessons that share a mechanism. The 236 authored
+ *             practices are all this size: measured concept-span 1→22, 2→106, 3→87, 4→20, 5→1.
+ *   module  — the capstone. Spans a module's whole `teaches` set: min 4, median 15, max 28.
+ *   exit    — a core track's project, graded against the plain-English capabilities it declares.
+ */
+export type PracticeGrain = 'check' | 'block' | 'module' | 'exit';
+
 export interface Practice {
   id: string; moduleId: string; kind: PracticeKind; title: string;
+  /** absent in older files; treated as 'block', which is what all 236 originally were */
+  grain?: PracticeGrain;
   concepts?: string[]; spec?: string;
   acceptance?: { command?: string; criteria?: string[] };
   hints?: string[]; difficulty?: number;
+  /**
+   * Module grain only: the concepts the capstone has to exercise together. Authored as the
+   * module's whole `teaches` set so a lint rule can check it has not drifted from it.
+   */
+  coversConcepts?: string[];
+  /** Exit grain only: the core track this project closes out. */
+  trackId?: string;
+  /**
+   * Module and exit grain: the question to answer in writing afterwards. For a capstone this is
+   * the module's existing `reflectionPrompt` — all 104 are already authored, so a second one would
+   * be a second thing to keep in sync.
+   */
+  writeUp?: string;
 }
 
 /** A concept plus everything the graph knows about where it sits. */

@@ -209,6 +209,98 @@ for mid, m in modules.items():
             if c not in concepts: err('BROKEN-LESSON-TEACHES', f'{lid}: {c!r}')
         for c in (L.get('assumes') or []):
             if c not in concepts: err('BROKEN-LESSON-ASSUMES', f'{lid}: {c!r}')
+# --- the practice ladder ------------------------------------------------------------------------
+# Practice is graded by grain: a block exercise over 2-3 lessons, a module capstone over a whole
+# module, a track exit project. Four properties have to hold or the ladder silently stops lining up
+# with the content it is supposed to be shaped to.
+#
+#   R13 every practice declares a grain
+#   R14 a practice names at least one concept a lesson in its own module teaches — otherwise it
+#       attaches to nothing and no lesson can point at it (one of 236 was in that state)
+#   R15 at most one module-grain capstone per module, and it covers that module's whole teaches set
+#   R16 an exit-grain practice names a core track
+
+GRAINS = {'block', 'module', 'exit'}
+_capstones = collections.defaultdict(list)
+
+for pid, p in practices.items():
+    grain = p.get('grain')
+    if grain not in GRAINS:
+        err('R13-PRACTICE-NO-GRAIN', f'{pid}: grain is {grain!r}, expected one of {sorted(GRAINS)}')
+        continue
+
+    mid = p.get('moduleId')
+    m = modules.get(mid)
+    if not m:
+        err('BROKEN-PRACTICE-MODULE', f'{pid}: moduleId {mid!r}')
+        continue
+
+    named = set(p.get('concepts') or [])
+    unknown = sorted(c for c in named if c not in concepts)
+    if unknown: err('BROKEN-PRACTICE-CONCEPTS', f'{pid}: {unknown[:3]}')
+
+    lesson_taught = set()
+    for L in (m.get('lessons') or []):
+        lesson_taught |= set(L.get('teaches') or [])
+    if named and not (named & lesson_taught):
+        err('R14-PRACTICE-ATTACHES-NOWHERE',
+            f'{pid}: names {sorted(named)[:3]}, none of which a lesson in {mid} teaches — '
+            f'no lesson can point at it')
+
+    if grain == 'module':
+        _capstones[mid].append(pid)
+        covers = set(p.get('coversConcepts') or [])
+        want = set(m.get('teaches') or [])
+        if covers != want:
+            err('R15-CAPSTONE-COVERAGE',
+                f'{pid}: coversConcepts differs from {mid}.teaches '
+                f'(missing {sorted(want - covers)[:3]}, extra {sorted(covers - want)[:3]})')
+
+    if grain == 'exit':
+        tid = p.get('trackId')
+        t = tracks.get(tid)
+        if not t: err('R16-EXIT-BAD-TRACK', f'{pid}: trackId {tid!r}')
+        elif t.get('kind') != 'core':
+            err('R16-EXIT-NOT-CORE', f'{pid}: {tid} is an elective; only core tracks carry an exit project')
+
+for mid, ids in _capstones.items():
+    if len(ids) > 1:
+        err('R15-TWO-CAPSTONES', f'{mid}: {sorted(ids)} both claim grain: module')
+
+#   R17 every core track has exactly one exit project; no elective has one. An elective is entered
+#       for one capability and its module capstones deliver it — seven more multi-day builds would
+#       convert optional depth into obligation.
+_exits = collections.defaultdict(list)
+for pid, p in practices.items():
+    if p.get('grain') == 'exit' and p.get('trackId'): _exits[p['trackId']].append(pid)
+
+for tid, t in tracks.items():
+    got = _exits.get(tid, [])
+    if t.get('kind') == 'core':
+        if not got: err('R17-CORE-NO-EXIT', f'{tid}: core track has no exit project')
+        elif len(got) > 1: err('R17-TWO-EXITS', f'{tid}: {sorted(got)}')
+    elif got:
+        err('R17-ELECTIVE-HAS-EXIT', f'{tid}: electives carry no exit project ({sorted(got)})')
+
+# An exit project is graded against a track's authored capabilities, so it needs enough criteria to
+# actually cover them, and the full hint ladder.
+for tid, ids in _exits.items():
+    for pid in ids:
+        p = practices[pid]
+        crit = len(p.get('acceptance', {}).get('criteria') or [])
+        caps = len(tracks.get(tid, {}).get('capabilities') or [])
+        if crit < max(5, caps - 2):
+            err('R17-EXIT-THIN', f'{pid}: {crit} criteria against {caps} capabilities')
+        if len(p.get('hints') or []) != 3:
+            err('R17-EXIT-HINTS', f'{pid}: {len(p.get("hints") or [])} hints, expected 3')
+
+# A module with lessons but no capstone is a real gap, reported rather than tolerated silently.
+for mid, m in modules.items():
+    if m.get('status') == 'stub': continue
+    if not (m.get('lessons') or []): continue
+    if not _capstones.get(mid):
+        warn('LADDER-NO-CAPSTONE', f'{mid}: no module-grain practice — the capstone is unauthored')
+
 # --- gating integrity ---------------------------------------------------------------------------
 # Content is gated on `assumes`: a lesson opens once the lesson teaching each assumed concept is
 # complete. Three properties have to hold or the gate locks the learner out of real content, and

@@ -11,10 +11,13 @@ import type { Neighbour } from './graph';
  * This is only the control after it, and it is one control, chosen by whether the module's build
  * work is the next thing or the next reading is.
  *
+ * The practices offered are the ones whose span actually covers this lesson, narrowest grain first.
+ * The old page fanned the module's whole list onto every lesson in it — up to 23 exercises on one
+ * lesson, most of them about something you had not read yet.
+ *
  * Deleted from here over this pass: an "Explain why" card that reprinted the concept one-liners the
  * reader had already seen twice on the page (putting the answer beside the prompt turns retrieval
- * into recognition), an "Entering review" card explaining the scheduler to itself, and a list of
- * every practice in the module fanned onto every lesson in it — up to 23 of them.
+ * into recognition), and an "Entering review" card explaining the scheduler to itself.
  */
 export function EndOfLesson({
   practices, moduleTitle, moduleHref, next,
@@ -24,11 +27,12 @@ export function EndOfLesson({
   moduleHref: string;
   next?: Neighbour | null;
 }) {
-  // Building is the primary move at the end of a module; mid-module, continuing is. Until practices
-  // are grained per lesson, "last lesson in the module" is the best available proxy for "you have
-  // now read enough to build the thing".
+  // Build when there is something to build over what you have just read; otherwise continue. At the
+  // end of a module the capstone outranks the block exercises, because that is the point of it.
   const atModuleEnd = !next || next.boundary !== null;
-  const primary = atModuleEnd && practices.length > 0 ? practices[0] : null;
+  const capstone = practices.find((p) => p.grain === 'module');
+  const block = practices.find((p) => (p.grain ?? 'block') === 'block');
+  const primary = (atModuleEnd && capstone) || block || (atModuleEnd ? capstone : null) || null;
   const primaryHref = primary ? hrefForPractice(primary.id) : null;
 
   return (
@@ -45,7 +49,7 @@ export function EndOfLesson({
             className="inline-flex flex-col gap-0.5 rounded border border-[var(--color-accent)] bg-[var(--color-accent-soft)] px-4 py-2.5 no-underline"
           >
             <span className="text-[var(--text-marginal)] uppercase tracking-wider text-[var(--color-accent)] opacity-80">
-              Build it · {primary.kind}
+              {primary.grain === 'module' ? 'Capstone' : 'Build it'} · {primary.kind}
             </span>
             <span className="text-[15px] text-[var(--color-ink)]">{primary.title}</span>
           </Link>
@@ -78,7 +82,7 @@ export function EndOfLesson({
         <Link href="/questions" className="hover:text-[var(--color-accent)]">Questions</Link>
         {primary && practices.length > 1 && (
           <Link href={moduleHref} className="hover:text-[var(--color-accent)]">
-            {practices.length - 1} more {practices.length === 2 ? 'exercise' : 'exercises'} here
+            {practices.length - 1} more over this material
           </Link>
         )}
       </p>

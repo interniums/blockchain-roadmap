@@ -3,7 +3,7 @@ import { notFound } from 'next/navigation';
 import { Breadcrumb } from '@/components/nav/Breadcrumb';
 import { Keyboard } from '@/components/nav/Keyboard';
 import {
-  crumbsFor, getLesson, getModule, getPracticesOf, getTrack, readingOrder, siblings,
+  crumbsFor, getLesson, getModule, getTrack, practicesForLesson, readingOrder, siblings,
 } from '@/lib/content/load';
 import { getLessonBody } from '@/lib/content/body';
 import { gateFor } from '@/lib/content/gate';
@@ -93,7 +93,9 @@ export default async function LessonPage({ params }: { params: Promise<Params> }
 
   const gate = gateFor(lesson.id);
   const assumes = (lesson.assumes ?? []).map((id) => conceptRef(id));
-  const practices = getPracticesOf(moduleId);
+  // The exercises whose span includes THIS lesson, narrowest grain first — not the module's whole
+  // list, which the old page fanned onto every lesson in it, up to 23 of them.
+  const practices = practicesForLesson(lesson.id);
 
   const { prev, next } = siblings(lesson.id);
   const prevN = neighbour(prev, moduleId, trackId);

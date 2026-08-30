@@ -40,6 +40,20 @@ export interface Graph {
    * a second source of truth that could drift from `teaches`.
    */
   conceptLesson: Map<string, string>;
+  /**
+   * practiceId -> the lessons it actually covers, in reading order.
+   *
+   * Derived, never authored: a practice already names its concepts, and a lesson already names what
+   * it teaches, so the span is the intersection. Measured across the 236: 22 practices span one
+   * lesson, 106 span two, 87 three, 20 four, 1 five — mean 2.4, and none spans zero.
+   *
+   * Deliberately NOT a lesson range. 90 of the 192 multi-lesson spans are non-contiguous, so any
+   * definition based on order would either mis-attribute a practice or silently drop lessons out of
+   * the middle of it.
+   */
+  practiceLessons: Map<string, string[]>;
+  /** the reverse: lessonId -> practices whose span includes it */
+  lessonPractices: Map<string, string[]>;
 }
 
 let cache: Graph | null = null;
@@ -120,10 +134,26 @@ export function graph(): Graph {
   const conceptLesson = new Map<string, string>();
   for (const [conceptId, ls] of lessonsByConcept) if (ls.length) conceptLesson.set(conceptId, ls[0]);
 
+  const practiceLessons = new Map<string, string[]>();
+  const lessonPractices = new Map<string, string[]>();
+  for (const p of practices) {
+    const mod = moduleById.get(p.moduleId);
+    if (!mod) continue;
+    const named = new Set(p.concepts ?? []);
+    const span = [...(mod.lessons ?? [])]
+      .sort((a, b) => a.order - b.order)
+      .filter((l) => (l.teaches ?? []).some((c) => named.has(c)))
+      .map((l) => l.id);
+    practiceLessons.set(p.id, span);
+    for (const lessonId of span) {
+      lessonPractices.set(lessonId, [...(lessonPractices.get(lessonId) ?? []), p.id]);
+    }
+  }
+
   cache = {
     tracks, trackById, moduleById, modulesByTrack, conceptById, conceptHome,
     sourceById, aliasOf, practiceById, practicesByModule, lessonById, requiredBy, lessonsByConcept,
-    conceptLesson,
+    conceptLesson, practiceLessons, lessonPractices,
   };
   return cache;
 }
@@ -138,6 +168,28 @@ export const getSource = (id: string) => graph().sourceById.get(id);
 export const getPractice = (id: string) => graph().practiceById.get(id);
 export const getPracticesOf = (moduleId: string) => graph().practicesByModule.get(moduleId) ?? [];
 export const getLesson = (id: string) => graph().lessonById.get(id);
+
+/** The lessons a practice covers — its grain, measured rather than declared. */
+export const lessonsOfPractice = (practiceId: string) => graph().practiceLessons.get(practiceId) ?? [];
+
+/**
+ * The practices that cover a lesson, narrowest grain first.
+ *
+ * This is what the end of a lesson points at: the exercise over the mechanism you have just read,
+ * not the module's whole list fanned onto every lesson in it — which is what the old page did, up
+ * to 23 of them on one lesson.
+ */
+export function practicesForLesson(practiceId: string): Practice[] {
+  const g = graph();
+  const RANK = { block: 0, module: 1, exit: 2, check: -1 } as const;
+  return (g.lessonPractices.get(practiceId) ?? [])
+    .map((id) => g.practiceById.get(id))
+    .filter((p): p is Practice => Boolean(p))
+    .sort((a, b) =>
+      (RANK[a.grain ?? 'block'] - RANK[b.grain ?? 'block'])
+      || (a.difficulty ?? 0) - (b.difficulty ?? 0)
+      || a.id.localeCompare(b.id));
+}
 
 /** Resolve a possibly-retired concept id to the live one. Identity, not guesswork. */
 export function resolveConceptId(id: string): string | undefined {
@@ -194,16 +246,30 @@ export function hrefForConcept(rawId: string): string | null {
 }
 
 /**
- * A practice lives under what it exercises, and its depth IS its grain. Today every practice is
- * module-attached, so every one sits at module depth; lesson- and track-grain practices land at
- * their own depths without this function changing shape.
+ * A practice lives under what it exercises, and its depth IS its grain: a block exercise and a
+ * module capstone sit under the module, a track exit project under the track.
+ *
+ * This is the canonical address. `/t/[track]/p/[practice]` exists as a real route so an exit
+ * project can be linked at track depth, and it resolves back to here.
  */
 export function hrefForPractice(practiceId: string): string | null {
-  const p = graph().practiceById.get(practiceId);
+  const g = graph();
+  const p = g.practiceById.get(practiceId);
   if (!p) return null;
-  const mod = graph().moduleById.get(p.moduleId);
+  // An exit project closes out a track, so it is addressed at track depth. Everything else is
+  // authored against a module and lives under it.
+  if (p.grain === 'exit' && p.trackId) return `/t/${p.trackId}/p/${p.id}`;
+  const mod = g.moduleById.get(p.moduleId);
   if (!mod) return null;
   return `/t/${mod.trackId}/${mod.id}/p/${p.id}`;
+}
+
+/** The exit project of a core track, if one is authored. Electives deliberately have none. */
+export function exitProjectOf(trackId: string): Practice | undefined {
+  for (const [, p] of graph().practiceById) {
+    if (p.grain === 'exit' && p.trackId === trackId) return p;
+  }
+  return undefined;
 }
 
 /** Every lesson in reading order across the whole curriculum. Powers next/prev. */
@@ -250,7 +316,12 @@ export function crumbsFor(opts: {
   } else if (opts.practiceId) {
     const p = g.practiceById.get(opts.practiceId);
     const mod = p ? g.moduleById.get(p.moduleId) : undefined;
-    if (mod) { trackId = mod.trackId; moduleId = mod.id; }
+    if (mod) {
+      trackId = mod.trackId;
+      // An exit project spans the whole track, so putting its host module in the ladder would say
+      // it belongs to that module. It does not; it is the thing that comes after all of them.
+      moduleId = p?.grain === 'exit' ? undefined : mod.id;
+    }
   }
 
   const out: Crumb[] = [{ href: '/', label: 'Curriculum' }];
