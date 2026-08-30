@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { hrefForConcept } from '@/lib/content/load';
 import { getTrack } from '@/lib/content/load';
 import type { PrereqRef } from './derive';
 
@@ -50,7 +51,7 @@ export function PrereqStrip({ refs, trackId }: { refs: PrereqRef[]; trackId: str
           return (
             <li key={r.id}>
               <Link
-                href={`/c/${r.id}`}
+                href={hrefForConcept(r.id) ?? `/t/${trackId}`}
                 title={r.oneLine}
                 className="inline-flex items-center gap-1 rounded border border-[var(--color-rule)] bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[12px] text-[var(--color-ink-2)] hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]"
               >

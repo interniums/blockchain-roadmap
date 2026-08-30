@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { getConcept } from '@/lib/content/load';
+import { getConcept, hrefForConcept } from '@/lib/content/load';
 import { trackTitle } from './derive';
 import { Badge, Empty } from './ui';
 
@@ -25,7 +25,7 @@ function ConceptRow({ id, fromTrackId }: { id: string; fromTrackId: string }) {
   return (
     <li>
       <Link
-        href={`/c/${c.id}`}
+        href={hrefForConcept(c.id) ?? `/t/${c.trackId}`}
         className="group block rounded px-2 py-1.5 hover:bg-[var(--color-surface-2)]"
       >
         <span className="flex items-baseline justify-between gap-3">

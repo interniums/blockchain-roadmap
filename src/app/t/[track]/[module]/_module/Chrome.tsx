@@ -1,5 +1,4 @@
 import type { ReactNode } from 'react';
-import type { LessonStatus } from '@/lib/content/types';
 
 /**
  * Structural primitives for the module screen only. Colour comes from the
@@ -60,16 +59,4 @@ export function Note({ tone = 'warn', children }: { tone?: Tone; children: React
   );
 }
 
-export const LESSON_STATUS: Record<LessonStatus, { label: string; tone: Tone; written: boolean }> = {
-  outlined: { label: 'Outline only', tone: 'warn', written: false },
-  drafted: { label: 'Draft', tone: 'neutral', written: true },
-  reviewed: { label: 'Reviewed', tone: 'accent', written: true },
-  published: { label: 'Published', tone: 'good', written: true },
-};
 
-export function minutes(total: number): string {
-  if (total < 60) return `${total} min`;
-  const h = Math.floor(total / 60);
-  const m = total % 60;
-  return m ? `${h} h ${m} min` : `${h} h`;
-}

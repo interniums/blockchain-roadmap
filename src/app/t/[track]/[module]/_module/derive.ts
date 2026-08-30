@@ -1,5 +1,6 @@
-import { getConcept } from '@/lib/content/load';
-import type { Lesson, LessonStatus, Module } from '@/lib/content/types';
+import { getConcept, hrefForConcept } from '@/lib/content/load';
+import { gateFor } from '@/lib/content/gate';
+import type { Lesson, Module } from '@/lib/content/types';
 
 /** Lessons in authored order. The YAML is usually sorted already; do not trust it. */
 export function orderedLessons(m: Module): Lesson[] {
@@ -63,12 +64,19 @@ export interface ConceptRef {
   oneLine?: string;
   /** false when nothing in the graph has this id — a content gap, shown rather than hidden. */
   resolved: boolean;
+  /** resolved server-side: the client cannot walk the graph to find a canonical parent. */
+  href?: string;
 }
 
 export function conceptRefs(ids: string[]): ConceptRef[] {
   return ids.map((id) => {
     const c = getConcept(id);
-    return { id, title: c?.title ?? id, oneLine: c?.oneLine, resolved: Boolean(c) };
+    // The href is resolved here because a concept's address is its teaching lesson's address,
+    // and only the server holds the graph that knows which lesson that is.
+    return {
+      id, title: c?.title ?? id, oneLine: c?.oneLine, resolved: Boolean(c),
+      href: hrefForConcept(id) ?? undefined,
+    };
   });
 }
 
@@ -76,22 +84,27 @@ export function conceptRefs(ids: string[]): ConceptRef[] {
 export interface LessonRow {
   id: string;
   title: string;
-  status: LessonStatus;
   teaches: ConceptRef[];
+  /** concepts whose grading opens this lesson; empty means it is an entry point */
+  watch: string[];
+  /** the readings that grant them, so a dimmed row can name its own key */
+  earnedBy: { lessonId: string; title: string; href?: string }[];
 }
 
 export function lessonRows(m: Module): LessonRow[] {
   return orderedLessons(m).map((l) => ({
     id: l.id,
     title: l.title,
-    status: l.status,
     teaches: conceptRefs(l.teaches ?? []),
+    watch: gateFor(l.id).watch,
+    earnedBy: gateFor(l.id).blockers.map((b) => ({
+      lessonId: b.lessonId, title: b.lessonTitle, href: b.lessonHref ?? undefined,
+    })),
   }));
 }
 
 export interface ModuleTotals {
   lessons: number;
-  written: number;
   concepts: number;
   /** module.teaches entries no lesson in this module actually teaches */
   unplacedConcepts: string[];
@@ -103,7 +116,6 @@ export function totals(m: Module): ModuleTotals {
   for (const l of lessons) for (const c of l.teaches ?? []) byLesson.add(c);
   return {
     lessons: lessons.length,
-    written: lessons.filter((l) => l.status !== 'outlined').length,
     concepts: (m.teaches ?? []).length,
     unplacedConcepts: (m.teaches ?? []).filter((c) => !byLesson.has(c)),
   };

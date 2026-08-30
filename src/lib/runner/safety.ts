@@ -101,18 +101,41 @@ export function parseAcceptanceCommand(raw: string): ParsedCommand {
 export type AcceptanceTier = 'runnable' | 'manual';
 
 /**
+ * Whether a binary's output can actually be graded. `runCheck` reads JUnit from stdout and nothing
+ * else, so a command the parser accepts but whose tool emits no JUnit can only ever come back as
+ * `could-not-run` — which the recorder refuses to store. Under gating that made whole modules
+ * uncompletable, so the check is derived here rather than discovered at run time.
+ *
+ * Only `forge` qualifies today, and the parser force-adds `--junit` for it. `node --test` could
+ * qualify with `--test-reporter=junit --test-reporter-destination=stdout`, but `--test-reporter`
+ * is not in the grammar and `=` is not a SAFE_VALUE character; `cargo`'s JSON output is
+ * nightly-only, and `anchor`'s mocha reporter writes a file rather than stdout.
+ */
+export function emitsJUnit(bin: string): boolean {
+  return BINS[bin]?.junit === true;
+}
+
+/**
  * Classify a practice's acceptance command.
  *
- * `runnable` — expressible as argv, so the app can execute and grade it.
- * `manual`   — needs a shell (pipes, chains, loops, globs, variable expansion) or a binary we will not
- *              run. The app shows the command, the learner runs it in their own terminal, and
- *              self-reports. This is deliberate: the alternative is handing a web page a shell,
- *              which plan §17 forbids.
+ * `runnable` — expressible as argv AND gradeable from its output, so the app can run it and say
+ *              whether you passed.
+ * `manual`   — needs a shell (pipes, chains, loops, globs, variable expansion), a binary we will
+ *              not run, or a tool whose results we cannot read. The app shows the command, the
+ *              learner runs it in their own terminal, and self-reports. This is deliberate: the
+ *              alternative is handing a web page a shell.
  */
 export function classifyAcceptance(raw: string | undefined): { tier: AcceptanceTier; reason?: string } {
   if (!raw) return { tier: 'manual', reason: 'no acceptance command authored' };
-  try { parseAcceptanceCommand(raw); return { tier: 'runnable' }; }
-  catch (e) { return { tier: 'manual', reason: e instanceof UnsafeCommand ? e.message : String(e) }; }
+  try {
+    const { bin } = parseAcceptanceCommand(raw);
+    if (!emitsJUnit(bin)) {
+      return { tier: 'manual', reason: `no machine-readable results: ${bin} emits no JUnit on stdout` };
+    }
+    return { tier: 'runnable' };
+  } catch (e) {
+    return { tier: 'manual', reason: e instanceof UnsafeCommand ? e.message : String(e) };
+  }
 }
 
 /** The repo must be a real directory the learner configured, and the command runs with cwd there. */

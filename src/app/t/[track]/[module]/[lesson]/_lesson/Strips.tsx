@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { hrefForConcept } from '@/lib/content/load';
 import { Chip, Notice, Panel } from './bits';
 import type { ConceptRef } from './graph';
 
@@ -29,7 +30,7 @@ function RefLink({
   return (
     <li>
       <Link
-        href={`/c/${ref_.id}`}
+        href={hrefForConcept(ref_.id) ?? `/t/${currentTrackId}`}
         className="group block rounded border border-[var(--color-rule)] px-2 py-1.5 hover:border-[var(--color-accent)]"
       >
         <span className="flex items-baseline justify-between gap-2">

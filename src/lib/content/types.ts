@@ -5,7 +5,6 @@ export type TrackKind = 'core' | 'elective';
 export type EdgeType = 'requires' | 'recommends' | 'deepens' | 'contrasts' | 'applies' | 'supersedes';
 export type Tier = 'spec' | 'canonical-docs' | 'primary-analysis' | 'secondary';
 export type Volatility = 'stable' | 'evolving' | 'hot';
-export type LessonStatus = 'outlined' | 'drafted' | 'reviewed' | 'published';
 export type PracticeKind = 'implement' | 'break' | 'fix' | 'read' | 'measure' | 'write';
 
 export interface Layout { lane: Lane; row: number }
@@ -19,7 +18,15 @@ export interface Track {
 export interface Lesson {
   id: string; order: number; title: string;
   teaches?: string[]; assumes?: string[];
-  readingMin?: number; status: LessonStatus;
+  readingMin?: number;
+  /**
+   * Concepts this lesson leans on that are taught LATER in reading order. They inform the reading
+   * but must never gate it — a gate keyed to them would lock the lesson behind content up to 154
+   * lessons downstream of itself. Kept as authored data rather than deleted, because the
+   * relationship is real; enforced non-gating by `assumesFor`, and R10 is what stops a genuine
+   * backward prerequisite being filed here by mistake.
+   */
+  softAssumes?: string[];
 }
 
 export interface Module {

@@ -81,10 +81,25 @@ export function ConceptChips({
               </li>
             );
           }
+          if (!c.href) {
+            return (
+              <li key={c.id}>
+                <span
+                  title={c.oneLine}
+                  className="inline-flex items-center gap-1.5 rounded border border-dashed border-[var(--color-rule)] px-2 py-1 text-[12.5px] text-[var(--color-ink-3)]"
+                >
+                  {c.title}
+                  <span className="text-[10px] uppercase tracking-wide text-[var(--color-warn)]">
+                    no lesson teaches it
+                  </span>
+                </span>
+              </li>
+            );
+          }
           return (
             <li key={c.id}>
               <Link
-                href={`/c/${c.id}`}
+                href={c.href}
                 title={c.oneLine}
                 className={`inline-flex items-center gap-1.5 rounded border px-2 py-1 text-[12.5px] hover:border-[var(--color-accent)] hover:text-[var(--color-accent)] ${
                   isOrphan

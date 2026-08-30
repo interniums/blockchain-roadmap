@@ -1,4 +1,4 @@
-import { graph, getModulesOf } from './load';
+import { graph, getModulesOf, hrefForConcept, hrefForPractice } from './load';
 
 export interface SearchItem { id: string; label: string; sub: string; href: string; kind: 'Track' | 'Module' | 'Lesson' | 'Concept' | 'Source' | 'Practice' }
 
@@ -20,10 +20,10 @@ export function searchIndex(): SearchItem[] {
     }
   }
   for (const [id, c] of g.conceptById) {
-    out.push({ id, label: c.title, sub: c.oneLine, href: `/c/${id}`, kind: 'Concept' });
+    out.push({ id, label: c.title, sub: c.oneLine, href: hrefForConcept(id) ?? '/', kind: 'Concept' });
   }
   for (const [id, p] of g.practiceById) {
-    out.push({ id, label: p.title, sub: `${p.kind} · practice`, href: `/p/${id}`, kind: 'Practice' });
+    out.push({ id, label: p.title, sub: `${p.kind} · practice`, href: hrefForPractice(id) ?? '/', kind: 'Practice' });
   }
   for (const [id, s] of g.sourceById) {
     out.push({ id, label: s.title, sub: s.tier, href: s.url, kind: 'Source' });

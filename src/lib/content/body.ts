@@ -24,15 +24,41 @@ export interface LessonBody {
   changeKind?: 'cosmetic' | 'clarifying' | 'corrective';
   /** sha256 of the body. Compared against what the learner last saw. */
   contentHash: string;
+  /**
+   * The concepts this lesson's inline `<Check>` blocks ask you to retrieve, in prose order.
+   *
+   * This is the gate key. A lesson counts as complete when every one of these has been graded,
+   * which is the only act this app records — so unlocking downstream content is a byproduct of
+   * reading in order rather than a separate obligation. Measured across the corpus: 649 checks,
+   * 621 lessons with one and 14 with two, none with zero, and every one carries a `concept=`.
+   */
+  checkConcepts: string[];
 }
 
-/** Returns undefined when the lesson has no prose yet — the caller must render an outline, not an empty page. */
+/**
+ * Pulled with a regex rather than by compiling the MDX, because this runs inside
+ * `generateStaticParams` and the gate index for 635 lessons — a full MDX compile per lesson to
+ * read one attribute would dominate the build. `content-lint` is what guarantees the shape.
+ */
+const CHECK_CONCEPT = /<Check\b[^>]*?\bconcept="([^"]+)"/g;
+
+export function checkConceptsIn(content: string): string[] {
+  const out: string[] = [];
+  for (const m of content.matchAll(CHECK_CONCEPT)) if (!out.includes(m[1])) out.push(m[1]);
+  return out;
+}
+
+/** Undefined only when the .mdx is missing, which content-lint treats as a build error. */
 export function getLessonBody(id: string): LessonBody | undefined {
   const p = path.join(DIR, `${id}.mdx`);
   if (!fs.existsSync(p)) return undefined;
   const { data, content } = matter(fs.readFileSync(p, 'utf8'));
   const contentHash = crypto.createHash('sha256').update(content).digest('hex').slice(0, 16);
-  return { id, content, contentHash, ...(data as Omit<LessonBody, 'id' | 'content' | 'contentHash'>) };
+  return {
+    id, content, contentHash,
+    ...(data as Omit<LessonBody, 'id' | 'content' | 'contentHash' | 'checkConcepts'>),
+    checkConcepts: checkConceptsIn(content),
+  };
 }
 
 export function writtenLessonIds(): Set<string> {

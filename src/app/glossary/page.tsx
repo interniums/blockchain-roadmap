@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
+import { hrefForConcept } from '@/lib/content/load';
 import { graph, stats } from '@/lib/content/load';
 import type { Volatility } from '@/lib/content/types';
 
@@ -164,7 +165,7 @@ export default function GlossaryPage() {
                   {list.map((e) => (
                     <div key={e.id} id={`g-${e.id}`} className="scroll-mt-16">
                       <dt className="flex flex-wrap items-baseline gap-2">
-                        <Link href={`/c/${e.id}`} className="text-[14px] font-medium hover:text-[var(--color-accent)]">
+                        <Link href={hrefForConcept(e.id) ?? '/'} className="text-[14px] font-medium hover:text-[var(--color-accent)]">
                           {e.title}
                         </Link>
                         {e.volatility && (

@@ -1,6 +1,8 @@
 'use server';
 
-import { getConcept, getLesson, getModule, getPractice, getTrack } from '@/lib/content/load';
+import {
+  getConcept, getLesson, getModule, getPractice, getTrack, hrefForConcept, hrefForPractice,
+} from '@/lib/content/load';
 import type { ConceptLabel, LabelBundle, OriginLabel } from './model';
 
 /**
@@ -41,7 +43,7 @@ function conceptLabel(id: string): ConceptLabel {
     id,
     title: c.title,
     oneLine: c.oneLine ?? '',
-    href: `/c/${id}`,
+    href: hrefForConcept(id) ?? '/',
     moduleTitle: getModule(c.moduleId)?.title ?? '',
     trackTitle: getTrack(c.trackId)?.title ?? '',
     trackId: c.trackId,
@@ -78,12 +80,12 @@ function originLabel(key: string): OriginLabel {
 
     const practice = getPractice(candidate);
     if (practice) {
-      return { key, href: `/p/${practice.id}`, label: `${practice.title} (practice)`, kind: 'practice' };
+      return { key, href: hrefForPractice(practice.id) ?? '/', label: `${practice.title} (practice)`, kind: 'practice' };
     }
 
     const concept = getConcept(candidate);
     if (concept) {
-      return { key, href: `/c/${concept.id}`, label: concept.title, kind: 'concept' };
+      return { key, href: hrefForConcept(concept.id) ?? '/', label: concept.title, kind: 'concept' };
     }
 
     const track = getTrack(candidate);

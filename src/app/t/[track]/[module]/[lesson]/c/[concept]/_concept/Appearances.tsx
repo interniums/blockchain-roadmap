@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import Link from 'next/link';
-import { getLesson, getModule, getPractice } from '@/lib/content/load';
+import { getLesson, getModule, getPractice, hrefForPractice } from '@/lib/content/load';
 import { can } from '@/lib/capabilities';
 import { trackTitle } from './derive';
 import { Badge, Empty } from './ui';
@@ -54,7 +54,7 @@ function PracticeRow({ id }: { id: string }) {
   const mod = getModule(p.moduleId);
   return (
     <li>
-      <Link href={`/p/${p.id}`} className="group block rounded px-2 py-1.5 hover:bg-[var(--color-surface-2)]">
+      <Link href={hrefForPractice(p.id) ?? '/'} className="group block rounded px-2 py-1.5 hover:bg-[var(--color-surface-2)]">
         <span className="block text-[14px] text-[var(--color-ink)] group-hover:text-[var(--color-accent)]">
           {p.title}
         </span>

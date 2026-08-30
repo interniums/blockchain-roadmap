@@ -1,6 +1,6 @@
 'use server';
 
-import { getConcept, getLesson, getTrack, getModule } from '@/lib/content/load';
+import { getConcept, getLesson, getTrack, getModule, hrefForConcept } from '@/lib/content/load';
 import type { ConceptLabel, ReviewItem } from './types';
 
 /**
@@ -47,7 +47,7 @@ export async function loadReviewItems(
       trackTitle: track?.title ?? c.trackId,
       moduleId: c.moduleId,
       moduleTitle: module_?.title ?? c.moduleId,
-      conceptHref: `/c/${c.id}`,
+      conceptHref: hrefForConcept(c.id) ?? '/',
       misconception: m ? { belief: m.belief, reality: m.reality } : null,
       reread,
       prereqCount: c.requires.length + deepens,
@@ -67,7 +67,7 @@ export async function loadConceptLabels(ids: string[]): Promise<ConceptLabel[]> 
     out.push({
       conceptId: id,
       title: c.title,
-      href: `/c/${id}`,
+      href: hrefForConcept(id) ?? '/',
       trackTitle: getTrack(c.trackId)?.title ?? c.trackId,
     });
   }

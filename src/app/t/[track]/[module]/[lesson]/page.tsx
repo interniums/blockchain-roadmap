@@ -12,9 +12,11 @@ import type { ConceptView } from '@/lib/content/types';
 import { ContextRail } from './_lesson/ContextRail';
 import { EndOfLesson } from './_lesson/EndOfLesson';
 import { getLessonBody } from '@/lib/content/body';
+import { gateFor } from '@/lib/content/gate';
 import { LessonProse, ProvenanceStrip } from '@/components/lesson/LessonProse';
 import { PrevNext, type Neighbour } from './_lesson/PrevNext';
 import { PrereqStrip } from './_lesson/Strips';
+import { Gate } from './_lesson/Gate';
 import { conceptRef, sourcesFor } from './_lesson/graph';
 
 type Params = { track: string; module: string; lesson: string };
@@ -93,6 +95,7 @@ export default async function LessonPage({ params }: { params: Promise<Params> }
   }
 
   const prereqs = (lesson.assumes ?? []).map((id) => conceptRef(id));
+  const gate = gateFor(lesson.id);
   const { entries: sourceEntries, unresolved: unresolvedSources } = sourcesFor(taught, getSource);
   const practices = getPracticesOf(moduleId);
 
@@ -128,16 +131,20 @@ export default async function LessonPage({ params }: { params: Promise<Params> }
         <div className="mt-5 max-w-[76ch]">
         <PrereqStrip refs={prereqs} currentTrackId={trackId} />
 
+        {/* The gate stands in place of the prose, not above it — and it takes the closing block
+            with it, because there is nothing to prove until the lesson has been read. */}
         <div className="mt-6">
-          <ProvenanceStrip body={body} />
-          <LessonProse body={body} />
-        </div>
+          <Gate watch={gate.watch} blockers={gate.blockers}>
+            <ProvenanceStrip body={body} />
+            <LessonProse body={body} />
 
-        <EndOfLesson
-          practices={practices}
-          moduleTitle={mod.title}
-          moduleHref={moduleHref}
-        />
+            <EndOfLesson
+              practices={practices}
+              moduleTitle={mod.title}
+              moduleHref={moduleHref}
+            />
+          </Gate>
+        </div>
 
         <PrevNext prev={prevN} next={nextN} />
         </div>

@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { hrefForPractice } from '@/lib/content/load';
 import { can, WEB_NOTICE } from '@/lib/capabilities';
 import type { Practice } from '@/lib/content/types';
 import { Chip, Notice } from './bits';
@@ -34,7 +35,7 @@ export function EndOfLesson({
           {practices.map((p) => (
             <li key={p.id}>
               <Link
-                href={`/p/${p.id}`}
+                href={hrefForPractice(p.id) ?? moduleHref}
                 className="flex flex-wrap items-baseline gap-2 text-[14px] text-[var(--color-ink)] hover:text-[var(--color-accent)]"
               >
                 <Chip>{p.kind}</Chip>

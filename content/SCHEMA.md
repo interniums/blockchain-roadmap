@@ -48,7 +48,9 @@ lessons:
     teaches: [account, eoa]        # subset of the module's teaches
     assumes: [key-value-state]     # concept ids from elsewhere
     readingMin: 12                 # 8-20. If >20, split the lesson.
-    status: outlined               # outlined | drafted | reviewed | published
+    softAssumes: [sequencer]       # OPTIONAL. Concepts taught LATER in reading order that this
+                                   # lesson leans on. They inform the reading and never gate it.
+                                   # A backward prerequisite filed here is a lint error (R12).
 practices: [evm-accounts-delegate-takeover]
 reflectionPrompt: >
   An open question the learner answers in writing at the end of the module.
@@ -78,8 +80,17 @@ concepts:
     paysOffIn: [solidity-delegatecall]    # REQUIRED for Track 01 concepts
 ```
 
-**Edge types:** `requires` (hard prereq, gates readiness) · `recommends` (soft) · `deepens` ·
-`contrasts` · `applies` · `supersedes`. Only `requires` gates.
+**Edge types:** `requires` (hard prereq) · `recommends` (soft) · `deepens` · `contrasts` ·
+`applies` · `supersedes`.
+
+**What actually gates content** is a lesson's `assumes`, not a concept's `requires`: a lesson opens
+once every lesson teaching one of its assumed concepts is complete, and a lesson is complete once
+every concept its inline `<Check>` blocks name has been graded — any rating, including "Again".
+`requires` describes the graph; `assumes` is the door. `softAssumes` is the same relationship
+stated as non-gating, for the 4 places where the curriculum leans forward on purpose.
+
+A lesson carries no authoring `status`. All 635 have prose, the field said `outlined` for every
+one of them, and nothing read it.
 
 ## Sources (one file per track)
 
@@ -136,3 +147,12 @@ difficulty: 3                    # 1-5
 6. No two tracks or modules share a `layout` lane+row.
 7. No concept id defined twice.
 8. A claim listed in `docs/research/CONFLICTS.md` may not be stated as fact.
+9. **R9** — every concept is taught by exactly one lesson. This is what gives a concept a single
+   address in the content tree, and it is why no `definedIn:` field is needed: `teaches` already
+   determines the parent uniquely. 1490/1490 hold today.
+10. **R10** — no `assumes` edge points forward in reading order. A forward prerequisite belongs in
+    `softAssumes`, where it cannot gate.
+11. **R11** — no cycle in the module projection of `assumes`, or of `requires`. A cycle makes every
+    lesson in it permanently unreachable; the zk track shipped one that locked 12 lessons.
+12. **R12** — `softAssumes` carries only genuinely-forward edges, and never an id also in
+    `assumes`. Otherwise a real prerequisite could silently opt out of the gate.

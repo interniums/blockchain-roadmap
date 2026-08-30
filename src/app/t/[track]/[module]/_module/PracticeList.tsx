@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { hrefForPractice } from '@/lib/content/load';
 import type { Practice } from '@/lib/content/types';
 import { Pill } from './Chrome';
 
@@ -66,7 +67,7 @@ export function PracticeList({
             )}
           </div>
           <h3 className="mt-1.5 text-[14px] font-medium leading-5">
-            <Link href={`/p/${p.id}`} className="text-[var(--color-ink)] hover:text-[var(--color-accent)]">
+            <Link href={hrefForPractice(p.id) ?? '/'} className="text-[var(--color-ink)] hover:text-[var(--color-accent)]">
               {p.title}
             </Link>
           </h3>

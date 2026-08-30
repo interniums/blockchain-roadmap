@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { load as parseYaml } from 'js-yaml';
-import { writtenLessonIds } from './body';
 import type {
   Track, Module, Concept, Source, Practice, Lesson, ConceptView, Crumb, EdgeType,
 } from './types';
@@ -34,6 +33,13 @@ export interface Graph {
   requiredBy: Map<string, string[]>;
   /** concepts taught by each lesson, reversed */
   lessonsByConcept: Map<string, string[]>;
+  /**
+   * conceptId -> the single lesson that teaches it. This is the canonical-parent rule, and it is
+   * derived rather than authored: all 1,490 concepts are taught by exactly one lesson, which lint
+   * rule R9 enforces. A concept therefore has one address in the tree without anyone hand-writing
+   * a second source of truth that could drift from `teaches`.
+   */
+  conceptLesson: Map<string, string>;
 }
 
 let cache: Graph | null = null;
@@ -87,12 +93,11 @@ export function graph(): Graph {
 
   const lessonById = new Map<string, { lesson: Lesson; moduleId: string; trackId: string }>();
   const lessonsByConcept = new Map<string, string[]>();
-  // Prose on disk is the truth. A lesson whose .mdx exists is at least 'drafted', whatever the YAML
-  // says — otherwise status drifts the moment someone writes a lesson without editing two files.
-  const written = writtenLessonIds();
+  // `Lesson.status` used to be patched here from what was on disk, because the YAML said
+  // `outlined` for all 635 lessons that in fact have prose. Nothing renders authoring status any
+  // more, so the patch — and the drift it papered over — is gone with it.
   for (const m of modules) {
     for (const l of m.lessons ?? []) {
-      if (written.has(l.id) && l.status === 'outlined') l.status = 'drafted';
       lessonById.set(l.id, { lesson: l, moduleId: m.id, trackId: m.trackId });
       for (const c of l.teaches ?? []) {
         const list = lessonsByConcept.get(c) ?? [];
@@ -112,9 +117,13 @@ export function graph(): Graph {
     }
   }
 
+  const conceptLesson = new Map<string, string>();
+  for (const [conceptId, ls] of lessonsByConcept) if (ls.length) conceptLesson.set(conceptId, ls[0]);
+
   cache = {
     tracks, trackById, moduleById, modulesByTrack, conceptById, conceptHome,
     sourceById, aliasOf, practiceById, practicesByModule, lessonById, requiredBy, lessonsByConcept,
+    conceptLesson,
   };
   return cache;
 }
@@ -157,6 +166,46 @@ export function getConcept(rawId: string): ConceptView | undefined {
   };
 }
 
+/**
+ * ---- addresses ------------------------------------------------------------------------------
+ *
+ * One tree, one address per entity. Every link goes through these: 36 call sites used to build
+ * `/c/${id}` and `/p/${id}` by hand, and none of them should re-derive a parent chain.
+ *
+ * The static `c` and `p` segments are load-bearing. Next's route sorter refuses two different
+ * slug names at the same path depth, so `…/[lesson]/[concept]` could not coexist with a sibling
+ * `…/[lesson]/[practice]`; and no track, module or lesson id equals `c` or `p`, so a static
+ * segment cannot shadow a real node.
+ */
+
+export function lessonHref(lessonId: string): string | null {
+  const found = graph().lessonById.get(lessonId);
+  return found ? `/t/${found.trackId}/${found.moduleId}/${lessonId}` : null;
+}
+
+/** A concept lives under the lesson that teaches it. Retired ids resolve first. */
+export function hrefForConcept(rawId: string): string | null {
+  const id = resolveConceptId(rawId);
+  if (!id) return null;
+  const lessonId = graph().conceptLesson.get(id);
+  if (!lessonId) return null;
+  const under = lessonHref(lessonId);
+  return under ? `${under}/c/${id}` : null;
+}
+
+/**
+ * A practice lives under what it exercises, and its depth IS its grain. Today every practice is
+ * module-attached, so every one sits at module depth; lesson- and track-grain practices land at
+ * their own depths without this function changing shape.
+ */
+export function hrefForPractice(practiceId: string): string | null {
+  const p = graph().practiceById.get(practiceId);
+  if (!p) return null;
+  const mod = graph().moduleById.get(p.moduleId);
+  if (!mod) return null;
+  return `/t/${mod.trackId}/${mod.id}/p/${p.id}`;
+}
+
 /** Every lesson in reading order across the whole curriculum. Powers next/prev. */
 export function readingOrder(): { lessonId: string; moduleId: string; trackId: string }[] {
   const g = graph();
@@ -177,16 +226,50 @@ export function siblings(lessonId: string) {
   return { prev: i > 0 ? order[i - 1] : null, next: i >= 0 && i < order.length - 1 ? order[i + 1] : null };
 }
 
-export function crumbsFor(opts: { trackId?: string; moduleId?: string; lessonId?: string }): Crumb[] {
+/**
+ * The breadcrumb IS the URL, segment for segment. Every entity type is reachable here, so no page
+ * has to append a leaf whose href is not a child of the ladder above it — which is what the
+ * concept and practice screens used to do.
+ *
+ * Pass the deepest thing you have; the parents are derived. A concept or practice id resolves its
+ * own ancestry, so callers never assemble a chain by hand.
+ */
+export function crumbsFor(opts: {
+  trackId?: string; moduleId?: string; lessonId?: string;
+  conceptId?: string; practiceId?: string;
+}): Crumb[] {
   const g = graph();
+
+  // Derive the ancestry of a leaf that knows its own parents.
+  let { trackId, moduleId, lessonId } = opts;
+  if (opts.conceptId) {
+    const cid = resolveConceptId(opts.conceptId);
+    const under = cid ? g.conceptLesson.get(cid) : undefined;
+    const found = under ? g.lessonById.get(under) : undefined;
+    if (found) { trackId = found.trackId; moduleId = found.moduleId; lessonId = found.lesson.id; }
+  } else if (opts.practiceId) {
+    const p = g.practiceById.get(opts.practiceId);
+    const mod = p ? g.moduleById.get(p.moduleId) : undefined;
+    if (mod) { trackId = mod.trackId; moduleId = mod.id; }
+  }
+
   const out: Crumb[] = [{ href: '/', label: 'Curriculum' }];
-  const t = opts.trackId ? g.trackById.get(opts.trackId) : undefined;
+  const t = trackId ? g.trackById.get(trackId) : undefined;
   if (t) out.push({ href: `/t/${t.id}`, label: t.title });
-  const m = opts.moduleId ? g.moduleById.get(opts.moduleId) : undefined;
+  const m = moduleId ? g.moduleById.get(moduleId) : undefined;
   if (m && t) out.push({ href: `/t/${t.id}/${m.id}`, label: m.title });
-  if (opts.lessonId) {
-    const l = g.lessonById.get(opts.lessonId);
-    if (l && m && t) out.push({ href: `/t/${t.id}/${m.id}/${l.lesson.id}`, label: l.lesson.title });
+  const l = lessonId ? g.lessonById.get(lessonId) : undefined;
+  if (l && m && t) out.push({ href: `/t/${t.id}/${m.id}/${l.lesson.id}`, label: l.lesson.title });
+
+  if (opts.conceptId) {
+    const cid = resolveConceptId(opts.conceptId);
+    const c = cid ? g.conceptById.get(cid) : undefined;
+    const href = cid ? hrefForConcept(cid) : null;
+    if (c && href) out.push({ href, label: c.title });
+  } else if (opts.practiceId) {
+    const p = g.practiceById.get(opts.practiceId);
+    const href = hrefForPractice(opts.practiceId);
+    if (p && href) out.push({ href, label: p.title });
   }
   return out;
 }
@@ -194,12 +277,8 @@ export function crumbsFor(opts: { trackId?: string; moduleId?: string; lessonId?
 export function stats() {
   const g = graph();
   let lessons = 0;
-  let written = 0;
-  for (const m of g.moduleById.values()) {
-    for (const l of m.lessons ?? []) { lessons++; if (l.status !== 'outlined') written++; }
-  }
+  for (const m of g.moduleById.values()) lessons += (m.lessons ?? []).length;
   return {
-    lessonsWritten: written,
     tracks: g.tracks.length,
     modules: g.moduleById.size,
     lessons,

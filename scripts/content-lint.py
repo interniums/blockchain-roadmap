@@ -245,6 +245,24 @@ for t in sorted(tracks.values(), key=lambda x: x.get('number', 0)):
             _lesson_module[L.get('id')] = m.get('id')
             _i += 1
 
+#   R12 softAssumes carries only genuinely-forward edges. A backward prerequisite filed there
+#       would silently opt out of the gate, which is the one way this schema can be abused.
+for mid, m in modules.items():
+    for L in (m.get('lessons') or []):
+        lid = L.get('id')
+        soft = L.get('softAssumes') or []
+        both = set(soft) & set(L.get('assumes') or [])
+        if both: err('R12-SOFT-AND-HARD', f'{lid}: {sorted(both)} in both assumes and softAssumes')
+        for c in soft:
+            if c not in concepts:
+                err('BROKEN-LESSON-SOFT-ASSUMES', f'{lid}: {c!r}'); continue
+            src = _teachers.get(c)
+            if not src or lid not in _pos: continue
+            if src[0] in _pos and _pos[src[0]] < _pos[lid]:
+                err('R12-SOFT-IS-BACKWARD',
+                    f'{lid} softAssumes {c!r}, but it is taught EARLIER in {src[0]} — '
+                    f'that is a real prerequisite and belongs in assumes')
+
 _module_edges = collections.defaultdict(set)
 for mid, m in modules.items():
     for L in (m.get('lessons') or []):
@@ -256,13 +274,9 @@ for mid, m in modules.items():
             src_lid = src[0]
             if src_lid not in _pos: continue
             if _pos[src_lid] > _pos[lid]:
-                # WARN, not ERR, until the gate ships: these 4 are a pre-existing content
-                # condition, not a regression, and each needs an authoring decision (drop the
-                # edge, or move the lesson) rather than a mechanical fix. Promote to err() in the
-                # same commit as gating, or the gate will lock these 4 lessons behind content
-                # up to 154 lessons downstream of them.
-                warn('R10-ASSUMES-POINTS-FORWARD',
-                     f'{lid} assumes {c!r}, taught {_pos[src_lid] - _pos[lid]} lessons later in {src_lid}')
+                err('R10-ASSUMES-POINTS-FORWARD',
+                    f'{lid} assumes {c!r}, taught {_pos[src_lid] - _pos[lid]} lessons later in '
+                    f'{src_lid} — move it to softAssumes, or move the lesson')
             src_mid = _lesson_module[src_lid]
             if src_mid != mid: _module_edges[mid].add(src_mid)
 

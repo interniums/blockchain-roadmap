@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
+import { hrefForPractice } from '@/lib/content/load';
 import { Breadcrumb } from '@/components/nav/Breadcrumb';
 import { can, MODE, WEB_NOTICE } from '@/lib/capabilities';
 import { TIMEOUT_MS } from '@/lib/runner/run';
@@ -249,7 +250,7 @@ export default async function SetupPage() {
                       <ul className="mt-1 flex flex-col gap-0.5">
                         {blocked.all.slice(0, 6).map((b) => (
                           <li key={b.id} className="text-[13px]">
-                            <Link href={`/p/${b.id}`} className="text-[var(--color-accent)] hover:underline">
+                            <Link href={hrefForPractice(b.id) ?? '/'} className="text-[var(--color-accent)] hover:underline">
                               {b.title}
                             </Link>{' '}
                             <span className="text-[12px] text-[var(--color-ink-3)]">
