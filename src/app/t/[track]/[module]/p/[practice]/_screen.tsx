@@ -1,8 +1,7 @@
-import type { Metadata } from 'next';
 import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import {
-  graph, getPractice, getPracticesOf, getModule, getTrack, getConcept, crumbsFor,
+  getPractice, getPracticesOf, getModule, getTrack, getConcept, crumbsFor,
   hrefForConcept, hrefForPractice,
 } from '@/lib/content/load';
 import { can, WEB_NOTICE } from '@/lib/capabilities';

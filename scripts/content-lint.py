@@ -164,7 +164,12 @@ for pid, p in practices.items():
     for i, h in enumerate(p.get('hints') or []):
         if not isinstance(h, str):
             err('HINT-NOT-STRING', f'{pid}: hints[{i}] parsed as {type(h).__name__} — quote the string')
-    for f in ('spec', 'title'):
+    # Same trap, and it was only being checked on hints. A criterion is prose with colons in it far
+    # more often than a hint is, so this is where it actually bit.
+    for i, c in enumerate((p.get('acceptance') or {}).get('criteria') or []):
+        if not isinstance(c, str):
+            err('CRITERION-NOT-STRING', f'{pid}: criteria[{i}] parsed as {type(c).__name__} — quote the string')
+    for f in ('spec', 'title', 'writeUp'):
         if p.get(f) is not None and not isinstance(p[f], str):
             err('FIELD-NOT-STRING', f'{pid}: {f} parsed as {type(p[f]).__name__}')
     m = p.get('moduleId')
@@ -295,9 +300,13 @@ for tid, ids in _exits.items():
             err('R17-EXIT-HINTS', f'{pid}: {len(p.get("hints") or [])} hints, expected 3')
 
 # A module with lessons but no capstone is a real gap, reported rather than tolerated silently.
+# Two exemptions: a stub is deliberately shallow, and the module that hosts its track's exit project
+# is already closed out by something strictly larger than a capstone.
+_hosts_exit = {p['moduleId'] for p in practices.values() if p.get('grain') == 'exit'}
 for mid, m in modules.items():
     if m.get('status') == 'stub': continue
     if not (m.get('lessons') or []): continue
+    if mid in _hosts_exit: continue
     if not _capstones.get(mid):
         warn('LADDER-NO-CAPSTONE', f'{mid}: no module-grain practice — the capstone is unauthored')
 

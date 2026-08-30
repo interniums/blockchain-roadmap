@@ -27,9 +27,14 @@ for (const t of allTracks()) {
     const ps = getPracticesOf(m.id);
     if (ps.length === 0) { missing.push(m.id); continue; }
 
+    // An exit project is hand-authored at track grain and lives in its track's last module. It must
+    // never be re-graded as that module's capstone, or re-running this clobbers all six.
+    const gradable = ps.filter((p) => p.grain !== 'exit');
+    if (gradable.length === 0) continue;
+
     const teaches = new Set(m.teaches ?? []);
     const score = (p: typeof ps[number]) => (p.concepts ?? []).filter((c) => teaches.has(c)).length;
-    const ranked = [...ps].sort((a, b) =>
+    const ranked = [...gradable].sort((a, b) =>
       (b.difficulty ?? 0) - (a.difficulty ?? 0)
       || score(b) - score(a)
       || a.id.localeCompare(b.id));
@@ -40,20 +45,27 @@ for (const t of allTracks()) {
     const capstone = (top.difficulty ?? 0) >= 4 ? top : null;
     if (!capstone) needCapstone++;
 
-    for (const p of ps) {
+    for (const p of gradable) {
       const file = path.join(DIR, `${p.id}.yaml`);
       if (!fs.existsSync(file)) { console.log(`  MISSING FILE ${p.id}`); continue; }
-      const isCapstone = capstone?.id === p.id;
+      const isCapstone = capstone?.id === p.id || p.grain === 'module';
       const grain = isCapstone ? 'module' : 'block';
       if (isCapstone) promoted++; else blocks++;
 
       let src = fs.readFileSync(file, 'utf8');
-      if (new RegExp(`^grain: ${grain}$`, 'm').test(src)) continue;
+      const alreadyGrained = new RegExp(`^grain: ${grain}$`, 'm').test(src);
+      const needsFill = isCapstone
+        && (!/^coversConcepts:/m.test(src) || (Boolean(m.reflectionPrompt) && !/^writeUp:/m.test(src)));
+      if (alreadyGrained && !needsFill) continue;
 
       src = src.replace(/^grain: .*\n/m, '');
       // After `moduleId:`, so the file reads id / module / grain — narrowest to widest.
       src = src.replace(/^(moduleId: .*\n)/m, `$1grain: ${grain}\n`);
 
+      // A hand-authored capstone already declares `grain: module`, so it lands here on the same
+      // path as a promoted one and gets coversConcepts and writeUp filled the same way. That is
+      // deliberate: those two fields are mechanical — the module's teaches set verbatim, and its
+      // existing reflectionPrompt — and duplicating them by hand is how they drift.
       if (isCapstone) {
         src = src.replace(/^coversConcepts:.*(\n( +.*|)\n?)*/m, '');
         const covers = [...teaches];
