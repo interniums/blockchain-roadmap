@@ -167,6 +167,7 @@ if (foreign.length) {
     const state = r.missing.length === 0 ? 'ok  ' : 'MISS';
     console.log(`  ${state} ${r.needs.join(' + ').padEnd(24)} ${r.id}`);
   }
-  console.log('\n  A manifest present is not the same as a toolchain installed. `nargo` and');
-  console.log('  `cargo-stylus` are not on this machine, so those two commands are authored but unrun.');
+  console.log('\n  A manifest present is not the same as a toolchain installed. Every one of these has');
+  console.log('  been run except `cargo stylus check`: cargo-stylus is a separate subcommand and is not');
+  console.log('  installed, so that half of the Stylus command is authored but unrun.');
 }

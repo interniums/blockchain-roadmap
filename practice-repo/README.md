@@ -123,7 +123,7 @@ Anchor, Noir or Python, and each wants its own toolchain present before its comm
 | 5 | `cargo test-sbf -p … --test …` | `solana` + `cargo-build-sbf` | yes |
 | 3 | `anchor test` / `anchor build` | `anchor` CLI | yes |
 | 4 | `pytest` / `uv run python` | Python 3.9+, pytest (or `uv`) | yes, with pytest |
-| 1 | `nargo test --show-output` | `nargo` (Noir) | **no — see below** |
+| 1 | `nargo test --show-output` | `nargo` (Noir) | yes, nargo 1.0.0-beta.26 |
 | 1 | `make devnet-up` | the Optimism monorepo | n/a, see the Makefile |
 
 ```sh
@@ -138,13 +138,12 @@ curl -L https://raw.githubusercontent.com/noir-lang/noirup/main/install | bash &
 uv sync                       # or: python3 -m venv .venv && .venv/bin/pip install pytest
 ```
 
-One honest gap: **the Noir circuit is unverified.** `nargo` is not installed on the machine that
-generated it, so `circuits/hint-forgery` was written against the language rather than against a
-compiler that accepted it. Everything else in the table above was run. If `nargo test` rejects the
-file, that is the reason, and it is a one-line fix rather than a design problem.
+One gap remains: `cargo stylus check`. `cargo-stylus` is a separate cargo subcommand and is not
+installed, so that half of the Stylus practice's command is authored but unrun. The Rust package it
+checks does compile and test, and the Solidity half of the same command runs.
 
-`cargo stylus check` is in the same position for a different reason — `cargo-stylus` is a separate
-cargo subcommand and is not installed — though the Rust package it checks does compile and test.
+Everything else in the table was executed. For Noir that means `nargo compile`, `nargo check` and
+`nargo test` on 1.0.0-beta.26: no warnings, and the four criteria fail by name.
 
 ### Where the Rust lives
 

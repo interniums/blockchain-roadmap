@@ -20,12 +20,25 @@
 //   the gate count of each version so you can see what the missing check actually cost. Pin both
 //   the compiler and the backend versions in the README.
 
-// The circuit itself. `main` is what gets proved; the tests below are what tells you whether
-// it constrains anything. An unconstrained hint is exactly the bug this practice is about, so
-// resist writing `unsafe` blocks until a test forces the question.
-fn main(_x: Field, _y: pub Field) {
+// The circuit itself. `main` is what gets proved; the tests below are what tell you whether it
+// constrains anything.
+//
+// The signature is the one the spec dictates and nothing more: a public input, and a hint the
+// prover computes outside the circuit. Parameter names are not underscore-prefixed because
+// `nargo check` writes them into Prover.toml, and `_x = 0` is a worse thing to hand someone
+// than `x = 0`.
+fn main(x: pub Field) {
+    // TODO: take the hint, then decide what has to be true of it. That decision is the
+    // practice: the unsound version constrains nothing about the hint, and still verifies.
+    let _ = x;
     assert(false, "TODO: main is unimplemented");
 }
+
+// Next: an `unconstrained fn` returning the hint. It is not stubbed here on purpose — an
+// uncalled one warns, and calling it means writing the unsound circuit, which is the exercise.
+// `unconstrained` means the prover computes it outside the circuit, so nothing it returns is
+// proved by itself. Reaching it from `main` needs an `unsafe` block, and that block is the
+// thing to be suspicious of: it is where a false statement gets in.
 
 // A test against the unsound circuit passes with a hint value that is not a square root of the
 // public input
