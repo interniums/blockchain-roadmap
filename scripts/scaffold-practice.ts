@@ -120,6 +120,16 @@ const FOREIGN_TARGETS: Record<string, Need[]> = {
     { kind: 'rust-test', file: 'programs/anchor-idl-audit/tests/idl_seed_audit.rs' },
   ],
 
+  // --- Move, done in Rust, because Rust is the only installed language with an ownership model to
+  //     compare against and the exercise is precisely that comparison. Two test targets in one
+  //     package: the abilities and the verifier are two readings of the same linearity claim.
+  'altvm-move-linear-by-construction': [
+    { kind: 'rust-test', file: 'rust/move-linearity/tests/abilities.rs' },
+  ],
+  'altvm-move-verify-the-bytecode': [
+    { kind: 'rust-test', file: 'rust/move-linearity/tests/verifier.rs' },
+  ],
+
   // --- host-only Rust.
   'zk-proof-systems-forge-a-fiat-shamir-proof': [
     { kind: 'rust-test', file: 'rust/fiat-shamir/tests/fiat_shamir.rs' },
