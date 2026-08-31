@@ -18,7 +18,15 @@ forge build                                                 # must succeed
 forge test                                                  # must fail - that is the starting state
 ```
 
-`forge-std` is vendored under `lib/`, so there is no install step — a fresh clone builds as it
+The TypeScript and browser exercises need their own install:
+
+```sh
+pnpm install                                                # vitest, playwright, tsx, typescript
+pnpm vitest run                                             # must fail - same starting state
+pnpm playwright install chromium                            # only for the five tests/*.spec.ts
+```
+
+`forge-std` is vendored under `lib/`, so the Solidity half has no install step — a fresh clone builds as it
 stands. Everything else the exercises need is in the standard library or already here.
 
 `foundry.toml` is deliberately plain: solc 0.8.36, optimizer off, one remapping. The exercises are
@@ -48,7 +56,8 @@ Manual is not a downgrade. It is the app being explicit about which of its claim
 
 ## What is in here
 
-Three Track 01 modules are scaffolded below. Three more — `fundamentals-distributed`,
+All 220 acceptance commands that name a path in this repo now resolve; the section below covers the
+three Track 01 modules that are hand-authored in full. Three more — `fundamentals-distributed`,
 `fundamentals-state` and `fundamentals-incentives` — live alongside them under `src/state/`,
 `src/distributed/`, `src/incentives/` and `docs/`; see `docs/README.md` for that half.
 
@@ -103,18 +112,49 @@ half of these two practices, and the half that is easy to skip.
 
 ---
 
-## The TypeScript exercises need one thing this repo does not ship
+## Two kinds of file in here, and how to tell them apart
 
-`test/rlp.test.ts` is a vitest suite, and this repo has no `package.json` — it is a Foundry project
-that also carries a handful of TypeScript exercises. Before running any of them:
+Every exercise file falls into one of two classes, and the difference matters when you open one.
 
-```sh
-npm init -y && npm pkg set type=module
-npm install -D vitest typescript
-npx vitest run test/rlp.test.ts
+**Hand-authored** — nine files. A real specification: it invents the API the exercise needs and
+asserts actual behaviour against it. `test/state/node-types.test.ts` is the reference: it names
+`classifyNode`, `BRANCH_ITEM_COUNT` and `readPathNode`, and its assertions are about tries rather
+than about the criteria. Paired with a `src/` stub whose TODOs tell you what to write.
+
+**Generated** — 227 files, each carrying the line `CHAINPATH-GENERATED-SCAFFOLD` near the top. One
+failing case per acceptance criterion, with the criterion as the failure message. That is a
+checklist, not a specification, and the header of each file says so.
+
+The generated ones exist because of what the alternative was. Before them, every acceptance command
+outside Track 01 named a path that did not exist, so the app reported
+
+```
+could-not-run: no JUnit output (exit 0); the test path may not exist
 ```
 
-The Solidity exercises do not care whether you do it.
+which is indistinguishable from a broken app. Now the same command fails with your six criteria
+listed by name, and each row goes green as you meet it. Replacing a `fail(...)` with a real
+assertion is the first move in every one of these.
+
+Regenerate from the content with:
+
+```sh
+npm run scaffold:practice --dry     # from the Chainpath root, not here
+npm run audit:scaffold              # does every command have something to run?
+```
+
+A hand-authored file is never overwritten — the marker is the only thing that authorises a rewrite,
+and the generator lists everything it left alone.
+
+Not generated, on purpose:
+
+- **Your write-ups.** 42 commands check a file you write (`docs/*.md`, `answers/*.md`). A template
+  with the right headings would pass `grep -qF "## Findings"` while saying nothing.
+- **`src/` stubs for generated tests.** A fabricated API would be a lie about the shape of the
+  answer. The generated tests import nothing.
+- **Foreign toolchains.** 18 practices are `cargo`, `anchor`, `nargo` or `pytest` and need a whole
+  Cargo workspace, Anchor program or Nargo package rather than a file. Those still fail at the
+  toolchain, and the audit script lists them.
 
 ---
 
@@ -124,13 +164,19 @@ The Solidity exercises do not care whether you do it.
 foundry.toml            solc 0.8.36, optimizer off, forge-std only
 src/crypto/             contracts for the fundamentals-crypto practices
 src/encoding/           contracts and the RLP codec for fundamentals-encoding
+package.json            vitest, playwright, tsx, typescript
+vitest.config.ts        two test roots: test/ and tests/; .spec.ts left to playwright
+playwright.config.ts    the five browser exercises, two named projects
 test/*.t.sol            one suite per practice, named to match its acceptance command
-test/rlp.test.ts        the RLP specification
+test/**/*.test.ts       vitest suites
+tests/*.spec.ts         playwright suites - .spec.ts is playwright's by convention here
 test/crypto/            shared fixtures - mock token, tree builder
-scripts/*.mjs           entry points named to match the acceptance commands
+script/*.s.sol          forge script targets
+scripts/                entry points named to match the acceptance commands
 scripts/networks/       the measurements themselves, plus their shared plumbing
+drills/                 one red-team drill and its report
 results/                measurement output (gitignored)
-docs/                   written-exercise prompts for the other Track 01 modules
+docs/                   written-exercise prompts, and where your write-ups go
 ```
 
 Test files sit directly in `test/` because `forge --match-path` matches the literal path in each
@@ -142,6 +188,8 @@ practice's acceptance command, and those paths are flat.
 
 The starting state is failures, so the useful question is which kind.
 
+- An acceptance criterion, word for word — a generated placeholder you have not replaced yet. It is
+  telling you the requirement, not diagnosing your code.
 - `TODO: <function> is unimplemented` — a stub you have not written yet. The message names the file.
 - `Error != expected error` — the contract reverted, but for a different reason than the
   specification asks for. Usually a missing check, not a wrong one.

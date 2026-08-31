@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.36;
+
+import {Test, console2} from "forge-std/Test.sol";
+
+/*
+ * CHAINPATH-GENERATED-SCAFFOLD
+ *
+ * Practice: fundamentals-exit-verify-without-trust  (implement, grain exit, difficulty 5)
+ * Run:      forge test --match-path test/exit/Attest.t.sol
+ *
+ * THIS IS A CHECKLIST, NOT A SPECIFICATION. It was generated so that the command above
+ * resolves and fails honestly, with one named case per acceptance criterion, instead of
+ * reporting "the test path may not exist" — which is a broken harness, not a red test.
+ *
+ * Replace each placeholder with a real assertion as you go. A criterion you have actually
+ * tested should no longer contain a fail() call. Delete this notice when none remain.
+ *
+ * What the practice asks for:
+ *   Build one command-line tool, `attest`, that takes an address, a slot and a block number and
+ *   prints a balance, a storage value and a confirmation verdict — where every line of that
+ *   output is something you verified rather than something an RPC asserted. It has four parts,
+ *   and they are the six modules of this track in one artefact. ONE. Fetch `eth_getProof` for
+ *   the address and slot at that block, and verify the account proof against the block's
+ *   `stateRoot` and the storage proof against the account's `storageRoot`, walking the trie
+ *   yourself. Not a library that says "valid" — your code has to hash the nodes, follow the
+ *   nibbles, and reach the root. It must also verify an ABSENCE: prove that an address you pick
+ *   has no account, and say which node type ends that walk. TWO. Get the block header by RPC,
+ *   re-hash it yourself, and confirm it matches the block hash you asked for. If it does not,
+ *   you have caught the node lying and the tool must say so and stop. THREE. Take one
+ *   transaction from that block and decode it from raw bytes with no ABI decoder: envelope type,
+ *   then selector, then arguments. Re-encode the arguments and assert you get the same bytes
+ *   back. A round trip that does not reproduce the input is a failure, not a rounding error.
+ *   FOUR. Print a confirmation verdict for a stated value at risk, which the caller passes in.
+ *   Not "12 blocks" — a depth, plus the ETH an attacker would have to destroy to reverse it,
+ *   plus the sentence that says whether that is more or less than the value at risk. If the
+ *   attack is cheaper than the prize, the tool says the value is not safe at any depth it can
+ *   offer.
+ */
+contract AttestTest is Test {
+    function setUp() public {
+        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+    }
+
+    /// A valid eth_getProof response verifies against the block's stateRoot with the trie walk
+    /// implemented in your own code, not delegated to a library
+    function test_criterion01_aValidEthGetproofResponseVerifiesAgainstTheBlock() public {
+        fail("A valid eth_getProof response verifies against the block's stateRoot with the trie walk implemented in your own code, not delegated to a library");
+    }
+
+    /// Mutating any single byte of the proof, the account value or the root causes verification to
+    /// fail rather than to pass or to throw an unhandled error
+    function test_criterion02_mutatingAnySingleByteOfTheProofTheAccount() public {
+        fail("Mutating any single byte of the proof, the account value or the root causes verification to fail rather than to pass or to throw an unhandled error");
+    }
+
+    /// A non-existent address produces a proof of absence that verifies, and the tool names the
+    /// node type that terminates the walk
+    function test_criterion03_aNonExistentAddressProducesAProofOfAbsence() public {
+        fail("A non-existent address produces a proof of absence that verifies, and the tool names the node type that terminates the walk");
+    }
+
+    /// The block header re-hashes to the requested block hash, and a deliberately corrupted header
+    /// is reported as the node lying rather than as a bug in the tool
+    function test_criterion04_theBlockHeaderReHashesToTheRequestedBlock() public {
+        fail("The block header re-hashes to the requested block hash, and a deliberately corrupted header is reported as the node lying rather than as a bug in the tool");
+    }
+
+    /// One real transaction round-trips: raw bytes to envelope type, selector and typed arguments,
+    /// and back to byte-identical calldata
+    function test_criterion05_oneRealTransactionRoundTripsRawBytesToEnvelope() public {
+        fail("One real transaction round-trips: raw bytes to envelope type, selector and typed arguments, and back to byte-identical calldata");
+    }
+
+    /// The confirmation verdict states a depth AND the ETH destroyed to reverse it AND whether that
+    /// exceeds the value at risk the caller passed
+    function test_criterion06_theConfirmationVerdictStatesADepthAndTheEth() public {
+        fail("The confirmation verdict states a depth AND the ETH destroyed to reverse it AND whether that exceeds the value at risk the caller passed");
+    }
+
+    /// For a value at risk above the cost of reversal, the tool refuses to certify any depth and
+    /// says why
+    function test_criterion07_forAValueAtRiskAboveTheCostOf() public {
+        fail("For a value at risk above the cost of reversal, the tool refuses to certify any depth and says why");
+    }
+
+    /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.
+    function _note(string memory what) internal pure {
+        console2.log(what);
+    }
+}
