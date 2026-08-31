@@ -59,7 +59,109 @@ type Need =
   | { kind: 'sol-script'; file: string }
   | { kind: 'ts-test'; file: string }
   | { kind: 'harness'; file: string }
+  | { kind: 'rust-test'; file: string }
+  | { kind: 'rust-bin'; file: string }
+  | { kind: 'noir-test'; file: string }
+  | { kind: 'py-test'; file: string }
+  | { kind: 'py-script'; file: string }
   | { kind: 'foreign'; tool: string };
+
+/**
+ * The foreign-toolchain practices, mapped by hand — and it has to be by hand.
+ *
+ * Everywhere else the target file is read out of the command, because the command names it:
+ * `--match-path test/X.t.sol` says where the file goes. These commands do not — `anchor test` and
+ * `nargo test --show-output` name no path at all, they build whatever the workspace holds — so the
+ * mapping is a judgement recorded here rather than guessed by a regex.
+ *
+ * The five `cargo test-sbf` practices used to share the single string `cargo test-sbf -- --nocapture`.
+ * That string cannot identify a practice: cargo picked the alphabetically first workspace member and
+ * fail-fast stopped there, so four of the five ran somebody else's tests and never reached their own.
+ * Their commands now carry `-p <package> --test <target>`, which is the same move `--match-path` is
+ * for forge. The package and target names below are the other half of that pair — change one and you
+ * must change the other.
+ *
+ * The layout the three roots imply:
+ *   programs/*   Anchor programs. Anchor discovers them by scanning this directory.
+ *   sbf/*        raw solana-program exercises, built by `cargo test-sbf`.
+ *   rust/*       host-only Rust, no Solana runtime.
+ *   circuits/*   Noir packages, members of the Nargo workspace.
+ */
+const FOREIGN_TARGETS: Record<string, Need[]> = {
+  // --- cargo test-sbf. One package per subject; the three Sealevel exploits share a package
+  //     because they are three readings of the same program, which is the point of that practice.
+  'altvm-pinocchio-same-program-twice': [
+    { kind: 'rust-test', file: 'sbf/pinocchio-twice/tests/same_program_twice.rs' },
+  ],
+  'altvm-token-2022-break-the-naive-vault': [
+    { kind: 'rust-test', file: 'sbf/token-2022-vault/tests/break_the_naive_vault.rs' },
+  ],
+  'altvm-solana-security-collide-two-pdas': [
+    { kind: 'rust-test', file: 'sbf/sealevel-attacks/tests/collide_two_pdas.rs' },
+  ],
+  'altvm-solana-security-revive-a-closed-account': [
+    { kind: 'rust-test', file: 'sbf/sealevel-attacks/tests/revive_a_closed_account.rs' },
+  ],
+  'altvm-solana-security-three-exploits-from-sealevel-attacks': [
+    { kind: 'rust-test', file: 'sbf/sealevel-attacks/tests/three_exploits.rs' },
+  ],
+
+  // --- anchor test, which in Anchor 1.x runs `cargo test` after building. Two practices share the
+  //     bare command; they get separate programs so each one's tests can be run alone with -p.
+  'altvm-anchor-delete-the-has-one': [
+    { kind: 'rust-test', file: 'programs/anchor-has-one/tests/delete_the_has_one.rs' },
+  ],
+  'altvm-anchor-pda-config-and-authority': [
+    { kind: 'rust-test', file: 'programs/anchor-pda-config/tests/pda_config_and_authority.rs' },
+  ],
+  // The IDL audit runs `anchor build` then a node script; the script itself is already generated
+  // from the command, so only the program it builds is needed here.
+  'altvm-anchor-idl-seed-audit': [
+    { kind: 'rust-test', file: 'programs/anchor-idl-audit/tests/idl_seed_audit.rs' },
+  ],
+
+  // --- host-only Rust.
+  'zk-proof-systems-forge-a-fiat-shamir-proof': [
+    { kind: 'rust-test', file: 'rust/fiat-shamir/tests/fiat_shamir.rs' },
+  ],
+  'zk-zkvms-bench-two-provers': [
+    { kind: 'rust-bin', file: 'rust/zkvm-bench/src/main.rs' },
+    { kind: 'py-script', file: 'scripts/check_results.py' },
+  ],
+  'protocol-contributing-first-issue': [
+    { kind: 'rust-test', file: 'rust/first-issue/tests/first_issue.rs' },
+  ],
+  // cargo stylus is a Rust contract compiled to WASM; the Solidity half of its command already has
+  // its scaffold from `--match-path`.
+  'scaling-stylus-compute-versus-storage': [
+    { kind: 'rust-test', file: 'rust/stylus-gas/tests/compute_versus_storage.rs' },
+  ],
+
+  // --- Noir.
+  'zk-noir-circuits-unconstrained-hint-forgery': [
+    { kind: 'noir-test', file: 'circuits/hint-forgery/src/main.nr' },
+  ],
+
+  // --- Python. Paths come from the commands, which do name them, but the toolchain does not fit
+  //     any of the emitters above.
+  'defi-oracles-twap-attack-cost': [
+    { kind: 'py-test', file: 'tests/test_twap_attack_cost.py' },
+  ],
+  'protocol-consensus-specs-mutate-and-see-what-fails': [
+    { kind: 'py-test', file: 'tests/core/pyspec/test_mutate_and_see_what_fails.py' },
+  ],
+  'protocol-consensus-specs-run-the-spec': [
+    { kind: 'py-script', file: 'solutions/advance_state.py' },
+  ],
+  'protocol-contributing-write-a-spec-test': [
+    { kind: 'py-test', file: 'tests/test_spec_case.py' },
+  ],
+
+  // scaling-op-stack-derive-it-yourself is deliberately absent. `make devnet-up` brings up the
+  // Optimism devnet from the upstream monorepo; there is no file that stands in for cloning it,
+  // and a Makefile target that pretended otherwise would be worse than the honest error. The
+  // Makefile written for it says what to clone instead.
+};
 
 /**
  * Clean a path token as the shell would hand it to the binary.
@@ -229,7 +331,7 @@ function header(p: Practice, cmd: string, comment: '//' | ' *'): string[] {
     `${lead} reporting "the test path may not exist" — which is a broken harness, not a red test.`,
     `${lead}`,
     `${lead} Replace each placeholder with a real assertion as you go. A criterion you have actually`,
-    `${lead} tested should no longer contain a fail() call. Delete this notice when none remain.`,
+    `${lead} tested no longer needs its placeholder. Delete this notice when none remain.`,
     `${lead}`,
     `${lead} What the practice asks for:`,
   ];
@@ -335,6 +437,157 @@ function tsTest(p: Practice, cmd: string): string {
     imports,
     '',
     open + cases.join('\n\n') + (isNodeTest ? '\n' : '\n') + close,
+  ].join('\n');
+}
+
+/** Rust identifiers: snake_case, and unique by the criterion index. */
+function rustCaseName(criterion: string, index: number): string {
+  const words = criterion.toLowerCase().replace(/`[^`]*`/g, ' ').replace(/[^a-z0-9]+/g, ' ')
+    .trim().split(' ').filter(Boolean).slice(0, 7).join('_');
+  return `criterion_${String(index + 1).padStart(2, '0')}_${words || 'unnamed'}`;
+}
+
+function rustString(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\s+/g, ' ').trim();
+}
+
+function rustTest(p: Practice, cmd: string): string {
+  const criteria = p.acceptance?.criteria ?? [];
+  const cases = criteria.map((c, i) => [
+    ...wrap(c, 92).map((l) => `/// ${l}`),
+    '#[test]',
+    `fn ${rustCaseName(c, i)}() {`,
+    `    panic!("${rustString(c)}");`,
+    '}',
+  ].join('\n'));
+  return [
+    '//! ' + MARKER,
+    '//!',
+    ...header(p, cmd, '//').slice(1).map((l) => l.replace(/^\/\//, '//!')),
+    '',
+    cases.join('\n\n'),
+    '',
+  ].join('\n');
+}
+
+/** A `cargo run --bin` target. It must exit non-zero, or the exercise reports success for nothing. */
+function rustBin(p: Practice, cmd: string): string {
+  const criteria = p.acceptance?.criteria ?? [];
+  return [
+    '//! ' + MARKER,
+    '//!',
+    ...header(p, cmd, '//').slice(1).map((l) => l.replace(/^\/\//, '//!')),
+    '//!',
+    '//! What this has to end up doing:',
+    ...criteria.flatMap((c, i) => wrap(`${i + 1}. ${c}`, 92).map((l) => `//!   ${l}`)),
+    '',
+    'fn main() {',
+    '    let args: Vec<String> = std::env::args().skip(1).collect();',
+    '    let _ = &args;',
+    `    eprintln!("TODO: this binary is unimplemented (practice ${p.id})");`,
+    '    std::process::exit(1);',
+    '}',
+    '',
+  ].join('\n');
+}
+
+/**
+ * A Noir circuit's tests.
+ *
+ * ASCII-folded, unlike every other emitter: Noir string literals are `str<N>` over ASCII bytes and
+ * the criteria carry em dashes. The full criterion is still above each test as a comment.
+ */
+function noirTest(p: Practice, cmd: string): string {
+  const criteria = p.acceptance?.criteria ?? [];
+  const fold = (x: string) => x
+    .replace(/[\u2014\u2013]/g, '-').replace(/[\u2018\u2019]/g, "'").replace(/[\u201c\u201d]/g, '"')
+    .replace(/\u00b7/g, '.').replace(/[^\x20-\x7E]/g, '?')
+    .replace(/"/g, "'").replace(/\s+/g, ' ').trim();
+  const cases = criteria.map((c, i) => [
+    ...wrap(c, 92).map((l) => `// ${l}`),
+    '#[test]',
+    `fn ${rustCaseName(c, i)}() {`,
+    `    assert(false, "${fold(c)}");`,
+    '}',
+  ].join('\n'));
+  return [
+    '// ' + MARKER,
+    ...header(p, cmd, '//').slice(1),
+    '',
+    '// The circuit itself. `main` is what gets proved; the tests below are what tells you whether',
+    '// it constrains anything. An unconstrained hint is exactly the bug this practice is about, so',
+    '// resist writing `unsafe` blocks until a test forces the question.',
+    'fn main(_x: Field, _y: pub Field) {',
+    '    assert(false, "TODO: main is unimplemented");',
+    '}',
+    '',
+    cases.join('\n\n'),
+    '',
+  ].join('\n');
+}
+
+/** Python identifiers, and pytest collects on the `test_` prefix. */
+function pyCaseName(criterion: string, index: number): string {
+  const words = criterion.toLowerCase().replace(/`[^`]*`/g, ' ').replace(/[^a-z0-9]+/g, ' ')
+    .trim().split(' ').filter(Boolean).slice(0, 7).join('_');
+  return `test_criterion_${String(index + 1).padStart(2, '0')}_${words || 'unnamed'}`;
+}
+
+function pyString(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\s+/g, ' ').trim();
+}
+
+function pyTest(p: Practice, cmd: string): string {
+  const criteria = p.acceptance?.criteria ?? [];
+  // `-k your_case_name` selects by substring, so the name it names has to exist.
+  const selector = /-k\s+(\w+)/.exec(cmd)?.[1];
+  const cases = criteria.map((c, i) => {
+    const name = pyCaseName(c, i);
+    const named = selector && i === 0 ? `${name}_${selector}` : name;
+    return [
+      ...wrap(c, 92).map((l) => `# ${l}`),
+      `def ${named}():`,
+      `    raise AssertionError("${pyString(c)}")`,
+    ].join('\n');
+  });
+  return [
+    '"""',
+    MARKER,
+    ...header(p, cmd, '//').slice(1).map((l) => l.replace(/^\/\/ ?/, '')),
+    ...(selector ? ['', `The command selects with \`-k ${selector}\`, so one case below carries that`,
+                   'substring in its name. Rename it to whatever your case is actually about, and',
+                   'change the command to match.'] : []),
+    '"""',
+    '',
+    cases.join('\n\n\n'),
+    '',
+  ].join('\n');
+}
+
+/** A Python entry point, run for its effects. Exits non-zero while unimplemented. */
+function pyScript(p: Practice, cmd: string): string {
+  const criteria = p.acceptance?.criteria ?? [];
+  return [
+    '"""',
+    MARKER,
+    ...header(p, cmd, '//').slice(1).map((l) => l.replace(/^\/\/ ?/, '')),
+    '',
+    'What this has to end up doing:',
+    ...criteria.flatMap((c, i) => wrap(`${i + 1}. ${c}`, 92)),
+    '"""',
+    '',
+    'import sys',
+    '',
+    '',
+    'def main(argv: list) -> int:',
+    '    del argv',
+    `    print("TODO: this script is unimplemented (practice ${p.id})", file=sys.stderr)`,
+    '    return 1',
+    '',
+    '',
+    'if __name__ == "__main__":',
+    '    sys.exit(main(sys.argv[1:]))',
+    '',
   ].join('\n');
 }
 
@@ -448,7 +701,11 @@ for (const t of allTracks()) {
       const criteria = p.acceptance?.criteria ?? [];
       if (criteria.length === 0) continue;
 
-      for (const need of needsOf(cmd)) {
+      // A foreign-toolchain practice contributes its hand-mapped targets on top of anything the
+      // command itself named (the Stylus one has a Solidity half; the IDL audit has a node script).
+      const needs = [...needsOf(cmd), ...(FOREIGN_TARGETS[p.id] ?? [])];
+
+      for (const need of needs) {
         if (need.kind === 'foreign') {
           const list = foreignBy.get(need.tool) ?? [];
           list.push(p.id);
@@ -459,6 +716,11 @@ for (const t of allTracks()) {
         else if (need.kind === 'sol-script') put(need.file, solScript(p, cmd, need.file), p.id);
         else if (need.kind === 'ts-test') put(need.file, tsTest(p, cmd), p.id);
         else if (need.kind === 'harness') put(need.file, harness(p, cmd, need.file), p.id);
+        else if (need.kind === 'rust-test') put(need.file, rustTest(p, cmd), p.id);
+        else if (need.kind === 'rust-bin') put(need.file, rustBin(p, cmd), p.id);
+        else if (need.kind === 'noir-test') put(need.file, noirTest(p, cmd), p.id);
+        else if (need.kind === 'py-test') put(need.file, pyTest(p, cmd), p.id);
+        else if (need.kind === 'py-script') put(need.file, pyScript(p, cmd), p.id);
       }
     }
   }
@@ -496,10 +758,17 @@ if (shared.length) {
 }
 
 if (foreignBy.size) {
-  const total = [...foreignBy.values()].reduce((a, b) => a + b.length, 0);
-  console.log(`\nNOT SCAFFOLDED — ${total} practices on a foreign toolchain, each needing a whole project:`);
+  const all = [...foreignBy.values()].flat();
+  const mapped = all.filter((id) => FOREIGN_TARGETS[id]);
+  const unmapped = [...new Set(all.filter((id) => !FOREIGN_TARGETS[id]))];
+  console.log(`\nFOREIGN TOOLCHAINS — ${new Set(all).size} practices, of which ${new Set(mapped).size} are scaffolded:`);
   for (const [tool, ids] of [...foreignBy].sort((a, b) => b[1].length - a[1].length)) {
-    console.log(`  ${tool.padEnd(8)} ${String(ids.length).padStart(3)}   ${ids.slice(0, 3).join(', ')}${ids.length > 3 ? ', …' : ''}`);
+    const done = ids.filter((id) => FOREIGN_TARGETS[id]).length;
+    console.log(`  ${tool.padEnd(8)} ${String(ids.length).padStart(3)} practices, ${done} scaffolded`);
+  }
+  if (unmapped.length) {
+    console.log(`\n  NOT SCAFFOLDED, deliberately — ${unmapped.length}:`);
+    for (const id of unmapped) console.log(`    ${id}`);
   }
 }
 

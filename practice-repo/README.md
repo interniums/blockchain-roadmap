@@ -112,6 +112,54 @@ half of these two practices, and the half that is easy to skip.
 
 ---
 
+## Five toolchains, and what each one needs installed
+
+The corpus is not one language. Foundry covers most of it, but 18 practices are Rust, Solana,
+Anchor, Noir or Python, and each wants its own toolchain present before its command does anything.
+
+| Practices | Command shape | Needs | Verified here |
+| --- | --- | --- | --- |
+| 4 | `cargo test` / `cargo run --bin bench` | rustc, cargo | yes |
+| 5 | `cargo test-sbf -p … --test …` | `solana` + `cargo-build-sbf` | yes |
+| 3 | `anchor test` / `anchor build` | `anchor` CLI | yes |
+| 4 | `pytest` / `uv run python` | Python 3.9+, pytest (or `uv`) | yes, with pytest |
+| 1 | `nargo test --show-output` | `nargo` (Noir) | **no — see below** |
+| 1 | `make devnet-up` | the Optimism monorepo | n/a, see the Makefile |
+
+```sh
+# Solana and Anchor
+sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+cargo install --git https://github.com/coral-xyz/anchor avm --force && avm install latest
+
+# Noir
+curl -L https://raw.githubusercontent.com/noir-lang/noirup/main/install | bash && noirup
+
+# Python
+uv sync                       # or: python3 -m venv .venv && .venv/bin/pip install pytest
+```
+
+One honest gap: **the Noir circuit is unverified.** `nargo` is not installed on the machine that
+generated it, so `circuits/hint-forgery` was written against the language rather than against a
+compiler that accepted it. Everything else in the table above was run. If `nargo test` rejects the
+file, that is the reason, and it is a one-line fix rather than a design problem.
+
+`cargo stylus check` is in the same position for a different reason — `cargo-stylus` is a separate
+cargo subcommand and is not installed — though the Rust package it checks does compile and test.
+
+### Where the Rust lives
+
+```
+Cargo.toml         one virtual workspace, three member groups
+  programs/*       Anchor programs. Anchor finds them by scanning this directory.
+  sbf/*            raw solana-program exercises, built for SBF, exercised with litesvm
+  rust/*           host-only Rust. No Solana runtime, so these test in seconds.
+```
+
+`default-members` scopes bare `cargo` commands to `sbf/*` and `rust/*`, so a plain `cargo test` does
+not spend minutes building Anchor programs you were not asking about.
+
+---
+
 ## Two kinds of file in here, and how to tell them apart
 
 Every exercise file falls into one of two classes, and the difference matters when you open one.
@@ -121,7 +169,7 @@ asserts actual behaviour against it. `test/state/node-types.test.ts` is the refe
 `classifyNode`, `BRANCH_ITEM_COUNT` and `readPathNode`, and its assertions are about tries rather
 than about the criteria. Paired with a `src/` stub whose TODOs tell you what to write.
 
-**Generated** — 227 files, each carrying the line `CHAINPATH-GENERATED-SCAFFOLD` near the top. One
+**Generated** — 245 files, each carrying the line `CHAINPATH-GENERATED-SCAFFOLD` near the top. One
 failing case per acceptance criterion, with the criterion as the failure message. That is a
 checklist, not a specification, and the header of each file says so.
 
@@ -152,9 +200,8 @@ Not generated, on purpose:
   with the right headings would pass `grep -qF "## Findings"` while saying nothing.
 - **`src/` stubs for generated tests.** A fabricated API would be a lie about the shape of the
   answer. The generated tests import nothing.
-- **Foreign toolchains.** 18 practices are `cargo`, `anchor`, `nargo` or `pytest` and need a whole
-  Cargo workspace, Anchor program or Nargo package rather than a file. Those still fail at the
-  toolchain, and the audit script lists them.
+- **The Optimism devnet.** One practice runs `make devnet-up`, which brings up a dozen services
+  from the upstream monorepo. No file stands in for cloning it; the `Makefile` says so and exits 1.
 
 ---
 
@@ -175,6 +222,11 @@ script/*.s.sol          forge script targets
 scripts/                entry points named to match the acceptance commands
 scripts/networks/       the measurements themselves, plus their shared plumbing
 drills/                 one red-team drill and its report
+sbf/                    raw solana-program exercises (cargo test-sbf)
+programs/               Anchor programs (anchor test)
+rust/                   host-only Rust exercises
+circuits/               Noir packages (nargo test)
+solutions/              Python entry points
 results/                measurement output (gitignored)
 docs/                   written-exercise prompts, and where your write-ups go
 ```

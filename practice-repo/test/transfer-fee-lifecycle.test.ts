@@ -9,7 +9,7 @@
  * reporting "the test path may not exist" — which is a broken harness, not a red test.
  *
  * Replace each placeholder with a real assertion as you go. A criterion you have actually
- * tested should no longer contain a fail() call. Delete this notice when none remain.
+ * tested no longer needs its placeholder. Delete this notice when none remain.
  *
  * What the practice asks for:
  *   Against a local validator or an in-process SVM, create a Token-2022 mint with the transfer

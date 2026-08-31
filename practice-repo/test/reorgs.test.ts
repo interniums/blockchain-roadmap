@@ -9,7 +9,7 @@
  * reporting "the test path may not exist" — which is a broken harness, not a red test.
  *
  * Replace each placeholder with a real assertion as you go. A criterion you have actually
- * tested should no longer contain a fail() call. Delete this notice when none remain.
+ * tested no longer needs its placeholder. Delete this notice when none remain.
  *
  * What the practice asks for:
  *   Using a public beacon API, walk at least one week of slots and reconstruct the canonical

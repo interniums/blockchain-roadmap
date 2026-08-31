@@ -31,10 +31,30 @@ import { spawnSync } from 'node:child_process';
 
 const REPO = path.join(process.cwd(), 'practice-repo');
 
+/**
+ * The manifest each foreign toolchain needs at the repo root before its command does anything.
+ *
+ * These commands name no path, so there is nothing to resolve in the usual sense. What can be
+ * checked is that the project they build against exists: `cargo test-sbf` with no Cargo.toml is the
+ * same class of failure as `forge test --match-path` with no test file.
+ */
+const FOREIGN_ROOTS: { match: RegExp; needs: string[]; label: string }[] = [
+  { match: /(?:^|&& )cargo (?:test-sbf|stylus)\b/, needs: ['Cargo.toml'], label: 'cargo/solana' },
+  { match: /(?:^|&& )cargo \b/, needs: ['Cargo.toml'], label: 'cargo' },
+  { match: /(?:^|&& )anchor \b/, needs: ['Anchor.toml', 'Cargo.toml'], label: 'anchor' },
+  { match: /(?:^|&& )nargo \b/, needs: ['Nargo.toml'], label: 'nargo' },
+  { match: /\bpytest\b|\buv run python\b|\bpython3 -m pytest\b/, needs: ['pyproject.toml'], label: 'python' },
+  { match: /(?:^|&& )make \b/, needs: ['Makefile'], label: 'make' },
+];
+
 /** Kept in step with `scaffold-practice.ts` deliberately: both answer "what must pre-exist". */
 function readPaths(cmd: string): string[] {
   const c = cmd.replace(/\s+/g, ' ').trim();
-  if (/(?:^|&& )(?:cargo|anchor|nargo|make)\b/.test(c) || /\bpytest\b|\buv run python\b/.test(c)) return [];
+  if (/(?:^|&& )(?:cargo|anchor|nargo|make)\b/.test(c) || /\bpytest\b|\buv run python\b/.test(c)) {
+    // Report the toolchain's manifest instead of the (absent) path arguments.
+    for (const r of FOREIGN_ROOTS) if (r.match.test(c)) return r.needs;
+    return [];
+  }
   const readable = c.replace(/--(?:out|report|record)\s+\S+/g, ' ');
   const out: string[] = [];
 
@@ -87,11 +107,12 @@ const local = rows.filter((r) => !r.foreign);
 const noPaths = local.filter((r) => r.needs.length === 0);
 const withPaths = local.filter((r) => r.needs.length > 0);
 const resolving = withPaths.filter((r) => r.missing.length === 0);
-const broken = withPaths.filter((r) => r.missing.length > 0);
+const broken = [...withPaths, ...foreign].filter((r) => r.missing.length > 0);
 
-console.log('STATIC — do the paths each command reads exist?\n');
+const foreignResolving = foreign.filter((r) => r.missing.length === 0);
+console.log('STATIC — does every command have something to run?\n');
 console.log(`  commands with an acceptance command   ${rows.length}`);
-console.log(`    on a foreign toolchain (not scaffolded)  ${foreign.length}`);
+console.log(`    foreign toolchain (checked by manifest)  ${foreign.length}, of which ${foreignResolving.length} resolve`);
 console.log(`    self-contained, name no input path       ${noPaths.length}`);
 console.log(`    name at least one input path             ${withPaths.length}`);
 console.log(`      RESOLVE fully                          ${resolving.length}`);
@@ -141,6 +162,11 @@ if (arg !== -1) {
 }
 
 if (foreign.length) {
-  console.log(`\n\nOUT OF SCOPE — ${foreign.length} practices need a whole foreign project:`);
-  for (const r of foreign) console.log(`  ${r.cmd.split(' ')[0].padEnd(8)} ${r.id}`);
+  console.log(`\n\nFOREIGN TOOLCHAINS — ${foreign.length} practices, and the manifest each needs:`);
+  for (const r of foreign) {
+    const state = r.missing.length === 0 ? 'ok  ' : 'MISS';
+    console.log(`  ${state} ${r.needs.join(' + ').padEnd(24)} ${r.id}`);
+  }
+  console.log('\n  A manifest present is not the same as a toolchain installed. `nargo` and');
+  console.log('  `cargo-stylus` are not on this machine, so those two commands are authored but unrun.');
 }
