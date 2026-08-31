@@ -8,7 +8,7 @@ import { TOOL_NAMES } from './tools';
  * What the app can actually run, counted from the content rather than asserted.
  *
  * Every number on the setup screen comes from here, and every number here comes from calling
- * classifyAcceptance over all 236 authored practices. If someone widens the safety grammar, these
+ * classifyAcceptance over every authored practice. If someone widens the safety grammar, these
  * counts move on their own — nothing is hard-coded.
  */
 

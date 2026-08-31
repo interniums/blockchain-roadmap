@@ -245,7 +245,13 @@ export async function PracticeScreen({ id }: { id: string }) {
                 rungs={hints.length}
               />
             ) : (
-              <ManualCheck practiceId={p.id} command={command} why={why} rungs={hints.length} />
+              <ManualCheck
+                practiceId={p.id}
+                command={command}
+                why={why}
+                rungs={hints.length}
+                split={{ total: inv.total, runnable: inv.runnable, manual: inv.manual }}
+              />
             )}
           </div>
         </section>
@@ -375,11 +381,12 @@ export async function PracticeScreen({ id }: { id: string }) {
               Why two tiers
             </h2>
             <p className="mt-2 text-[var(--color-ink-2)]">
-              {inv.runnable} of the {inv.total} acceptance commands reduce to a plain argument list; the app runs
-              those and reads the results test by test. The other {inv.manual} need a shell — pipes,{' '}
+              {inv.runnable} of the {inv.total} practices carry an acceptance command that reduces to a plain
+              argument list; the app runs those and reads the results test by test. Another{' '}
+              {inv.manual - inv.noCommand} carry one that needs a shell — pipes,{' '}
               <code className="font-mono">&amp;&amp;</code> chains, globs, placeholders — and a page in a browser
-              does not get a shell. Those are handed to your terminal, which is strictly more capable than the
-              runner.
+              does not get a shell, so those are handed to your terminal. The remaining {inv.noCommand} are graded
+              against their written criteria: there is no command to run for them, here or anywhere.
             </p>
           </section>
 

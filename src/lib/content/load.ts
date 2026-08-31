@@ -44,7 +44,7 @@ export interface Graph {
    * practiceId -> the lessons it actually covers, in reading order.
    *
    * Derived, never authored: a practice already names its concepts, and a lesson already names what
-   * it teaches, so the span is the intersection. Measured across the 236: 22 practices span one
+   * it teaches, so the span is the intersection. Measured across the corpus: 64 practices span one
    * lesson, 106 span two, 87 three, 20 four, 1 five — mean 2.4, and none spans zero.
    *
    * Deliberately NOT a lesson range. 90 of the 192 multi-lesson spans are non-contiguous, so any

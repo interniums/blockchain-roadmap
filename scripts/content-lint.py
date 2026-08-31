@@ -299,6 +299,26 @@ for tid, ids in _exits.items():
         if len(p.get('hints') or []) != 3:
             err('R17-EXIT-HINTS', f'{pid}: {len(p.get("hints") or [])} hints, expected 3')
 
+#   R18 every lesson outside a stub module has at least one practice whose concept set overlaps
+#       what it teaches. This is the coverage rule, and it also catches the failure that produced
+#       it twice while authoring: a practice whose spec covers a lesson but whose `concepts` list
+#       forgets to name it, so the exercise exists and the lesson still reads as uncovered.
+_exercised = collections.defaultdict(set)
+for pid, p in practices.items():
+    _exercised[p.get('moduleId')] |= set(p.get('concepts') or [])
+
+_uncovered = []
+for mid, m in modules.items():
+    if m.get('status') == 'stub': continue
+    named = _exercised.get(mid, set())
+    for L in (m.get('lessons') or []):
+        teaches = set(L.get('teaches') or [])
+        if teaches and not (teaches & named):
+            _uncovered.append(L.get('id'))
+if _uncovered:
+    warn('R18-LESSON-NO-PRACTICE',
+         f'{len(_uncovered)} lessons have no practice over them: {_uncovered[:4]}')
+
 # A module with lessons but no capstone is a real gap, reported rather than tolerated silently.
 # Two exemptions: a stub is deliberately shallow, and the module that hosts its track's exit project
 # is already closed out by something strictly larger than a capstone.

@@ -6,8 +6,8 @@
  * This turns it into one, without softening it into an apology — the two tiers are a design
  * decision, and a practice we hand you is not a lesser practice.
  *
- * Of 236 authored acceptance commands, 101 parse into a plain argument list and 135 do not.
- * The 135 need a shell, and a web page does not get a shell.
+ * Most authored acceptance commands do not parse into a plain argument list: they need a shell,
+ * and a web page does not get a shell. `inventory()` holds the live split; no figure is kept here.
  */
 
 export interface ManualReason {

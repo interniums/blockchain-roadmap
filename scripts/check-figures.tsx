@@ -47,8 +47,12 @@ const SCOPE = (process.env.CHAINPATH_FIGURE_SCOPE ?? '').split(',').map((x) => x
 
 // Prose components are stubbed: this script is about figures, and the real ones drag in the content
 // graph and client-only code that has nothing to do with whether a diagram lays out.
-const stub = (tag: string) => (p: Record<string, unknown>) =>
-  React.createElement(tag, null, (p.children ?? null) as React.ReactNode);
+const stub = (tag: string) => {
+  const Stub = (p: Record<string, unknown>) =>
+    React.createElement(tag, null, (p.children ?? null) as React.ReactNode);
+  Stub.displayName = `stub(${tag})`;
+  return Stub;
+};
 
 const components: Record<string, unknown> = {
   Flow, ByteLayout, Anatomy, Timeline, Tree, StackTrace, Compare, Matrix, Bars,

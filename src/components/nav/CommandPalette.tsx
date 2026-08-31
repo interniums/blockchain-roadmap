@@ -7,10 +7,6 @@ const ORDER: SearchItem['kind'][] = ['Lesson', 'Concept', 'Module', 'Track', 'Pr
 
 export function CommandPalette({ items }: { items: SearchItem[] }) {
   const [open, setOpen] = useState(false);
-  const [q, setQ] = useState('');
-  const [sel, setSel] = useState(0);
-  const router = useRouter();
-  const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -21,7 +17,18 @@ export function CommandPalette({ items }: { items: SearchItem[] }) {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  useEffect(() => { if (open) { setQ(''); setSel(0); requestAnimationFrame(() => inputRef.current?.focus()); } }, [open]);
+  // Mounted only while open, so each open starts from fresh query/selection state.
+  if (!open) return null;
+  return <Palette items={items} onClose={() => setOpen(false)} />;
+}
+
+function Palette({ items, onClose }: { items: SearchItem[]; onClose: () => void }) {
+  const [q, setQ] = useState('');
+  const [sel, setSel] = useState(0);
+  const router = useRouter();
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => { requestAnimationFrame(() => inputRef.current?.focus()); }, []);
 
   const results = useMemo(() => {
     if (!q.trim()) return [];
@@ -41,12 +48,10 @@ export function CommandPalette({ items }: { items: SearchItem[] }) {
     return scored.sort((a, b) => a.s - b.s).slice(0, 30).map((x) => x.it);
   }, [q, items]);
 
-  if (!open) return null;
-
-  const go = (i: number) => { const r = results[i]; if (r) { setOpen(false); router.push(r.href); } };
+  const go = (i: number) => { const r = results[i]; if (r) { onClose(); router.push(r.href); } };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 pt-[12vh]" onClick={() => setOpen(false)}>
+    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 pt-[12vh]" onClick={onClose}>
       <div
         role="dialog" aria-modal="true" aria-label="Search"
         className="w-full max-w-2xl overflow-hidden rounded-lg border border-[var(--color-rule)] bg-[var(--color-surface)] shadow-2xl"

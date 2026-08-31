@@ -10,15 +10,21 @@ import type { ManualReason } from './explain';
  * one is handed to you instead.
  *
  * The framing matters: this is not a broken feature and not a lesser practice. Your terminal is
- * strictly more capable than the runner, and 135 of the 236 authored practices live here.
+ * strictly more capable than the runner, and most authored practices live here.
+ *
+ * The counts in the closing paragraph are passed in from `inventory()` rather than written here.
+ * They were hardcoded as 236/101/135 and were wrong within one authoring session of being typed;
+ * a figure about the corpus belongs to whatever counts the corpus.
  */
 export function ManualCheck({
-  practiceId, command, why, rungs,
+  practiceId, command, why, rungs, split,
 }: {
   practiceId: string;
   command: string | null;
   why: ManualReason;
   rungs: number;
+  /** counted by `inventory()` on the server, never written by hand */
+  split: { total: number; runnable: number; manual: number };
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -39,7 +45,7 @@ export function ManualCheck({
           <p className="max-w-[70ch] text-[13px] text-[var(--color-ink-2)]">{why.plain}</p>
         )}
 
-        {why.raw && (
+        {why.raw && why.hasCommand && (
           <p className="mt-2 max-w-[70ch] rounded border border-dashed border-[var(--color-rule)] bg-[var(--color-surface-2)] px-3 py-2 text-[12.5px]">
             <span className="text-[var(--color-ink-3)]">The safety parser&rsquo;s exact words: </span>
             <span className="font-mono text-[var(--color-ink)]">{why.raw}</span>
@@ -47,9 +53,10 @@ export function ManualCheck({
         )}
 
         <p className="mt-3 max-w-[70ch] text-[12px] text-[var(--color-ink-3)]">
-          The app runs what it can run safely and hands you the rest. Of the 236 authored acceptance commands, 101
-          reduce to a plain argument list and can be executed and graded here; the other 135 do not, and giving a
-          browser page a shell to close that gap would be a worse trade than asking you to paste a line.
+          The app runs what it can run safely and hands you the rest. Of the {split.total} authored
+          practices, {split.runnable} reduce to a plain argument list and can be executed and graded
+          here; the other {split.manual} do not, and giving a browser page a shell to close that gap
+          would be a worse trade than asking you to paste a line.
         </p>
       </div>
 

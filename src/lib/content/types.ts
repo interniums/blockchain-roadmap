@@ -62,7 +62,7 @@ export interface Source {
  *
  *   check   — an inline retrieval inside one lesson. Authored in the prose as `<Check>`, not as a
  *             practice file; listed here because it is the bottom of the same ladder.
- *   block   — a repo exercise over the 2-3 lessons that share a mechanism. The 236 authored
+ *   block   — a repo exercise over the 2-3 lessons that share a mechanism. The originally authored
  *             practices are all this size: measured concept-span 1→22, 2→106, 3→87, 4→20, 5→1.
  *   module  — the capstone. Spans a module's whole `teaches` set: min 4, median 15, max 28.
  *   exit    — a core track's project, graded against the plain-English capabilities it declares.
@@ -71,7 +71,7 @@ export type PracticeGrain = 'check' | 'block' | 'module' | 'exit';
 
 export interface Practice {
   id: string; moduleId: string; kind: PracticeKind; title: string;
-  /** absent in older files; treated as 'block', which is what all 236 originally were */
+  /** absent in older files; treated as 'block', which is what every original file was */
   grain?: PracticeGrain;
   concepts?: string[]; spec?: string;
   acceptance?: { command?: string; criteria?: string[] };

@@ -17,7 +17,7 @@ t('review sets stability > 0', s.stability > 0, `(${s.stability.toFixed(2)})`);
 const afterFirst = s.due.getTime();
 
 console.log('\n--- prerequisite credit ---');
-let anc = review(emptyState('anc', D(0)), Rating.Good, D(0));
+const anc = review(emptyState('anc', D(0)), Rating.Good, D(0));
 const before = { stab: anc.stability, due: anc.due.getTime(), reps: anc.reps };
 const credited = applyCredit(anc, 1, Rating.Good, D(1));
 t('credit does NOT increment reps', credited.reps === before.reps, `(${credited.reps})`);
