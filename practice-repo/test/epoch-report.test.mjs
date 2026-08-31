@@ -20,6 +20,10 @@
  *   exactly once per epoch. Report the total active stake in ETH rather than in validator count,
  *   and state why those two numbers no longer track each other. Emit `out/epoch-report.json` and
  *   assert its contents in `test/epoch-report.test.mjs`.
+ *
+ * Your code goes in src/ledgers-proof-of-stake/EpochReport.mjs. Nothing here imports it yet —
+ * a TypeScript module is its named exports, and this scaffold does not invent them. Export
+ * what the exercise needs, then import it above.
  */
 import { test } from 'node:test';
 

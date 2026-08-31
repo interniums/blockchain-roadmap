@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {AssignmentRules} from "../src/solidity-language-core/AssignmentRules.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,20 +28,27 @@ import {Test, console2} from "forge-std/Test.sol";
  *   curve rather than a fixed number.
  */
 contract AssignmentRulesTest is Test {
+    /// The subject, from src/solidity-language-core/AssignmentRules.sol. Add functions there and call them here.
+    AssignmentRules internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new AssignmentRules();
     }
 
     /// A test asserts the memory-parameter version's gas grows with input length while the
     /// read-only calldata version stays roughly flat
     function test_criterion01_aTestAssertsTheMemoryParameterVersionSGas() public {
-        fail("A test asserts the memory-parameter version's gas grows with input length while the read-only calldata version stays roughly flat");
+        fail(
+            "A test asserts the memory-parameter version's gas grows with input length while the read-only calldata version stays roughly flat"
+        );
     }
 
     /// A test proves that assigning to a local storage pointer changes no state and that writing
     /// through it does
     function test_criterion02_aTestProvesThatAssigningToALocalStorage() public {
-        fail("A test proves that assigning to a local storage pointer changes no state and that writing through it does");
+        fail(
+            "A test proves that assigning to a local storage pointer changes no state and that writing through it does"
+        );
     }
 
     /// Each test name states which of the four assignment rules it exercises

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {CallFrames} from "../src/evm-execution/CallFrames.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -32,8 +33,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   what breaks in a contract written against the old semantics.
  */
 contract CallFramesTest is Test {
+    /// The subject, from src/evm-execution/CallFrames.sol. Add functions there and call them here.
+    CallFrames internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new CallFrames();
     }
 
     /// A caller's memory is shown unaffected by a callee writing the same offsets
@@ -59,7 +63,9 @@ contract CallFramesTest is Test {
     /// A case is constructed where hitting the depth limit makes a contract behave incorrectly
     /// rather than merely fail
     function test_criterion05_aCaseIsConstructedWhereHittingTheDepthLimit() public {
-        fail("A case is constructed where hitting the depth limit makes a contract behave incorrectly rather than merely fail");
+        fail(
+            "A case is constructed where hitting the depth limit makes a contract behave incorrectly rather than merely fail"
+        );
     }
 
     /// Forwarded gas is shown to be a ceiling, with requested and received amounts reported and the
@@ -71,7 +77,9 @@ contract CallFramesTest is Test {
     /// selfdestruct is shown with what is and is not destroyed, and the single remaining
     /// circumstance for old behaviour
     function test_criterion07_selfdestructIsShownWithWhatIsAndIsNot() public {
-        fail("selfdestruct is shown with what is and is not destroyed, and the single remaining circumstance for old behaviour");
+        fail(
+            "selfdestruct is shown with what is and is not destroyed, and the single remaining circumstance for old behaviour"
+        );
     }
 
     /// What breaks in a contract written against the old selfdestruct semantics is stated

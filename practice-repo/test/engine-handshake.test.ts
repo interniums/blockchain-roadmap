@@ -23,6 +23,10 @@
  *   body each produces, and what the execution client logs in each case. Finally, call
  *   engine_getPayloadVn twice for the same payloadId with a delay between the calls and compare
  *   the block values.
+ *
+ * Your code goes in src/protocol-client-architecture/EngineHandshake.ts. Nothing here imports
+ * it yet — a TypeScript module is its named exports, and this scaffold does not invent them.
+ * Export what the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

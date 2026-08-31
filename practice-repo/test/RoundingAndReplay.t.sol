@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {RoundingAndReplay} from "../src/security-vulnerability-classes/RoundingAndReplay.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -32,8 +33,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   have prevented it.
  */
 contract RoundingAndReplayTest is Test {
+    /// The subject, from src/security-vulnerability-classes/RoundingAndReplay.sol. Add functions there and call them here.
+    RoundingAndReplay internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new RoundingAndReplay();
     }
 
     /// A rounding bug is exploited by repetition, with per-call gain, break-even call count and
@@ -45,7 +49,9 @@ contract RoundingAndReplayTest is Test {
     /// The fix is proven by an invariant campaign over arbitrary sequences asserting the contract
     /// never owes more than it holds
     function test_criterion02_theFixIsProvenByAnInvariantCampaignOver() public {
-        fail("The fix is proven by an invariant campaign over arbitrary sequences asserting the contract never owes more than it holds");
+        fail(
+            "The fix is proven by an invariant campaign over arbitrary sequences asserting the contract never owes more than it holds"
+        );
     }
 
     /// The rounding direction of each conversion is stated with why it is safe

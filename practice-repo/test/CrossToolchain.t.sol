@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {CrossToolchain} from "../src/toolchain-hardhat-literacy/CrossToolchain.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,8 +29,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   key to its counterpart.
  */
 contract CrossToolchainTest is Test {
+    /// The subject, from src/toolchain-hardhat-literacy/CrossToolchain.sol. Add functions there and call them here.
+    CrossToolchain internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new CrossToolchain();
     }
 
     /// The Foundry test passes against src/ with the project's existing remappings
@@ -40,13 +44,17 @@ contract CrossToolchainTest is Test {
     /// The Hardhat test command passes against the same sources, and the command used is recorded
     /// in the repository README
     function test_criterion02_theHardhatTestCommandPassesAgainstTheSameSources() public {
-        fail("The Hardhat test command passes against the same sources, and the command used is recorded in the repository README");
+        fail(
+            "The Hardhat test command passes against the same sources, and the command used is recorded in the repository README"
+        );
     }
 
     /// A test asserts on a version- or behaviour-distinguishing constant from the dependency, and
     /// the learner shows the two toolchains disagreeing once the versions diverge
     function test_criterion03_aTestAssertsOnAVersionOrBehaviourDistinguishing() public {
-        fail("A test asserts on a version- or behaviour-distinguishing constant from the dependency, and the learner shows the two toolchains disagreeing once the versions diverge");
+        fail(
+            "A test asserts on a version- or behaviour-distinguishing constant from the dependency, and the learner shows the two toolchains disagreeing once the versions diverge"
+        );
     }
 
     /// A translation table covers sources, artifacts, tests, deployments, dependencies and import

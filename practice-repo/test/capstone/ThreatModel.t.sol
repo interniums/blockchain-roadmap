@@ -57,19 +57,25 @@ contract ThreatModelTest is Test {
     /// Actors are enumerated by capability, and any two actors sharing a capability are identified
     /// as equivalent
     function test_criterion03_actorsAreEnumeratedByCapabilityAndAnyTwoActors() public {
-        fail("Actors are enumerated by capability, and any two actors sharing a capability are identified as equivalent");
+        fail(
+            "Actors are enumerated by capability, and any two actors sharing a capability are identified as equivalent"
+        );
     }
 
     /// One value is followed across every boundary with the chooser named at each hop, and the
     /// first out-of-zone hop identified
     function test_criterion04_oneValueIsFollowedAcrossEveryBoundaryWithThe() public {
-        fail("One value is followed across every boundary with the chooser named at each hop, and the first out-of-zone hop identified");
+        fail(
+            "One value is followed across every boundary with the chooser named at each hop, and the first out-of-zone hop identified"
+        );
     }
 
     /// A blind-signing scenario is constructed where the approved transaction differs from what the
     /// interface showed, with the prevention named
     function test_criterion05_aBlindSigningScenarioIsConstructedWhereTheApproved() public {
-        fail("A blind-signing scenario is constructed where the approved transaction differs from what the interface showed, with the prevention named");
+        fail(
+            "A blind-signing scenario is constructed where the approved transaction differs from what the interface showed, with the prevention named"
+        );
     }
 
     /// At least four function-level and two system-level invariants are written as predicates
@@ -80,7 +86,9 @@ contract ThreatModelTest is Test {
     /// A handler-based campaign runs against those invariants and reports which held, which broke,
     /// and which had to be sharpened
     function test_criterion07_aHandlerBasedCampaignRunsAgainstThoseInvariantsAnd() public {
-        fail("A handler-based campaign runs against those invariants and reports which held, which broke, and which had to be sharpened");
+        fail(
+            "A handler-based campaign runs against those invariants and reports which held, which broke, and which had to be sharpened"
+        );
     }
 
     /// The document names the events that require revisiting it, not a calendar interval

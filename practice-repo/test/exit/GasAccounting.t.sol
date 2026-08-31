@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {GasAccounting} from "../../src/evm-yul-assembly/GasAccounting.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -38,8 +39,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   assembly, it carries a memory-safe annotation and you argue the annotation is honest.
  */
 contract GasAccountingTest is Test {
+    /// The subject, from src/evm-yul-assembly/GasAccounting.sol. Add functions there and call them here.
+    GasAccounting internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new GasAccounting();
     }
 
     /// The gas attribution sums to the receipt, or the unaccounted remainder is stated as a number
@@ -51,7 +55,9 @@ contract GasAccountingTest is Test {
     /// Each cold access, warm access, storage write and refund is attributed to a specific frame
     /// rather than to the transaction as a whole
     function test_criterion02_eachColdAccessWarmAccessStorageWriteAndRefund() public {
-        fail("Each cold access, warm access, storage write and refund is attributed to a specific frame rather than to the transaction as a whole");
+        fail(
+            "Each cold access, warm access, storage write and refund is attributed to a specific frame rather than to the transaction as a whole"
+        );
     }
 
     /// One written storage slot verifies against the post-state root using your own trie walk
@@ -62,13 +68,17 @@ contract GasAccountingTest is Test {
     /// Every contract-detection check in the reachable code is listed with a verdict on whether
     /// EIP-7702 breaks it and what fails when it does
     function test_criterion04_everyContractDetectionCheckInTheReachableCodeIs() public {
-        fail("Every contract-detection check in the reachable code is listed with a verdict on whether EIP-7702 breaks it and what fails when it does");
+        fail(
+            "Every contract-detection check in the reachable code is listed with a verdict on whether EIP-7702 breaks it and what fails when it does"
+        );
     }
 
     /// One contract address is predicted from its deployment inputs and a named single change moves
     /// it, demonstrated rather than asserted
     function test_criterion05_oneContractAddressIsPredictedFromItsDeploymentInputs() public {
-        fail("One contract address is predicted from its deployment inputs and a named single change moves it, demonstrated rather than asserted");
+        fail(
+            "One contract address is predicted from its deployment inputs and a named single change moves it, demonstrated rather than asserted"
+        );
     }
 
     /// The rewrite is measurably cheaper under a test that fails if the saving disappears

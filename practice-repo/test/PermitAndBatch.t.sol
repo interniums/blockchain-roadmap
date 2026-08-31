@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {PermitAndBatch} from "../src/solidity-token-standards/PermitAndBatch.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -32,8 +33,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   looks like at that moment, and state what ordering would have made the re-entry harmless.
  */
 contract PermitAndBatchTest is Test {
+    /// The subject, from src/solidity-token-standards/PermitAndBatch.sol. Add functions there and call them here.
+    PermitAndBatch internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new PermitAndBatch();
     }
 
     /// A signed allowance produces an allowance with no transaction from the owner
@@ -44,13 +48,17 @@ contract PermitAndBatchTest is Test {
     /// Replaying the signature is rejected, and altering one signed field is rejected, with the
     /// mechanism named for each
     function test_criterion02_replayingTheSignatureIsRejectedAndAlteringOneSigned() public {
-        fail("Replaying the signature is rejected, and altering one signed field is rejected, with the mechanism named for each");
+        fail(
+            "Replaying the signature is rejected, and altering one signed field is rejected, with the mechanism named for each"
+        );
     }
 
     /// What happens on a token without permit is stated, with the intermediary approach and what it
     /// asks the user to trust
     function test_criterion03_whatHappensOnATokenWithoutPermitIsStated() public {
-        fail("What happens on a token without permit is stated, with the intermediary approach and what it asks the user to trust");
+        fail(
+            "What happens on a token without permit is stated, with the intermediary approach and what it asks the user to trust"
+        );
     }
 
     /// Ten token ids move in one call
@@ -76,7 +84,9 @@ contract PermitAndBatchTest is Test {
     /// The callback re-enters the sender, with the sender's state at that moment shown and the safe
     /// ordering stated
     function test_criterion08_theCallbackReEntersTheSenderWithTheSender() public {
-        fail("The callback re-enters the sender, with the sender's state at that moment shown and the safe ordering stated");
+        fail(
+            "The callback re-enters the sender, with the sender's state at that moment shown and the safe ordering stated"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

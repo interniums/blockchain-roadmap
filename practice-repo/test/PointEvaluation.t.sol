@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {PointEvaluation} from "../src/zk-commitments-kzg/PointEvaluation.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,8 +29,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   number quoted in a tutorial.
  */
 contract PointEvaluationTest is Test {
+    /// The subject, from src/zk-commitments-kzg/PointEvaluation.sol. Add functions there and call them here.
+    PointEvaluation internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new PointEvaluation();
     }
 
     /// A test asserts the hand-derived versioned hash equals the library-produced one byte for byte
@@ -45,13 +49,17 @@ contract PointEvaluationTest is Test {
     /// A test flips one bit of y and asserts the call fails, and a second negative test corrupts
     /// the versioned hash and asserts it fails for a different reason
     function test_criterion03_aTestFlipsOneBitOfYAndAsserts() public {
-        fail("A test flips one bit of y and asserts the call fails, and a second negative test corrupts the versioned hash and asserts it fails for a different reason");
+        fail(
+            "A test flips one bit of y and asserts the call fails, and a second negative test corrupts the versioned hash and asserts it fails for a different reason"
+        );
     }
 
     /// The test output records measured gas for the successful call, and the README compares it to
     /// the constant read from EIP-4844
     function test_criterion04_theTestOutputRecordsMeasuredGasForTheSuccessful() public {
-        fail("The test output records measured gas for the successful call, and the README compares it to the constant read from EIP-4844");
+        fail(
+            "The test output records measured gas for the successful call, and the README compares it to the constant read from EIP-4844"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

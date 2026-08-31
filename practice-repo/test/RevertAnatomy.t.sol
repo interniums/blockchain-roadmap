@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {RevertAnatomy} from "../src/solidity-errors-events/RevertAnatomy.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   captured data.
  */
 contract RevertAnatomyTest is Test {
+    /// The subject, from src/solidity-errors-events/RevertAnatomy.sol. Add functions there and call them here.
+    RevertAnatomy internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new RevertAnatomy();
     }
 
     /// A test asserts the bare require returns exactly zero bytes of revert data
@@ -38,13 +42,17 @@ contract RevertAnatomyTest is Test {
     /// A test asserts the first four bytes of the custom-error revert data equal the hand-computed
     /// keccak256 of the canonical signature
     function test_criterion02_aTestAssertsTheFirstFourBytesOfThe() public {
-        fail("A test asserts the first four bytes of the custom-error revert data equal the hand-computed keccak256 of the canonical signature");
+        fail(
+            "A test asserts the first four bytes of the custom-error revert data equal the hand-computed keccak256 of the canonical signature"
+        );
     }
 
     /// Recorded deploy size and gas numbers state the solc version, optimizer setting and whether
     /// via-IR was used
     function test_criterion03_recordedDeploySizeAndGasNumbersStateTheSolc() public {
-        fail("Recorded deploy size and gas numbers state the solc version, optimizer setting and whether via-IR was used");
+        fail(
+            "Recorded deploy size and gas numbers state the solc version, optimizer setting and whether via-IR was used"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

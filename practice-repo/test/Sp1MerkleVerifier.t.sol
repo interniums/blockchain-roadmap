@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Sp1MerkleVerifier} from "../src/zk-zkvms/Sp1MerkleVerifier.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,8 +29,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   wall-clock in seconds, peak memory in gigabytes, and proof size in bytes.
  */
 contract Sp1MerkleVerifierTest is Test {
+    /// The subject, from src/zk-zkvms/Sp1MerkleVerifier.sol. Add functions there and call them here.
+    Sp1MerkleVerifier internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Sp1MerkleVerifier();
     }
 
     /// A test submits the real proof and the matching public values and the verifier returns
@@ -46,13 +50,17 @@ contract Sp1MerkleVerifierTest is Test {
     /// A third test submits the unmodified proof with a different Merkle root as the public input
     /// and asserts it fails
     function test_criterion03_aThirdTestSubmitsTheUnmodifiedProofWithA() public {
-        fail("A third test submits the unmodified proof with a different Merkle root as the public input and asserts it fails");
+        fail(
+            "A third test submits the unmodified proof with a different Merkle root as the public input and asserts it fails"
+        );
     }
 
     /// The README records the pinned SP1 version plus proving wall-clock in seconds, peak RSS in
     /// GB, and proof size in bytes
     function test_criterion04_theReadmeRecordsThePinnedSp1VersionPlusProving() public {
-        fail("The README records the pinned SP1 version plus proving wall-clock in seconds, peak RSS in GB, and proof size in bytes");
+        fail(
+            "The README records the pinned SP1 version plus proving wall-clock in seconds, peak RSS in GB, and proof size in bytes"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

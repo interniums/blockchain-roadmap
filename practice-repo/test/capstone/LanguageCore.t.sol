@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {LanguageCore} from "../../src/solidity-language-core/LanguageCore.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -39,14 +40,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   an abstract contract, and justify each choice in two sentences.
  */
 contract LanguageCoreTest is Test {
+    /// The subject, from src/solidity-language-core/LanguageCore.sol. Add functions there and call them here.
+    LanguageCore internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new LanguageCore();
     }
 
     /// Two visually similar assignments differ in copy-versus-alias behaviour, proven by mutating
     /// through one and not the other
     function test_criterion01_twoVisuallySimilarAssignmentsDifferInCopyVersusAlias() public {
-        fail("Two visually similar assignments differ in copy-versus-alias behaviour, proven by mutating through one and not the other");
+        fail(
+            "Two visually similar assignments differ in copy-versus-alias behaviour, proven by mutating through one and not the other"
+        );
     }
 
     /// A dangling storage pointer is demonstrated with what reading through it returns
@@ -57,13 +63,17 @@ contract LanguageCoreTest is Test {
     /// A private state variable is read from outside the contract, with the slot and the derivation
     /// named in a comment
     function test_criterion03_aPrivateStateVariableIsReadFromOutsideThe() public {
-        fail("A private state variable is read from outside the contract, with the slot and the derivation named in a comment");
+        fail(
+            "A private state variable is read from outside the contract, with the slot and the derivation named in a comment"
+        );
     }
 
     /// A view and a pure function each do something the keyword does not prevent, with the actual
     /// enforcement point stated
     function test_criterion04_aViewAndAPureFunctionEachDoSomething() public {
-        fail("A view and a pure function each do something the keyword does not prevent, with the actual enforcement point stated");
+        fail(
+            "A view and a pure function each do something the keyword does not prevent, with the actual enforcement point stated"
+        );
     }
 
     /// Two modifiers whose order changes the outcome, and one whose placeholder position runs the
@@ -81,7 +91,9 @@ contract LanguageCoreTest is Test {
     /// Constructor order and C3 linearised override order for a four-contract diamond are predicted
     /// before being asserted
     function test_criterion07_constructorOrderAndC3LinearisedOverrideOrderForA() public {
-        fail("Constructor order and C3 linearised override order for a four-contract diamond are predicted before being asserted");
+        fail(
+            "Constructor order and C3 linearised override order for a four-contract diamond are predicted before being asserted"
+        );
     }
 
     /// One refactor to an interface and one to an abstract contract, each justified in two

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {HandEncoded} from "../src/solidity-abi-selectors/HandEncoded.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,14 +27,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   with uint instead of uint256 produces a different, wrong selector.
  */
 contract HandEncodedTest is Test {
+    /// The subject, from src/solidity-abi-selectors/HandEncoded.sol. Add functions there and call them here.
+    HandEncoded internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new HandEncoded();
     }
 
     /// The hand-produced calldata for both signatures is embedded as a literal in the test and a
     /// raw call with it succeeds and returns the expected values
     function test_criterion01_theHandProducedCalldataForBothSignaturesIsEmbedded() public {
-        fail("The hand-produced calldata for both signatures is embedded as a literal in the test and a raw call with it succeeds and returns the expected values");
+        fail(
+            "The hand-produced calldata for both signatures is embedded as a literal in the test and a raw call with it succeeds and returns the expected values"
+        );
     }
 
     /// A test asserts that keccak256("f(uint,uint32[],bytes10,bytes)") does not equal the real

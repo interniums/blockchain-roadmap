@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Auctions} from "../src/fundamentals-incentives/Auctions.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -33,8 +34,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   properties have been distinguished by a concrete failure rather than by definition.
  */
 contract AuctionsTest is Test {
+    /// The subject, from src/fundamentals-incentives/Auctions.sol. Add functions there and call them here.
+    Auctions internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Auctions();
     }
 
     /// Both auction formats are simulated over identical private valuations

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {StylusGas} from "../src/scaling-stylus/StylusGas.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,14 +28,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   and state, in one sentence per row, which cost component explains it.
  */
 contract StylusGasTest is Test {
+    /// The subject, from src/scaling-stylus/StylusGas.sol. Add functions there and call them here.
+    StylusGas internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new StylusGas();
     }
 
     /// Gas measured for compute-bound, storage-bound and memory-heavy workloads in both Solidity
     /// and Stylus, reported as a table of ratios
     function test_criterion01_gasMeasuredForComputeBoundStorageBoundAndMemory() public {
-        fail("Gas measured for compute-bound, storage-bound and memory-heavy workloads in both Solidity and Stylus, reported as a table of ratios");
+        fail(
+            "Gas measured for compute-bound, storage-bound and memory-heavy workloads in both Solidity and Stylus, reported as a table of ratios"
+        );
     }
 
     /// The storage-bound row shows little or no saving, with the reason stated in one sentence
@@ -51,7 +57,9 @@ contract StylusGasTest is Test {
     /// A Foundry test on the fork has a Solidity contract call the Rust contract through the
     /// interface produced by `cargo stylus export-abi`, and read a return value
     function test_criterion04_aFoundryTestOnTheForkHasASolidity() public {
-        fail("A Foundry test on the fork has a Solidity contract call the Rust contract through the interface produced by `cargo stylus export-abi`, and read a return value");
+        fail(
+            "A Foundry test on the fork has a Solidity contract call the Rust contract through the interface produced by `cargo stylus export-abi`, and read a return value"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

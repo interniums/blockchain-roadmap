@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {InvariantPlacement} from "../src/security-threat-modeling/InvariantPlacement.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,14 +27,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   which of the three placements this invariant should have, and why.
  */
 contract InvariantPlacementTest is Test {
+    /// The subject, from src/security-threat-modeling/InvariantPlacement.sol. Add functions there and call them here.
+    InvariantPlacement internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new InvariantPlacement();
     }
 
     /// A reported gas figure for the on-chain check on a realistic call path, with the harness
     /// overhead subtracted
     function test_criterion01_aReportedGasFigureForTheOnChainCheck() public {
-        fail("A reported gas figure for the on-chain check on a realistic call path, with the harness overhead subtracted");
+        fail(
+            "A reported gas figure for the on-chain check on a realistic call path, with the harness overhead subtracted"
+        );
     }
 
     /// The same invariant expressed as a passing Foundry invariant_ property
@@ -44,7 +50,9 @@ contract InvariantPlacementTest is Test {
     /// A written placement decision that cites the gas number and the failure mode the invariant is
     /// meant to catch
     function test_criterion03_aWrittenPlacementDecisionThatCitesTheGasNumber() public {
-        fail("A written placement decision that cites the gas number and the failure mode the invariant is meant to catch");
+        fail(
+            "A written placement decision that cites the gas number and the failure mode the invariant is meant to catch"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

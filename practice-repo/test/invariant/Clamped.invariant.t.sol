@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Clamped} from "../../src/security-fuzzing/Clamped.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,8 +26,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   docs/harness-measurements.md and state which single change bought the most.
  */
 contract ClampedInvariantTest is Test {
+    /// The subject, from src/security-fuzzing/Clamped.sol. Add functions there and call them here.
+    Clamped internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Clamped();
     }
 
     /// Revert rate falls below twenty percent and coverage strictly increases at the same call

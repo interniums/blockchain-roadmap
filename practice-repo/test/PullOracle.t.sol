@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {PullOracle} from "../src/defi-oracles/PullOracle.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -34,14 +35,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   made somebody else's problem, and say whether you would still choose pull.
  */
 contract PullOracleTest is Test {
+    /// The subject, from src/defi-oracles/PullOracle.sol. Add functions there and call them here.
+    PullOracle internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new PullOracle();
     }
 
     /// A signed price is fetched off chain and verified on chain for signature, publisher and
     /// observation age, with the gas reported
     function test_criterion01_aSignedPriceIsFetchedOffChainAndVerified() public {
-        fail("A signed price is fetched off chain and verified on chain for signature, publisher and observation age, with the gas reported");
+        fail(
+            "A signed price is fetched off chain and verified on chain for signature, publisher and observation age, with the gas reported"
+        );
     }
 
     /// Wrong signer, stale timestamp and tampered price are each rejected with a distinct error
@@ -68,13 +74,17 @@ contract PullOracleTest is Test {
     /// A refusal is demonstrated, with a real widening moment reported or the conditions that would
     /// produce one stated
     function test_criterion06_aRefusalIsDemonstratedWithARealWideningMoment() public {
-        fail("A refusal is demonstrated, with a real widening moment reported or the conditions that would produce one stated");
+        fail(
+            "A refusal is demonstrated, with a real widening moment reported or the conditions that would produce one stated"
+        );
     }
 
     /// Every failure in the exercise that a push model would have made someone else's problem is
     /// named, with a pull-versus-push verdict
     function test_criterion07_everyFailureInTheExerciseThatAPushModel() public {
-        fail("Every failure in the exercise that a push model would have made someone else's problem is named, with a pull-versus-push verdict");
+        fail(
+            "Every failure in the exercise that a push model would have made someone else's problem is named, with a pull-versus-push verdict"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

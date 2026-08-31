@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Attest} from "../../src/fundamentals-incentives/Attest.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -38,44 +39,59 @@ import {Test, console2} from "forge-std/Test.sol";
  *   offer.
  */
 contract AttestTest is Test {
+    /// The subject, from src/fundamentals-incentives/Attest.sol. Add functions there and call them here.
+    Attest internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Attest();
     }
 
     /// A valid eth_getProof response verifies against the block's stateRoot with the trie walk
     /// implemented in your own code, not delegated to a library
     function test_criterion01_aValidEthGetproofResponseVerifiesAgainstTheBlock() public {
-        fail("A valid eth_getProof response verifies against the block's stateRoot with the trie walk implemented in your own code, not delegated to a library");
+        fail(
+            "A valid eth_getProof response verifies against the block's stateRoot with the trie walk implemented in your own code, not delegated to a library"
+        );
     }
 
     /// Mutating any single byte of the proof, the account value or the root causes verification to
     /// fail rather than to pass or to throw an unhandled error
     function test_criterion02_mutatingAnySingleByteOfTheProofTheAccount() public {
-        fail("Mutating any single byte of the proof, the account value or the root causes verification to fail rather than to pass or to throw an unhandled error");
+        fail(
+            "Mutating any single byte of the proof, the account value or the root causes verification to fail rather than to pass or to throw an unhandled error"
+        );
     }
 
     /// A non-existent address produces a proof of absence that verifies, and the tool names the
     /// node type that terminates the walk
     function test_criterion03_aNonExistentAddressProducesAProofOfAbsence() public {
-        fail("A non-existent address produces a proof of absence that verifies, and the tool names the node type that terminates the walk");
+        fail(
+            "A non-existent address produces a proof of absence that verifies, and the tool names the node type that terminates the walk"
+        );
     }
 
     /// The block header re-hashes to the requested block hash, and a deliberately corrupted header
     /// is reported as the node lying rather than as a bug in the tool
     function test_criterion04_theBlockHeaderReHashesToTheRequestedBlock() public {
-        fail("The block header re-hashes to the requested block hash, and a deliberately corrupted header is reported as the node lying rather than as a bug in the tool");
+        fail(
+            "The block header re-hashes to the requested block hash, and a deliberately corrupted header is reported as the node lying rather than as a bug in the tool"
+        );
     }
 
     /// One real transaction round-trips: raw bytes to envelope type, selector and typed arguments,
     /// and back to byte-identical calldata
     function test_criterion05_oneRealTransactionRoundTripsRawBytesToEnvelope() public {
-        fail("One real transaction round-trips: raw bytes to envelope type, selector and typed arguments, and back to byte-identical calldata");
+        fail(
+            "One real transaction round-trips: raw bytes to envelope type, selector and typed arguments, and back to byte-identical calldata"
+        );
     }
 
     /// The confirmation verdict states a depth AND the ETH destroyed to reverse it AND whether that
     /// exceeds the value at risk the caller passed
     function test_criterion06_theConfirmationVerdictStatesADepthAndTheEth() public {
-        fail("The confirmation verdict states a depth AND the ETH destroyed to reverse it AND whether that exceeds the value at risk the caller passed");
+        fail(
+            "The confirmation verdict states a depth AND the ETH destroyed to reverse it AND whether that exceeds the value at risk the caller passed"
+        );
     }
 
     /// For a value at risk above the cost of reversal, the tool refuses to certify any depth and

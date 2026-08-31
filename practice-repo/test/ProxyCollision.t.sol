@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ProxyCollision} from "../src/solidity-proxies-upgrades/ProxyCollision.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,14 +26,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   slots with inline assembly, and re-run both attacks.
  */
 contract ProxyCollisionTest is Test {
+    /// The subject, from src/solidity-proxies-upgrades/ProxyCollision.sol. Add functions there and call them here.
+    ProxyCollision internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ProxyCollision();
     }
 
     /// A test proves an attacker-chosen address ends up in the proxy's implementation position
     /// after calling an innocuous implementation function
     function test_criterion01_aTestProvesAnAttackerChosenAddressEndsUp() public {
-        fail("A test proves an attacker-chosen address ends up in the proxy's implementation position after calling an innocuous implementation function");
+        fail(
+            "A test proves an attacker-chosen address ends up in the proxy's implementation position after calling an innocuous implementation function"
+        );
     }
 
     /// A second test proves the admin position can be captured the same way
@@ -43,7 +49,9 @@ contract ProxyCollisionTest is Test {
     /// Both tests fail to corrupt anything against the EIP-1967 version, verified by reading the
     /// two standard slots with vm.load
     function test_criterion03_bothTestsFailToCorruptAnythingAgainstTheEip() public {
-        fail("Both tests fail to corrupt anything against the EIP-1967 version, verified by reading the two standard slots with vm.load");
+        fail(
+            "Both tests fail to corrupt anything against the EIP-1967 version, verified by reading the two standard slots with vm.load"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

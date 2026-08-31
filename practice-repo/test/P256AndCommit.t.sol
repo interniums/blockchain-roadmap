@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {P256AndCommit} from "../src/fundamentals-crypto/P256AndCommit.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -30,8 +31,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   which the fix restored.
  */
 contract P256AndCommitTest is Test {
+    /// The subject, from src/fundamentals-crypto/P256AndCommit.sol. Add functions there and call them here.
+    P256AndCommit internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new P256AndCommit();
     }
 
     /// A P-256 signature verifies on chain through the precompile, with the gas reported
@@ -42,13 +46,17 @@ contract P256AndCommitTest is Test {
     /// The same signature verifies via Solidity without the precompile, with the gas reported and
     /// the ratio stated
     function test_criterion02_theSameSignatureVerifiesViaSolidityWithoutThePrecompile() public {
-        fail("The same signature verifies via Solidity without the precompile, with the gas reported and the ratio stated");
+        fail(
+            "The same signature verifies via Solidity without the precompile, with the gas reported and the ratio stated"
+        );
     }
 
     /// The write-up states what a secure-element key gains and what it costs, against a key in
     /// application memory
     function test_criterion03_theWriteUpStatesWhatASecureElementKey() public {
-        fail("The write-up states what a secure-element key gains and what it costs, against a key in application memory");
+        fail(
+            "The write-up states what a secure-element key gains and what it costs, against a key in application memory"
+        );
     }
 
     /// A hash commitment is implemented with commit, reveal and verification

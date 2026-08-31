@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {TwoLanguageToken} from "../src/solidity-vyper/TwoLanguageToken.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,14 +26,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   inline instead.
  */
 contract TwoLanguageTokenTest is Test {
+    /// The subject, from src/solidity-vyper/TwoLanguageToken.sol. Add functions there and call them here.
+    TwoLanguageToken internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new TwoLanguageToken();
     }
 
     /// One test contract runs the same assertions against both deployments, addressed only through
     /// the shared ABI
     function test_criterion01_oneTestContractRunsTheSameAssertionsAgainstBoth() public {
-        fail("One test contract runs the same assertions against both deployments, addressed only through the shared ABI");
+        fail(
+            "One test contract runs the same assertions against both deployments, addressed only through the shared ABI"
+        );
     }
 
     /// Deployed bytecode size is recorded for both, with the exact compiler versions named
@@ -43,7 +49,9 @@ contract TwoLanguageTokenTest is Test {
     /// A written list names at least three behaviours the Solidity version inherits and where the
     /// Vyper version states them inline
     function test_criterion03_aWrittenListNamesAtLeastThreeBehavioursThe() public {
-        fail("A written list names at least three behaviours the Solidity version inherits and where the Vyper version states them inline");
+        fail(
+            "A written list names at least three behaviours the Solidity version inherits and where the Vyper version states them inline"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

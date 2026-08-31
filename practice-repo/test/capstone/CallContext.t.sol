@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {CallContext} from "../../src/solidity-calls-delegatecall/CallContext.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -38,8 +39,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   somewhere and show it does not mean what it looks like it means.
  */
 contract CallContextTest is Test {
+    /// The subject, from src/solidity-calls-delegatecall/CallContext.sol. Add functions there and call them here.
+    CallContext internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new CallContext();
     }
 
     /// All twelve cells of the context table are predicted in comments before being asserted
@@ -50,7 +54,9 @@ contract CallContextTest is Test {
     /// A delegatecall to a codeless address returns true, and the check that would catch it is
     /// written with a note on why EIP-7702 makes it unreliable
     function test_criterion02_aDelegatecallToACodelessAddressReturnsTrueAnd() public {
-        fail("A delegatecall to a codeless address returns true, and the check that would catch it is written with a note on why EIP-7702 makes it unreliable");
+        fail(
+            "A delegatecall to a codeless address returns true, and the check that would catch it is written with a note on why EIP-7702 makes it unreliable"
+        );
     }
 
     /// this.f() is shown to differ from f() in both context and gas, with the gas difference
@@ -62,13 +68,17 @@ contract CallContextTest is Test {
     /// A view function's state change is shown failing under staticcall and succeeding when not
     /// reached through one
     function test_criterion04_aViewFunctionSStateChangeIsShownFailing() public {
-        fail("A view function's state change is shown failing under staticcall and succeeding when not reached through one");
+        fail(
+            "A view function's state change is shown failing under staticcall and succeeding when not reached through one"
+        );
     }
 
     /// An ignored low-level-call boolean lets the caller proceed after a failure, and proper revert
     /// bubbling is contrasted with it
     function test_criterion05_anIgnoredLowLevelCallBooleanLetsTheCaller() public {
-        fail("An ignored low-level-call boolean lets the caller proceed after a failure, and proper revert bubbling is contrasted with it");
+        fail(
+            "An ignored low-level-call boolean lets the caller proceed after a failure, and proper revert bubbling is contrasted with it"
+        );
     }
 
     /// A returndata bomb's cost to a naive caller is measured as a number
@@ -79,7 +89,9 @@ contract CallContextTest is Test {
     /// The implementation pointer is overwritten from an unrelated setter, with the colliding slot
     /// and its origin named in a comment
     function test_criterion07_theImplementationPointerIsOverwrittenFromAnUnrelatedSetter() public {
-        fail("The implementation pointer is overwritten from an unrelated setter, with the colliding slot and its origin named in a comment");
+        fail(
+            "The implementation pointer is overwritten from an unrelated setter, with the colliding slot and its origin named in a comment"
+        );
     }
 
     /// A tx.origin check is shown not to mean what it appears to mean

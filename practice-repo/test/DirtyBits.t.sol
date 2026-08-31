@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {DirtyBits} from "../src/evm-yul-assembly/DirtyBits.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   show it silently produces the wrong branch.
  */
 contract DirtyBitsTest is Test {
+    /// The subject, from src/evm-yul-assembly/DirtyBits.sol. Add functions there and call them here.
+    DirtyBits internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new DirtyBits();
     }
 
     /// A test that fails before the fix by showing two logically equal addresses comparing unequal

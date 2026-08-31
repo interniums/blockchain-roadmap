@@ -32,7 +32,9 @@ contract UnguardedInternalsTest is Test {
     /// The list names at least _pause, _unpause, _mint and the clone initializer, each with the
     /// guard you would add
     function test_criterion01_theListNamesAtLeastPauseUnpauseMintAnd() public {
-        fail("The list names at least _pause, _unpause, _mint and the clone initializer, each with the guard you would add");
+        fail(
+            "The list names at least _pause, _unpause, _mint and the clone initializer, each with the guard you would add"
+        );
     }
 
     /// Each entry has a test proving an unprivileged address can invoke it when it is exposed
@@ -44,7 +46,9 @@ contract UnguardedInternalsTest is Test {
     /// A written note explains why upgradeable variants use __X_init instead of a constructor, in
     /// terms of what a proxy does and does not run
     function test_criterion03_aWrittenNoteExplainsWhyUpgradeableVariantsUseX() public {
-        fail("A written note explains why upgradeable variants use __X_init instead of a constructor, in terms of what a proxy does and does not run");
+        fail(
+            "A written note explains why upgradeable variants use __X_init instead of a constructor, in terms of what a proxy does and does not run"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

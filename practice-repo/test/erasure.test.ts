@@ -19,6 +19,10 @@
  *   each holding a random slice, have any node that reaches the recovery threshold reconstruct
  *   and republish the columns it recovered, and measure how many rounds it takes for the whole
  *   network to hold what it needs when the adversary withholds various fractions below one half.
+ *
+ * Your code goes in src/protocol-peerdas/Erasure.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

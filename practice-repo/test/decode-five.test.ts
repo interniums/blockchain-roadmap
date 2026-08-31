@@ -17,6 +17,10 @@
  *   address holding no code. Capture the raw revert bytes for each. Build a five-row table
  *   mapping raw hex to selector to decoded meaning, using `cast sig`, `cast decode-error` and
  *   viem's `decodeErrorResult`, and explain why exactly one row has no selector at all.
+ *
+ * Your code goes in src/app-error-surfaces/DecodeFive.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

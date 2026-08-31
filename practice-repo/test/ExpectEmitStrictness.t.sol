@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ExpectEmitStrictness} from "../src/toolchain-unit-testing/ExpectEmitStrictness.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,14 +27,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   seen ordering enforced as well as emitter blindness.
  */
 contract ExpectEmitStrictnessTest is Test {
+    /// The subject, from src/toolchain-unit-testing/ExpectEmitStrictness.sol. Add functions there and call them here.
+    ExpectEmitStrictness internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ExpectEmitStrictness();
     }
 
     /// A test passes while the real token never emits, because the decoy's identical event
     /// satisfied an unpinned expectation
     function test_criterion01_aTestPassesWhileTheRealTokenNeverEmits() public {
-        fail("A test passes while the real token never emits, because the decoy's identical event satisfied an unpinned expectation");
+        fail(
+            "A test passes while the real token never emits, because the decoy's identical event satisfied an unpinned expectation"
+        );
     }
 
     /// The equivalent test using the address overload fails against the decoy and passes against
@@ -45,7 +51,9 @@ contract ExpectEmitStrictnessTest is Test {
     /// A test demonstrates that two expectations registered in reverse order fail, and the same two
     /// in actual order pass
     function test_criterion03_aTestDemonstratesThatTwoExpectationsRegisteredInReverse() public {
-        fail("A test demonstrates that two expectations registered in reverse order fail, and the same two in actual order pass");
+        fail(
+            "A test demonstrates that two expectations registered in reverse order fail, and the same two in actual order pass"
+        );
     }
 
     /// Comments state which of topic0, topics 1-3, the data body and the emitter each assertion is

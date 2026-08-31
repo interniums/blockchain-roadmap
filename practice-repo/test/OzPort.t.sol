@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {OzPort} from "../src/solidity-openzeppelin/OzPort.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -24,8 +25,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   upgradeable variant, fix the imports so stateless contracts come from the main package.
  */
 contract OzPortTest is Test {
+    /// The subject, from src/solidity-openzeppelin/OzPort.sol. Add functions there and call them here.
+    OzPort internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new OzPort();
     }
 
     /// The project compiles against openzeppelin-contracts v5.7.0 with no deprecated or removed
@@ -37,7 +41,9 @@ contract OzPortTest is Test {
     /// Tests assert OwnableUnauthorizedAccount and at least one other 5.x custom error by selector,
     /// not by string
     function test_criterion02_testsAssertOwnableunauthorizedaccountAndAtLeastOneOther5() public {
-        fail("Tests assert OwnableUnauthorizedAccount and at least one other 5.x custom error by selector, not by string");
+        fail(
+            "Tests assert OwnableUnauthorizedAccount and at least one other 5.x custom error by selector, not by string"
+        );
     }
 
     /// A comment records, for each removed 4.x API, what replaced it and where the behaviour is not

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {RevocationWindow} from "../src/app-session-keys/RevocationWindow.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,26 +26,35 @@ import {Test, console2} from "forge-std/Test.sol";
  *   record which landed.
  */
 contract RevocationWindowTest is Test {
+    /// The subject, from src/app-session-keys/RevocationWindow.sol. Add functions there and call them here.
+    RevocationWindow internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new RevocationWindow();
     }
 
     /// The gas report contains a measured cost for the revocation path, quoted from the report
     /// rather than estimated
     function test_criterion01_theGasReportContainsAMeasuredCostForThe() public {
-        fail("The gas report contains a measured cost for the revocation path, quoted from the report rather than estimated");
+        fail(
+            "The gas report contains a measured cost for the revocation path, quoted from the report rather than estimated"
+        );
     }
 
     /// latency.json records click-to-receipt seconds on a testnet and converts it into a window
     /// expressed in blocks
     function test_criterion02_latencyJsonRecordsClickToReceiptSecondsOnA() public {
-        fail("latency.json records click-to-receipt seconds on a testnet and converts it into a window expressed in blocks");
+        fail(
+            "latency.json records click-to-receipt seconds on a testnet and converts it into a window expressed in blocks"
+        );
     }
 
     /// The Anvil race test shows the session-key operation being included ahead of the revocation
     /// and asserts it succeeded
     function test_criterion03_theAnvilRaceTestShowsTheSessionKeyOperation() public {
-        fail("The Anvil race test shows the session-key operation being included ahead of the revocation and asserts it succeeded");
+        fail(
+            "The Anvil race test shows the session-key operation being included ahead of the revocation and asserts it succeeded"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

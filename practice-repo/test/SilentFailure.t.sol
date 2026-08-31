@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {SilentFailure} from "../src/evm-execution/SilentFailure.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   from B is bubbled up unchanged.
  */
 contract SilentFailureTest is Test {
+    /// The subject, from src/evm-execution/SilentFailure.sol. Add functions there and call them here.
+    SilentFailure internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new SilentFailure();
     }
 
     /// A passing test in which the outer transaction succeeds, A's state changed, and B reverted
@@ -38,13 +42,17 @@ contract SilentFailureTest is Test {
     /// A second passing test producing the same silent failure via insufficient forwarded gas
     /// rather than a revert
     function test_criterion02_aSecondPassingTestProducingTheSameSilentFailure() public {
-        fail("A second passing test producing the same silent failure via insufficient forwarded gas rather than a revert");
+        fail(
+            "A second passing test producing the same silent failure via insufficient forwarded gas rather than a revert"
+        );
     }
 
     /// A third test on the fixed version proving it reverts, with B's custom error selector
     /// preserved in the bubbled data
     function test_criterion03_aThirdTestOnTheFixedVersionProvingIt() public {
-        fail("A third test on the fixed version proving it reverts, with B's custom error selector preserved in the bubbled data");
+        fail(
+            "A third test on the fixed version proving it reverts, with B's custom error selector preserved in the bubbled data"
+        );
     }
 
     /// A comment distinguishing the two failure mechanisms and explaining why the fix catches both

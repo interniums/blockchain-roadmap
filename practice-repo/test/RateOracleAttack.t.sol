@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {RateOracleAttack} from "../src/defi-liquidations/RateOracleAttack.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,8 +29,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   same attack test now fails.
  */
 contract RateOracleAttackTest is Test {
+    /// The subject, from src/defi-liquidations/RateOracleAttack.sol. Add functions there and call them here.
+    RateOracleAttack internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new RateOracleAttack();
     }
 
     /// A test moves the vault's conversion rate in one transaction using only calls any address may
@@ -41,19 +45,25 @@ contract RateOracleAttackTest is Test {
     /// The same test asserts a previously healthy position becomes hard-liquidatable in that block
     /// and reports the attacker's net profit
     function test_criterion02_theSameTestAssertsAPreviouslyHealthyPositionBecomes() public {
-        fail("The same test asserts a previously healthy position becomes hard-liquidatable in that block and reports the attacker's net profit");
+        fail(
+            "The same test asserts a previously healthy position becomes hard-liquidatable in that block and reports the attacker's net profit"
+        );
     }
 
     /// After swapping in the rate-limited oracle, the attack test fails and a separate test asserts
     /// the exact bound the limiter enforces
     function test_criterion03_afterSwappingInTheRateLimitedOracleTheAttack() public {
-        fail("After swapping in the rate-limited oracle, the attack test fails and a separate test asserts the exact bound the limiter enforces");
+        fail(
+            "After swapping in the rate-limited oracle, the attack test fails and a separate test asserts the exact bound the limiter enforces"
+        );
     }
 
     /// A test demonstrates the cost of the defence — a genuine large rate move is reported late by
     /// the limiter, and the test quantifies the lag
     function test_criterion04_aTestDemonstratesTheCostOfTheDefenceA() public {
-        fail(unicode"A test demonstrates the cost of the defence — a genuine large rate move is reported late by the limiter, and the test quantifies the lag");
+        fail(
+            unicode"A test demonstrates the cost of the defence — a genuine large rate move is reported late by the limiter, and the test quantifies the lag"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

@@ -21,6 +21,10 @@
  *   `waitForTransactionReceipt`, and print the formatted balance again. The script must contain
  *   no call to `writeContract` that is not preceded by a successful `simulateContract` on the
  *   same line of reasoning.
+ *
+ * Your code goes in src/app-viem/TwoClientRoundTrip.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

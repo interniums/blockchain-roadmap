@@ -18,6 +18,10 @@
  *   In both cases catch the thrown error and walk its `cause` chain rather than reading
  *   `error.message`. Record what you get in each case, and write one paragraph explaining the
  *   difference in terms of where decoding information lives.
+ *
+ * Your code goes in src/app-viem/TypedRevert.ts. Nothing here imports it yet — a TypeScript
+ * module is its named exports, and this scaffold does not invent them. Export what the
+ * exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

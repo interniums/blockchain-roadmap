@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {AbiValidation} from "../src/solidity-abi-selectors/AbiValidation.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -33,20 +34,27 @@ import {Test, console2} from "forge-std/Test.sol";
  *   compute. Assert both match what the normal decoding produced.
  */
 contract AbiValidationTest is Test {
+    /// The subject, from src/solidity-abi-selectors/AbiValidation.sol. Add functions there and call them here.
+    AbiValidation internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new AbiValidation();
     }
 
     /// Hand-crafted calldata with an out-of-range narrow-type value is rejected by the decoder,
     /// with the revert reported
     function test_criterion01_handCraftedCalldataWithAnOutOfRangeNarrow() public {
-        fail("Hand-crafted calldata with an out-of-range narrow-type value is rejected by the decoder, with the revert reported");
+        fail(
+            "Hand-crafted calldata with an out-of-range narrow-type value is rejected by the decoder, with the revert reported"
+        );
     }
 
     /// Calldata violating strict encoding rules is accepted, with what a strict decoder would have
     /// rejected stated for each case
     function test_criterion02_calldataViolatingStrictEncodingRulesIsAcceptedWithWhat() public {
-        fail("Calldata violating strict encoding rules is accepted, with what a strict decoder would have rejected stated for each case");
+        fail(
+            "Calldata violating strict encoding rules is accepted, with what a strict decoder would have rejected stated for each case"
+        );
     }
 
     /// Packed encoding is shown to carry no length information

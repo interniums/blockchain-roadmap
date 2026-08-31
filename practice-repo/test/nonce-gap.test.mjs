@@ -21,6 +21,10 @@
  *   wall-clock moments. Emit a timeline to `out/nonce-gap.json` with, for each poll, the
  *   timestamp, each endpoint's answer, and the pool bucket the transaction was in. Assertions go
  *   in `test/nonce-gap.test.mjs`.
+ *
+ * Your code goes in src/ledgers-mempool/NonceGap.mjs. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { test } from 'node:test';
 

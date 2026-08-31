@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {VaultInflation} from "../src/solidity-token-standards/VaultInflation.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   put in plus their share of yield, and show it fails against the naive version.
  */
 contract VaultInflationTest is Test {
+    /// The subject, from src/solidity-token-standards/VaultInflation.sol. Add functions there and call them here.
+    VaultInflation internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new VaultInflation();
     }
 
     /// A test asserts the victim receives zero shares and the attacker withdraws more than they
@@ -39,7 +43,9 @@ contract VaultInflationTest is Test {
     /// The same attack against the virtual-offset vault leaves the attacker no better off, with the
     /// residual quantified in the assertion
     function test_criterion02_theSameAttackAgainstTheVirtualOffsetVaultLeaves() public {
-        fail("The same attack against the virtual-offset vault leaves the attacker no better off, with the residual quantified in the assertion");
+        fail(
+            "The same attack against the virtual-offset vault leaves the attacker no better off, with the residual quantified in the assertion"
+        );
     }
 
     /// An invariant test passes on the fixed vault and produces a counterexample against the naive

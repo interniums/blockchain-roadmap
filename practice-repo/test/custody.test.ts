@@ -21,6 +21,10 @@
  *   full-node requirement and measure the distribution: how many nodes cover each custody group,
  *   and what the least-covered group gets. Repeat with the validator requirement and state how
  *   the picture changes.
+ *
+ * Your code goes in src/protocol-peerdas/Custody.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {FixReview} from "../src/security-audit-craft/FixReview.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   including finding nothing.
  */
 contract FixReviewTest is Test {
+    /// The subject, from src/security-audit-craft/FixReview.sol. Add functions there and call them here.
+    FixReview internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new FixReview();
     }
 
     /// A test that fails at the audited commit and passes after the fix

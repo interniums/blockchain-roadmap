@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ContextTable} from "../src/solidity-calls-delegatecall/ContextTable.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   of the exercise.
  */
 contract ContextTableTest is Test {
+    /// The subject, from src/solidity-calls-delegatecall/ContextTable.sol. Add functions there and call them here.
+    ContextTable internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ContextTable();
     }
 
     /// Every cell of the five-by-four table is asserted, and the assertions match the prediction
@@ -39,13 +43,17 @@ contract ContextTableTest is Test {
     /// A test proves that emitting a log inside the staticcall path reverts, and the passing
     /// version returns the values instead
     function test_criterion02_aTestProvesThatEmittingALogInsideThe() public {
-        fail("A test proves that emitting a log inside the staticcall path reverts, and the passing version returns the values instead");
+        fail(
+            "A test proves that emitting a log inside the staticcall path reverts, and the passing version returns the values instead"
+        );
     }
 
     /// A test asserts msg.sender inside the delegatecalled probe is the original caller and not the
     /// Caller contract
     function test_criterion03_aTestAssertsMsgSenderInsideTheDelegatecalledProbe() public {
-        fail("A test asserts msg.sender inside the delegatecalled probe is the original caller and not the Caller contract");
+        fail(
+            "A test asserts msg.sender inside the delegatecalled probe is the original caller and not the Caller contract"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

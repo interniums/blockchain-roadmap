@@ -50,7 +50,9 @@ contract AuditTest is Test {
     /// The nine-category maturity score is dated before the business-logic read, and the report
     /// says how it redirected the audit
     function test_criterion01_theNineCategoryMaturityScoreIsDatedBeforeThe() public {
-        fail("The nine-category maturity score is dated before the business-logic read, and the report says how it redirected the audit");
+        fail(
+            "The nine-category maturity score is dated before the business-logic read, and the report says how it redirected the audit"
+        );
     }
 
     /// A trust-boundary diagram and table state, for every crossing, what an attacker controls
@@ -61,7 +63,9 @@ contract AuditTest is Test {
     /// Vulnerability classes are ranked by money at risk in this codebase, with ruled-out classes
     /// named and the method for ruling them out stated
     function test_criterion03_vulnerabilityClassesAreRankedByMoneyAtRiskIn() public {
-        fail("Vulnerability classes are ranked by money at risk in this codebase, with ruled-out classes named and the method for ruling them out stated");
+        fail(
+            "Vulnerability classes are ranked by money at risk in this codebase, with ruled-out classes named and the method for ruling them out stated"
+        );
     }
 
     /// All four tool categories were run, and each has a stated blind spot rather than only a
@@ -78,7 +82,9 @@ contract AuditTest is Test {
     /// Every finding has a severity, an exploitability difficulty, a named exploit scenario, and a
     /// proof of concept that runs
     function test_criterion06_everyFindingHasASeverityAnExploitabilityDifficultyA() public {
-        fail("Every finding has a severity, an exploitability difficulty, a named exploit scenario, and a proof of concept that runs");
+        fail(
+            "Every finding has a severity, an exploitability difficulty, a named exploit scenario, and a proof of concept that runs"
+        );
     }
 
     /// Severity is assigned impact-first, and any finding below high says so rather than being
@@ -90,7 +96,9 @@ contract AuditTest is Test {
     /// A one-page summary of a published formal-verification report covers its assumptions and
     /// summaries, not its checkmarks
     function test_criterion08_aOnePageSummaryOfAPublishedFormalVerification() public {
-        fail("A one-page summary of a published formal-verification report covers its assumptions and summaries, not its checkmarks");
+        fail(
+            "A one-page summary of a published formal-verification report covers its assumptions and summaries, not its checkmarks"
+        );
     }
 
     /// The contest arithmetic names likely duplicates, likely rule-based invalidations, and a

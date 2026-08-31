@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ForkPinned} from "../src/toolchain-fork-testing/ForkPinned.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,20 +26,27 @@ import {Test, console2} from "forge-std/Test.sol";
  *   third run. Finally, remove the pin, run twice, and record what changes.
  */
 contract ForkPinnedTest is Test {
+    /// The subject, from src/toolchain-fork-testing/ForkPinned.sol. Add functions there and call them here.
+    ForkPinned internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ForkPinned();
     }
 
     /// The test passes against a pinned block and the block number appears in foundry.toml or on
     /// the command line, never as "latest"
     function test_criterion01_theTestPassesAgainstAPinnedBlockAndThe() public {
-        fail("The test passes against a pinned block and the block number appears in foundry.toml or on the command line, never as \"latest\"");
+        fail(
+            "The test passes against a pinned block and the block number appears in foundry.toml or on the command line, never as \"latest\""
+        );
     }
 
     /// Three wall-clock timings are recorded — cold, warm, and after clearing the cache — with the
     /// gap explained in terms of per-slot RPC fetches
     function test_criterion02_threeWallClockTimingsAreRecordedColdWarmAnd() public {
-        fail(unicode"Three wall-clock timings are recorded — cold, warm, and after clearing the cache — with the gap explained in terms of per-slot RPC fetches");
+        fail(
+            unicode"Three wall-clock timings are recorded — cold, warm, and after clearing the cache — with the gap explained in terms of per-slot RPC fetches"
+        );
     }
 
     /// No endpoint URL or API key appears in any committed source file
@@ -49,7 +57,9 @@ contract ForkPinnedTest is Test {
     /// The unpinned variant is shown either producing different results or missing the cache, and
     /// the learner can say why CI would be flaky
     function test_criterion04_theUnpinnedVariantIsShownEitherProducingDifferentResults() public {
-        fail("The unpinned variant is shown either producing different results or missing the cache, and the learner can say why CI would be flaky");
+        fail(
+            "The unpinned variant is shown either producing different results or missing the cache, and the learner can say why CI would be flaky"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

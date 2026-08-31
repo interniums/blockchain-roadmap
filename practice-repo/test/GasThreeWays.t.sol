@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {GasThreeWays} from "../src/toolchain-gas-profiling/GasThreeWays.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,8 +28,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   excluded, and which one is closest to what a user pays.
  */
 contract GasThreeWaysTest is Test {
+    /// The subject, from src/toolchain-gas-profiling/GasThreeWays.sol. Add functions there and call them here.
+    GasThreeWays internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new GasThreeWays();
     }
 
     /// Four numbers are recorded for the same function, with the isolation setting stated for each
@@ -39,7 +43,9 @@ contract GasThreeWaysTest is Test {
     /// A test asserts that the naive probe over a read produces a value below a threshold that no
     /// real cold read could produce, demonstrating the elimination
     function test_criterion02_aTestAssertsThatTheNaiveProbeOverA() public {
-        fail("A test asserts that the naive probe over a read produces a value below a threshold that no real cold read could produce, demonstrating the elimination");
+        fail(
+            "A test asserts that the naive probe over a read produces a value below a threshold that no real cold read could produce, demonstrating the elimination"
+        );
     }
 
     /// The sink-based probe reproduces the documented cold and warm read costs to within the
@@ -51,7 +57,9 @@ contract GasThreeWaysTest is Test {
     /// A written note states which of the four numbers is closest to a mainnet transaction cost and
     /// names the two components still missing from it
     function test_criterion04_aWrittenNoteStatesWhichOfTheFourNumbers() public {
-        fail("A written note states which of the four numbers is closest to a mainnet transaction cost and names the two components still missing from it");
+        fail(
+            "A written note states which of the four numbers is closest to a mainnet transaction cost and names the two components still missing from it"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

@@ -19,6 +19,10 @@
  *   to build the header bloom. Fetch a real mainnet receipt and a real block over RPC and
  *   compare against the `logsBloom` fields byte for byte. Then measure saturation: for a range
  *   of recent blocks, report the fraction of bits set in each header bloom.
+ *
+ * Your code goes in src/evm-logs-bloom/LogsBloom.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

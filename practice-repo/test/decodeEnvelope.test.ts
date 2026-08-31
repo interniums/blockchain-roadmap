@@ -19,6 +19,10 @@
  *   transaction of each of the five types with `cast tx --raw` and use them as fixtures. Produce
  *   a table of which fields each type carries, generated from your decoder rather than written
  *   by hand.
+ *
+ * Your code goes in src/evm-transaction-types/DecodeEnvelope.ts. Nothing here imports it yet —
+ * a TypeScript module is its named exports, and this scaffold does not invent them. Export
+ * what the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

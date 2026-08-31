@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {VyperLockRegression} from "../src/solidity-vyper/VyperLockRegression.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,20 +27,27 @@ import {Test, console2} from "forge-std/Test.sol";
  *   repository.
  */
 contract VyperLockRegressionTest is Test {
+    /// The subject, from src/solidity-vyper/VyperLockRegression.sol. Add functions there and call them here.
+    VyperLockRegression internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new VyperLockRegression();
     }
 
     /// The storage layout output from both compilers is captured in the repository and the
     /// differing lock slots are identified by number
     function test_criterion01_theStorageLayoutOutputFromBothCompilersIsCaptured() public {
-        fail("The storage layout output from both compilers is captured in the repository and the differing lock slots are identified by number");
+        fail(
+            "The storage layout output from both compilers is captured in the repository and the differing lock slots are identified by number"
+        );
     }
 
     /// A test proves cross-function re-entry succeeds against the 0.3.0 bytecode and reverts
     /// against the current one
     function test_criterion02_aTestProvesCrossFunctionReEntrySucceedsAgainst() public {
-        fail("A test proves cross-function re-entry succeeds against the 0.3.0 bytecode and reverts against the current one");
+        fail(
+            "A test proves cross-function re-entry succeeds against the 0.3.0 bytecode and reverts against the current one"
+        );
     }
 
     /// A written note names the affected version range and states the mechanism without quoting a

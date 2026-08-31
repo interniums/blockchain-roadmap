@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ProxyUpgrade} from "../src/solidity-proxies-upgrades/ProxyUpgrade.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,8 +26,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   slots, and show what the old bytes look like when read under the new layout.
  */
 contract ProxyUpgradeTest is Test {
+    /// The subject, from src/solidity-proxies-upgrades/ProxyUpgrade.sol. Add functions there and call them here.
+    ProxyUpgrade internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ProxyUpgrade();
     }
 
     /// Tests prove pre-upgrade state is readable after upgrade on both the transparent and the UUPS
@@ -38,13 +42,17 @@ contract ProxyUpgradeTest is Test {
     /// A test proves that after upgrading the UUPS proxy to an implementation with no upgrade
     /// function, every upgrade attempt reverts, including from the admin
     function test_criterion02_aTestProvesThatAfterUpgradingTheUupsProxy() public {
-        fail("A test proves that after upgrading the UUPS proxy to an implementation with no upgrade function, every upgrade attempt reverts, including from the admin");
+        fail(
+            "A test proves that after upgrading the UUPS proxy to an implementation with no upgrade function, every upgrade attempt reverts, including from the admin"
+        );
     }
 
     /// A test reads a variable after the sequential-to-namespaced migration and asserts it does not
     /// equal what it held before, with a comment identifying which slot collided
     function test_criterion03_aTestReadsAVariableAfterTheSequentialTo() public {
-        fail("A test reads a variable after the sequential-to-namespaced migration and asserts it does not equal what it held before, with a comment identifying which slot collided");
+        fail(
+            "A test reads a variable after the sequential-to-namespaced migration and asserts it does not equal what it held before, with a comment identifying which slot collided"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {StorageLayout} from "../../src/solidity-storage-layout/StorageLayout.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -37,8 +38,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   gone at the end of the transaction.
  */
 contract StorageLayoutTest is Test {
+    /// The subject, from src/solidity-storage-layout/StorageLayout.sol. Add functions there and call them here.
+    StorageLayout internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new StorageLayout();
     }
 
     /// Every state variable of a real deployed contract has a slot, byte offset and width, derived
@@ -60,7 +64,9 @@ contract StorageLayoutTest is Test {
     /// A mapping entry, a nested mapping entry and a dynamic array element are each derived by hand
     /// with their hash inputs shown, then proven against the chain
     function test_criterion04_aMappingEntryANestedMappingEntryAndA() public {
-        fail("A mapping entry, a nested mapping entry and a dynamic array element are each derived by hand with their hash inputs shown, then proven against the chain");
+        fail(
+            "A mapping entry, a nested mapping entry and a dynamic array element are each derived by hand with their hash inputs shown, then proven against the chain"
+        );
     }
 
     /// An unused portion of a slot is identified with the declaration change that would fill it
@@ -76,13 +82,17 @@ contract StorageLayoutTest is Test {
     /// A reordered layout is strictly cheaper for one named operation and strictly more expensive
     /// for another, with both numbers reported
     function test_criterion07_aReorderedLayoutIsStrictlyCheaperForOneNamed() public {
-        fail("A reordered layout is strictly cheaper for one named operation and strictly more expensive for another, with both numbers reported");
+        fail(
+            "A reordered layout is strictly cheaper for one named operation and strictly more expensive for another, with both numbers reported"
+        );
     }
 
     /// A transient variable is shown to occupy a separate address space from storage at the same
     /// slot number, and to be gone after the transaction
     function test_criterion08_aTransientVariableIsShownToOccupyASeparate() public {
-        fail("A transient variable is shown to occupy a separate address space from storage at the same slot number, and to be gone after the transaction");
+        fail(
+            "A transient variable is shown to occupy a separate address space from storage at the same slot number, and to be gone after the transaction"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

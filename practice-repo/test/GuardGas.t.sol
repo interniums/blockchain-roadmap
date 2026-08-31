@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {GuardGas} from "../src/toolchain-gas-profiling/GuardGas.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,32 +27,43 @@ import {Test, console2} from "forge-std/Test.sol";
  *   attempts reentry and asserting it is blocked in both cases.
  */
 contract GuardGasTest is Test {
+    /// The subject, from src/toolchain-gas-profiling/GuardGas.sol. Add functions there and call them here.
+    GuardGas internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new GuardGas();
     }
 
     /// Measured overheads are reported for the transient guard and for the storage guard in both
     /// the cold-slot and warm-slot cases
     function test_criterion01_measuredOverheadsAreReportedForTheTransientGuardAnd() public {
-        fail("Measured overheads are reported for the transient guard and for the storage guard in both the cold-slot and warm-slot cases");
+        fail(
+            "Measured overheads are reported for the transient guard and for the storage guard in both the cold-slot and warm-slot cases"
+        );
     }
 
     /// A test asserts the transient guard's overhead is under 400 gas and the warm storage guard's
     /// is over 2500, so the ordering is machine-checked rather than asserted in prose
     function test_criterion02_aTestAssertsTheTransientGuardSOverheadIs() public {
-        fail("A test asserts the transient guard's overhead is under 400 gas and the warm storage guard's is over 2500, so the ordering is machine-checked rather than asserted in prose");
+        fail(
+            "A test asserts the transient guard's overhead is under 400 gas and the warm storage guard's is over 2500, so the ordering is machine-checked rather than asserted in prose"
+        );
     }
 
     /// A reentrancy attempt is blocked by both implementations, proven by a test that succeeds
     /// against the unguarded control
     function test_criterion03_aReentrancyAttemptIsBlockedByBothImplementationsProven() public {
-        fail("A reentrancy attempt is blocked by both implementations, proven by a test that succeeds against the unguarded control");
+        fail(
+            "A reentrancy attempt is blocked by both implementations, proven by a test that succeeds against the unguarded control"
+        );
     }
 
     /// The write-up states a range for the storage guard and names the condition that puts you at
     /// each end of it
     function test_criterion04_theWriteUpStatesARangeForTheStorage() public {
-        fail("The write-up states a range for the storage guard and names the condition that puts you at each end of it");
+        fail(
+            "The write-up states a range for the storage guard and names the condition that puts you at each end of it"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

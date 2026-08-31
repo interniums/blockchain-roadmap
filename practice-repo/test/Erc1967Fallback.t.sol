@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Erc1967Fallback} from "../src/evm-yul-assembly/Erc1967Fallback.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   the high-level equivalent would have inserted it for you.
  */
 contract Erc1967FallbackTest is Test {
+    /// The subject, from src/evm-yul-assembly/Erc1967Fallback.sol. Add functions there and call them here.
+    Erc1967Fallback internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Erc1967Fallback();
     }
 
     /// Forwards a function taking dynamic arguments and returns a dynamic return value unchanged
@@ -43,7 +47,9 @@ contract Erc1967FallbackTest is Test {
     /// A test proves the proxy reverts rather than silently succeeding when the implementation slot
     /// points at an address with no code
     function test_criterion03_aTestProvesTheProxyRevertsRatherThanSilently() public {
-        fail("A test proves the proxy reverts rather than silently succeeding when the implementation slot points at an address with no code");
+        fail(
+            "A test proves the proxy reverts rather than silently succeeding when the implementation slot points at an address with no code"
+        );
     }
 
     /// A comment justifies the memory-safe decision against the documented permitted regions

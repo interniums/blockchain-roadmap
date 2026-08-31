@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {PaymasterDrain} from "../src/app-account-abstraction/PaymasterDrain.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -24,14 +25,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   attack fails.
  */
 contract PaymasterDrainTest is Test {
+    /// The subject, from src/app-account-abstraction/PaymasterDrain.sol. Add functions there and call them here.
+    PaymasterDrain internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new PaymasterDrain();
     }
 
     /// A test drives the permissive paymaster's deposit to zero from an account with no
     /// relationship to the application, and asserts the amount extracted
     function test_criterion01_aTestDrivesThePermissivePaymasterSDepositTo() public {
-        fail("A test drives the permissive paymaster's deposit to zero from an account with no relationship to the application, and asserts the amount extracted");
+        fail(
+            "A test drives the permissive paymaster's deposit to zero from an account with no relationship to the application, and asserts the amount extracted"
+        );
     }
 
     /// The same attack against the scoped paymaster reverts during validation
@@ -42,7 +48,9 @@ contract PaymasterDrainTest is Test {
     /// The test reports the number of operations required, and a comment states what that number
     /// would be at mainnet gas prices
     function test_criterion03_theTestReportsTheNumberOfOperationsRequiredAnd() public {
-        fail("The test reports the number of operations required, and a comment states what that number would be at mainnet gas prices");
+        fail(
+            "The test reports the number of operations required, and a comment states what that number would be at mainnet gas prices"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

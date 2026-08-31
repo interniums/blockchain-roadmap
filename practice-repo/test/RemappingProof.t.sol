@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {RemappingProof} from "../src/toolchain-foundry-basics/RemappingProof.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,14 +28,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   than that nothing referenced it.
  */
 contract RemappingProofTest is Test {
+    /// The subject, from src/toolchain-foundry-basics/RemappingProof.sol. Add functions there and call them here.
+    RemappingProof internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new RemappingProof();
     }
 
     /// The suite fails to compile with auto-detection off and no explicit remapping, and the
     /// learner can point at the line of foundry.toml responsible
     function test_criterion01_theSuiteFailsToCompileWithAutoDetectionOff() public {
-        fail("The suite fails to compile with auto-detection off and no explicit remapping, and the learner can point at the line of foundry.toml responsible");
+        fail(
+            "The suite fails to compile with auto-detection off and no explicit remapping, and the learner can point at the line of foundry.toml responsible"
+        );
     }
 
     /// The suite compiles and passes with exactly one explicit remapping added and auto-detection
@@ -46,7 +52,9 @@ contract RemappingProofTest is Test {
     /// `forge remappings` output before and after is captured, and the learner can explain which of
     /// the three sources supplied each entry
     function test_criterion03_outputBeforeAndAfterIsCapturedAndTheLearner() public {
-        fail("`forge remappings` output before and after is captured, and the learner can explain which of the three sources supplied each entry");
+        fail(
+            "`forge remappings` output before and after is captured, and the learner can explain which of the three sources supplied each entry"
+        );
     }
 
     /// The test does something with an imported OpenZeppelin symbol, so the import is load-bearing

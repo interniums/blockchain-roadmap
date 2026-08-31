@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {AccountShape} from "../src/evm-accounts/AccountShape.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -31,8 +32,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   reader might expect. State the rule in one sentence.
  */
 contract AccountShapeTest is Test {
+    /// The subject, from src/evm-accounts/AccountShape.sol. Add functions there and call them here.
+    AccountShape internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new AccountShape();
     }
 
     /// All four fields are printed for a plain EOA, a contract and a delegated EOA, with the
@@ -61,7 +65,9 @@ contract AccountShapeTest is Test {
     /// Delegation pointed at an already-delegated account is shown not to chain, with the rule
     /// stated in one sentence
     function test_criterion05_delegationPointedAtAnAlreadyDelegatedAccountIsShown() public {
-        fail("Delegation pointed at an already-delegated account is shown not to chain, with the rule stated in one sentence");
+        fail(
+            "Delegation pointed at an already-delegated account is shown not to chain, with the rule stated in one sentence"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

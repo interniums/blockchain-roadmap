@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {DeployRecovery} from "../src/toolchain-deploy-verify/DeployRecovery.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,8 +29,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   entry for the broadcast directory.
  */
 contract DeployRecoveryTest is Test {
+    /// The subject, from src/toolchain-deploy-verify/DeployRecovery.sol. Add functions there and call them here.
+    DeployRecovery internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new DeployRecovery();
     }
 
     /// A test parses run-latest.json and asserts exactly five deployed contract addresses, all

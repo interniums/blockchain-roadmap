@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {MaliciousHook} from "../src/defi-hooks/MaliciousHook.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,32 +28,43 @@ import {Test, console2} from "forge-std/Test.sol";
  *   before trading, and honestly mark which of your checks your own hook would defeat.
  */
 contract MaliciousHookTest is Test {
+    /// The subject, from src/defi-hooks/MaliciousHook.sol. Add functions there and call them here.
+    MaliciousHook internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new MaliciousHook();
     }
 
     /// A test shows a swapper receiving materially less output on the hooked pool than on an
     /// identical unhooked pool, with the difference landing at the attacker address
     function test_criterion01_aTestShowsASwapperReceivingMateriallyLessOutput() public {
-        fail("A test shows a swapper receiving materially less output on the hooked pool than on an identical unhooked pool, with the difference landing at the attacker address");
+        fail(
+            "A test shows a swapper receiving materially less output on the hooked pool than on an identical unhooked pool, with the difference landing at the attacker address"
+        );
     }
 
     /// A test asserts the hook's deployed address carries exactly the permission bits for the
     /// callbacks it uses, and that changing the salt breaks deployment
     function test_criterion02_aTestAssertsTheHookSDeployedAddressCarries() public {
-        fail("A test asserts the hook's deployed address carries exactly the permission bits for the callbacks it uses, and that changing the salt breaks deployment");
+        fail(
+            "A test asserts the hook's deployed address carries exactly the permission bits for the callbacks it uses, and that changing the salt breaks deployment"
+        );
     }
 
     /// A test demonstrates the conditional behaviour — the same call returns a benign result under
     /// one condition and an extractive one under another
     function test_criterion03_aTestDemonstratesTheConditionalBehaviourTheSameCall() public {
-        fail(unicode"A test demonstrates the conditional behaviour — the same call returns a benign result under one condition and an extractive one under another");
+        fail(
+            unicode"A test demonstrates the conditional behaviour — the same call returns a benign result under one condition and an extractive one under another"
+        );
     }
 
     /// The repository contains a checklist naming at least five concrete checks, with the ones this
     /// hook defeats marked as such
     function test_criterion04_theRepositoryContainsAChecklistNamingAtLeastFive() public {
-        fail("The repository contains a checklist naming at least five concrete checks, with the ones this hook defeats marked as such");
+        fail(
+            "The repository contains a checklist naming at least five concrete checks, with the ones this hook defeats marked as such"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

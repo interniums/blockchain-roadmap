@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ReadOnlyReentrancy} from "../src/security-vulnerability-classes/ReadOnlyReentrancy.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,8 +28,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   inconsistent across an external call.
  */
 contract ReadOnlyReentrancyTest is Test {
+    /// The subject, from src/security-vulnerability-classes/ReadOnlyReentrancy.sol. Add functions there and call them here.
+    ReadOnlyReentrancy internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ReadOnlyReentrancy();
     }
 
     /// A test proves the attacker profits while every state-changing function on the pool is
@@ -45,7 +49,9 @@ contract ReadOnlyReentrancyTest is Test {
     /// A third test proves the same attack fails under checks-effects-interactions ordering with no
     /// guard on the view
     function test_criterion03_aThirdTestProvesTheSameAttackFailsUnder() public {
-        fail("A third test proves the same attack fails under checks-effects-interactions ordering with no guard on the view");
+        fail(
+            "A third test proves the same attack fails under checks-effects-interactions ordering with no guard on the view"
+        );
     }
 
     /// A written note states which of the two fixes you would ship and what it costs

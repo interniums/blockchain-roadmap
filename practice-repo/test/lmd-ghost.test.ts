@@ -22,6 +22,10 @@
  *   implementation must pick the late block with the boost applied and the earlier one with it
  *   removed. Add a second fixture in which a validator re-votes and the head moves as a result,
  *   with no new blocks and no new validators.
+ *
+ * Your code goes in src/protocol-fork-choice/LmdGhost.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

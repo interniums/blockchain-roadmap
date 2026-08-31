@@ -20,6 +20,10 @@
  *   the decision note an exchange would use: given your measured reorg depth distribution, how
  *   many slots would you wait before crediting a deposit, and what does the confirmation rule
  *   change about that answer compared with picking a depth from your histogram?
+ *
+ * Your code goes in src/protocol-fork-choice/Reorgs.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

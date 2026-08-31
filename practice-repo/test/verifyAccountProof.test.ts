@@ -20,6 +20,10 @@
  *   provider and the block header's stateRoot from a different one, so the verification is
  *   genuinely cross-checked. Then add negative tests: flip a single byte in any node, and swap
  *   in a leaf belonging to a different account.
+ *
+ * Your code goes in src/evm-state-tries/VerifyAccountProof.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

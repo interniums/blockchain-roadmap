@@ -20,6 +20,10 @@
  *   an independent check: build a 128-column matrix, withhold exactly 64 columns, simulate 5,000
  *   nodes each sampling the spec count, and count how many fail to detect it. Compare the
  *   simulated failure count with the analytic prediction.
+ *
+ * Your code goes in src/protocol-peerdas/SamplingSecurity.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

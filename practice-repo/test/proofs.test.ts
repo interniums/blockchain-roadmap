@@ -20,6 +20,10 @@
  *   arithmetic alone. Finally, pull a recent mainnet block, count the distinct accounts and
  *   storage slots it touched, and produce an estimated full-block witness size under each
  *   structure. State clearly which of your numbers are measured and which are derived.
+ *
+ * Your code goes in src/protocol-statelessness/Proofs.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

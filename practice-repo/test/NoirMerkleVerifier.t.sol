@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {NoirMerkleVerifier} from "../src/zk-noir-circuits/NoirMerkleVerifier.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   versions in the README and state what breaks if they are mismatched by one release.
  */
 contract NoirMerkleVerifierTest is Test {
+    /// The subject, from src/zk-noir-circuits/NoirMerkleVerifier.sol. Add functions there and call them here.
+    NoirMerkleVerifier internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new NoirMerkleVerifier();
     }
 
     /// A test passes a valid proof with the correct public root and asserts verification succeeds
@@ -43,13 +47,17 @@ contract NoirMerkleVerifierTest is Test {
     /// The gas report records measured verification gas, and the README states it as a measured
     /// figure with the toolchain versions that produced it
     function test_criterion03_theGasReportRecordsMeasuredVerificationGasAndThe() public {
-        fail("The gas report records measured verification gas, and the README states it as a measured figure with the toolchain versions that produced it");
+        fail(
+            "The gas report records measured verification gas, and the README states it as a measured figure with the toolchain versions that produced it"
+        );
     }
 
     /// The README lists ACIR opcode count and backend gate count as two separate numbers with a
     /// sentence on why they differ
     function test_criterion04_theReadmeListsAcirOpcodeCountAndBackendGate() public {
-        fail("The README lists ACIR opcode count and backend gate count as two separate numbers with a sentence on why they differ");
+        fail(
+            "The README lists ACIR opcode count and backend gate count as two separate numbers with a sentence on why they differ"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

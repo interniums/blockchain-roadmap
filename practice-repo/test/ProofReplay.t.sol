@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ProofReplay} from "../src/zk-onchain-verification/ProofReplay.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,26 +29,35 @@ import {Test, console2} from "forge-std/Test.sol";
  *   own storage — and show each exploit now reverts, while an honest claim still succeeds.
  */
 contract ProofReplayTest is Test {
+    /// The subject, from src/zk-onchain-verification/ProofReplay.sol. Add functions there and call them here.
+    ProofReplay internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ProofReplay();
     }
 
     /// A test submits one valid proof twice against the vulnerable contract and asserts the balance
     /// decreased twice
     function test_criterion01_aTestSubmitsOneValidProofTwiceAgainstThe() public {
-        fail("A test submits one valid proof twice against the vulnerable contract and asserts the balance decreased twice");
+        fail(
+            "A test submits one valid proof twice against the vulnerable contract and asserts the balance decreased twice"
+        );
     }
 
     /// A test claims against an attacker-supplied root on the vulnerable contract and asserts the
     /// payout succeeded
     function test_criterion02_aTestClaimsAgainstAnAttackerSuppliedRootOn() public {
-        fail("A test claims against an attacker-supplied root on the vulnerable contract and asserts the payout succeeded");
+        fail(
+            "A test claims against an attacker-supplied root on the vulnerable contract and asserts the payout succeeded"
+        );
     }
 
     /// Against the fixed contract, the replay reverts and the attacker-root claim reverts, each
     /// with a distinct revert reason
     function test_criterion03_againstTheFixedContractTheReplayRevertsAndThe() public {
-        fail("Against the fixed contract, the replay reverts and the attacker-root claim reverts, each with a distinct revert reason");
+        fail(
+            "Against the fixed contract, the replay reverts and the attacker-root claim reverts, each with a distinct revert reason"
+        );
     }
 
     /// A test asserts an honest first-time claim still succeeds against the fixed contract

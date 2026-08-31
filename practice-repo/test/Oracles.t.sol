@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Oracles} from "../src/defi-oracles/Oracles.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -34,8 +35,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   price before the protocols reacted. State who captured it and who could have.
  */
 contract OraclesTest is Test {
+    /// The subject, from src/defi-oracles/Oracles.sol. Add functions there and call them here.
+    Oracles internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Oracles();
     }
 
     /// Four prices for one asset are obtained at the same block with the spread reported
@@ -61,7 +65,9 @@ contract OraclesTest is Test {
     /// A protocol function that is an oracle without being called one is identified and shown
     /// manipulable, affecting a third party
     function test_criterion05_aProtocolFunctionThatIsAnOracleWithoutBeing() public {
-        fail("A protocol function that is an oracle without being called one is identified and shown manipulable, affecting a third party");
+        fail(
+            "A protocol function that is an oracle without being called one is identified and shown manipulable, affecting a third party"
+        );
     }
 
     /// What makes a function an oracle regardless of its name is stated
@@ -72,7 +78,9 @@ contract OraclesTest is Test {
     /// The block after a real price update is examined with the extracted value identified and the
     /// capturing and potential parties named
     function test_criterion07_theBlockAfterARealPriceUpdateIsExamined() public {
-        fail("The block after a real price update is examined with the extracted value identified and the capturing and potential parties named");
+        fail(
+            "The block after a real price update is examined with the extracted value identified and the capturing and potential parties named"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

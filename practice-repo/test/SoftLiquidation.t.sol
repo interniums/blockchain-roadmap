@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {SoftLiquidation} from "../src/defi-liquidations/SoftLiquidation.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -33,8 +34,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   the price behaviour you are assuming when you choose it.
  */
 contract SoftLiquidationTest is Test {
+    /// The subject, from src/defi-liquidations/SoftLiquidation.sol. Add functions there and call them here.
+    SoftLiquidation internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new SoftLiquidation();
     }
 
     /// A banded mechanism is implemented or modelled with collateral distributed across price bands
@@ -50,13 +54,17 @@ contract SoftLiquidationTest is Test {
     /// A round-trip price path is shown leaving the position worse off, with the loss as a
     /// percentage and the recipient identified
     function test_criterion03_aRoundTripPricePathIsShownLeavingThe() public {
-        fail("A round-trip price path is shown leaving the position worse off, with the loss as a percentage and the recipient identified");
+        fail(
+            "A round-trip price path is shown leaving the position worse off, with the loss as a percentage and the recipient identified"
+        );
     }
 
     /// The amplification parameter is swept over at least four values with maximum leverage and
     /// round-trip loss reported for each
     function test_criterion04_theAmplificationParameterIsSweptOverAtLeastFour() public {
-        fail("The amplification parameter is swept over at least four values with maximum leverage and round-trip loss reported for each");
+        fail(
+            "The amplification parameter is swept over at least four values with maximum leverage and round-trip loss reported for each"
+        );
     }
 
     /// Both are plotted against the parameter with a one-sentence trade statement containing
@@ -68,7 +76,9 @@ contract SoftLiquidationTest is Test {
     /// A price path is found under which hard liquidation would have been preferable, with both
     /// outcomes reported
     function test_criterion06_aPricePathIsFoundUnderWhichHardLiquidation() public {
-        fail("A price path is found under which hard liquidation would have been preferable, with both outcomes reported");
+        fail(
+            "A price path is found under which hard liquidation would have been preferable, with both outcomes reported"
+        );
     }
 
     /// A parameter choice is made with the assumed price behaviour stated

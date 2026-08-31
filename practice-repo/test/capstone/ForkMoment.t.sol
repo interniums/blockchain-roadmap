@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ForkMoment} from "../../src/toolchain-fork-testing/ForkMoment.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -37,8 +38,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   restored cache, and report the time saved against a cold run.
  */
 contract ForkMomentTest is Test {
+    /// The subject, from src/toolchain-fork-testing/ForkMoment.sol. Add functions there and call them here.
+    ForkMoment internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ForkMoment();
     }
 
     /// The suite forks at a pinned block before a real named event and runs against real deployed
@@ -50,7 +54,9 @@ contract ForkMomentTest is Test {
     /// The same result is produced cold with network, warm with network, and warm with the network
     /// off, with all three recorded
     function test_criterion02_theSameResultIsProducedColdWithNetworkWarm() public {
-        fail("The same result is produced cold with network, warm with network, and warm with the network off, with all three recorded");
+        fail(
+            "The same result is produced cold with network, warm with network, and warm with the network off, with all three recorded"
+        );
     }
 
     /// RPC request count is reported, and adding one storage read is shown to increase it by a
@@ -84,7 +90,9 @@ contract ForkMomentTest is Test {
     /// The write-up reports request count, cold and warm wall-clock time, and a cost estimate at
     /// provider prices
     function test_criterion08_theWriteUpReportsRequestCountColdAndWarm() public {
-        fail("The write-up reports request count, cold and warm wall-clock time, and a cost estimate at provider prices");
+        fail(
+            "The write-up reports request count, cold and warm wall-clock time, and a cost estimate at provider prices"
+        );
     }
 
     /// Whether an archive node was required is stated with the reason

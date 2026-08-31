@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {AmmMath} from "../../src/defi-amm-math/AmmMath.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -39,8 +40,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   a pool reserve as a price.
  */
 contract AmmMathTest is Test {
+    /// The subject, from src/defi-amm-math/AmmMath.sol. Add functions there and call them here.
+    AmmMath internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new AmmMath();
     }
 
     /// The invariant is asserted never to shrink across swaps, adds and removes, including with
@@ -84,7 +88,9 @@ contract AmmMathTest is Test {
     /// Stableswap and constant product are compared near and far from parity, with the
     /// amplification value where behaviour flips
     function test_criterion08_stableswapAndConstantProductAreComparedNearAndFar() public {
-        fail("Stableswap and constant product are compared near and far from parity, with the amplification value where behaviour flips");
+        fail(
+            "Stableswap and constant product are compared near and far from parity, with the amplification value where behaviour flips"
+        );
     }
 
     /// A flash loan moves the pool price and another contract's mid-transaction quote is shown

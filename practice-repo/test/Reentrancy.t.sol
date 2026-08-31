@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Reentrancy} from "../src/solidity-contract-patterns/Reentrancy.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,26 +27,35 @@ import {Test, console2} from "forge-std/Test.sol";
  *   ReentrancyGuardTransient on the same function.
  */
 contract ReentrancyTest is Test {
+    /// The subject, from src/solidity-contract-patterns/Reentrancy.sol. Add functions there and call them here.
+    Reentrancy internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Reentrancy();
     }
 
     /// A test proves the attacker's ending balance exceeds its deposit against the vulnerable
     /// version and does not against the CEI version
     function test_criterion01_aTestProvesTheAttackerSEndingBalanceExceeds() public {
-        fail("A test proves the attacker's ending balance exceeds its deposit against the vulnerable version and does not against the CEI version");
+        fail(
+            "A test proves the attacker's ending balance exceeds its deposit against the vulnerable version and does not against the CEI version"
+        );
     }
 
     /// A test proves the observer contract reads an incorrect price during the callback even with
     /// CEI and nonReentrant both applied
     function test_criterion02_aTestProvesTheObserverContractReadsAnIncorrect() public {
-        fail("A test proves the observer contract reads an incorrect price during the callback even with CEI and nonReentrant both applied");
+        fail(
+            "A test proves the observer contract reads an incorrect price during the callback even with CEI and nonReentrant both applied"
+        );
     }
 
     /// Measured guard overheads are recorded for all three variants with the solc version and
     /// optimizer setting stated
     function test_criterion03_measuredGuardOverheadsAreRecordedForAllThreeVariants() public {
-        fail("Measured guard overheads are recorded for all three variants with the solc version and optimizer setting stated");
+        fail(
+            "Measured guard overheads are recorded for all three variants with the solc version and optimizer setting stated"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ForceInclude} from "../src/scaling-forced-inclusion/ForceInclude.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,14 +29,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   example an allowance that was revoked.
  */
 contract ForceIncludeTest is Test {
+    /// The subject, from src/scaling-forced-inclusion/ForceInclude.sol. Add functions there and call them here.
+    ForceInclude internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ForceInclude();
     }
 
     /// Force-inclusion parameters are read from the SequencerInbox contract on-chain and asserted,
     /// not hard-coded from docs
     function test_criterion01_forceInclusionParametersAreReadFromTheSequencerinboxContract() public {
-        fail("Force-inclusion parameters are read from the SequencerInbox contract on-chain and asserted, not hard-coded from docs");
+        fail(
+            "Force-inclusion parameters are read from the SequencerInbox contract on-chain and asserted, not hard-coded from docs"
+        );
     }
 
     /// The force-include call reverts before the delay elapses and succeeds after it
@@ -51,7 +57,9 @@ contract ForceIncludeTest is Test {
     /// One test demonstrates that inclusion is not the outcome — a forced transaction lands and
     /// reverts because state moved during the delay
     function test_criterion04_oneTestDemonstratesThatInclusionIsNotTheOutcome() public {
-        fail(unicode"One test demonstrates that inclusion is not the outcome — a forced transaction lands and reverts because state moved during the delay");
+        fail(
+            unicode"One test demonstrates that inclusion is not the outcome — a forced transaction lands and reverts because state moved during the delay"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

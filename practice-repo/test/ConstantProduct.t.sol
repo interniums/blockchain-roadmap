@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ConstantProduct} from "../src/defi-amm-math/ConstantProduct.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,8 +29,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   is non-decreasing.
  */
 contract ConstantProductTest is Test {
+    /// The subject, from src/defi-amm-math/ConstantProduct.sol. Add functions there and call them here.
+    ConstantProduct internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ConstantProduct();
     }
 
     /// An invariant run of at least 256 runs with depth 50 shows k non-decreasing across every swap
@@ -46,13 +50,17 @@ contract ConstantProductTest is Test {
     /// A test demonstrates that a swap of 10 percent of reserves pays a materially worse average
     /// price than ten swaps of 1 percent
     function test_criterion03_aTestDemonstratesThatASwapOf10Percent() public {
-        fail("A test demonstrates that a swap of 10 percent of reserves pays a materially worse average price than ten swaps of 1 percent");
+        fail(
+            "A test demonstrates that a swap of 10 percent of reserves pays a materially worse average price than ten swaps of 1 percent"
+        );
     }
 
     /// A test opens an LP position, moves the price by a factor of four through swaps, closes it,
     /// and asserts the withdrawn value is less than simply having held the two original amounts
     function test_criterion04_aTestOpensAnLpPositionMovesThePrice() public {
-        fail("A test opens an LP position, moves the price by a factor of four through swaps, closes it, and asserts the withdrawn value is less than simply having held the two original amounts");
+        fail(
+            "A test opens an LP position, moves the price by a factor of four through swaps, closes it, and asserts the withdrawn value is less than simply having held the two original amounts"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

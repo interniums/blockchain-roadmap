@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {HashGuarantees} from "../src/fundamentals-crypto/HashGuarantees.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -29,8 +30,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   it.
  */
 contract HashGuaranteesTest is Test {
+    /// The subject, from src/fundamentals-crypto/HashGuarantees.sol. Add functions there and call them here.
+    HashGuarantees internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new HashGuarantees();
     }
 
     /// Expected work for all three properties is stated for a 256-bit digest, with the arithmetic
@@ -47,7 +51,9 @@ contract HashGuaranteesTest is Test {
     /// Three real uses of a digest are each mapped to the property they depend on, with the
     /// consequence of breaking it
     function test_criterion03_threeRealUsesOfADigestAreEachMapped() public {
-        fail("Three real uses of a digest are each mapped to the property they depend on, with the consequence of breaking it");
+        fail(
+            "Three real uses of a digest are each mapped to the property they depend on, with the consequence of breaking it"
+        );
     }
 
     /// A test shows keccak256 and SHA3-256 producing different digests for the same input, with

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Diamond} from "../src/solidity-language-core/Diamond.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   linearised.
  */
 contract DiamondTest is Test {
+    /// The subject, from src/solidity-language-core/Diamond.sol. Add functions there and call them here.
+    Diamond internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Diamond();
     }
 
     /// A test asserts the exact constructor emission order and it matches the prediction recorded

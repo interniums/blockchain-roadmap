@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ReceiptProof} from "../src/ledgers-blocks/ReceiptProof.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -33,8 +34,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   that was not possible before it existed.
  */
 contract ReceiptProofTest is Test {
+    /// The subject, from src/ledgers-blocks/ReceiptProof.sol. Add functions there and call them here.
+    ReceiptProof internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ReceiptProof();
     }
 
     /// A real receipt is proven against a real header's receipts root using only the header and the
@@ -51,7 +55,9 @@ contract ReceiptProofTest is Test {
     /// All three roots are described by what they commit to, with state-root keying contrasted
     /// against index-keying
     function test_criterion03_allThreeRootsAreDescribedByWhatTheyCommit() public {
-        fail("All three roots are described by what they commit to, with state-root keying contrasted against index-keying");
+        fail(
+            "All three roots are described by what they commit to, with state-root keying contrasted against index-keying"
+        );
     }
 
     /// One consequence of index-keying that account-keying lacks is demonstrated
@@ -67,7 +73,9 @@ contract ReceiptProofTest is Test {
     /// A false-positive bloom query is constructed, with what the client must do next and the
     /// consequence for treating the bloom as an answer
     function test_criterion06_aFalsePositiveBloomQueryIsConstructedWithWhat() public {
-        fail("A false-positive bloom query is constructed, with what the client must do next and the consequence for treating the bloom as an answer");
+        fail(
+            "A false-positive bloom query is constructed, with what the client must do next and the consequence for treating the bloom as an answer"
+        );
     }
 
     /// The parent beacon block root is read from a contract, with one capability it enables stated

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {SessionKeyBypass} from "../src/app-session-keys/SessionKeyBypass.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -24,8 +25,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   dimension that was missing, and add the regression test.
  */
 contract SessionKeyBypassTest is Test {
+    /// The subject, from src/app-session-keys/SessionKeyBypass.sol. Add functions there and call them here.
+    SessionKeyBypass internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new SessionKeyBypass();
     }
 
     /// At least one test demonstrates a working bypass against the original module and is marked as
@@ -37,7 +41,9 @@ contract SessionKeyBypassTest is Test {
     /// After the patch, that test asserts a revert instead, and the previously passing
     /// legitimate-use tests still pass
     function test_criterion02_afterThePatchThatTestAssertsARevertInstead() public {
-        fail("After the patch, that test asserts a revert instead, and the previously passing legitimate-use tests still pass");
+        fail(
+            "After the patch, that test asserts a revert instead, and the previously passing legitimate-use tests still pass"
+        );
     }
 
     /// A comment in the test file names the policy dimension the bypass exploited

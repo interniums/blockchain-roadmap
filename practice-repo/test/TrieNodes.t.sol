@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {TrieNodes} from "../src/fundamentals-state/TrieNodes.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -29,8 +30,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   length at which your implementation flips from one to the other.
  */
 contract TrieNodesTest is Test {
+    /// The subject, from src/fundamentals-state/TrieNodes.sol. Add functions there and call them here.
+    TrieNodes internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new TrieNodes();
     }
 
     /// A trie is implemented from scratch supporting insert and lookup over a key-value map
@@ -46,7 +50,9 @@ contract TrieNodesTest is Test {
     /// One insertion is shown converting a leaf into an extension plus a branch, with the shape
     /// asserted against a prediction written first
     function test_criterion03_oneInsertionIsShownConvertingALeafIntoAn() public {
-        fail("One insertion is shown converting a leaf into an extension plus a branch, with the shape asserted against a prediction written first");
+        fail(
+            "One insertion is shown converting a leaf into an extension plus a branch, with the shape asserted against a prediction written first"
+        );
     }
 
     /// Encoded bytes for a branch, an extension and a leaf are printed with every field labelled
@@ -62,7 +68,9 @@ contract TrieNodesTest is Test {
     /// A child below the inlining threshold is shown inlined rather than hash-referenced, with the
     /// flip point identified
     function test_criterion06_aChildBelowTheInliningThresholdIsShownInlined() public {
-        fail("A child below the inlining threshold is shown inlined rather than hash-referenced, with the flip point identified");
+        fail(
+            "A child below the inlining threshold is shown inlined rather than hash-referenced, with the flip point identified"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

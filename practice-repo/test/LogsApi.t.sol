@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {LogsApi} from "../src/evm-logs-bloom/LogsApi.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -33,8 +34,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   rule you would adopt, in one sentence.
  */
 contract LogsApiTest is Test {
+    /// The subject, from src/evm-logs-bloom/LogsApi.sol. Add functions there and call them here.
+    LogsApi internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new LogsApi();
     }
 
     /// A contract is shown unable to read its own past event
@@ -51,13 +55,17 @@ contract LogsApiTest is Test {
     /// An event emitted before a revert is shown absent, and one from a reverting sub-call under a
     /// succeeding outer call is shown with the rule stated
     function test_criterion03_anEventEmittedBeforeARevertIsShownAbsent() public {
-        fail("An event emitted before a revert is shown absent, and one from a reverting sub-call under a succeeding outer call is shown with the rule stated");
+        fail(
+            "An event emitted before a revert is shown absent, and one from a reverting sub-call under a succeeding outer call is shown with the rule stated"
+        );
     }
 
     /// Four queries demonstrate first-topic matching, later-topic matching, either-of-two matching,
     /// and a positional misunderstanding returning nothing
     function test_criterion04_fourQueriesDemonstrateFirstTopicMatchingLaterTopicMatching() public {
-        fail("Four queries demonstrate first-topic matching, later-topic matching, either-of-two matching, and a positional misunderstanding returning nothing");
+        fail(
+            "Four queries demonstrate first-topic matching, later-topic matching, either-of-two matching, and a positional misunderstanding returning nothing"
+        );
     }
 
     /// The positional failure is explained

@@ -21,6 +21,10 @@
  *   Return the cheaper path and both costs. Then test it against three fixtures: blob base fee
  *   pinned at its 1 wei floor, blob base fee spiking with execution gas calm, and the reverse.
  *   Prove the decision flips.
+ *
+ * Your code goes in src/scaling-blobs-peerdas/BlobVsCalldata.ts. Nothing here imports it yet —
+ * a TypeScript module is its named exports, and this scaffold does not invent them. Export
+ * what the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

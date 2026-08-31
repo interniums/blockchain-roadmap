@@ -17,6 +17,10 @@
  *   observe. Record both hashes, which transaction landed, and what happened to the account's
  *   nonce. Then repeat with a second transaction queued behind the first and show what the stuck
  *   head does to it.
+ *
+ * Your code goes in src/app-transaction-ux/Replacement.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

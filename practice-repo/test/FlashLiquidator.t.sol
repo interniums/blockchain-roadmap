@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {FlashLiquidator} from "../src/defi-liquidations/FlashLiquidator.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,20 +27,27 @@ import {Test, console2} from "forge-std/Test.sol";
  *   prices, and record the point at which the trade turns negative for a given position size.
  */
 contract FlashLiquidatorTest is Test {
+    /// The subject, from src/defi-liquidations/FlashLiquidator.sol. Add functions there and call them here.
+    FlashLiquidator internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new FlashLiquidator();
     }
 
     /// The successful test ends with a strictly positive balance of the debt asset at the
     /// liquidator and the borrower's health factor restored above one
     function test_criterion01_theSuccessfulTestEndsWithAStrictlyPositiveBalance() public {
-        fail("The successful test ends with a strictly positive balance of the debt asset at the liquidator and the borrower's health factor restored above one");
+        fail(
+            "The successful test ends with a strictly positive balance of the debt asset at the liquidator and the borrower's health factor restored above one"
+        );
     }
 
     /// Re-running with roughly three percent of injected exit slippage makes the same liquidation
     /// net-negative, and the test asserts the revert or the loss
     function test_criterion02_reRunningWithRoughlyThreePercentOfInjectedExit() public {
-        fail("Re-running with roughly three percent of injected exit slippage makes the same liquidation net-negative, and the test asserts the revert or the loss");
+        fail(
+            "Re-running with roughly three percent of injected exit slippage makes the same liquidation net-negative, and the test asserts the revert or the loss"
+        );
     }
 
     /// A sweep over position size at fixed gas and incentive reports the minimum profitable

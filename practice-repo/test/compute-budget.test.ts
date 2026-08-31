@@ -21,6 +21,10 @@
  *   classifies its outcome into exactly one of four buckets: confirmed, confirmed-but-failed,
  *   never included before the blockhash expired, or never submitted. The classifier must
  *   distinguish an on-chain program error from a transaction that has no on-chain record at all.
+ *
+ * Your code goes in src/altvm-parallel-execution/ComputeBudget.ts. Nothing here imports it yet
+ * — a TypeScript module is its named exports, and this scaffold does not invent them. Export
+ * what the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

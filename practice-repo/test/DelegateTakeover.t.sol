@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {DelegateTakeover} from "../src/evm-accounts/DelegateTakeover.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,14 +28,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   caller is the account itself, and prove the drain now reverts.
  */
 contract DelegateTakeoverTest is Test {
+    /// The subject, from src/evm-accounts/DelegateTakeover.sol. Add functions there and call them here.
+    DelegateTakeover internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new DelegateTakeover();
     }
 
     /// A test asserts the delegated account's code is exactly 23 bytes and begins with 0xef0100
     /// followed by the delegate address
     function test_criterion01_aTestAssertsTheDelegatedAccountSCodeIs() public {
-        fail("A test asserts the delegated account's code is exactly 23 bytes and begins with 0xef0100 followed by the delegate address");
+        fail(
+            "A test asserts the delegated account's code is exactly 23 bytes and begins with 0xef0100 followed by the delegate address"
+        );
     }
 
     /// A test proves an unrelated third-party address can move the delegated account's entire ETH

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Eip7702Upgrade} from "../src/app-eoa-upgrade/Eip7702Upgrade.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,20 +26,27 @@ import {Test, console2} from "forge-std/Test.sol";
  *   an authorization pointing at the zero address and prove the account's code is empty again.
  */
 contract Eip7702UpgradeTest is Test {
+    /// The subject, from src/app-eoa-upgrade/Eip7702Upgrade.sol. Add functions there and call them here.
+    Eip7702Upgrade internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Eip7702Upgrade();
     }
 
     /// After the sponsored upgrade the account's code is the delegation designator naming the
     /// executor, and the sponsor paid the gas
     function test_criterion01_afterTheSponsoredUpgradeTheAccountSCodeIs() public {
-        fail("After the sponsored upgrade the account's code is the delegation designator naming the executor, and the sponsor paid the gas");
+        fail(
+            "After the sponsored upgrade the account's code is the delegation designator naming the executor, and the sponsor paid the gas"
+        );
     }
 
     /// The self-submitted upgrade succeeds, and the test documents which nonce value the
     /// authorization had to use and why it differs from the sponsored case
     function test_criterion02_theSelfSubmittedUpgradeSucceedsAndTheTestDocuments() public {
-        fail("The self-submitted upgrade succeeds, and the test documents which nonce value the authorization had to use and why it differs from the sponsored case");
+        fail(
+            "The self-submitted upgrade succeeds, and the test documents which nonce value the authorization had to use and why it differs from the sponsored case"
+        );
     }
 
     /// After clearing, the account's code length is zero and the batch call reverts

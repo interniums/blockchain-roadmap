@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ExpectRevertTraps} from "../src/toolchain-unit-testing/ExpectRevertTraps.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,8 +28,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   `.call` in expectRevert and assert on the returned boolean correctly, not intuitively.
  */
 contract ExpectRevertTrapsTest is Test {
+    /// The subject, from src/toolchain-unit-testing/ExpectRevertTraps.sol. Add functions there and call them here.
+    ExpectRevertTraps internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ExpectRevertTraps();
     }
 
     /// A test demonstrates that the nested form passes against a withdraw implementation that never
@@ -50,7 +54,9 @@ contract ExpectRevertTrapsTest is Test {
     /// One test wraps a low-level call and asserts the correct value of the returned success
     /// boolean, with a comment explaining what that boolean now means
     function test_criterion04_oneTestWrapsALowLevelCallAndAsserts() public {
-        fail("One test wraps a low-level call and asserts the correct value of the returned success boolean, with a comment explaining what that boolean now means");
+        fail(
+            "One test wraps a low-level call and asserts the correct value of the returned success boolean, with a comment explaining what that boolean now means"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

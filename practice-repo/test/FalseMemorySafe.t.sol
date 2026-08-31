@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {FalseMemorySafe} from "../src/evm-yul-assembly/FalseMemorySafe.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   the conservative choice.
  */
 contract FalseMemorySafeTest is Test {
+    /// The subject, from src/evm-yul-assembly/FalseMemorySafe.sol. Add functions there and call them here.
+    FalseMemorySafe internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new FalseMemorySafe();
     }
 
     /// The same test produces different results under at least two documented compiler

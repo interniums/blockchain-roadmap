@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {VaultInvariant} from "../src/toolchain-invariant-testing/VaultInvariant.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,8 +28,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   sequence and reporting it.
  */
 contract VaultInvariantTest is Test {
+    /// The subject, from src/toolchain-invariant-testing/VaultInvariant.sol. Add functions there and call them here.
+    VaultInvariant internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new VaultInvariant();
     }
 
     /// Every per-function unit test passes against the buggy implementation
@@ -39,7 +43,9 @@ contract VaultInvariantTest is Test {
     /// The invariant fails against the buggy implementation and the reported call sequence is at
     /// least three calls long
     function test_criterion02_theInvariantFailsAgainstTheBuggyImplementationAndThe() public {
-        fail("The invariant fails against the buggy implementation and the reported call sequence is at least three calls long");
+        fail(
+            "The invariant fails against the buggy implementation and the reported call sequence is at least three calls long"
+        );
     }
 
     /// The same invariant passes against the fixed implementation at the configured runs and depth
@@ -50,7 +56,9 @@ contract VaultInvariantTest is Test {
     /// The invariant compares vault state against ghost variables, not against a value the vault
     /// itself computed
     function test_criterion04_theInvariantComparesVaultStateAgainstGhostVariablesNot() public {
-        fail("The invariant compares vault state against ghost variables, not against a value the vault itself computed");
+        fail(
+            "The invariant compares vault state against ghost variables, not against a value the vault itself computed"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

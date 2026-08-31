@@ -20,6 +20,10 @@
  *   and enumerate every field access that raises or silently returns the wrong thing. Add a
  *   second fixture representing a slot whose payload was never revealed, and check what your
  *   parser reports for it. Deliver the migration note an indexing team would act on.
+ *
+ * Your code goes in src/protocol-epbs/EpbsParser.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

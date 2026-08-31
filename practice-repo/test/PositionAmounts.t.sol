@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {PositionAmounts} from "../src/defi-concentrated-liquidity/PositionAmounts.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,14 +27,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   your computed amounts against the amounts the protocol itself reports for that position.
  */
 contract PositionAmountsTest is Test {
+    /// The subject, from src/defi-concentrated-liquidity/PositionAmounts.sol. Add functions there and call them here.
+    PositionAmounts internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new PositionAmounts();
     }
 
     /// Your computed token0 and token1 for a live position match the protocol's own figures to
     /// within one wei per token
     function test_criterion01_yourComputedToken0AndToken1ForALivePosition() public {
-        fail("Your computed token0 and token1 for a live position match the protocol's own figures to within one wei per token");
+        fail(
+            "Your computed token0 and token1 for a live position match the protocol's own figures to within one wei per token"
+        );
     }
 
     /// Unit tests cover price below range (all token0), above range (all token1) and inside the
@@ -45,7 +51,9 @@ contract PositionAmountsTest is Test {
     /// A test asserts your tick-to-sqrtPrice conversion matches the protocol's for at least ten
     /// ticks spread across the usable range, including negative ticks
     function test_criterion03_aTestAssertsYourTickToSqrtpriceConversionMatches() public {
-        fail("A test asserts your tick-to-sqrtPrice conversion matches the protocol's for at least ten ticks spread across the usable range, including negative ticks");
+        fail(
+            "A test asserts your tick-to-sqrtPrice conversion matches the protocol's for at least ten ticks spread across the usable range, including negative ticks"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

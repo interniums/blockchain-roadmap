@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {OriginGuard} from "../src/ledgers-accounts/OriginGuard.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -29,8 +30,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   your bypass fails against it.
  */
 contract OriginGuardTest is Test {
+    /// The subject, from src/ledgers-accounts/OriginGuard.sol. Add functions there and call them here.
+    OriginGuard internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new OriginGuard();
     }
 
     /// A test proves a normal contract caller is rejected by the guard

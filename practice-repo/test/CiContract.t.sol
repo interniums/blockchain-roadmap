@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {CiContract} from "../src/toolchain-ci/CiContract.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,14 +28,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   You will need `fs_permissions` entries for both files.
  */
 contract CiContractTest is Test {
+    /// The subject, from src/toolchain-ci/CiContract.sol. Add functions there and call them here.
+    CiContract internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new CiContract();
     }
 
     /// A test asserts the workflow contains no action reference pinned by a moving tag, only
     /// forty-character commit SHAs
     function test_criterion01_aTestAssertsTheWorkflowContainsNoActionReference() public {
-        fail("A test asserts the workflow contains no action reference pinned by a moving tag, only forty-character commit SHAs");
+        fail(
+            "A test asserts the workflow contains no action reference pinned by a moving tag, only forty-character commit SHAs"
+        );
     }
 
     /// A test asserts the Foundry install step names an exact version string rather than a channel
@@ -52,7 +58,9 @@ contract CiContractTest is Test {
     /// The workflow is demonstrated failing in under sixty seconds on a formatting-only error,
     /// without the test job having run
     function test_criterion04_theWorkflowIsDemonstratedFailingInUnderSixtySeconds() public {
-        fail("The workflow is demonstrated failing in under sixty seconds on a formatting-only error, without the test job having run");
+        fail(
+            "The workflow is demonstrated failing in under sixty seconds on a formatting-only error, without the test job having run"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

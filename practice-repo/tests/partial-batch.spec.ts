@@ -17,6 +17,10 @@
  *   executes the batch atomically and once through the sequential fallback. Capture the on-chain
  *   state after each. Then write the UI copy for the state the sequential run leaves the user
  *   in, and add the code that detects it.
+ *
+ * Your code goes in src/app-wallet-capabilities/PartialBatch.ts. Nothing here imports it yet —
+ * a TypeScript module is its named exports, and this scaffold does not invent them. Export
+ * what the exercise needs, then import it above.
  */
 import { test } from '@playwright/test';
 

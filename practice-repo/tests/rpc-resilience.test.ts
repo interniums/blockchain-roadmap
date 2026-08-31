@@ -20,6 +20,10 @@
  *   for every request, and one that stubs a fleet whose reported head oscillates between two
  *   heights across consecutive calls. The application must serve correct, mutually consistent
  *   data under both.
+ *
+ * Your code goes in src/infra-rpc-economics/RpcResilience.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

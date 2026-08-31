@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Fuzzing} from "../../src/toolchain-fuzzing/Fuzzing.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -38,8 +39,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   constrain it, and say in one sentence what it needs instead.
  */
 contract FuzzingTest is Test {
+    /// The subject, from src/toolchain-fuzzing/Fuzzing.sol. Add functions there and call them here.
+    Fuzzing internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Fuzzing();
     }
 
     /// The triggering input class is written down before any test exists
@@ -50,13 +54,17 @@ contract FuzzingTest is Test {
     /// A vm.assume-constrained property passes while excluding the triggering class, with the
     /// rejection count reported and shown near the ceiling
     function test_criterion02_aVmAssumeConstrainedPropertyPassesWhileExcludingThe() public {
-        fail("A vm.assume-constrained property passes while excluding the triggering class, with the rejection count reported and shown near the ceiling");
+        fail(
+            "A vm.assume-constrained property passes while excluding the triggering class, with the rejection count reported and shown near the ceiling"
+        );
     }
 
     /// A naive bound version also passes, with the actual value distribution shown and its
     /// clustering identified
     function test_criterion03_aNaiveBoundVersionAlsoPassesWithTheActual() public {
-        fail("A naive bound version also passes, with the actual value distribution shown and its clustering identified");
+        fail(
+            "A naive bound version also passes, with the actual value distribution shown and its clustering identified"
+        );
     }
 
     /// Corrected constraints make the test fail, with the change explained in terms of the stated
@@ -84,7 +92,9 @@ contract FuzzingTest is Test {
     /// A second bug is constructed that stateless fuzzing cannot reach, with one sentence on what
     /// it needs instead
     function test_criterion08_aSecondBugIsConstructedThatStatelessFuzzingCannot() public {
-        fail("A second bug is constructed that stateless fuzzing cannot reach, with one sentence on what it needs instead");
+        fail(
+            "A second bug is constructed that stateless fuzzing cannot reach, with one sentence on what it needs instead"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {WireFormat} from "../../src/solidity-errors-events/WireFormat.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -40,14 +41,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   would silently break downstream.
  */
 contract WireFormatTest is Test {
+    /// The subject, from src/solidity-errors-events/WireFormat.sol. Add functions there and call them here.
+    WireFormat internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new WireFormat();
     }
 
     /// All six failure modes are triggered, their revert bytes captured, and decoded by your own
     /// decoder rather than a library
     function test_criterion01_allSixFailureModesAreTriggeredTheirRevertBytes() public {
-        fail("All six failure modes are triggered, their revert bytes captured, and decoded by your own decoder rather than a library");
+        fail(
+            "All six failure modes are triggered, their revert bytes captured, and decoded by your own decoder rather than a library"
+        );
     }
 
     /// The byte length of each failure mode is tabulated
@@ -58,7 +64,9 @@ contract WireFormatTest is Test {
     /// Eager evaluation of a require's error arguments is demonstrated by measurement, with the
     /// consequence for placing calls in a require stated
     function test_criterion03_eagerEvaluationOfARequireSErrorArgumentsIs() public {
-        fail("Eager evaluation of a require's error arguments is demonstrated by measurement, with the consequence for placing calls in a require stated");
+        fail(
+            "Eager evaluation of a require's error arguments is demonstrated by measurement, with the consequence for placing calls in a require stated"
+        );
     }
 
     /// A client is shown unable to determine which of two contracts declaring the same error
@@ -70,7 +78,9 @@ contract WireFormatTest is Test {
     /// An error forwarded through a proxy is shown to be absent from the proxy's ABI, and therefore
     /// undecodable from it
     function test_criterion05_anErrorForwardedThroughAProxyIsShownTo() public {
-        fail("An error forwarded through a proxy is shown to be absent from the proxy's ABI, and therefore undecodable from it");
+        fail(
+            "An error forwarded through a proxy is shown to be absent from the proxy's ABI, and therefore undecodable from it"
+        );
     }
 
     /// Four event shapes are emitted with topics and data shown separately for each
@@ -81,7 +91,9 @@ contract WireFormatTest is Test {
     /// Recovering an indexed dynamic argument's original value fails, and the fixed event makes it
     /// recoverable with the cost stated
     function test_criterion07_recoveringAnIndexedDynamicArgumentSOriginalValueFails() public {
-        fail("Recovering an indexed dynamic argument's original value fails, and the fixed event makes it recoverable with the cost stated");
+        fail(
+            "Recovering an indexed dynamic argument's original value fails, and the fixed event makes it recoverable with the cost stated"
+        );
     }
 
     /// A test asserts a contract cannot read its own emitted event
@@ -92,7 +104,9 @@ contract WireFormatTest is Test {
     /// Per-topic gas cost is measured, and the final schema comes with two sentences on what a v2
     /// change would silently break
     function test_criterion09_perTopicGasCostIsMeasuredAndTheFinal() public {
-        fail("Per-topic gas cost is measured, and the final schema comes with two sentences on what a v2 change would silently break");
+        fail(
+            "Per-topic gas cost is measured, and the final schema comes with two sentences on what a v2 change would silently break"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

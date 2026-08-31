@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Frozen} from "../../src/toolchain-ci/Frozen.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,14 +29,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   produces.
  */
 contract FrozenTest is Test {
+    /// The subject, from src/toolchain-ci/Frozen.sol. Add functions there and call them here.
+    Frozen internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Frozen();
     }
 
     /// The frozen gas suite passes with its recorded numbers before and after an unrelated
     /// functional test is added
     function test_criterion01_theFrozenGasSuitePassesWithItsRecordedNumbers() public {
-        fail("The frozen gas suite passes with its recorded numbers before and after an unrelated functional test is added");
+        fail(
+            "The frozen gas suite passes with its recorded numbers before and after an unrelated functional test is added"
+        );
     }
 
     /// A written explanation states why the original gate failed on a change with no production
@@ -52,7 +58,9 @@ contract FrozenTest is Test {
     /// The assertion-free coverage test is reported with its coverage percentage, as evidence that
     /// coverage measures execution rather than checking
     function test_criterion04_theAssertionFreeCoverageTestIsReportedWithIts() public {
-        fail("The assertion-free coverage test is reported with its coverage percentage, as evidence that coverage measures execution rather than checking");
+        fail(
+            "The assertion-free coverage test is reported with its coverage percentage, as evidence that coverage measures execution rather than checking"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

@@ -18,6 +18,10 @@
  *   authorizing account submitting its own upgrade - getting the nonce right in each case. Then
  *   execute a two-call batch through the delegated account. Finally, clear the delegation with
  *   an authorization pointing at the zero address and prove the account's code is empty again.
+ *
+ * Your code goes in src/app-eoa-upgrade/SignAuthorization.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

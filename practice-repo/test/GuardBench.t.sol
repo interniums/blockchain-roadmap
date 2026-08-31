@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {GuardBench} from "../src/evm-opcodes-memory/GuardBench.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,14 +27,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   evidence.
  */
 contract GuardBenchTest is Test {
+    /// The subject, from src/evm-opcodes-memory/GuardBench.sol. Add functions there and call them here.
+    GuardBench internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new GuardBench();
     }
 
     /// Four measured overheads from the learner's own run - storage cold, storage warm, transient,
     /// and the unguarded baseline
     function test_criterion01_fourMeasuredOverheadsFromTheLearnerSOwnRun() public {
-        fail("Four measured overheads from the learner's own run - storage cold, storage warm, transient, and the unguarded baseline");
+        fail(
+            "Four measured overheads from the learner's own run - storage cold, storage warm, transient, and the unguarded baseline"
+        );
     }
 
     /// The transient overhead is flat across cold and warm cases and the storage overhead is not

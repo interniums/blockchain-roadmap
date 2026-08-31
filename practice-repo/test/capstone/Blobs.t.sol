@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Blobs} from "../../src/evm-blobs-data-lane/Blobs.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -38,8 +39,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   recently to move that number.
  */
 contract BlobsTest is Test {
+    /// The subject, from src/evm-blobs-data-lane/Blobs.sol. Add functions there and call them here.
+    Blobs internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Blobs();
     }
 
     /// A type-3 transaction with a self-constructed blob is sent on a testnet
@@ -72,7 +76,9 @@ contract BlobsTest is Test {
     /// Both fee markets are plotted over at least 200 blocks, with a range identified where they
     /// moved in opposite directions
     function test_criterion06_bothFeeMarketsArePlottedOverAtLeast200() public {
-        fail("Both fee markets are plotted over at least 200 blocks, with a range identified where they moved in opposite directions");
+        fail(
+            "Both fee markets are plotted over at least 200 blocks, with a range identified where they moved in opposite directions"
+        );
     }
 
     /// The availability guarantee is stated as a sentence about time, with reference to the
@@ -84,7 +90,9 @@ contract BlobsTest is Test {
     /// The blob's contents are retrieved, and the date after which retrieval fails is stated along
     /// with what would preserve the data
     function test_criterion08_theBlobSContentsAreRetrievedAndTheDate() public {
-        fail("The blob's contents are retrieved, and the date after which retrieval fails is stated along with what would preserve the data");
+        fail(
+            "The blob's contents are retrieved, and the date after which retrieval fails is stated along with what would preserve the data"
+        );
     }
 
     /// Sustained throughput is derived from the current target and max, with the most recent change

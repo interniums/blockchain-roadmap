@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {PegStabilityModule} from "../src/defi-stablecoins/PegStabilityModule.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,15 +27,20 @@ import {Test, console2} from "forge-std/Test.sol";
  *   ceiling and show what happens to the peg when the arbitrage is no longer available.
  */
 contract PegStabilityModuleTest is Test {
+    /// The subject, from src/defi-stablecoins/PegStabilityModule.sol. Add functions there and call them here.
+    PegStabilityModule internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new PegStabilityModule();
     }
 
     /// A test pushes the pool price above parity, runs a profit-maximising arbitrage through the
     /// module, and asserts the resulting price lies inside a band whose width equals the configured
     /// fee
     function test_criterion01_aTestPushesThePoolPriceAboveParityRuns() public {
-        fail("A test pushes the pool price above parity, runs a profit-maximising arbitrage through the module, and asserts the resulting price lies inside a band whose width equals the configured fee");
+        fail(
+            "A test pushes the pool price above parity, runs a profit-maximising arbitrage through the module, and asserts the resulting price lies inside a band whose width equals the configured fee"
+        );
     }
 
     /// Doubling the mint fee doubles the measured band width, asserted numerically rather than
@@ -46,13 +52,17 @@ contract PegStabilityModuleTest is Test {
     /// A test exhausts the debt ceiling and shows the pool price departing parity with no
     /// profitable arbitrage available
     function test_criterion03_aTestExhaustsTheDebtCeilingAndShowsThe() public {
-        fail("A test exhausts the debt ceiling and shows the pool price departing parity with no profitable arbitrage available");
+        fail(
+            "A test exhausts the debt ceiling and shows the pool price departing parity with no profitable arbitrage available"
+        );
     }
 
     /// A test asserts the module's reserve balance equals the outstanding stablecoin minted through
     /// it at every point, so the balance-sheet effect is visible
     function test_criterion04_aTestAssertsTheModuleSReserveBalanceEquals() public {
-        fail("A test asserts the module's reserve balance equals the outstanding stablecoin minted through it at every point, so the balance-sheet effect is visible");
+        fail(
+            "A test asserts the module's reserve balance equals the outstanding stablecoin minted through it at every point, so the balance-sheet effect is visible"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

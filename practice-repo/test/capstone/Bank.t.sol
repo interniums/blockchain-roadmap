@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Bank} from "../../src/solidity-contract-patterns/Bank.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -38,8 +39,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   Then state, in one sentence, what a clone cannot do that a full deployment can.
  */
 contract BankTest is Test {
+    /// The subject, from src/solidity-contract-patterns/Bank.sol. Add functions there and call them here.
+    Bank internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Bank();
     }
 
     /// A reentrancy drain succeeds against the naive bank and fails after CEI ordering
@@ -60,7 +64,9 @@ contract BankTest is Test {
     /// One reverting recipient bricks the push distribution, and the pull version confines the
     /// damage to that recipient
     function test_criterion04_oneRevertingRecipientBricksThePushDistributionAndThe() public {
-        fail("One reverting recipient bricks the push distribution, and the pull version confines the damage to that recipient");
+        fail(
+            "One reverting recipient bricks the push distribution, and the pull version confines the damage to that recipient"
+        );
     }
 
     /// The cost of the pull conversion is stated in gas and in interface complexity
@@ -76,19 +82,25 @@ contract BankTest is Test {
     /// Three authorization models are implemented, each with the blast radius of every key stated
     /// as what it can take and what it can irrecoverably destroy
     function test_criterion07_threeAuthorizationModelsAreImplementedEachWithTheBlast() public {
-        fail("Three authorization models are implemented, each with the blast radius of every key stated as what it can take and what it can irrecoverably destroy");
+        fail(
+            "Three authorization models are implemented, each with the blast radius of every key stated as what it can take and what it can irrecoverably destroy"
+        );
     }
 
     /// A scenario is constructed where the pause is the attack rather than the defence, with the
     /// freezing party named
     function test_criterion08_aScenarioIsConstructedWhereThePauseIsThe() public {
-        fail("A scenario is constructed where the pause is the attack rather than the defence, with the freezing party named");
+        fail(
+            "A scenario is constructed where the pause is the attack rather than the defence, with the freezing party named"
+        );
     }
 
     /// Clones are deployed, shown to have no constructor, and the failure from assuming otherwise
     /// is demonstrated
     function test_criterion09_clonesAreDeployedShownToHaveNoConstructorAnd() public {
-        fail("Clones are deployed, shown to have no constructor, and the failure from assuming otherwise is demonstrated");
+        fail(
+            "Clones are deployed, shown to have no constructor, and the failure from assuming otherwise is demonstrated"
+        );
     }
 
     /// CREATE and CREATE2 are compared with a stated choice, and one sentence names what a clone

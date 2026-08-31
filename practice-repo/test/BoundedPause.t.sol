@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {BoundedPause} from "../src/infra-incident-response/BoundedPause.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   guardian acting in bad faith cannot keep user funds frozen indefinitely.
  */
 contract BoundedPauseTest is Test {
+    /// The subject, from src/infra-incident-response/BoundedPause.sol. Add functions there and call them here.
+    BoundedPause internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new BoundedPause();
     }
 
     /// A test proves the guardian can pause at the low threshold and cannot unpause
@@ -38,19 +42,25 @@ contract BoundedPauseTest is Test {
     /// A test proves the pause expires without any transaction being sent, and withdrawals succeed
     /// immediately after expiry
     function test_criterion02_aTestProvesThePauseExpiresWithoutAnyTransaction() public {
-        fail("A test proves the pause expires without any transaction being sent, and withdrawals succeed immediately after expiry");
+        fail(
+            "A test proves the pause expires without any transaction being sent, and withdrawals succeed immediately after expiry"
+        );
     }
 
     /// A test proves a guardian re-pausing during the cooldown reverts, and computes the maximum
     /// fraction of time a bad-faith guardian can keep the protocol paused
     function test_criterion03_aTestProvesAGuardianRePausingDuringThe() public {
-        fail("A test proves a guardian re-pausing during the cooldown reverts, and computes the maximum fraction of time a bad-faith guardian can keep the protocol paused");
+        fail(
+            "A test proves a guardian re-pausing during the cooldown reverts, and computes the maximum fraction of time a bad-faith guardian can keep the protocol paused"
+        );
     }
 
     /// A test proves the withdrawal cap can be lowered by the guardian while the protocol stays
     /// live, and that honest users can still exit at the reduced rate
     function test_criterion04_aTestProvesTheWithdrawalCapCanBeLowered() public {
-        fail("A test proves the withdrawal cap can be lowered by the guardian while the protocol stays live, and that honest users can still exit at the reduced rate");
+        fail(
+            "A test proves the withdrawal cap can be lowered by the guardian while the protocol stays live, and that honest users can still exit at the reduced rate"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

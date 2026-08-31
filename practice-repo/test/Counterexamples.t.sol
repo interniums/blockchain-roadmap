@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Counterexamples} from "../src/security-formal-verification/Counterexamples.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   the bound you ran under next to each result.
  */
 contract CounterexamplesTest is Test {
+    /// The subject, from src/security-formal-verification/Counterexamples.sol. Add functions there and call them here.
+    Counterexamples internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Counterexamples();
     }
 
     /// Every converted check has symbolic inputs and explicit preconditions rather than literals

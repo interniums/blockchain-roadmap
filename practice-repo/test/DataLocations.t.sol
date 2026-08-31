@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {DataLocations} from "../src/evm-opcodes-memory/DataLocations.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -33,8 +34,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   read, cost to write, and lifetime for each — every number measured, none copied.
  */
 contract DataLocationsTest is Test {
+    /// The subject, from src/evm-opcodes-memory/DataLocations.sol. Add functions there and call them here.
+    DataLocations internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new DataLocations();
     }
 
     /// Storing a single byte is measured, demonstrating the 256-bit word
@@ -60,7 +64,9 @@ contract DataLocationsTest is Test {
     /// Exceeding stack depth at runtime is shown with the machine's behaviour, and the two failures
     /// attributed to different layers
     function test_criterion05_exceedingStackDepthAtRuntimeIsShownWithThe() public {
-        fail("Exceeding stack depth at runtime is shown with the machine's behaviour, and the two failures attributed to different layers");
+        fail(
+            "Exceeding stack depth at runtime is shown with the machine's behaviour, and the two failures attributed to different layers"
+        );
     }
 
     /// Calldata is shown read-only by a failed write attempt
@@ -71,7 +77,9 @@ contract DataLocationsTest is Test {
     /// A long calldata payload and a short expanded one are both costed including intrinsic gas,
     /// with the flip size stated
     function test_criterion07_aLongCalldataPayloadAndAShortExpandedOne() public {
-        fail("A long calldata payload and a short expanded one are both costed including intrinsic gas, with the flip size stated");
+        fail(
+            "A long calldata payload and a short expanded one are both costed including intrinsic gas, with the flip size stated"
+        );
     }
 
     /// A six-row table gives read cost, write cost and lifetime for each location, all measured

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Liquidations} from "../src/defi-liquidations/Liquidations.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -35,14 +36,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   what that means for anyone modelling liquidation risk on a single protocol.
  */
 contract LiquidationsTest is Test {
+    /// The subject, from src/defi-liquidations/Liquidations.sol. Add functions there and call them here.
+    Liquidations internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Liquidations();
     }
 
     /// The same underwater position is closed by fixed discount with a close factor, full fixed
     /// discount, and descending-price auction
     function test_criterion01_theSameUnderwaterPositionIsClosedByFixedDiscount() public {
-        fail("The same underwater position is closed by fixed discount with a close factor, full fixed discount, and descending-price auction");
+        fail(
+            "The same underwater position is closed by fixed discount with a close factor, full fixed discount, and descending-price auction"
+        );
     }
 
     /// Borrower loss, liquidator gain and protocol residual are reported for all three
@@ -53,7 +59,9 @@ contract LiquidationsTest is Test {
     /// Close factor is swept with borrower loss plotted, and the value where partial liquidation
     /// stops helping identified
     function test_criterion03_closeFactorIsSweptWithBorrowerLossPlottedAnd() public {
-        fail("Close factor is swept with borrower loss plotted, and the value where partial liquidation stops helping identified");
+        fail(
+            "Close factor is swept with borrower loss plotted, and the value where partial liquidation stops helping identified"
+        );
     }
 
     /// Auction clear time and clearing discount are reported
@@ -75,7 +83,9 @@ contract LiquidationsTest is Test {
     /// One liquidation's price impact is shown pushing a second position underwater, with the
     /// triggering size reported
     function test_criterion07_oneLiquidationSPriceImpactIsShownPushingA() public {
-        fail("One liquidation's price impact is shown pushing a second position underwater, with the triggering size reported");
+        fail(
+            "One liquidation's price impact is shown pushing a second position underwater, with the triggering size reported"
+        );
     }
 
     /// A cross-venue cascade is demonstrated with the consequence for single-protocol risk models

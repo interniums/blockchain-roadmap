@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {CanonicalRoot} from "../src/fundamentals-state/CanonicalRoot.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -30,8 +31,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   about this structure, and what is being pursued instead.
  */
 contract CanonicalRootTest is Test {
+    /// The subject, from src/fundamentals-state/CanonicalRoot.sol. Add functions there and call them here.
+    CanonicalRoot internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new CanonicalRoot();
     }
 
     /// The same key-value set inserted in two orders produces an identical root
@@ -48,7 +52,9 @@ contract CanonicalRootTest is Test {
     /// Each violation names the rule broken and the live-network consequence of two clients
     /// disagreeing that way
     function test_criterion03_eachViolationNamesTheRuleBrokenAndTheLive() public {
-        fail("Each violation names the rule broken and the live-network consequence of two clients disagreeing that way");
+        fail(
+            "Each violation names the rule broken and the live-network consequence of two clients disagreeing that way"
+        );
     }
 
     /// A single account change is shown changing the root

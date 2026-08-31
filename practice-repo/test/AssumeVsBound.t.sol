@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {AssumeVsBound} from "../src/toolchain-fuzzing/AssumeVsBound.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,8 +28,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   landed exactly on the boundary.
  */
 contract AssumeVsBoundTest is Test {
+    /// The subject, from src/toolchain-fuzzing/AssumeVsBound.sol. Add functions there and call them here.
+    AssumeVsBound internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new AssumeVsBound();
     }
 
     /// The bound version passes with the full configured run count and the clamp version passes too
@@ -45,13 +49,17 @@ contract AssumeVsBoundTest is Test {
     /// A test configured with a small max_test_rejects fails with a rejection error, and the
     /// learner can distinguish that output from a property violation at a glance
     function test_criterion03_aTestConfiguredWithASmallMaxTestRejects() public {
-        fail("A test configured with a small max_test_rejects fails with a rejection error, and the learner can distinguish that output from a property violation at a glance");
+        fail(
+            "A test configured with a small max_test_rejects fails with a rejection error, and the learner can distinguish that output from a property violation at a glance"
+        );
     }
 
     /// Wall-clock timings for all three are recorded, with a one-line explanation of the assume
     /// version's acceptance probability
     function test_criterion04_wallClockTimingsForAllThreeAreRecordedWith() public {
-        fail("Wall-clock timings for all three are recorded, with a one-line explanation of the assume version's acceptance probability");
+        fail(
+            "Wall-clock timings for all three are recorded, with a one-line explanation of the assume version's acceptance probability"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

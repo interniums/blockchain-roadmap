@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {MultiFork} from "../src/toolchain-fork-testing/MultiFork.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,26 +27,35 @@ import {Test, console2} from "forge-std/Test.sol";
  *   you declared anything.
  */
 contract MultiForkTest is Test {
+    /// The subject, from src/toolchain-fork-testing/MultiFork.sol. Add functions there and call them here.
+    MultiFork internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new MultiFork();
     }
 
     /// A test reproduces the failure — a call into a contract that exists on one fork and not the
     /// other
     function test_criterion01_aTestReproducesTheFailureACallIntoA() public {
-        fail(unicode"A test reproduces the failure — a call into a contract that exists on one fork and not the other");
+        fail(
+            unicode"A test reproduces the failure — a call into a contract that exists on one fork and not the other"
+        );
     }
 
     /// The repaired test passes and the fix is a persistence declaration, with no second deployment
     /// anywhere in the file
     function test_criterion02_theRepairedTestPassesAndTheFixIsA() public {
-        fail("The repaired test passes and the fix is a persistence declaration, with no second deployment anywhere in the file");
+        fail(
+            "The repaired test passes and the fix is a persistence declaration, with no second deployment anywhere in the file"
+        );
     }
 
     /// A test demonstrates that two createSelectFork calls with the same URL yield independent
     /// forks, and a fixed version reuses the id instead
     function test_criterion03_aTestDemonstratesThatTwoCreateselectforkCallsWithThe() public {
-        fail("A test demonstrates that two createSelectFork calls with the same URL yield independent forks, and a fixed version reuses the id instead");
+        fail(
+            "A test demonstrates that two createSelectFork calls with the same URL yield independent forks, and a fixed version reuses the id instead"
+        );
     }
 
     /// An assertion or comment records which accounts survive a fork switch by default

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {SafeMintReentrancy} from "../src/solidity-token-standards/SafeMintReentrancy.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,8 +26,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   attacker to exactly the cap.
  */
 contract SafeMintReentrancyTest is Test {
+    /// The subject, from src/solidity-token-standards/SafeMintReentrancy.sol. Add functions there and call them here.
+    SafeMintReentrancy internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new SafeMintReentrancy();
     }
 
     /// A test asserts balanceOf(attacker) is strictly greater than CAP against the vulnerable

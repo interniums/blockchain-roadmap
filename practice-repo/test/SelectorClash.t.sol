@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {SelectorClash} from "../src/solidity-abi-selectors/SelectorClash.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   reachable.
  */
 contract SelectorClashTest is Test {
+    /// The subject, from src/solidity-abi-selectors/SelectorClash.sol. Add functions there and call them here.
+    SelectorClash internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new SelectorClash();
     }
 
     /// The mined function name is in the test source and a test asserts its selector equals the
@@ -44,7 +48,9 @@ contract SelectorClashTest is Test {
     /// The same test passes safely against the caller-splitting proxy, with an assertion that the
     /// admin path and the user path now differ
     function test_criterion03_theSameTestPassesSafelyAgainstTheCallerSplitting() public {
-        fail("The same test passes safely against the caller-splitting proxy, with an assertion that the admin path and the user path now differ");
+        fail(
+            "The same test passes safely against the caller-splitting proxy, with an assertion that the admin path and the user path now differ"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

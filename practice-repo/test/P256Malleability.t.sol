@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {P256Malleability} from "../src/app-passkeys/P256Malleability.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,8 +26,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   clientDataJSON checks, and replay an assertion harvested from a different ceremony.
  */
 contract P256MalleabilityTest is Test {
+    /// The subject, from src/app-passkeys/P256Malleability.sol. Add functions there and call them here.
+    P256Malleability internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new P256Malleability();
     }
 
     /// A test asserts that both (r, s) and (r, n - s) return one from the precompile
@@ -43,7 +47,9 @@ contract P256MalleabilityTest is Test {
     /// A further test shows the signature-only verifier accepting an assertion from another
     /// ceremony and the hardened verifier rejecting it on the type or challenge check
     function test_criterion03_aFurtherTestShowsTheSignatureOnlyVerifierAccepting() public {
-        fail("A further test shows the signature-only verifier accepting an assertion from another ceremony and the hardened verifier rejecting it on the type or challenge check");
+        fail(
+            "A further test shows the signature-only verifier accepting an assertion from another ceremony and the hardened verifier rejecting it on the type or challenge check"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

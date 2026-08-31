@@ -20,6 +20,10 @@
  *   heartbeat: the watcher writes a timestamp every block, and a separate process with its own
  *   RPC endpoint pages if the heartbeat goes stale, distinguishing "watcher down" from "RPC
  *   down". Verify everything by replaying historical blocks containing a real upgrade.
+ *
+ * Your code goes in src/infra-monitoring/AdminWatcher.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

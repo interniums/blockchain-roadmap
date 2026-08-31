@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {P256Precompile} from "../src/app-passkeys/P256Precompile.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,14 +26,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   `0x100` with the resulting 160-byte payload on a fork with the precompile active.
  */
 contract P256PrecompileTest is Test {
+    /// The subject, from src/app-passkeys/P256Precompile.sol. Add functions there and call them here.
+    P256Precompile internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new P256Precompile();
     }
 
     /// The TypeScript test verifies the reconstructed digest against the credential's public key
     /// and locates the challenge bytes inside the raw clientDataJSON
     function test_criterion01_theTypescriptTestVerifiesTheReconstructedDigestAgainstThe() public {
-        fail("The TypeScript test verifies the reconstructed digest against the credential's public key and locates the challenge bytes inside the raw clientDataJSON");
+        fail(
+            "The TypeScript test verifies the reconstructed digest against the credential's public key and locates the challenge bytes inside the raw clientDataJSON"
+        );
     }
 
     /// The Foundry test asserts a valid payload returns 32 bytes whose value is one
@@ -43,7 +49,9 @@ contract P256PrecompileTest is Test {
     /// Flipping one byte of r makes the Foundry test assert a zero-length return, and the assertion
     /// is on returndatasize rather than on call success
     function test_criterion03_flippingOneByteOfRMakesTheFoundryTest() public {
-        fail("Flipping one byte of r makes the Foundry test assert a zero-length return, and the assertion is on returndatasize rather than on call success");
+        fail(
+            "Flipping one byte of r makes the Foundry test assert a zero-length return, and the assertion is on returndatasize rather than on call success"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

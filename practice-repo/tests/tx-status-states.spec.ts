@@ -17,6 +17,10 @@
  *   `simulateContract` then `writeContract` then `waitForTransactionReceipt` with an
  *   `onReplaced` handler. Each state must have its own copy and its own affordances; a spinner
  *   counts as one state, not three. Make every one of the six reachable on Anvil.
+ *
+ * Your code goes in src/app-transaction-ux/TxStatusStates.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { test } from '@playwright/test';
 

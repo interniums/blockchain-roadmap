@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {SlotCollision} from "../src/evm-execution/SlotCollision.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,14 +27,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   what made the collision possible.
  */
 contract SlotCollisionTest is Test {
+    /// The subject, from src/evm-execution/SlotCollision.sol. Add functions there and call them here.
+    SlotCollision internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new SlotCollision();
     }
 
     /// A test that fails on the vulnerable proxy by showing the admin address changed after an
     /// implementation call
     function test_criterion01_aTestThatFailsOnTheVulnerableProxyBy() public {
-        fail("A test that fails on the vulnerable proxy by showing the admin address changed after an implementation call");
+        fail(
+            "A test that fails on the vulnerable proxy by showing the admin address changed after an implementation call"
+        );
     }
 
     /// The same test passing against the ERC-1967-style proxy with the admin unchanged

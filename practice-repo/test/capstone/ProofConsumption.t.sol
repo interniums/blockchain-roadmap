@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ProofConsumption} from "../../src/zk-onchain-verification/ProofConsumption.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -40,14 +41,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   the verifier can be replaced. Then say what you would do about it.
  */
 contract ProofConsumptionTest is Test {
+    /// The subject, from src/zk-onchain-verification/ProofConsumption.sol. Add functions there and call them here.
+    ProofConsumption internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ProofConsumption();
     }
 
     /// A proof that verifies correctly drains the contract via an unbound public input, with the
     /// input named in a comment
     function test_criterion01_aProofThatVerifiesCorrectlyDrainsTheContractVia() public {
-        fail("A proof that verifies correctly drains the contract via an unbound public input, with the input named in a comment");
+        fail(
+            "A proof that verifies correctly drains the contract via an unbound public input, with the input named in a comment"
+        );
     }
 
     /// Binding the input makes the same attack fail
@@ -58,7 +64,9 @@ contract ProofConsumptionTest is Test {
     /// A bound, valid proof is successfully replayed, then prevented, with the fix's per-claim gas
     /// and storage cost stated
     function test_criterion03_aBoundValidProofIsSuccessfullyReplayedThenPrevented() public {
-        fail("A bound, valid proof is successfully replayed, then prevented, with the fix's per-claim gas and storage cost stated");
+        fail(
+            "A bound, valid proof is successfully replayed, then prevented, with the fix's per-claim gas and storage cost stated"
+        );
     }
 
     /// The verifier is profiled with the pairing fraction and the verification floor reported
@@ -85,19 +93,25 @@ contract ProofConsumptionTest is Test {
     /// Verification gas and native re-execution gas are computed for one statement, with the size
     /// at which the answer flips
     function test_criterion08_verificationGasAndNativeReExecutionGasAreComputed() public {
-        fail("Verification gas and native re-execution gas are computed for one statement, with the size at which the answer flips");
+        fail(
+            "Verification gas and native re-execution gas are computed for one statement, with the size at which the answer flips"
+        );
     }
 
     /// Verification gas, public-input and proof calldata cost, and off-chain proving cost in
     /// dollars are reported separately for one claim
     function test_criterion09_verificationGasPublicInputAndProofCalldataCostAnd() public {
-        fail("Verification gas, public-input and proof calldata cost, and off-chain proving cost in dollars are reported separately for one claim");
+        fail(
+            "Verification gas, public-input and proof calldata cost, and off-chain proving cost in dollars are reported separately for one claim"
+        );
     }
 
     /// The verifier's upgrade path is found and what the proofs are worth under it is stated, with
     /// a proposed mitigation
     function test_criterion10_theVerifierSUpgradePathIsFoundAndWhat() public {
-        fail("The verifier's upgrade path is found and what the proofs are worth under it is stated, with a proposed mitigation");
+        fail(
+            "The verifier's upgrade path is found and what the proofs are worth under it is stated, with a proposed mitigation"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

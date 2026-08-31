@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {BlockReport} from "../../src/ledgers-finality/BlockReport.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -36,8 +37,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   State the value at risk you assumed, because the answer is meaningless without it.
  */
 contract BlockReportTest is Test {
+    /// The subject, from src/ledgers-finality/BlockReport.sol. Add functions there and call them here.
+    BlockReport internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new BlockReport();
     }
 
     /// A test reconstructs the chosen block's hash from its header fields and fails if any field is
@@ -49,37 +53,49 @@ contract BlockReportTest is Test {
     /// Every header field is listed and marked live or post-Merge fossil, with the fossils named
     /// specifically rather than counted
     function test_criterion02_everyHeaderFieldIsListedAndMarkedLiveOr() public {
-        fail("Every header field is listed and marked live or post-Merge fossil, with the fossils named specifically rather than counted");
+        fail(
+            "Every header field is listed and marked live or post-Merge fossil, with the fossils named specifically rather than counted"
+        );
     }
 
     /// Four account records are printed with all four fields, and the report states where code and
     /// storage actually live rather than implying they are in the record
     function test_criterion03_fourAccountRecordsArePrintedWithAllFourFields() public {
-        fail("Four account records are printed with all four fields, and the report states where code and storage actually live rather than implying they are in the record");
+        fail(
+            "Four account records are printed with all four fields, and the report states where code and storage actually live rather than implying they are in the record"
+        );
     }
 
     /// Six transactions are each diagnosed to a named failure mode or to success, from raw RPC
     /// output, and at least one is a stuck or vanished transaction rather than a revert
     function test_criterion04_sixTransactionsAreEachDiagnosedToANamedFailure() public {
-        fail("Six transactions are each diagnosed to a named failure mode or to success, from raw RPC output, and at least one is a stuck or vanished transaction rather than a revert");
+        fail(
+            "Six transactions are each diagnosed to a named failure mode or to success, from raw RPC output, and at least one is a stuck or vanished transaction rather than a revert"
+        );
     }
 
     /// Every hop of searcher, builder, relay and proposer is named, with a concrete undetectable
     /// action stated for each
     function test_criterion05_everyHopOfSearcherBuilderRelayAndProposerIs() public {
-        fail("Every hop of searcher, builder, relay and proposer is named, with a concrete undetectable action stated for each");
+        fail(
+            "Every hop of searcher, builder, relay and proposer is named, with a concrete undetectable action stated for each"
+        );
     }
 
     /// The confirmation policy names a depth, the value at risk it assumes, and the cost of
     /// reversal at that depth
     function test_criterion06_theConfirmationPolicyNamesADepthTheValueAt() public {
-        fail("The confirmation policy names a depth, the value at risk it assumes, and the cost of reversal at that depth");
+        fail(
+            "The confirmation policy names a depth, the value at risk it assumes, and the cost of reversal at that depth"
+        );
     }
 
     /// A reader who does not have your RPC access can follow the report and reach the same
     /// conclusions from the data you quote
     function test_criterion07_aReaderWhoDoesNotHaveYourRpcAccess() public {
-        fail("A reader who does not have your RPC access can follow the report and reach the same conclusions from the data you quote");
+        fail(
+            "A reader who does not have your RPC access can follow the report and reach the same conclusions from the data you quote"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

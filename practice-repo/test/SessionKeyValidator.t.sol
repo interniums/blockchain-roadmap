@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {SessionKeyValidator} from "../src/app-session-keys/SessionKeyValidator.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -24,14 +25,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   constants, so a second session with different bounds can be installed alongside the first.
  */
 contract SessionKeyValidatorTest is Test {
+    /// The subject, from src/app-session-keys/SessionKeyValidator.sol. Add functions there and call them here.
+    SessionKeyValidator internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new SessionKeyValidator();
     }
 
     /// Four tests pass - the allowed call succeeds; a call to a different target reverts; a call
     /// over the value cap reverts; a call after validUntil reverts
     function test_criterion01_fourTestsPassTheAllowedCallSucceedsACall() public {
-        fail("Four tests pass - the allowed call succeeds; a call to a different target reverts; a call over the value cap reverts; a call after validUntil reverts");
+        fail(
+            "Four tests pass - the allowed call succeeds; a call to a different target reverts; a call over the value cap reverts; a call after validUntil reverts"
+        );
     }
 
     /// A fifth test installs a second session with different bounds and proves the two do not

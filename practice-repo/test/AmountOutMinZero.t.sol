@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {AmountOutMinZero} from "../src/defi-mev/AmountOutMinZero.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,20 +28,27 @@ import {Test, console2} from "forge-std/Test.sol";
  *   router now trusts that the broken one did not.
  */
 contract AmountOutMinZeroTest is Test {
+    /// The subject, from src/defi-mev/AmountOutMinZero.sol. Add functions there and call them here.
+    AmountOutMinZero internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new AmountOutMinZero();
     }
 
     /// A test sandwiches the naive router and asserts the victim receives less than a stated
     /// fraction of the fair-price output
     function test_criterion01_aTestSandwichesTheNaiveRouterAndAssertsThe() public {
-        fail("A test sandwiches the naive router and asserts the victim receives less than a stated fraction of the fair-price output");
+        fail(
+            "A test sandwiches the naive router and asserts the victim receives less than a stated fraction of the fair-price output"
+        );
     }
 
     /// A parameterised test shows extraction rising with attacker capital, demonstrating the
     /// absence of any bound
     function test_criterion02_aParameterisedTestShowsExtractionRisingWithAttackerCapital() public {
-        fail("A parameterised test shows extraction rising with attacker capital, demonstrating the absence of any bound");
+        fail(
+            "A parameterised test shows extraction rising with attacker capital, demonstrating the absence of any bound"
+        );
     }
 
     /// The same attack against the fixed router either reverts or leaves the attacker net-negative
@@ -52,7 +60,9 @@ contract AmountOutMinZeroTest is Test {
     /// A test asserts the fixed router reverts on a stale deadline, and the repository states in
     /// one sentence what the minimum-output source is now trusted to provide
     function test_criterion04_aTestAssertsTheFixedRouterRevertsOnA() public {
-        fail("A test asserts the fixed router reverts on a stale deadline, and the repository states in one sentence what the minimum-output source is now trusted to provide");
+        fail(
+            "A test asserts the fixed router reverts on a stale deadline, and the repository states in one sentence what the minimum-output source is now trusted to provide"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

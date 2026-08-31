@@ -22,6 +22,10 @@
  *   measurement for a type-3 blob transaction on the same endpoint and show the two thresholds
  *   are not the same. Emit `out/bump-threshold.json` with both measured thresholds, the endpoint
  *   identity, and every rejected attempt with its error string.
+ *
+ * Your code goes in src/ledgers-mempool/BumpThreshold.mjs. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { test } from 'node:test';
 

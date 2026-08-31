@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {MemoryCurve} from "../src/evm-opcodes-memory/MemoryCurve.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   and 32 KiB argument.
  */
 contract MemoryCurveTest is Test {
+    /// The subject, from src/evm-opcodes-memory/MemoryCurve.sol. Add functions there and call them here.
+    MemoryCurve internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new MemoryCurve();
     }
 
     /// Measured costs match 3·words + words²/512 within rounding at every measured size
@@ -38,7 +42,9 @@ contract MemoryCurveTest is Test {
     /// The learner states the approximate size at which the quadratic term exceeds the linear one,
     /// derived from their own data
     function test_criterion02_theLearnerStatesTheApproximateSizeAtWhichThe() public {
-        fail("The learner states the approximate size at which the quadratic term exceeds the linear one, derived from their own data");
+        fail(
+            "The learner states the approximate size at which the quadratic term exceeds the linear one, derived from their own data"
+        );
     }
 
     /// A test proves that touching a high offset and then working low refunds nothing

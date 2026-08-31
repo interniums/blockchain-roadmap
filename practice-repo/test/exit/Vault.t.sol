@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Vault} from "../../src/solidity-vyper/Vault.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -41,32 +42,43 @@ import {Test, console2} from "forge-std/Test.sol";
  *   what is unrecoverable because of that.
  */
 contract VaultTest is Test {
+    /// The subject, from src/solidity-vyper/Vault.sol. Add functions there and call them here.
+    Vault internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Vault();
     }
 
     /// An inflation-attack test passes against a naive vault and fails against yours, with the
     /// defence named in a comment
     function test_criterion01_anInflationAttackTestPassesAgainstANaiveVault() public {
-        fail("An inflation-attack test passes against a naive vault and fails against yours, with the defence named in a comment");
+        fail(
+            "An inflation-attack test passes against a naive vault and fails against yours, with the defence named in a comment"
+        );
     }
 
     /// An invariant campaign over deposits, withdrawals and donations never leaves the vault owing
     /// more than it holds
     function test_criterion02_anInvariantCampaignOverDepositsWithdrawalsAndDonationsNever() public {
-        fail("An invariant campaign over deposits, withdrawals and donations never leaves the vault owing more than it holds");
+        fail(
+            "An invariant campaign over deposits, withdrawals and donations never leaves the vault owing more than it holds"
+        );
     }
 
     /// The vault stays solvent and its share accounting stays meaningful against a no-return-data
     /// token, a fee-on-transfer token and a downward-rebasing token
     function test_criterion03_theVaultStaysSolventAndItsShareAccountingStays() public {
-        fail("The vault stays solvent and its share accounting stays meaningful against a no-return-data token, a fee-on-transfer token and a downward-rebasing token");
+        fail(
+            "The vault stays solvent and its share accounting stays meaningful against a no-return-data token, a fee-on-transfer token and a downward-rebasing token"
+        );
     }
 
     /// v2 adds a state variable behind the same proxy with state intact, and slot maps before and
     /// after are included
     function test_criterion04_v2AddsAStateVariableBehindTheSameProxy() public {
-        fail("v2 adds a state variable behind the same proxy with state intact, and slot maps before and after are included");
+        fail(
+            "v2 adds a state variable behind the same proxy with state intact, and slot maps before and after are included"
+        );
     }
 
     /// A v2-bad upgrade demonstrably bricks the contract, and a comment names the colliding slot
@@ -83,7 +95,9 @@ contract VaultTest is Test {
     /// CALL, DELEGATECALL and STATICCALL paths each have their context predicted in a comment
     /// before the assertion that checks it
     function test_criterion07_callDelegatecallAndStaticcallPathsEachHaveTheirContext() public {
-        fail("CALL, DELEGATECALL and STATICCALL paths each have their context predicted in a comment before the assertion that checks it");
+        fail(
+            "CALL, DELEGATECALL and STATICCALL paths each have their context predicted in a comment before the assertion that checks it"
+        );
     }
 
     /// An indexed dynamic event argument is present with a comment stating what it makes
@@ -95,7 +109,9 @@ contract VaultTest is Test {
     /// Custom errors and events from v1 still decode against the v2 ABI, proven by a test rather
     /// than by inspection
     function test_criterion09_customErrorsAndEventsFromV1StillDecodeAgainst() public {
-        fail("Custom errors and events from v1 still decode against the v2 ABI, proven by a test rather than by inspection");
+        fail(
+            "Custom errors and events from v1 still decode against the v2 ABI, proven by a test rather than by inspection"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

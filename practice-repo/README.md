@@ -186,9 +186,25 @@ asserts actual behaviour against it. `test/state/node-types.test.ts` is the refe
 `classifyNode`, `BRANCH_ITEM_COUNT` and `readPathNode`, and its assertions are about tries rather
 than about the criteria. Paired with a `src/` stub whose TODOs tell you what to write.
 
-**Generated** — 245 files, each carrying the line `CHAINPATH-GENERATED-SCAFFOLD` near the top. One
-failing case per acceptance criterion, with the criterion as the failure message. That is a
-checklist, not a specification, and the header of each file says so.
+**Generated** — 438 files, each carrying the line `CHAINPATH-GENERATED-SCAFFOLD` near the top.
+Two halves:
+
+- **A test** with one failing case per acceptance criterion, the criterion as the failure message.
+  A checklist, not a specification, and the header of each file says so.
+- **A `src/` stub** where the answer goes: named after its test, carrying the practice's spec and
+  the concepts it covers by title with a one-line gloss each — a mean of 4.9 of them, taken from
+  the content graph rather than invented.
+
+A Solidity test imports its stub and deploys it in `setUp`, so the first function you write there is
+callable from the test without touching its plumbing. `new Subject()` needs the contract to exist
+and nothing more, which is why that wiring names no method.
+
+TypeScript stubs are not imported, and that is the honest answer rather than a missing feature: a
+module is its named exports, so exporting a class or a function to make the wiring look symmetrical
+would be inventing your API. The test header says which file to write in.
+
+No stub is generated for `read` or `write` practices — one reads code that lives elsewhere, the
+other produces a document — nor opposite a hand-authored test, which already has its own pair.
 
 The generated ones exist because of what the alternative was. Before them, every acceptance command
 outside Track 01 named a path that did not exist, so the app reported
@@ -215,8 +231,10 @@ Not generated, on purpose:
 
 - **Your write-ups.** 42 commands check a file you write (`docs/*.md`, `answers/*.md`). A template
   with the right headings would pass `grep -qF "## Findings"` while saying nothing.
-- **`src/` stubs for generated tests.** A fabricated API would be a lie about the shape of the
-  answer. The generated tests import nothing.
+- **Function signatures in a stub.** The hand-authored pairs invent an API — `src/state/node.ts`
+  declares `classifyNode`, `BRANCH_ITEM_COUNT` and `readPathNode` — and that took judgement about
+  the material. A generated guess at the same thing would be worse than an empty file, because you
+  would build to it.
 - **The Optimism devnet.** One practice runs `make devnet-up`, which brings up a dozen services
   from the upstream monorepo. No file stands in for cloning it; the `Makefile` says so and exits 1.
 
@@ -228,6 +246,10 @@ Not generated, on purpose:
 foundry.toml            solc 0.8.36, optimizer off, forge-std only
 src/crypto/             contracts for the fundamentals-crypto practices
 src/encoding/           contracts and the RLP codec for fundamentals-encoding
+src/<module-id>/        generated stubs, one per generated test. The full module id, not the
+                        short suffix the hand-authored dirs use: three suffixes collide across
+                        tracks (accounts, fuzzing, proof-systems), so the short form cannot
+                        be a path.
 package.json            vitest, playwright, tsx, typescript
 vitest.config.ts        two test roots: test/ and tests/; .spec.ts left to playwright
 playwright.config.ts    the five browser exercises, two named projects
@@ -258,7 +280,8 @@ practice's acceptance command, and those paths are flat.
 The starting state is failures, so the useful question is which kind.
 
 - An acceptance criterion, word for word — a generated placeholder you have not replaced yet. It is
-  telling you the requirement, not diagnosing your code.
+  telling you the requirement, not diagnosing your code. Its `src/` stub is where the answer goes;
+  the test names it.
 - `TODO: <function> is unimplemented` — a stub you have not written yet. The message names the file.
 - `Error != expected error` — the contract reverted, but for a different reason than the
   specification asks for. Usually a missing check, not a wrong one.

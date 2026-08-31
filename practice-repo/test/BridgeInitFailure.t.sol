@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {BridgeInitFailure} from "../src/scaling-bridges/BridgeInitFailure.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,14 +28,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   that asserts the trusted root is non-zero and matches the expected value.
  */
 contract BridgeInitFailureTest is Test {
+    /// The subject, from src/scaling-bridges/BridgeInitFailure.sol. Add functions there and call them here.
+    BridgeInitFailure internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new BridgeInitFailure();
     }
 
     /// A test proves an unauthorised message is accepted while the trusted root is zero, minting to
     /// an attacker-chosen address
     function test_criterion01_aTestProvesAnUnauthorisedMessageIsAcceptedWhile() public {
-        fail("A test proves an unauthorised message is accepted while the trusted root is zero, minting to an attacker-chosen address");
+        fail(
+            "A test proves an unauthorised message is accepted while the trusted root is zero, minting to an attacker-chosen address"
+        );
     }
 
     /// A second test proves the same message is rejected after the one-line fix
@@ -45,13 +51,17 @@ contract BridgeInitFailureTest is Test {
     /// A third test runs the same exploit against a second, unrelated message and passes,
     /// demonstrating the bug was copy-pasteable rather than message-specific
     function test_criterion03_aThirdTestRunsTheSameExploitAgainstA() public {
-        fail("A third test runs the same exploit against a second, unrelated message and passes, demonstrating the bug was copy-pasteable rather than message-specific");
+        fail(
+            "A third test runs the same exploit against a second, unrelated message and passes, demonstrating the bug was copy-pasteable rather than message-specific"
+        );
     }
 
     /// The deployment script asserts a non-zero trusted root after upgrade and the test proves that
     /// assertion fails on the broken deployment
     function test_criterion04_theDeploymentScriptAssertsANonZeroTrustedRoot() public {
-        fail("The deployment script asserts a non-zero trusted root after upgrade and the test proves that assertion fails on the broken deployment");
+        fail(
+            "The deployment script asserts a non-zero trusted root after upgrade and the test proves that assertion fails on the broken deployment"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

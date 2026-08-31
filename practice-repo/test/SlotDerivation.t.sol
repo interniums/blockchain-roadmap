@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {SlotDerivation} from "../src/evm-state-tries/SlotDerivation.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   storage sink so the compiler cannot eliminate it as dead code.
  */
 contract SlotDerivationTest is Test {
+    /// The subject, from src/evm-state-tries/SlotDerivation.sol. Add functions there and call them here.
+    SlotDerivation internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new SlotDerivation();
     }
 
     /// The derived slot value equals balanceOf for three distinct holders
@@ -44,7 +48,9 @@ contract SlotDerivationTest is Test {
     /// A test asserts that a slot that has never been written and a slot explicitly written to zero
     /// read identically
     function test_criterion03_aTestAssertsThatASlotThatHasNever() public {
-        fail("A test asserts that a slot that has never been written and a slot explicitly written to zero read identically");
+        fail(
+            "A test asserts that a slot that has never been written and a slot explicitly written to zero read identically"
+        );
     }
 
     /// The test file states the slot formula in a comment, written from memory rather than pasted

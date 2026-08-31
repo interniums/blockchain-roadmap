@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Passkey} from "../src/app-passkeys/Passkey.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -33,14 +34,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   different meaning. State what a contract must check beyond the signature.
  */
 contract PasskeyTest is Test {
+    /// The subject, from src/app-passkeys/Passkey.sol. Add functions there and call them here.
+    Passkey internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Passkey();
     }
 
     /// A passkey credential is created with where the key lives, what can move it and what unlocks
     /// it all reported
     function test_criterion01_aPasskeyCredentialIsCreatedWithWhereTheKey() public {
-        fail("A passkey credential is created with where the key lives, what can move it and what unlocks it all reported");
+        fail(
+            "A passkey credential is created with where the key lives, what can move it and what unlocks it all reported"
+        );
     }
 
     /// Onboarding steps are counted for a passkey and a seed phrase, both reported

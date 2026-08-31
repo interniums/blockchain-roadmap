@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {V3Piecewise} from "../src/defi-concentrated-liquidity/V3Piecewise.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -30,8 +31,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   pricing.
  */
 contract V3PiecewiseTest is Test {
+    /// The subject, from src/defi-concentrated-liquidity/V3Piecewise.sol. Add functions there and call them here.
+    V3Piecewise internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new V3Piecewise();
     }
 
     /// A real pool's current liquidity and active range are read
@@ -47,13 +51,17 @@ contract V3PiecewiseTest is Test {
     /// Quotes are compared across ten trade sizes inside the range with the difference reported at
     /// rounding level
     function test_criterion03_quotesAreComparedAcrossTenTradeSizesInsideThe() public {
-        fail("Quotes are compared across ten trade sizes inside the range with the difference reported at rounding level");
+        fail(
+            "Quotes are compared across ten trade sizes inside the range with the difference reported at rounding level"
+        );
     }
 
     /// A trade exhausting the active range shows the single-curve model diverging, with the
     /// divergence point reported
     function test_criterion04_aTradeExhaustingTheActiveRangeShowsTheSingle() public {
-        fail("A trade exhausting the active range shows the single-curve model diverging, with the divergence point reported");
+        fail(
+            "A trade exhausting the active range shows the single-curve model diverging, with the divergence point reported"
+        );
     }
 
     /// A piecewise model with a boundary switch removes the divergence

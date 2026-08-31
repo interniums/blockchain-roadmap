@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {SlotZeroTakeover} from "../src/solidity-calls-delegatecall/SlotZeroTakeover.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,8 +26,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   EIP-1967 slot with inline assembly and re-run the identical breaking test.
  */
 contract SlotZeroTakeoverTest is Test {
+    /// The subject, from src/solidity-calls-delegatecall/SlotZeroTakeover.sol. Add functions there and call them here.
+    SlotZeroTakeover internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new SlotZeroTakeover();
     }
 
     /// A test asserts vm.load of the proxy's slot 0 changed to the value written by the
@@ -45,7 +49,9 @@ contract SlotZeroTakeoverTest is Test {
     /// unchanged, verified with vm.load of
     /// 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
     function test_criterion03_theSameBreakingTestRunAgainstTheEip1967() public {
-        fail("The same breaking test run against the EIP-1967 version leaves the implementation slot unchanged, verified with vm.load of 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc");
+        fail(
+            "The same breaking test run against the EIP-1967 version leaves the implementation slot unchanged, verified with vm.load of 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

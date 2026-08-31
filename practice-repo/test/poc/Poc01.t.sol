@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Poc01} from "../../src/security-exploit-archaeology/Poc01.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   was wrong.
  */
 contract Poc01Test is Test {
+    /// The subject, from src/security-exploit-archaeology/Poc01.sol. Add functions there and call them here.
+    Poc01 internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Poc01();
     }
 
     /// Three passing tests, each forking at the block before its incident and asserting attacker
@@ -49,7 +53,9 @@ contract Poc01Test is Test {
     /// Each test selects its own pinned fork block with vm.createSelectFork, so the suite
     /// reproduces offline from cache
     function test_criterion04_eachTestSelectsItsOwnPinnedForkBlockWith() public {
-        fail("Each test selects its own pinned fork block with vm.createSelectFork, so the suite reproduces offline from cache");
+        fail(
+            "Each test selects its own pinned fork block with vm.createSelectFork, so the suite reproduces offline from cache"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

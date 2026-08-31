@@ -20,6 +20,10 @@
  *   withholding rate for each combination. State the break-even condition in closed form and
  *   check your simulation agrees with it. Then answer: at what withholding rate does the
  *   availability bitvector stop being an edge case for downstream tooling?
+ *
+ * Your code goes in src/protocol-epbs/FreeOption.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

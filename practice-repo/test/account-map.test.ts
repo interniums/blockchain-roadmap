@@ -23,6 +23,10 @@
  *   the balances it governs. Write a four-line comment at the top of the file stating where the
  *   equivalent state would live on Ethereum and which of these five printed values would have no
  *   Ethereum counterpart.
+ *
+ * Your code goes in src/altvm-solana-accounts/AccountMap.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

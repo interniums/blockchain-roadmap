@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ReplayLayers} from "../src/ledgers-accounts/ReplayLayers.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -32,8 +33,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   UTXO model made expensive, and one naming the reverse.
  */
 contract ReplayLayersTest is Test {
+    /// The subject, from src/ledgers-accounts/ReplayLayers.sol. Add functions there and call them here.
+    ReplayLayers internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ReplayLayers();
     }
 
     /// Three replay attempts are made and each attributed to the layer that rejected it, or to

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {FakeSignerSet} from "../src/scaling-bridges/FakeSignerSet.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,8 +28,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   threshold at which that happens.
  */
 contract FakeSignerSetTest is Test {
+    /// The subject, from src/scaling-bridges/FakeSignerSet.sol. Add functions there and call them here.
+    FakeSignerSet internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new FakeSignerSet();
     }
 
     /// A test forges a message accepted by the broken verifier using an attacker-controlled
@@ -40,19 +44,25 @@ contract FakeSignerSetTest is Test {
     /// The fixed verifier reverts on the identical call, with the guardian set bound to immutable
     /// or contract-controlled storage
     function test_criterion02_theFixedVerifierRevertsOnTheIdenticalCallWith() public {
-        fail("The fixed verifier reverts on the identical call, with the guardian set bound to immutable or contract-controlled storage");
+        fail(
+            "The fixed verifier reverts on the identical call, with the guardian set bound to immutable or contract-controlled storage"
+        );
     }
 
     /// A test parameterised on threshold shows the number of compromised keys required to defeat
     /// the fixed verifier
     function test_criterion03_aTestParameterisedOnThresholdShowsTheNumberOf() public {
-        fail("A test parameterised on threshold shows the number of compromised keys required to defeat the fixed verifier");
+        fail(
+            "A test parameterised on threshold shows the number of compromised keys required to defeat the fixed verifier"
+        );
     }
 
     /// The write-up distinguishes the two failure classes in one sentence each: verification that
     /// does not verify, versus key compromise
     function test_criterion04_theWriteUpDistinguishesTheTwoFailureClassesIn() public {
-        fail("The write-up distinguishes the two failure classes in one sentence each: verification that does not verify, versus key compromise");
+        fail(
+            "The write-up distinguishes the two failure classes in one sentence each: verification that does not verify, versus key compromise"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

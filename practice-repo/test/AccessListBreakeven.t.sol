@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {AccessListBreakeven} from "../src/evm-gas-fee-market/AccessListBreakeven.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   entries, with the reasoning.
  */
 contract AccessListBreakevenTest is Test {
+    /// The subject, from src/evm-gas-fee-market/AccessListBreakeven.sol. Add functions there and call them here.
+    AccessListBreakeven internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new AccessListBreakeven();
     }
 
     /// Three measured totals for the three transaction shapes, from the learner's own run
@@ -43,7 +47,9 @@ contract AccessListBreakevenTest is Test {
     /// A stated break-even entry count with the arithmetic that produces it from the measured
     /// per-entry and cold/warm figures
     function test_criterion03_aStatedBreakEvenEntryCountWithTheArithmetic() public {
-        fail("A stated break-even entry count with the arithmetic that produces it from the measured per-entry and cold/warm figures");
+        fail(
+            "A stated break-even entry count with the arithmetic that produces it from the measured per-entry and cold/warm figures"
+        );
     }
 
     /// A one-sentence rule for when a caller should attach an access list in production

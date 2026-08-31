@@ -18,6 +18,10 @@
  *   implements `wallet_sendCalls` and one that does not. The application code must be identical
  *   in both runs - all branching happens on the capability response and inside viem's fallback,
  *   not on the wallet's name.
+ *
+ * Your code goes in src/app-wallet-capabilities/SendcallsFallback.ts. Nothing here imports it
+ * yet — a TypeScript module is its named exports, and this scaffold does not invent them.
+ * Export what the exercise needs, then import it above.
  */
 import { test } from '@playwright/test';
 

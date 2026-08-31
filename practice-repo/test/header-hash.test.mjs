@@ -21,6 +21,10 @@
  *   one field and asserts the hash no longer matches, and a test that swaps two adjacent fields
  *   and asserts the same. Finally, print the three post-Merge fossil fields and assert their
  *   values are the constants they are frozen at. Tests go in `test/header-hash.test.mjs`.
+ *
+ * Your code goes in src/ledgers-blocks/HeaderHash.mjs. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { test } from 'node:test';
 

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {AddressDerivation} from "../src/toolchain-deploy-verify/AddressDerivation.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,20 +28,27 @@ import {Test, console2} from "forge-std/Test.sol";
  *   any of them.
  */
 contract AddressDerivationTest is Test {
+    /// The subject, from src/toolchain-deploy-verify/AddressDerivation.sol. Add functions there and call them here.
+    AddressDerivation internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new AddressDerivation();
     }
 
     /// A test computes the CREATE2 address from its four inputs and asserts equality with a real
     /// salted deployment
     function test_criterion01_aTestComputesTheCreate2AddressFromItsFour() public {
-        fail("A test computes the CREATE2 address from its four inputs and asserts equality with a real salted deployment");
+        fail(
+            "A test computes the CREATE2 address from its four inputs and asserts equality with a real salted deployment"
+        );
     }
 
     /// Changing one constructor argument changes the address, and the new address is predicted
     /// before deployment rather than read back afterwards
     function test_criterion02_changingOneConstructorArgumentChangesTheAddressAndThe() public {
-        fail("Changing one constructor argument changes the address, and the new address is predicted before deployment rather than read back afterwards");
+        fail(
+            "Changing one constructor argument changes the address, and the new address is predicted before deployment rather than read back afterwards"
+        );
     }
 
     /// A test shows the plain CREATE address depending on the deployer's nonce

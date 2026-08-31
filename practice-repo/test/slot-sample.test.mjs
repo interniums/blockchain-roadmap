@@ -22,6 +22,10 @@
  *   observed gas limit, and the correlation between the execution base fee and the blob base fee
  *   over the sample. Assertions live in `test/slot-sample.test.mjs` and run against the emitted
  *   summary.
+ *
+ * Your code goes in src/ledgers-blocks/SlotSample.mjs. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { test } from 'node:test';
 

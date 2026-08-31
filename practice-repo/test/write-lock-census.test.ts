@@ -22,6 +22,10 @@
  *   take the single hottest account and one cold account and chart `getRecentPrioritizationFees`
  *   for both over at least an hour, and state - with the numbers - whether the two had
  *   materially different fee floors.
+ *
+ * Your code goes in src/altvm-parallel-execution/WriteLockCensus.ts. Nothing here imports it
+ * yet — a TypeScript module is its named exports, and this scaffold does not invent them.
+ * Export what the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

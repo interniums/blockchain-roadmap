@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {EstimateGasTraps} from "../src/app-error-surfaces/EstimateGasTraps.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -24,8 +25,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   and a larger one at which it does not, and show what the estimator returns for it.
  */
 contract EstimateGasTrapsTest is Test {
+    /// The subject, from src/app-error-surfaces/EstimateGasTraps.sol. Add functions there and call them here.
+    EstimateGasTraps internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new EstimateGasTraps();
     }
 
     /// A test sends with exactly the estimated limit and asserts an out-of-gas failure inside a
@@ -42,7 +46,9 @@ contract EstimateGasTrapsTest is Test {
     /// The headroom multiplier that makes the first case pass is recorded, with a comment
     /// explaining why it is a compensation for a documented rule rather than superstition
     function test_criterion03_theHeadroomMultiplierThatMakesTheFirstCasePass() public {
-        fail("The headroom multiplier that makes the first case pass is recorded, with a comment explaining why it is a compensation for a documented rule rather than superstition");
+        fail(
+            "The headroom multiplier that makes the first case pass is recorded, with a comment explaining why it is a compensation for a documented rule rather than superstition"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

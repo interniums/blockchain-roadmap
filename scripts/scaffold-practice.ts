@@ -41,7 +41,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { allTracks, getModulesOf, getPracticesOf } from '../src/lib/content/load';
+import { allTracks, getConcept, getModulesOf, getPracticesOf } from '../src/lib/content/load';
 import type { Practice } from '../src/lib/content/types';
 
 const REPO = path.join(process.cwd(), 'practice-repo');
@@ -340,24 +340,168 @@ function header(p: Practice, cmd: string, comment: '//' | ' *'): string[] {
   return lines;
 }
 
-function solTest(p: Practice, cmd: string, file: string): string {
+/**
+ * Where the answer goes.
+ *
+ * The generated tests import nothing, which was a deliberate limit and also a gap: for 190-odd
+ * practices there was no answer to "where do I put the code?". These stubs answer that, and they
+ * are careful about what they claim.
+ *
+ * WHAT IS IN A STUB. Its name, taken from the test that exercises it. The practice's spec. And a
+ * checklist of the concepts the practice covers, by title, taken from the content graph — authored
+ * facts, not guesses. Mean 4.9 of them per practice, so the list is substantive.
+ *
+ * WHAT IS NOT. Any function signature. The hand-authored pairs invent an API — `src/state/node.ts`
+ * declares `classifyNode`, `BRANCH_ITEM_COUNT` and `readPathNode` — and that took judgement about
+ * the material. A generated guess at the same thing would be a lie about the shape of the answer,
+ * and worse than nothing, because the learner would build to it.
+ *
+ * A Solidity stub is still worth wiring up, because Solidity has a neutral unit: a contract exists
+ * before it has methods. So the test imports it and deploys it in `setUp`, and the first method the
+ * learner writes is callable from the test immediately. TypeScript has no equivalent — a module is
+ * its named exports — so those stubs are created and documented but not imported, and saying that
+ * plainly is better than exporting a fabricated class to make the wiring look symmetrical.
+ *
+ * Only for kinds that build something. A `read` practice reads real code elsewhere and a `write`
+ * practice produces a document; neither has a src file, and inventing one would misdescribe it.
+ */
+const BUILD_KINDS = new Set(['implement', 'break', 'fix', 'measure']);
+
+/** True if the file exists and was written by hand, so its pair already exists too. */
+function isHandAuthored(rel: string): boolean {
+  const abs = path.join(REPO, rel);
+  return fs.existsSync(abs) && !fs.readFileSync(abs, 'utf8').includes(MARKER);
+}
+
+/**
+ * `src/<moduleId>/` — the full module id, not the short suffix the 13 hand-authored files use.
+ * Three suffixes collide across tracks (`accounts` in ledgers and evm, `fuzzing` in toolchain and
+ * security, `proof-systems` in scaling and zk), so the short form cannot be a path.
+ */
+function stubDir(p: Practice): string {
+  return `src/${p.moduleId}`;
+}
+
+/** The subject's name, from the test that exercises it: `test/TrieNodes.t.sol` -> `TrieNodes`. */
+function subjectName(testFile: string): string {
+  // Every suffix the corpus uses. Missing `.mjs` here produced names like `AccountRecordTestMjs`.
+  const base = path.basename(testFile)
+    .replace(/\.(?:t|s)\.sol$/, '')
+    .replace(/\.(?:test|spec)\.(?:tsx?|mjs|cjs|js)$/, '')
+    .replace(/\.(?:invariant|e2e)$/, '');
+  const camel = base.replace(/[^A-Za-z0-9]+(.)?/g, (_, ch) => (ch ? ch.toUpperCase() : ''));
+  return camel.charAt(0).toUpperCase() + camel.slice(1);
+}
+
+/** The concepts this practice covers, as titles. Authored content, so safe to put in a stub. */
+function conceptLines(p: Practice): string[] {
+  return (p.concepts ?? [])
+    .map((id) => getConcept(id))
+    .filter((c): c is NonNullable<typeof c> => !!c)
+    .map((c) => `${c.title}${c.oneLine ? ` — ${c.oneLine}` : ''}`);
+}
+
+function stubHeader(p: Practice, cmd: string, testFile: string, lead: string): string[] {
+  const lines = [
+    `${lead} ${MARKER}`,
+    `${lead}`,
+    `${lead} Practice: ${p.id}  (${p.kind}, difficulty ${p.difficulty ?? '?'})`,
+    `${lead} Exercised by: ${testFile}`,
+    `${lead} Run:      ${cmd}`,
+    `${lead}`,
+    `${lead} THE ANSWER GOES HERE. This file is named and empty on purpose — no signatures are`,
+    `${lead} suggested, because guessing them would be guessing the shape of your answer. What is`,
+    `${lead} below is the practice's own description and the concepts it covers.`,
+    `${lead}`,
+    `${lead} What the practice asks for:`,
+  ];
+  for (const l of wrap(p.spec ?? '', 92)) lines.push(`${lead}   ${l}`);
+  const concepts = conceptLines(p);
+  if (concepts.length) {
+    lines.push(`${lead}`, `${lead} The ${concepts.length} concepts this has to end up demonstrating:`);
+    for (const c of concepts) {
+      const w = wrap(c, 88);
+      lines.push(`${lead}   - ${w[0]}`);
+      for (const rest of w.slice(1)) lines.push(`${lead}     ${rest}`);
+    }
+  }
+  return lines;
+}
+
+function solStub(p: Practice, cmd: string, testFile: string, name: string): string {
+  return [
+    '// SPDX-License-Identifier: MIT',
+    'pragma solidity 0.8.36;',
+    '',
+    '/*',
+    ...stubHeader(p, cmd, testFile, ' *'),
+    ' */',
+    `contract ${name} {`,
+    '    // Nothing yet. The test deploys this, so the first function you add is callable from it',
+    '    // without touching the test\'s plumbing.',
+    '}',
+    '',
+  ].join('\n');
+}
+
+function tsStub(p: Practice, cmd: string, testFile: string, name: string): string {
+  return [
+    '/**',
+    ...stubHeader(p, cmd, testFile, ' *'),
+    ' *',
+    ' * Unlike the Solidity stubs, the test does not import this one. A TypeScript module is its',
+    ' * named exports and there is no neutral unit to stand in for them, so exporting a class or a',
+    ' * function here would be inventing your API rather than holding a place for it. Export what the',
+    ' * exercise actually needs, then import it from the test.',
+    ' */',
+    '',
+    `export const ${name.charAt(0).toLowerCase()}${name.slice(1)}Unimplemented = true;`,
+    '',
+  ].join('\n');
+}
+
+function solTest(p: Practice, cmd: string, file: string, stub: string | null): string {
   const criteria = p.acceptance?.criteria ?? [];
   const body = criteria.map((c, i) => {
     const doc = wrap(c, 92).map((l) => `    /// ${l}`).join('\n');
-    return `${doc}\n    function test_${caseName(c, i)}() public {\n        fail(${solLiteral(c)});\n    }`;
+    // Emit what `forge fmt` would produce. Its default line length is 120 and a criterion can run
+    // to 160 characters, so the long ones get the broken-out call rather than being left for the
+    // formatter to fix — 125 generated files failed `forge fmt --check` before this.
+    const lit = solLiteral(c);
+    const single = `        fail(${lit});`;
+    // Bytes, not characters: `forge fmt` measures UTF-8, and a criterion with an em dash costs
+    // three bytes for one JS char. Measuring `.length` left exactly the `unicode"…"` lines wrong.
+    //
+    // 121, not the configured 120, also measured rather than assumed — forge accepts a
+    // 121-byte `fail(...);` line, and guessing 120 left 16 files it wanted joined back up.
+    const call = Buffer.byteLength(single, 'utf8') > 121
+      ? `        fail(\n            ${lit}\n        );`
+      : single;
+    return `${doc}\n    function test_${caseName(c, i)}() public {\n${call}\n    }`;
   });
+
+  // When there is a src stub, the test owns a deployed instance of it. `new Subject()` needs the
+  // contract to exist and nothing more, so this wires the pair up without naming a single method.
+  const name = stub ? subjectName(file) : null;
+  const rel = stub ? path.posix.relative(path.posix.dirname(file), stub) : null;
+
   return [
     '// SPDX-License-Identifier: MIT',
     'pragma solidity 0.8.36;',
     '',
     'import {Test, console2} from "forge-std/Test.sol";',
+    ...(name && rel ? [`import {${name}} from "${rel.startsWith('.') ? rel : `./${rel}`}";`] : []),
     '',
     '/*',
     ...header(p, cmd, ' *'),
     ' */',
     `contract ${solContractName(file)} is Test {`,
+    ...(name ? [`    /// The subject, from ${stub}. Add functions there and call them here.`,
+                `    ${name} internal subject;`, ''] : []),
     '    function setUp() public {',
-    '        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.',
+    ...(name
+      ? [`        subject = new ${name}();`]
+      : ['        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.']),
     '    }',
     '',
     body.join('\n\n'),
@@ -400,7 +544,7 @@ function solScript(p: Practice, cmd: string, file: string): string {
   ].join('\n');
 }
 
-function tsTest(p: Practice, cmd: string): string {
+function tsTest(p: Practice, cmd: string, stub: string | null): string {
   const criteria = p.acceptance?.criteria ?? [];
   const isNodeTest = /node --test/.test(cmd);
   const isPlaywright = /playwright test/.test(cmd);
@@ -434,6 +578,12 @@ function tsTest(p: Practice, cmd: string): string {
   return [
     '/**',
     ...header(p, cmd, ' *'),
+    ...(stub ? [
+      ' *',
+      ...wrap(`Your code goes in ${stub}. Nothing here imports it yet — a TypeScript module is its `
+        + 'named exports, and this scaffold does not invent them. Export what the exercise needs, '
+        + 'then import it above.', 92).map((l) => ` * ${l}`),
+    ] : []),
     ' */',
     imports,
     '',
@@ -726,9 +876,28 @@ for (const t of allTracks()) {
           foreignBy.set(need.tool, list);
           continue;
         }
-        if (need.kind === 'sol-test') put(need.file, solTest(p, cmd, need.file), p.id);
-        else if (need.kind === 'sol-script') put(need.file, solScript(p, cmd, need.file), p.id);
-        else if (need.kind === 'ts-test') put(need.file, tsTest(p, cmd), p.id);
+        if (need.kind === 'sol-test') {
+          // A stub only for kinds that build something, and never opposite a hand-authored test —
+          // those already have their own src file, written with judgement this cannot supply.
+          const wants = BUILD_KINDS.has(p.kind) && !isHandAuthored(need.file);
+          const name = subjectName(need.file);
+          const stubFile = wants ? `${stubDir(p)}/${name}.sol` : null;
+          if (stubFile) put(stubFile, solStub(p, cmd, need.file, name), p.id);
+          put(need.file, solTest(p, cmd, need.file, stubFile), p.id);
+        } else if (need.kind === 'sol-script') put(need.file, solScript(p, cmd, need.file), p.id);
+        else if (need.kind === 'ts-test') {
+          let stubFile: string | null = null;
+          if (BUILD_KINDS.has(p.kind) && !isHandAuthored(need.file)) {
+            const name = subjectName(need.file);
+            // Match the test's language. Seven practices run `node --test` on plain `.mjs`, and a
+            // `.ts` stub beside a `.mjs` test would be a file the test could not import even after
+            // the learner wired it up.
+            const ext = need.file.endsWith('.mjs') ? 'mjs' : 'ts';
+            stubFile = `${stubDir(p)}/${name}.${ext}`;
+            put(stubFile, tsStub(p, cmd, need.file, name), p.id);
+          }
+          put(need.file, tsTest(p, cmd, stubFile), p.id);
+        }
         else if (need.kind === 'harness') put(need.file, harness(p, cmd, need.file), p.id);
         else if (need.kind === 'rust-test') put(need.file, rustTest(p, cmd), p.id);
         else if (need.kind === 'rust-bin') put(need.file, rustBin(p, cmd), p.id);

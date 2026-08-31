@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {FiveReverts} from "../src/app-error-surfaces/FiveReverts.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -24,8 +25,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   viem's `decodeErrorResult`, and explain why exactly one row has no selector at all.
  */
 contract FiveRevertsTest is Test {
+    /// The subject, from src/app-error-surfaces/FiveReverts.sol. Add functions there and call them here.
+    FiveReverts internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new FiveReverts();
     }
 
     /// Both toolchains produce the same error name and arguments for every decodable row
@@ -36,13 +40,17 @@ contract FiveRevertsTest is Test {
     /// The table records the two builtin selectors explicitly and identifies which panic code each
     /// panic row produced
     function test_criterion02_theTableRecordsTheTwoBuiltinSelectorsExplicitlyAnd() public {
-        fail("The table records the two builtin selectors explicitly and identifies which panic code each panic row produced");
+        fail(
+            "The table records the two builtin selectors explicitly and identifies which panic code each panic row produced"
+        );
     }
 
     /// The written explanation identifies the no-selector row and lists at least three other causes
     /// that produce the same empty data
     function test_criterion03_theWrittenExplanationIdentifiesTheNoSelectorRowAnd() public {
-        fail("The written explanation identifies the no-selector row and lists at least three other causes that produce the same empty data");
+        fail(
+            "The written explanation identifies the no-selector row and lists at least three other causes that produce the same empty data"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

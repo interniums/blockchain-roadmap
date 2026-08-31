@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {IsolationBreak} from "../src/defi-lending/IsolationBreak.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,32 +28,43 @@ import {Test, console2} from "forge-std/Test.sol";
  *   affected market and measure exactly how much the loss is reduced.
  */
 contract IsolationBreakTest is Test {
+    /// The subject, from src/defi-lending/IsolationBreak.sol. Add functions there and call them here.
+    IsolationBreak internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new IsolationBreak();
     }
 
     /// A test drives one market's oracle until a position is under water past the incentive and
     /// asserts a rational liquidator declines, leaving quantified bad debt
     function test_criterion01_aTestDrivesOneMarketSOracleUntilA() public {
-        fail("A test drives one market's oracle until a position is under water past the incentive and asserts a rational liquidator declines, leaving quantified bad debt");
+        fail(
+            "A test drives one market's oracle until a position is under water past the incentive and asserts a rational liquidator declines, leaving quantified bad debt"
+        );
     }
 
     /// A test asserts the loss lands only on the affected market's suppliers, demonstrating
     /// accounting isolation
     function test_criterion02_aTestAssertsTheLossLandsOnlyOnThe() public {
-        fail("A test asserts the loss lands only on the affected market's suppliers, demonstrating accounting isolation");
+        fail(
+            "A test asserts the loss lands only on the affected market's suppliers, demonstrating accounting isolation"
+        );
     }
 
     /// A second test shows an attacker exploiting the divergence between the two markets' oracles
     /// for net profit
     function test_criterion03_aSecondTestShowsAnAttackerExploitingTheDivergence() public {
-        fail("A second test shows an attacker exploiting the divergence between the two markets' oracles for net profit");
+        fail(
+            "A second test shows an attacker exploiting the divergence between the two markets' oracles for net profit"
+        );
     }
 
     /// Adding a supply cap reduces the realised loss, and the test asserts the new loss equals the
     /// cap times the price gap rather than merely being smaller
     function test_criterion04_addingASupplyCapReducesTheRealisedLossAnd() public {
-        fail("Adding a supply cap reduces the realised loss, and the test asserts the new loss equals the cap times the price gap rather than merely being smaller");
+        fail(
+            "Adding a supply cap reduces the realised loss, and the test asserts the new loss equals the cap times the price gap rather than merely being smaller"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {EventIndexing} from "../src/solidity-errors-events/EventIndexing.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,26 +26,35 @@ import {Test, console2} from "forge-std/Test.sol";
  *   components.
  */
 contract EventIndexingTest is Test {
+    /// The subject, from src/solidity-errors-events/EventIndexing.sol. Add functions there and call them here.
+    EventIndexing internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new EventIndexing();
     }
 
     /// A test asserts the indexed-string topic equals keccak256 of the string and that the string
     /// itself appears nowhere in the log
     function test_criterion01_aTestAssertsTheIndexedStringTopicEqualsKeccak256() public {
-        fail("A test asserts the indexed-string topic equals keccak256 of the string and that the string itself appears nowhere in the log");
+        fail(
+            "A test asserts the indexed-string topic equals keccak256 of the string and that the string itself appears nowhere in the log"
+        );
     }
 
     /// A test filters by the indexed topic and separately reads the plain value from the data
     /// field, both succeeding on the fixed event
     function test_criterion02_aTestFiltersByTheIndexedTopicAndSeparately() public {
-        fail("A test filters by the indexed topic and separately reads the plain value from the data field, both succeeding on the fixed event");
+        fail(
+            "A test filters by the indexed topic and separately reads the plain value from the data field, both succeeding on the fixed event"
+        );
     }
 
     /// Measured per-topic gas deltas land near 375 and the file decomposes one emit into base,
     /// topics and data bytes
     function test_criterion03_measuredPerTopicGasDeltasLandNear375And() public {
-        fail("Measured per-topic gas deltas land near 375 and the file decomposes one emit into base, topics and data bytes");
+        fail(
+            "Measured per-topic gas deltas land near 375 and the file decomposes one emit into base, topics and data bytes"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

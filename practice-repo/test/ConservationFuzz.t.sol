@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ConservationFuzz} from "../src/toolchain-fuzzing/ConservationFuzz.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,8 +29,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   down the bound that hid it.
  */
 contract ConservationFuzzTest is Test {
+    /// The subject, from src/toolchain-fuzzing/ConservationFuzz.sol. Add functions there and call them here.
+    ConservationFuzz internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ConservationFuzz();
     }
 
     /// The conservation property passes on the correct implementation at the configured run count
@@ -46,13 +50,17 @@ contract ConservationFuzzTest is Test {
     /// A named unit test carrying those exact arguments fails on the buggy implementation and
     /// passes on the fixed one
     function test_criterion03_aNamedUnitTestCarryingThoseExactArgumentsFails() public {
-        fail("A named unit test carrying those exact arguments fails on the buggy implementation and passes on the fixed one");
+        fail(
+            "A named unit test carrying those exact arguments fails on the buggy implementation and passes on the fixed one"
+        );
     }
 
     /// A commented-out or clearly labelled over-tight bound is included, with a note stating which
     /// bug it conceals and why
     function test_criterion04_aCommentedOutOrClearlyLabelledOverTightBound() public {
-        fail("A commented-out or clearly labelled over-tight bound is included, with a note stating which bug it conceals and why");
+        fail(
+            "A commented-out or clearly labelled over-tight bound is included, with a note stating which bug it conceals and why"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

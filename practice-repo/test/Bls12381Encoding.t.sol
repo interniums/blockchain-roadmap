@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Bls12381Encoding} from "../src/zk-curves-pairings/Bls12381Encoding.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,8 +28,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   extrapolating from two points.
  */
 contract Bls12381EncodingTest is Test {
+    /// The subject, from src/zk-curves-pairings/Bls12381Encoding.sol. Add functions there and call them here.
+    Bls12381Encoding internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Bls12381Encoding();
     }
 
     /// Positive tests call 0x0b and 0x0f with spec-test vectors and assert the documented outputs
@@ -44,13 +48,17 @@ contract Bls12381EncodingTest is Test {
     /// A test sending a compressed 48-byte G1 point asserts the call reverts, with a comment naming
     /// which encoding rule was violated
     function test_criterion03_aTestSendingACompressed48ByteG1Point() public {
-        fail("A test sending a compressed 48-byte G1 point asserts the call reverts, with a comment naming which encoding rule was violated");
+        fail(
+            "A test sending a compressed 48-byte G1 point asserts the call reverts, with a comment naming which encoding rule was violated"
+        );
     }
 
     /// Measured G1MSM gas at k = 1, 8 and 64 is recorded and compared in the README against the
     /// EIP's formula including its discount table
     function test_criterion04_measuredG1msmGasAtK18And64() public {
-        fail("Measured G1MSM gas at k = 1, 8 and 64 is recorded and compared in the README against the EIP's formula including its discount table");
+        fail(
+            "Measured G1MSM gas at k = 1, 8 and 64 is recorded and compared in the README against the EIP's formula including its discount table"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

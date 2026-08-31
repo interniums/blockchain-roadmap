@@ -18,6 +18,10 @@
  *   exported `get<X>QueryOptions(config, args)` rather than hand-written. Prove it works by
  *   transferring from a second Anvil account outside the app entirely, so nothing in your own
  *   code path could have triggered the refresh.
+ *
+ * Your code goes in src/app-wagmi/BalanceInvalidation.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { test } from '@playwright/test';
 

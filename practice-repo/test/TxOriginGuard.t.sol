@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {TxOriginGuard} from "../src/security-threat-modeling/TxOriginGuard.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   instead.
  */
 contract TxOriginGuardTest is Test {
+    /// The subject, from src/security-threat-modeling/TxOriginGuard.sol. Add functions there and call them here.
+    TxOriginGuard internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new TxOriginGuard();
     }
 
     /// A test proves the guarded function executes attacker logic through a delegated EOA
@@ -38,7 +42,9 @@ contract TxOriginGuardTest is Test {
     /// A second test shows the same attack failing against a guard that checks an explicit
     /// allowlist or capability instead
     function test_criterion02_aSecondTestShowsTheSameAttackFailingAgainst() public {
-        fail("A second test shows the same attack failing against a guard that checks an explicit allowlist or capability instead");
+        fail(
+            "A second test shows the same attack failing against a guard that checks an explicit allowlist or capability instead"
+        );
     }
 
     /// The written note names the invalidated assumption, not just the failing line

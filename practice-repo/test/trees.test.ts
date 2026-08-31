@@ -19,6 +19,10 @@
  *   demonstrate that several adjacent storage slots of one contract share a stem. Show that a
  *   multi-slot proof under a shared stem costs one branch opening rather than one per slot, and
  *   quantify the saving for a contract that reads a run of adjacent slots.
+ *
+ * Your code goes in src/protocol-statelessness/Trees.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

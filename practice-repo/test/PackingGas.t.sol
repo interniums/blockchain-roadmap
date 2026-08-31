@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {PackingGas} from "../src/solidity-storage-layout/PackingGas.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,26 +26,35 @@ import {Test, console2} from "forge-std/Test.sol";
  *   more expensive than the unpacked one.
  */
 contract PackingGasTest is Test {
+    /// The subject, from src/solidity-storage-layout/PackingGas.sol. Add functions there and call them here.
+    PackingGas internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new PackingGas();
     }
 
     /// A test asserts the two orderings occupy a different number of slots, using values taken from
     /// forge inspect storage-layout
     function test_criterion01_aTestAssertsTheTwoOrderingsOccupyADifferent() public {
-        fail("A test asserts the two orderings occupy a different number of slots, using values taken from forge inspect storage-layout");
+        fail(
+            "A test asserts the two orderings occupy a different number of slots, using values taken from forge inspect storage-layout"
+        );
     }
 
     /// Measured write-all and write-one gas is recorded for every variant with the environment
     /// (solc version, optimizer setting) stated
     function test_criterion02_measuredWriteAllAndWriteOneGasIsRecorded() public {
-        fail("Measured write-all and write-one gas is recorded for every variant with the environment (solc version, optimizer setting) stated");
+        fail(
+            "Measured write-all and write-one gas is recorded for every variant with the environment (solc version, optimizer setting) stated"
+        );
     }
 
     /// A test demonstrates at least one access pattern where the packed layout costs more, and the
     /// file explains why in terms of masking
     function test_criterion03_aTestDemonstratesAtLeastOneAccessPatternWhere() public {
-        fail("A test demonstrates at least one access pattern where the packed layout costs more, and the file explains why in terms of masking");
+        fail(
+            "A test demonstrates at least one access pattern where the packed layout costs more, and the file explains why in terms of masking"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

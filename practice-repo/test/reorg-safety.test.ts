@@ -18,6 +18,10 @@
  *   one - and show the order marked paid for a transaction that no longer exists. Then fix it:
  *   key on `(address, chainId, nonce)`, wait a configurable confirmation count before crediting,
  *   and un-credit when a log arrives with the removed flag set.
+ *
+ * Your code goes in src/app-transaction-ux/ReorgSafety.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

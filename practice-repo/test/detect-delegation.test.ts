@@ -19,6 +19,10 @@
  *   prefix, extracts the delegate address, and returns one of three answers: plain EOA,
  *   delegated EOA, or contract. Render all three distinctly, and show the delegate address for
  *   the middle case.
+ *
+ * Your code goes in src/app-eoa-upgrade/DetectDelegation.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

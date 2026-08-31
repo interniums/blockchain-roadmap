@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Hooks} from "../src/defi-hooks/Hooks.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -33,8 +34,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   not mean what they used to.
  */
 contract HooksTest is Test {
+    /// The subject, from src/defi-hooks/Hooks.sol. Add functions there and call them here.
+    Hooks internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Hooks();
     }
 
     /// A new pool is created with the interaction address shown unchanged before and after

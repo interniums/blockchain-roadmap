@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {BlobHash} from "../src/evm-blobs-data-lane/BlobHash.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,8 +28,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   using the point-evaluation precompile, and note what that does and does not tell you.
  */
 contract BlobHashTest is Test {
+    /// The subject, from src/evm-blobs-data-lane/BlobHash.sol. Add functions there and call them here.
+    BlobHash internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new BlobHash();
     }
 
     /// The contract returns exactly the versioned hashes set on the transaction, for at least two

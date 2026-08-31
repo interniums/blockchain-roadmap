@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ConfigLayers} from "../src/toolchain-foundry-basics/ConfigLayers.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -29,8 +30,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   it has no effect under the ci profile.
  */
 contract ConfigLayersTest is Test {
+    /// The subject, from src/toolchain-foundry-basics/ConfigLayers.sol. Add functions there and call them here.
+    ConfigLayers internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ConfigLayers();
     }
 
     /// The counter test passes with EXPECTED_RUNS unset, confirming the built-in default of 256
@@ -46,13 +50,17 @@ contract ConfigLayersTest is Test {
     /// The same test passes with FOUNDRY_PROFILE=ci, FOUNDRY_FUZZ_RUNS and EXPECTED_RUNS both set
     /// to a third value, proving the environment variable beat the file
     function test_criterion03_theSameTestPassesWithFoundryProfileCiFoundry() public {
-        fail("The same test passes with FOUNDRY_PROFILE=ci, FOUNDRY_FUZZ_RUNS and EXPECTED_RUNS both set to a third value, proving the environment variable beat the file");
+        fail(
+            "The same test passes with FOUNDRY_PROFILE=ci, FOUNDRY_FUZZ_RUNS and EXPECTED_RUNS both set to a third value, proving the environment variable beat the file"
+        );
     }
 
     /// An inline forge-config comment naming the default profile is shown to change nothing under
     /// FOUNDRY_PROFILE=ci
     function test_criterion04_anInlineForgeConfigCommentNamingTheDefaultProfile() public {
-        fail("An inline forge-config comment naming the default profile is shown to change nothing under FOUNDRY_PROFILE=ci");
+        fail(
+            "An inline forge-config comment naming the default profile is shown to change nothing under FOUNDRY_PROFILE=ci"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

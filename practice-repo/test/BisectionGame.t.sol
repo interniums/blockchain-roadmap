@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {BisectionGame} from "../src/scaling-proof-systems/BisectionGame.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,8 +29,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   permitted moment, and measure how long the honest party is forced to stay engaged.
  */
 contract BisectionGameTest is Test {
+    /// The subject, from src/scaling-proof-systems/BisectionGame.sol. Add functions there and call them here.
+    BisectionGame internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new BisectionGame();
     }
 
     /// An honest party defeats a dishonest one and receives the forfeited bond
@@ -45,7 +49,9 @@ contract BisectionGameTest is Test {
     /// The one-step resolution executes exactly one step of the trace on-chain, asserted by a gas
     /// or event check
     function test_criterion03_theOneStepResolutionExecutesExactlyOneStepOf() public {
-        fail("The one-step resolution executes exactly one step of the trace on-chain, asserted by a gas or event check");
+        fail(
+            "The one-step resolution executes exactly one step of the trace on-chain, asserted by a gas or event check"
+        );
     }
 
     /// A party who stops responding loses on timeout, including the case where both sides stop

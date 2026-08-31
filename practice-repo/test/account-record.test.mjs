@@ -21,6 +21,10 @@
  *   targets: a plain EOA that has sent transactions, a deployed contract with non-empty storage,
  *   and an address that has never been touched. Report what the third one returns and why. Write
  *   the tests in `test/account-record.test.mjs` so all three cases are asserted.
+ *
+ * Your code goes in src/ledgers-accounts/AccountRecord.mjs. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { test } from 'node:test';
 

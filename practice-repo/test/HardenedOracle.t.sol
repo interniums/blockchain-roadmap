@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {HardenedOracle} from "../src/defi-oracles/HardenedOracle.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,8 +29,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   heartbeat.
  */
 contract HardenedOracleTest is Test {
+    /// The subject, from src/defi-oracles/HardenedOracle.sol. Add functions there and call them here.
+    HardenedOracle internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new HardenedOracle();
     }
 
     /// Five unit tests, each triggering exactly one failure mode and asserting its specific custom
@@ -46,7 +50,9 @@ contract HardenedOracleTest is Test {
     /// The chosen maxAge is documented and is strictly greater than the feed's published heartbeat,
     /// with the reasoning stated
     function test_criterion03_theChosenMaxageIsDocumentedAndIsStrictlyGreater() public {
-        fail("The chosen maxAge is documented and is strictly greater than the feed's published heartbeat, with the reasoning stated");
+        fail(
+            "The chosen maxAge is documented and is strictly greater than the feed's published heartbeat, with the reasoning stated"
+        );
     }
 
     /// A test asserts the divergence check fires in both directions, not only when the primary is

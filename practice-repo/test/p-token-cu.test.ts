@@ -21,6 +21,10 @@
  *   stating what that changes for a protocol whose users all write the same pool account. The
  *   transaction you sample must be one you found on chain, and its signature must be recorded in
  *   the output.
+ *
+ * Your code goes in src/altvm-pinocchio/PTokenCu.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

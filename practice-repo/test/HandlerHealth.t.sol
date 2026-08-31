@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {HandlerHealth} from "../src/toolchain-invariant-testing/HandlerHealth.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,8 +29,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   produce.
  */
 contract HandlerHealthTest is Test {
+    /// The subject, from src/toolchain-invariant-testing/HandlerHealth.sol. Add functions there and call them here.
+    HandlerHealth internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new HandlerHealth();
     }
 
     /// Before-and-after revert rates are captured for each handler function
@@ -40,7 +44,9 @@ contract HandlerHealthTest is Test {
     /// After the fix, a test asserts that the campaign reached a state requiring a multi-call
     /// sequence, which fails against the original handler
     function test_criterion02_afterTheFixATestAssertsThatTheCampaign() public {
-        fail("After the fix, a test asserts that the campaign reached a state requiring a multi-call sequence, which fails against the original handler");
+        fail(
+            "After the fix, a test asserts that the campaign reached a state requiring a multi-call sequence, which fails against the original handler"
+        );
     }
 
     /// The invariant still passes on the correct implementation and still fails on a seeded bug
@@ -51,7 +57,9 @@ contract HandlerHealthTest is Test {
     /// The learner can state, in one sentence, why the original campaign's green result carried
     /// almost no information
     function test_criterion04_theLearnerCanStateInOneSentenceWhyThe() public {
-        fail("The learner can state, in one sentence, why the original campaign's green result carried almost no information");
+        fail(
+            "The learner can state, in one sentence, why the original campaign's green result carried almost no information"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

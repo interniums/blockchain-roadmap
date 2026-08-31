@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ScopedPaymaster} from "../src/app-account-abstraction/ScopedPaymaster.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,8 +26,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   sponsored.
  */
 contract ScopedPaymasterTest is Test {
+    /// The subject, from src/app-account-abstraction/ScopedPaymaster.sol. Add functions there and call them here.
+    ScopedPaymaster internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ScopedPaymaster();
     }
 
     /// The intended call is sponsored and the sending account's ETH balance is unchanged
@@ -43,7 +47,9 @@ contract ScopedPaymasterTest is Test {
     /// A fourth test proves the per-account cap is enforced by exhausting it and showing the next
     /// operation is refused
     function test_criterion03_aFourthTestProvesThePerAccountCapIs() public {
-        fail("A fourth test proves the per-account cap is enforced by exhausting it and showing the next operation is refused");
+        fail(
+            "A fourth test proves the per-account cap is enforced by exhausting it and showing the next operation is refused"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

@@ -21,6 +21,10 @@
  *   builder to the proposer, stating where in the block that payment appears. Emit
  *   `out/builder-share.json` with the distribution, the sample range, and the source you
  *   measured from, and record how your top-two figure compares with the two published claims.
+ *
+ * Your code goes in src/ledgers-finality/BuilderShare.mjs. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { test } from 'node:test';
 

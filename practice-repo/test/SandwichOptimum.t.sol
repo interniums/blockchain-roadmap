@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {SandwichOptimum} from "../src/defi-mev/SandwichOptimum.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,32 +27,43 @@ import {Test, console2} from "forge-std/Test.sol";
  *   price impact approaches the tolerance.
  */
 contract SandwichOptimumTest is Test {
+    /// The subject, from src/defi-mev/SandwichOptimum.sol. Add functions there and call them here.
+    SandwichOptimum internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new SandwichOptimum();
     }
 
     /// A test asserts the computed optimal frontrun size is a genuine maximum by checking profit is
     /// lower on both sides of it
     function test_criterion01_aTestAssertsTheComputedOptimalFrontrunSizeIs() public {
-        fail("A test asserts the computed optimal frontrun size is a genuine maximum by checking profit is lower on both sides of it");
+        fail(
+            "A test asserts the computed optimal frontrun size is a genuine maximum by checking profit is lower on both sides of it"
+        );
     }
 
     /// A test asserts attacker profit goes to zero as the victim's slippage tolerance approaches
     /// the victim's own price impact
     function test_criterion02_aTestAssertsAttackerProfitGoesToZeroAs() public {
-        fail("A test asserts attacker profit goes to zero as the victim's slippage tolerance approaches the victim's own price impact");
+        fail(
+            "A test asserts attacker profit goes to zero as the victim's slippage tolerance approaches the victim's own price impact"
+        );
     }
 
     /// A test asserts that at the optimum the victim's realised output is above their stated
     /// minimum, so the bundle does not revert
     function test_criterion03_aTestAssertsThatAtTheOptimumTheVictim() public {
-        fail("A test asserts that at the optimum the victim's realised output is above their stated minimum, so the bundle does not revert");
+        fail(
+            "A test asserts that at the optimum the victim's realised output is above their stated minimum, so the bundle does not revert"
+        );
     }
 
     /// A sweep reports the profit curve over at least ten tolerance values, and gas cost is
     /// included so the profitability threshold is a real number
     function test_criterion04_aSweepReportsTheProfitCurveOverAtLeast() public {
-        fail("A sweep reports the profit curve over at least ten tolerance values, and gas cost is included so the profitability threshold is a real number");
+        fail(
+            "A sweep reports the profit curve over at least ten tolerance values, and gas cost is included so the profitability threshold is a real number"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

@@ -19,6 +19,10 @@
  *   local chain - mine, snapshot, revert, mine a different branch containing different events -
  *   and run the whole pipeline across it. Add the two invariant queries from the module as a
  *   scheduled check running in a separate process.
+ *
+ * Your code goes in src/infra-event-pipelines/FinalityGate.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {StableRounding} from "../../src/security-exploit-archaeology/StableRounding.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,8 +28,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   per unit of capital, and say at what pool size the attack stops being worth firing.
  */
 contract StableRoundingInvariantTest is Test {
+    /// The subject, from src/security-exploit-archaeology/StableRounding.sol. Add functions there and call them here.
+    StableRounding internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new StableRounding();
     }
 
     /// The invariant test fails on the unfixed implementation and passes on the fixed one

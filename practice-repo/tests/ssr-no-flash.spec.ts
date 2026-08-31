@@ -19,6 +19,10 @@
  *   and `QueryClientProvider` in a `"use client"` component and create the `QueryClient` per
  *   mount rather than at module scope. Hard-refresh while connected: the address must be in the
  *   server-rendered HTML.
+ *
+ * Your code goes in src/app-wagmi/SsrNoFlash.ts. Nothing here imports it yet — a TypeScript
+ * module is its named exports, and this scaffold does not invent them. Export what the
+ * exercise needs, then import it above.
  */
 import { test } from '@playwright/test';
 

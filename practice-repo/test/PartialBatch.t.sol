@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {PartialBatch} from "../src/app-wallet-capabilities/PartialBatch.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -24,8 +25,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   in, and add the code that detects it.
  */
 contract PartialBatchTest is Test {
+    /// The subject, from src/app-wallet-capabilities/PartialBatch.sol. Add functions there and call them here.
+    PartialBatch internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new PartialBatch();
     }
 
     /// The Foundry test proves the atomic account leaves no trace of the first call after the

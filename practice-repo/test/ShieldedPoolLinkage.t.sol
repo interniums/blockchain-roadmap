@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ShieldedPoolLinkage} from "../src/zk-privacy-applications/ShieldedPoolLinkage.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -30,8 +31,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   window — and state your filtering assumptions.
  */
 contract ShieldedPoolLinkageTest is Test {
+    /// The subject, from src/zk-privacy-applications/ShieldedPoolLinkage.sol. Add functions there and call them here.
+    ShieldedPoolLinkage internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ShieldedPoolLinkage();
     }
 
     /// A test asserts an honest withdrawal succeeds and a replayed nullifier reverts
@@ -42,20 +46,26 @@ contract ShieldedPoolLinkageTest is Test {
     /// A test using the commitment-derived nullifier reconstructs the full deposit-to-withdrawal
     /// mapping and asserts it is exactly correct
     function test_criterion02_aTestUsingTheCommitmentDerivedNullifierReconstructsThe() public {
-        fail("A test using the commitment-derived nullifier reconstructs the full deposit-to-withdrawal mapping and asserts it is exactly correct");
+        fail(
+            "A test using the commitment-derived nullifier reconstructs the full deposit-to-withdrawal mapping and asserts it is exactly correct"
+        );
     }
 
     /// The same test against the key-derived nullifier asserts no such mapping can be built from
     /// the emitted events
     function test_criterion03_theSameTestAgainstTheKeyDerivedNullifierAsserts() public {
-        fail("The same test against the key-derived nullifier asserts no such mapping can be built from the emitted events");
+        fail(
+            "The same test against the key-derived nullifier asserts no such mapping can be built from the emitted events"
+        );
     }
 
     /// A test or script recovers the A-to-B link from the gas-funding transaction and reports the
     /// effective anonymity set as a number smaller than the total deposit count, with the filtering
     /// assumptions stated
     function test_criterion04_aTestOrScriptRecoversTheAToB() public {
-        fail("A test or script recovers the A-to-B link from the gas-funding transaction and reports the effective anonymity set as a number smaller than the total deposit count, with the filtering assumptions stated");
+        fail(
+            "A test or script recovers the A-to-B link from the gas-funding transaction and reports the effective anonymity set as a number smaller than the total deposit count, with the filtering assumptions stated"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

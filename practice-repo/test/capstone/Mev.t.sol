@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Mev} from "../../src/defi-mev/Mev.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -39,8 +40,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   assumed the mitigations above apply.
  */
 contract MevTest is Test {
+    /// The subject, from src/defi-mev/Mev.sol. Add functions there and call them here.
+    Mev internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Mev();
     }
 
     /// A real sandwich is reproduced on a fork with front-run, victim and back-run transactions
@@ -56,7 +60,9 @@ contract MevTest is Test {
     /// Slippage tolerance is swept against attacker profit, with the break-even tolerance and its
     /// cost in failed transactions stated
     function test_criterion03_slippageToleranceIsSweptAgainstAttackerProfitWithThe() public {
-        fail("Slippage tolerance is swept against attacker profit, with the break-even tolerance and its cost in failed transactions stated");
+        fail(
+            "Slippage tolerance is swept against attacker profit, with the break-even tolerance and its cost in failed transactions stated"
+        );
     }
 
     /// Four extractions from one block are classified as user-harming or public-inconsistency
@@ -83,7 +89,9 @@ contract MevTest is Test {
     /// Four mitigations each have what they prevent, what they merely move, who becomes trusted,
     /// and a latency or fee cost
     function test_criterion08_fourMitigationsEachHaveWhatTheyPreventWhatThey() public {
-        fail("Four mitigations each have what they prevent, what they merely move, who becomes trusted, and a latency or fee cost");
+        fail(
+            "Four mitigations each have what they prevent, what they merely move, who becomes trusted, and a latency or fee cost"
+        );
     }
 
     /// A shipping recommendation states what is being accepted

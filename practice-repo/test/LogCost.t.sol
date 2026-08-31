@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {LogCost} from "../src/evm-logs-bloom/LogCost.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   does work.
  */
 contract LogCostTest is Test {
+    /// The subject, from src/evm-logs-bloom/LogCost.sol. Add functions there and call them here.
+    LogCost internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new LogCost();
     }
 
     /// Three measured totals for indexed, non-indexed and storage versions of the same payload

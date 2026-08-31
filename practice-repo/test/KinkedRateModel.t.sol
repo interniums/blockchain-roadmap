@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {KinkedRateModel} from "../src/defi-lending/KinkedRateModel.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,14 +28,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   that reserve's current utilisation.
  */
 contract KinkedRateModelTest is Test {
+    /// The subject, from src/defi-lending/KinkedRateModel.sol. Add functions there and call them here.
+    KinkedRateModel internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new KinkedRateModel();
     }
 
     /// A fuzz test over U in [0, 1e18] and reserveFactor in [0, 1e4] proves supplyRate is always
     /// less than or equal to borrowRate
     function test_criterion01_aFuzzTestOverUIn01e18And() public {
-        fail("A fuzz test over U in [0, 1e18] and reserveFactor in [0, 1e4] proves supplyRate is always less than or equal to borrowRate");
+        fail(
+            "A fuzz test over U in [0, 1e18] and reserveFactor in [0, 1e4] proves supplyRate is always less than or equal to borrowRate"
+        );
     }
 
     /// A fuzz test proves borrowRate is monotonically non-decreasing in U
@@ -45,13 +51,17 @@ contract KinkedRateModelTest is Test {
     /// A test proves the function is continuous at the kink, with the left and right limits
     /// differing by at most one unit of last place
     function test_criterion03_aTestProvesTheFunctionIsContinuousAtThe() public {
-        fail("A test proves the function is continuous at the kink, with the left and right limits differing by at most one unit of last place");
+        fail(
+            "A test proves the function is continuous at the kink, with the left and right limits differing by at most one unit of last place"
+        );
     }
 
     /// A test using a real reserve's parameters reproduces its published borrow and supply APY to
     /// within one basis point
     function test_criterion04_aTestUsingARealReserveSParametersReproduces() public {
-        fail("A test using a real reserve's parameters reproduces its published borrow and supply APY to within one basis point");
+        fail(
+            "A test using a real reserve's parameters reproduces its published borrow and supply APY to within one basis point"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

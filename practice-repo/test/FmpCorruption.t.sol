@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {FmpCorruption} from "../src/evm-opcodes-memory/FmpCorruption.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,14 +27,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   write the corrected version that allocates properly by reading and advancing the pointer.
  */
 contract FmpCorruptionTest is Test {
+    /// The subject, from src/evm-opcodes-memory/FmpCorruption.sol. Add functions there and call them here.
+    FmpCorruption internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new FmpCorruption();
     }
 
     /// A failing-then-passing pair of tests for the 0x40 corruption, with an assertion on the
     /// concrete wrong value
     function test_criterion01_aFailingThenPassingPairOfTestsForThe() public {
-        fail("A failing-then-passing pair of tests for the 0x40 corruption, with an assertion on the concrete wrong value");
+        fail(
+            "A failing-then-passing pair of tests for the 0x40 corruption, with an assertion on the concrete wrong value"
+        );
     }
 
     /// A second pair for the 0x60 zero-slot corruption

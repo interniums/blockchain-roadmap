@@ -18,6 +18,10 @@
  *   and the one thing the reader should do. Cover at least eight distinct failures: a decodable
  *   custom error, an undecodable one from a contract whose ABI you withheld, panic 0x11, panic
  *   0x32, an empty revert, insufficient funds, user rejection, and an RPC timeout.
+ *
+ * Your code goes in src/app-error-surfaces/ToUserMessage.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

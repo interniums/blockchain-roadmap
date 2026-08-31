@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {SuiteIntegrity} from "../../src/toolchain-unit-testing/SuiteIntegrity.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -39,8 +40,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   you either close it or document why it is acceptable.
  */
 contract SuiteIntegrityTest is Test {
+    /// The subject, from src/toolchain-unit-testing/SuiteIntegrity.sol. Add functions there and call them here.
+    SuiteIntegrity internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new SuiteIntegrity();
     }
 
     /// Each of the six named traps is demonstrated passing wrongly, then fixed, with both versions
@@ -62,7 +66,9 @@ contract SuiteIntegrityTest is Test {
     /// An expectEmit is shown matching a decoy contract, and a topic-flag combination is shown
     /// letting a wrong value through
     function test_criterion04_anExpectemitIsShownMatchingADecoyContractAnd() public {
-        fail("An expectEmit is shown matching a decoy contract, and a topic-flag combination is shown letting a wrong value through");
+        fail(
+            "An expectEmit is shown matching a decoy contract, and a topic-flag combination is shown letting a wrong value through"
+        );
     }
 
     /// What the four topic flags do not cover is stated
@@ -73,13 +79,17 @@ contract SuiteIntegrityTest is Test {
     /// setUp is shown to run per test, with one consequence demonstrated, and one thing that does
     /// leak via the snapshot model identified
     function test_criterion06_setupIsShownToRunPerTestWithOne() public {
-        fail("setUp is shown to run per test, with one consequence demonstrated, and one thing that does leak via the snapshot model identified");
+        fail(
+            "setUp is shown to run per test, with one consequence demonstrated, and one thing that does leak via the snapshot model identified"
+        );
     }
 
     /// All three prank scopes are demonstrated, including the tx.origin and delegatecall forms,
     /// plus one case where the scope ended early
     function test_criterion07_allThreePrankScopesAreDemonstratedIncludingTheTx() public {
-        fail("All three prank scopes are demonstrated, including the tx.origin and delegatecall forms, plus one case where the scope ended early");
+        fail(
+            "All three prank scopes are demonstrated, including the tx.origin and delegatecall forms, plus one case where the scope ended early"
+        );
     }
 
     /// Five distinct contract mutations are each caught by the fixed suite

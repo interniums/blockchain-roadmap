@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {PullPayments} from "../src/solidity-contract-patterns/PullPayments.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,14 +26,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   call{value:}("") with a checked return, and prove all three now succeed for everyone else.
  */
 contract PullPaymentsTest is Test {
+    /// The subject, from src/solidity-contract-patterns/PullPayments.sol. Add functions there and call them here.
+    PullPayments internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new PullPayments();
     }
 
     /// Three tests each prove a distinct failure of the push version — reverting recipient,
     /// gas-burning recipient, and a recipient needing more than the 2300-gas stipend
     function test_criterion01_threeTestsEachProveADistinctFailureOfThe() public {
-        fail(unicode"Three tests each prove a distinct failure of the push version — reverting recipient, gas-burning recipient, and a recipient needing more than the 2300-gas stipend");
+        fail(
+            unicode"Three tests each prove a distinct failure of the push version — reverting recipient, gas-burning recipient, and a recipient needing more than the 2300-gas stipend"
+        );
     }
 
     /// The same three scenarios all pass against the pull version, with every other recipient paid

@@ -18,6 +18,10 @@
  *   `r` and `s`. In TypeScript, reconstruct the signed digest as `SHA-256(authenticatorData ‖
  *   SHA-256(clientDataJSON))` and verify it locally. Then write a Foundry test that staticcalls
  *   `0x100` with the resulting 160-byte payload on a fork with the precompile active.
+ *
+ * Your code goes in src/app-passkeys/WebauthnDigest.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

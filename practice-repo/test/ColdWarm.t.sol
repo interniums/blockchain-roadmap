@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ColdWarm} from "../src/evm-gas-fee-market/ColdWarm.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   gas; work out why before reading the hint.
  */
 contract ColdWarmTest is Test {
+    /// The subject, from src/evm-gas-fee-market/ColdWarm.sol. Add functions there and call them here.
+    ColdWarm internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ColdWarm();
     }
 
     /// Six measured figures produced by the learner's own run, each with the harness overhead
@@ -39,7 +43,9 @@ contract ColdWarmTest is Test {
     /// The cold SLOAD figure lands on 2100 and the cold account-access figures land on 2600 after
     /// subtracting overhead
     function test_criterion02_theColdSloadFigureLandsOn2100AndThe() public {
-        fail("The cold SLOAD figure lands on 2100 and the cold account-access figures land on 2600 after subtracting overhead");
+        fail(
+            "The cold SLOAD figure lands on 2100 and the cold account-access figures land on 2600 after subtracting overhead"
+        );
     }
 
     /// The test emits the toolchain versions and optimizer setting alongside the numbers

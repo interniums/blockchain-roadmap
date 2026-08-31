@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Vault} from "../../src/security-fuzzing/Vault.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -28,8 +29,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   confirm that the path-independence property, and only that property, fails.
  */
 contract VaultInvariantTest is Test {
+    /// The subject, from src/security-fuzzing/Vault.sol. Add functions there and call them here.
+    Vault internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Vault();
     }
 
     /// All three invariants pass on the correct implementation
@@ -45,7 +49,9 @@ contract VaultInvariantTest is Test {
     /// Inverting one rounding direction makes the path-independence property fail and leaves the
     /// other two passing
     function test_criterion03_invertingOneRoundingDirectionMakesThePathIndependenceProperty() public {
-        fail("Inverting one rounding direction makes the path-independence property fail and leaves the other two passing");
+        fail(
+            "Inverting one rounding direction makes the path-independence property fail and leaves the other two passing"
+        );
     }
 
     /// The handler clamps rather than rejects, and the reported revert rate is below twenty percent

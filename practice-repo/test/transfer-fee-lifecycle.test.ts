@@ -21,6 +21,10 @@
  *   the associated token account address for one holder twice - once with the Token-2022 program
  *   id as a seed and once with the legacy token program id - and print both, showing they
  *   differ. Also attempt the same transfer with plain `transfer` and record what happens.
+ *
+ * Your code goes in src/altvm-token-2022/TransferFeeLifecycle.ts. Nothing here imports it yet
+ * — a TypeScript module is its named exports, and this scaffold does not invent them. Export
+ * what the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

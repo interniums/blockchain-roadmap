@@ -20,6 +20,10 @@
  *   attestation deadline drawn on it, and state your observed missed-slot rate. Then answer in
  *   writing: what fraction of blocks arrived after the deadline, and what would you expect to
  *   happen to those blocks in fork choice.
+ *
+ * Your code goes in src/protocol-client-architecture/Arrivals.ts. Nothing here imports it yet
+ * — a TypeScript module is its named exports, and this scaffold does not invent them. Export
+ * what the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

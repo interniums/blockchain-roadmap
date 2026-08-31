@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {GasPriceList} from "../../src/evm-gas-fee-market/GasPriceList.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -39,20 +40,27 @@ import {Test, console2} from "forge-std/Test.sol";
  *   wrong or out of date. Quote it, quote yours, and say why they differ.
  */
 contract GasPriceListTest is Test {
+    /// The subject, from src/evm-gas-fee-market/GasPriceList.sol. Add functions there and call them here.
+    GasPriceList internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new GasPriceList();
     }
 
     /// Intrinsic gas is measured separately for a transfer, a call with calldata and a creation,
     /// with base and calldata costs split
     function test_criterion01_intrinsicGasIsMeasuredSeparatelyForATransferA() public {
-        fail("Intrinsic gas is measured separately for a transfer, a call with calldata and a creation, with base and calldata costs split");
+        fail(
+            "Intrinsic gas is measured separately for a transfer, a call with calldata and a creation, with base and calldata costs split"
+        );
     }
 
     /// One transaction where the calldata floor binds and one where it does not, with the byte
     /// pattern responsible named
     function test_criterion02_oneTransactionWhereTheCalldataFloorBindsAndOne() public {
-        fail("One transaction where the calldata floor binds and one where it does not, with the byte pattern responsible named");
+        fail(
+            "One transaction where the calldata floor binds and one where it does not, with the byte pattern responsible named"
+        );
     }
 
     /// Cold and warm costs are measured independently for account access and storage read
@@ -63,7 +71,9 @@ contract GasPriceListTest is Test {
     /// The dead-code trap is demonstrated: the same harness yields a different number with the
     /// optimiser defeated, and the report says which is real
     function test_criterion04_theDeadCodeTrapIsDemonstratedTheSameHarness() public {
-        fail("The dead-code trap is demonstrated: the same harness yields a different number with the optimiser defeated, and the report says which is real");
+        fail(
+            "The dead-code trap is demonstrated: the same harness yields a different number with the optimiser defeated, and the report says which is real"
+        );
     }
 
     /// All four SSTORE dynamic cases are reported separately, including the refund and the
@@ -90,7 +100,9 @@ contract GasPriceListTest is Test {
     /// One circulating figure is quoted alongside your contradicting measurement, with the
     /// discrepancy explained
     function test_criterion09_oneCirculatingFigureIsQuotedAlongsideYourContradictingMeasurement() public {
-        fail("One circulating figure is quoted alongside your contradicting measurement, with the discrepancy explained");
+        fail(
+            "One circulating figure is quoted alongside your contradicting measurement, with the discrepancy explained"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

@@ -17,6 +17,10 @@
  *   in one of the five components and count again. Finally, remove the explicit `chainId` from
  *   all five while the wallet is on a different chain than the config's default, and record what
  *   the components display. Write down the request counts and what changed the answer.
+ *
+ * Your code goes in src/app-wagmi/CountRpc.ts. Nothing here imports it yet — a TypeScript
+ * module is its named exports, and this scaffold does not invent them. Export what the
+ * exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

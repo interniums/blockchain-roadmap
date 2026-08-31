@@ -20,6 +20,10 @@
  *   canonical one, and that nothing in the process logged an error. Then fix it: record the
  *   block hash with every row, detect the common ancestor when the parent hash of a new block
  *   does not match the hash you stored, delete every row above it, and reapply.
+ *
+ * Your code goes in src/infra-indexing/ReorgIndexer.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

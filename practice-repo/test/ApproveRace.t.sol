@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {ApproveRace} from "../src/solidity-token-standards/ApproveRace.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -33,14 +34,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   the money goes? Support the answer with what the alternative failure would cost.
  */
 contract ApproveRaceTest is Test {
+    /// The subject, from src/solidity-token-standards/ApproveRace.sol. Add functions there and call them here.
+    ApproveRace internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new ApproveRace();
     }
 
     /// A token balance is changed by writing the token's mapping directly, with the consequence for
     /// treating a balance as a held asset stated
     function test_criterion01_aTokenBalanceIsChangedByWritingTheToken() public {
-        fail("A token balance is changed by writing the token's mapping directly, with the consequence for treating a balance as a held asset stated");
+        fail(
+            "A token balance is changed by writing the token's mapping directly, with the consequence for treating a balance as a held asset stated"
+        );
     }
 
     /// The approve race is executed with the total extracted exceeding either individual approval

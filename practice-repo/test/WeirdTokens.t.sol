@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {WeirdTokens} from "../src/solidity-token-standards/WeirdTokens.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -25,8 +26,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   balance, and prove the balance-delta version does not.
  */
 contract WeirdTokensTest is Test {
+    /// The subject, from src/solidity-token-standards/WeirdTokens.sol. Add functions there and call them here.
+    WeirdTokens internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new WeirdTokens();
     }
 
     /// A forked test asserts the plain IERC20 transfer against USDT reverts and the SafeERC20
@@ -38,13 +42,17 @@ contract WeirdTokensTest is Test {
     /// A test proves the naive vault becomes insolvent after three fee-on-transfer deposits and
     /// that the last withdrawal reverts
     function test_criterion02_aTestProvesTheNaiveVaultBecomesInsolventAfter() public {
-        fail("A test proves the naive vault becomes insolvent after three fee-on-transfer deposits and that the last withdrawal reverts");
+        fail(
+            "A test proves the naive vault becomes insolvent after three fee-on-transfer deposits and that the last withdrawal reverts"
+        );
     }
 
     /// The balance-delta vault passes the same three-user sequence with every user able to withdraw
     /// what they are owed
     function test_criterion03_theBalanceDeltaVaultPassesTheSameThreeUser() public {
-        fail("The balance-delta vault passes the same three-user sequence with every user able to withdraw what they are owed");
+        fail(
+            "The balance-delta vault passes the same three-user sequence with every user able to withdraw what they are owed"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

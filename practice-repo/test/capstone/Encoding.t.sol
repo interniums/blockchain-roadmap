@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Encoding} from "../../src/fundamentals-encoding/Encoding.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -34,14 +35,19 @@ import {Test, console2} from "forge-std/Test.sol";
  *   is the whole module in one test: an ambiguous encoding is one you cannot safely hash.
  */
 contract EncodingTest is Test {
+    /// The subject, from src/fundamentals-encoding/Encoding.sol. Add functions there and call them here.
+    Encoding internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Encoding();
     }
 
     /// Real mainnet calldata with at least one dynamic argument round-trips byte-for-byte through
     /// your own ABI codec, with the selector derived from the signature
     function test_criterion01_realMainnetCalldataWithAtLeastOneDynamicArgument() public {
-        fail("Real mainnet calldata with at least one dynamic argument round-trips byte-for-byte through your own ABI codec, with the selector derived from the signature");
+        fail(
+            "Real mainnet calldata with at least one dynamic argument round-trips byte-for-byte through your own ABI codec, with the selector derived from the signature"
+        );
     }
 
     /// A real transaction round-trips through your own RLP codec byte-for-byte
@@ -52,7 +58,9 @@ contract EncodingTest is Test {
     /// A non-minimal length prefix and a leading-zero integer are both rejected, each with an error
     /// naming the canonicality rule broken
     function test_criterion03_aNonMinimalLengthPrefixAndALeadingZero() public {
-        fail("A non-minimal length prefix and a leading-zero integer are both rejected, each with an error naming the canonicality rule broken");
+        fail(
+            "A non-minimal length prefix and a leading-zero integer are both rejected, each with an error naming the canonicality rule broken"
+        );
     }
 
     /// SSZ Merkle roots change when a field changes and are stable across two encodings of the same

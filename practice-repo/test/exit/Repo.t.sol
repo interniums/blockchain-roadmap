@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {Repo} from "../../src/toolchain-hardhat-literacy/Repo.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -39,8 +40,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   project needs it. "No" is the expected answer and it still has to be argued.
  */
 contract RepoTest is Test {
+    /// The subject, from src/toolchain-hardhat-literacy/Repo.sol. Add functions there and call them here.
+    Repo internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new Repo();
     }
 
     /// A documented command produces byte-identical bytecode across two runs, with both hashes
@@ -96,7 +100,9 @@ contract RepoTest is Test {
     /// A written page argues whether this project needs Hardhat 3, from the repository you read
     /// rather than from generalities
     function test_criterion10_aWrittenPageArguesWhetherThisProjectNeedsHardhat() public {
-        fail("A written page argues whether this project needs Hardhat 3, from the repository you read rather than from generalities");
+        fail(
+            "A written page argues whether this project needs Hardhat 3, from the repository you read rather than from generalities"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

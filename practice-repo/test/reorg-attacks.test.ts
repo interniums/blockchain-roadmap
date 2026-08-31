@@ -20,6 +20,10 @@
  *   attack, sweep the adversarial stake fraction and the boost value and record the minimum
  *   fraction that succeeds. Plot both curves on one chart against boost value. The two curves
  *   must move in opposite directions; if they do not, your simulation is wrong.
+ *
+ * Your code goes in src/protocol-fork-choice/ReorgAttacks.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

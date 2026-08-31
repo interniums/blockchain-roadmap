@@ -18,6 +18,10 @@
  *   issued - from the node's own log if you run Anvil, or from a request-counting transport
  *   wrapper. Report both numbers and explain the difference in terms of round trips rather than
  *   compute.
+ *
+ * Your code goes in src/app-viem/MulticallBenchmark.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

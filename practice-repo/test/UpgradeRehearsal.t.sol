@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {UpgradeRehearsal} from "../src/infra-simulation/UpgradeRehearsal.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -27,32 +28,43 @@ import {Test, console2} from "forge-std/Test.sol";
  *   pinned and cached.
  */
 contract UpgradeRehearsalTest is Test {
+    /// The subject, from src/infra-simulation/UpgradeRehearsal.sol. Add functions there and call them here.
+    UpgradeRehearsal internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new UpgradeRehearsal();
     }
 
     /// The integration suite passes against the upgraded proxy on a pinned fork, and the pin is a
     /// literal block number in the test
     function test_criterion01_theIntegrationSuitePassesAgainstTheUpgradedProxyOn() public {
-        fail("The integration suite passes against the upgraded proxy on a pinned fork, and the pin is a literal block number in the test");
+        fail(
+            "The integration suite passes against the upgraded proxy on a pinned fork, and the pin is a literal block number in the test"
+        );
     }
 
     /// The governance path reaches execute and asserts the target parameter's new value, with the
     /// timelock delay skipped rather than removed
     function test_criterion02_theGovernancePathReachesExecuteAndAssertsTheTarget() public {
-        fail("The governance path reaches execute and asserts the target parameter's new value, with the timelock delay skipped rather than removed");
+        fail(
+            "The governance path reaches execute and asserts the target parameter's new value, with the timelock delay skipped rather than removed"
+        );
     }
 
     /// Introducing a storage-layout shift makes the rehearsal fail, and the failure names the
     /// shifted slot rather than a generic revert
     function test_criterion03_introducingAStorageLayoutShiftMakesTheRehearsalFail() public {
-        fail("Introducing a storage-layout shift makes the rehearsal fail, and the failure names the shifted slot rather than a generic revert");
+        fail(
+            "Introducing a storage-layout shift makes the rehearsal fail, and the failure names the shifted slot rather than a generic revert"
+        );
     }
 
     /// The CI job runs the same test with a warm fork cache and the second run is measurably faster
     /// than the first
     function test_criterion04_theCiJobRunsTheSameTestWithA() public {
-        fail("The CI job runs the same test with a warm fork cache and the second run is measurably faster than the first");
+        fail(
+            "The CI job runs the same test with a warm fork cache and the second run is measurably faster than the first"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

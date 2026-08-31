@@ -20,6 +20,10 @@
  *   The final table must checksum identically. Then break it deliberately: move the cursor
  *   update into a second transaction, repeat the SIGKILL run, and demonstrate and name the
  *   resulting failure.
+ *
+ * Your code goes in src/infra-event-pipelines/IngesterCrashSafety.ts. Nothing here imports it
+ * yet — a TypeScript module is its named exports, and this scaffold does not invent them.
+ * Export what the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 

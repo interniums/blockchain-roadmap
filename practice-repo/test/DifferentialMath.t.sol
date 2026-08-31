@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import {Test, console2} from "forge-std/Test.sol";
+import {DifferentialMath} from "../src/security-fuzzing/DifferentialMath.sol";
 
 /*
  * CHAINPATH-GENERATED-SCAFFOLD
@@ -26,8 +27,11 @@ import {Test, console2} from "forge-std/Test.sol";
  *   enough that someone could attack it.
  */
 contract DifferentialMathTest is Test {
+    /// The subject, from src/security-fuzzing/DifferentialMath.sol. Add functions there and call them here.
+    DifferentialMath internal subject;
+
     function setUp() public {
-        // Deploy what the exercise needs. Nothing is deployed yet because nothing is written yet.
+        subject = new DifferentialMath();
     }
 
     /// Each of your implementations is compared against a named reference over the same fuzzed
@@ -39,7 +43,9 @@ contract DifferentialMathTest is Test {
     /// At least one disagreement is found and adjudicated, or an explicit equivalence argument is
     /// written for each pair
     function test_criterion02_atLeastOneDisagreementIsFoundAndAdjudicatedOr() public {
-        fail("At least one disagreement is found and adjudicated, or an explicit equivalence argument is written for each pair");
+        fail(
+            "At least one disagreement is found and adjudicated, or an explicit equivalence argument is written for each pair"
+        );
     }
 
     /// Round-trip properties are present for every operation that has an inverse
@@ -50,7 +56,9 @@ contract DifferentialMathTest is Test {
     /// Edge inputs - zero, one, the maximum value, and the value just below an overflow - are
     /// exercised rather than left to chance
     function test_criterion04_edgeInputsZeroOneTheMaximumValueAndThe() public {
-        fail("Edge inputs - zero, one, the maximum value, and the value just below an overflow - are exercised rather than left to chance");
+        fail(
+            "Edge inputs - zero, one, the maximum value, and the value just below an overflow - are exercised rather than left to chance"
+        );
     }
 
     /// Keeps console2 referenced: the exercises want you to print evidence, not just assert.

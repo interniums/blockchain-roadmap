@@ -20,6 +20,10 @@
  *   the two cannot drift. Corrupt the vault's accounting on the fork with a storage write, and
  *   show the monitor reporting failure within one block. Make the failure output enriched: which
  *   term of the predicate broke, by how much, and the balance deltas that produced it.
+ *
+ * Your code goes in src/infra-monitoring/InvariantMonitor.ts. Nothing here imports it yet — a
+ * TypeScript module is its named exports, and this scaffold does not invent them. Export what
+ * the exercise needs, then import it above.
  */
 import { describe, it, expect } from 'vitest';
 
