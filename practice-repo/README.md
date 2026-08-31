@@ -120,6 +120,7 @@ Anchor, Noir or Python, and each wants its own toolchain present before its comm
 | Practices | Command shape | Needs | Verified here |
 | --- | --- | --- | --- |
 | 4 | `cargo test` / `cargo run --bin bench` | rustc, cargo | yes |
+| 1 | `cargo stylus check` | `cargo-stylus`, wasm32 target | yes, cargo-stylus 0.10.9 |
 | 5 | `cargo test-sbf -p … --test …` | `solana` + `cargo-build-sbf` | yes |
 | 3 | `anchor test` / `anchor build` | `anchor` CLI | yes |
 | 4 | `pytest` / `uv run python` | Python 3.9+, pytest (or `uv`) | yes, with pytest |
@@ -131,6 +132,9 @@ Anchor, Noir or Python, and each wants its own toolchain present before its comm
 sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
 cargo install --git https://github.com/coral-xyz/anchor avm --force && avm install latest
 
+# Stylus
+rustup target add wasm32-unknown-unknown && cargo install cargo-stylus
+
 # Noir
 curl -L https://raw.githubusercontent.com/noir-lang/noirup/main/install | bash && noirup
 
@@ -138,12 +142,18 @@ curl -L https://raw.githubusercontent.com/noir-lang/noirup/main/install | bash &
 uv sync                       # or: python3 -m venv .venv && .venv/bin/pip install pytest
 ```
 
-One gap remains: `cargo stylus check`. `cargo-stylus` is a separate cargo subcommand and is not
-installed, so that half of the Stylus practice's command is authored but unrun. The Rust package it
-checks does compile and test, and the Solidity half of the same command runs.
+Every command in the table has been run. Two are worth knowing the detail of.
 
-Everything else in the table was executed. For Noir that means `nargo compile`, `nargo check` and
-`nargo test` on 1.0.0-beta.26: no warnings, and the four criteria fail by name.
+**Noir**: `nargo compile`, `nargo check` and `nargo test` on 1.0.0-beta.26 — no warnings, and the
+four criteria fail by name.
+
+**Stylus**: `cargo stylus check` does two things, and only the first is local. It compiles the
+contract to WASM and reports its size, then *simulates activation against a chain* — defaulting to
+a local Nitro devnode on `:8547`, which is why it fails with a connection error out of the box. The
+command therefore passes `-e $ARB_SEPOLIA_RPC_URL`, the same endpoint its `forge test` half already
+uses. Verified against Arbitrum Sepolia: 4.7 KB, and a wasm data fee of 0.000067 ETH. That fee is
+a gift to the practice — criterion 3 asks you to record activation cost as a measured number, and
+this is where the first one comes from.
 
 ### Where the Rust lives
 
@@ -156,6 +166,14 @@ Cargo.toml         one virtual workspace, three member groups
 
 `default-members` scopes bare `cargo` commands to `sbf/*` and `rust/*`, so a plain `cargo test` does
 not spend minutes building Anchor programs you were not asking about.
+
+`rust/stylus-gas` is **excluded** from that workspace and is its own package, which is not a style
+choice. A Stylus contract is a `cdylib` referencing WASM hostio symbols — `_msg_reentrant` and
+friends — that exist only inside the Stylus runtime, so it cannot link for the host at all. As a
+workspace member it broke `cargo test --workspace`, which is another practice's acceptance command.
+It carries its own `Cargo.lock` and `rust-toolchain.toml` because cargo-stylus requires both: the
+toolchain and the lockfile are part of the deployment hash, so `cargo stylus verify` can only
+reproduce your bytes if it can reproduce your compiler.
 
 ---
 

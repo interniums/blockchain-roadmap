@@ -7,7 +7,7 @@ import {Test, console2} from "forge-std/Test.sol";
  * CHAINPATH-GENERATED-SCAFFOLD
  *
  * Practice: scaling-stylus-compute-versus-storage  (measure, grain module, difficulty 4)
- * Run:      cargo stylus check && forge test --match-path test/StylusGas.t.sol --fork-url $ARB_SEPOLIA_RPC_URL -vvv
+ * Run:      cd rust/stylus-gas && cargo stylus check -e $ARB_SEPOLIA_RPC_URL && cd ../.. && forge test --match-path test/StylusGas.t.sol --fork-url $ARB_SEPOLIA_RPC_URL -vvv
  *
  * THIS IS A CHECKLIST, NOT A SPECIFICATION. It was generated so that the command above
  * resolves and fails honestly, with one named case per acceptance criterion, instead of

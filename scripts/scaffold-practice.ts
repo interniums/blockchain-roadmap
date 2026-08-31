@@ -131,11 +131,12 @@ const FOREIGN_TARGETS: Record<string, Need[]> = {
   'protocol-contributing-first-issue': [
     { kind: 'rust-test', file: 'rust/first-issue/tests/first_issue.rs' },
   ],
-  // cargo stylus is a Rust contract compiled to WASM; the Solidity half of its command already has
-  // its scaffold from `--match-path`.
-  'scaling-stylus-compute-versus-storage': [
-    { kind: 'rust-test', file: 'rust/stylus-gas/tests/compute_versus_storage.rs' },
-  ],
+  // scaling-stylus-compute-versus-storage takes no entry here. Its criteria are already scaffolded
+  // on the Solidity side — the command's second half is
+  // `forge test --match-path test/StylusGas.t.sol` — and a Rust criterion file in the Stylus crate
+  // could not run anyway: a Stylus cdylib does not link for the host, because its hostio symbols
+  // exist only inside the Stylus runtime. It would also land in the deployment hash, which is
+  // computed over every .rs in the crate.
 
   // --- Noir.
   'zk-noir-circuits-unconstrained-hint-forgery': [
